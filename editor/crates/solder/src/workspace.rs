@@ -101,11 +101,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-`", ToggleTerminal, None),
         KeyBinding::new("ctrl-shift-`", NewTerminal, None),
         KeyBinding::new("ctrl-shift-g", ShowGit, None),
-        KeyBinding::new(
-            "secondary-alt-d",
-            ShowFileDiff,
-            Some("Editor && mode == full"),
-        ),
+        KeyBinding::new("secondary-alt-d", ShowFileDiff, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
@@ -2597,7 +2593,7 @@ mod tests {
         });
         cx.simulate_input("unsaved ");
         let before = active_text(&workspace, cx);
-        cx.simulate_keystrokes("secondary-alt-d");
+        cx.simulate_keystrokes("ctrl-shift-g secondary-alt-d");
         wait_for(cx, "diff", &|cx| {
             workspace
                 .read(cx)
