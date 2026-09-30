@@ -1836,9 +1836,9 @@ mod tests {
         cx.simulate_keystrokes("enter");
         cx.simulate_input("x");
         assert_eq!(text(&editor, cx), "fn main() {\n    x\n}");
-        cx.simulate_keystrokes("cmd-z");
+        cx.simulate_keystrokes("secondary-z");
         assert_eq!(text(&editor, cx), "");
-        cx.simulate_keystrokes("cmd-shift-z");
+        cx.simulate_keystrokes("secondary-shift-z");
         assert_eq!(text(&editor, cx), "fn main() {\n    x\n}");
     }
 
@@ -1865,7 +1865,7 @@ mod tests {
     #[gpui::test]
     fn selection_wraps_in_pair(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx, "a.js", "value");
-        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_keystrokes("secondary-a");
         cx.simulate_input("(");
         assert_eq!(text(&editor, cx), "(value)");
     }
@@ -1890,7 +1890,7 @@ mod tests {
     #[gpui::test]
     fn enter_between_brackets_splits_block(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx, "a.ts", "if (a) {}");
-        cx.simulate_keystrokes("cmd-right left enter");
+        cx.simulate_keystrokes("secondary-right left enter");
         assert_eq!(text(&editor, cx), "if (a) {\n  \n}".replace("  ", "    "));
         assert_eq!(cursors(&editor, cx), vec![13..13]);
     }
@@ -1898,7 +1898,7 @@ mod tests {
     #[gpui::test]
     fn multi_cursor_editing(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx, "a.txt", "one\ntwo\nthree");
-        cx.simulate_keystrokes("cmd-alt-down cmd-alt-down");
+        cx.simulate_keystrokes("secondary-alt-down secondary-alt-down");
         assert_eq!(cursors(&editor, cx).len(), 3);
         cx.simulate_input("- ");
         assert_eq!(text(&editor, cx), "- one\n- two\n- three");
@@ -1909,7 +1909,7 @@ mod tests {
     #[gpui::test]
     fn select_next_occurrence_and_replace(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx, "a.js", "let foo = foo + foo;");
-        cx.simulate_keystrokes("right right right right cmd-d cmd-d cmd-d");
+        cx.simulate_keystrokes("right right right right secondary-d secondary-d secondary-d");
         assert_eq!(cursors(&editor, cx), vec![4..7, 10..13, 16..19]);
         cx.simulate_input("bar");
         assert_eq!(text(&editor, cx), "let bar = bar + bar;");
@@ -1924,9 +1924,9 @@ mod tests {
         assert_eq!(text(&editor, cx), "b\na\nc");
         cx.simulate_keystrokes("alt-shift-down");
         assert_eq!(text(&editor, cx), "b\nb\na\nc");
-        cx.simulate_keystrokes("cmd-/");
+        cx.simulate_keystrokes("secondary-/");
         assert_eq!(text(&editor, cx), "b\n// b\na\nc");
-        cx.simulate_keystrokes("cmd-/");
+        cx.simulate_keystrokes("secondary-/");
         assert_eq!(text(&editor, cx), "b\nb\na\nc");
     }
 
@@ -1942,14 +1942,14 @@ mod tests {
     #[gpui::test]
     fn backspace_removes_one_indent_level(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx, "a.rs", "        x");
-        cx.simulate_keystrokes("cmd-right cmd-left backspace");
+        cx.simulate_keystrokes("secondary-right secondary-left backspace");
         assert_eq!(text(&editor, cx), "    x");
     }
 
     #[gpui::test]
     fn copy_without_selection_copies_line(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx, "a.txt", "first\nsecond");
-        cx.simulate_keystrokes("cmd-c down cmd-v");
+        cx.simulate_keystrokes("secondary-c down secondary-v");
         assert_eq!(text(&editor, cx), "first\nfirst\nsecond");
         let _ = editor;
     }
