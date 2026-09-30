@@ -204,6 +204,25 @@ undoes it. Then:
   similar, with the undo as the down file), dbmate (`-- migrate:up` and `down`), or
   timestamped SQL files in `migrations/`. The file opens in the editor.
 
+### ERD
+
+**ERD** on a connection shows its tables and views with their columns, and foreign
+keys as lines: referenced tables to the left, tables pointing at them to the right,
+tables without relations after them. Drag the background (or scroll) to pan,
+`cmd`-scroll or `cmd-=`/`cmd--` to zoom, `cmd-0` to fit. Drag a table by its header
+to move it; the layout is saved in `.solder/erd/<connection>.json`, so it can be
+committed and shared. **Find a table** highlights matches and `enter` centers the
+first.
+
+Select a table to see its relations: **Data** browses its rows (so does a double
+click), **Structure** opens its form, **Join** runs a query joining the two tables
+of a relation. **New table** opens an empty form. Drag from a column's right edge
+onto a column of another table to add a foreign key: the structure form opens with
+it drafted, to review and apply or save as a migration like any other change.
+
+**Mermaid** copies the diagram as a Mermaid `erDiagram` for docs and pull requests;
+**SVG** and **PNG** save it as a file.
+
 ### Editing rows
 
 Rows from a plain `SELECT` on one table with a primary key can be edited in

@@ -225,6 +225,19 @@ impl StructureView {
         cx.notify();
     }
 
+    /// Adds a foreign key already filled in (dragged in the ERD).
+    pub fn add_foreign_key_draft(&mut self, fk: &ForeignKeyDraft, cx: &mut Context<Self>) {
+        self.foreign_keys.push(ForeignKeyRow {
+            original: None,
+            name: field(&fk.name, "name", cx),
+            columns: field(&names(&fk.columns), "columns", cx),
+            ref_table: field(&fk.ref_table, "table", cx),
+            ref_columns: field(&names(&fk.ref_columns), "columns", cx),
+            on_delete: fk.on_delete.clone(),
+        });
+        cx.notify();
+    }
+
     pub fn add_foreign_key(&mut self, cx: &mut Context<Self>) {
         let table = self.name.read(cx).text(cx);
         self.foreign_keys.push(ForeignKeyRow {

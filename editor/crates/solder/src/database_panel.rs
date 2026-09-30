@@ -38,6 +38,11 @@ pub enum DatabasePanelEvent {
         engine: Engine,
         object: Option<Object>,
     },
+    /// Show the connection's ERD.
+    Diagram {
+        connection: SharedString,
+        engine: Engine,
+    },
     /// Open the connection's scratch query file.
     NewQuery { connection: SharedString },
 }
@@ -327,6 +332,7 @@ impl DatabasePanel {
                     .when(conn.spec.engine.is_sql(), |d| {
                         let engine = conn.spec.engine;
                         let connection: SharedString = conn.spec.name.clone().into();
+                        let conn_name = connection.clone();
                         d.child(
                             div()
                                 .id(("db-new-table", i))
@@ -348,6 +354,30 @@ impl DatabasePanel {
                                         object: None,
                                     });
                                 })),
+                        )
+                        .child(
+                            div()
+                                .id(("db-erd", i))
+                                .flex_none()
+                                .h(px(20.))
+                                .px_1p5()
+                                .flex()
+                                .items_center()
+                                .rounded(px(6.))
+                                .text_size(px(11.))
+                                .text_color(theme.fg_subtle)
+                                .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                                .child("ERD")
+                                .on_click({
+                                    let connection = conn_name.clone();
+                                    cx.listener(move |_, _, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.emit(DatabasePanelEvent::Diagram {
+                                            connection: connection.clone(),
+                                            engine,
+                                        });
+                                    })
+                                }),
                         )
                     })
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_connection(i, cx)))
