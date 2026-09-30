@@ -145,8 +145,7 @@ mod tests {
     use crate::{ConnectionSpec, Engine, Session, Value};
 
     fn database(name: &str, read_only: bool) -> ConnectionSpec {
-        let path = std::env::temp_dir().join(format!("solder-{name}-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = crate::testing::dir(name).join("test.db");
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL, avatar BLOB);

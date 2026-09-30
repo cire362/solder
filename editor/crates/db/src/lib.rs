@@ -14,6 +14,8 @@ mod pg;
 mod redis;
 pub mod sql;
 mod sqlite;
+#[doc(hidden)]
+pub mod testing;
 mod tls;
 
 use std::{

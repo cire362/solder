@@ -697,8 +697,7 @@ mod tests {
 
     #[test]
     fn root_is_nearest_marker() {
-        let dir = std::env::temp_dir().join(format!("solder-root-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = db::testing::dir("root");
         std::fs::create_dir_all(dir.join("crates/a/src")).unwrap();
         std::fs::write(dir.join("Cargo.toml"), "").unwrap();
         std::fs::write(dir.join("crates/a/Cargo.toml"), "").unwrap();
