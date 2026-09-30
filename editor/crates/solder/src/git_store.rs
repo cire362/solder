@@ -31,6 +31,8 @@ pub struct GitStore {
     repo: Option<Repo>,
     discovered: bool,
     status: Arc<RepoStatus>,
+    /// Whether `status` came from git at least once (not just the default).
+    status_loaded: bool,
     refresh_task: Option<Task<()>>,
     /// The last failed operation, shown in the git panel until the next success.
     pub last_error: Option<SharedString>,
@@ -55,6 +57,7 @@ impl GitStore {
             repo: None,
             discovered: false,
             status: Arc::default(),
+            status_loaded: false,
             refresh_task: None,
             last_error: None,
         }
@@ -71,6 +74,11 @@ impl GitStore {
 
     pub fn status(&self) -> &Arc<RepoStatus> {
         &self.status
+    }
+
+    /// The last status read from git, or `None` before the first read.
+    pub fn loaded_status(&self) -> Option<Arc<RepoStatus>> {
+        self.status_loaded.then(|| self.status.clone())
     }
 
     /// Refreshes after a short pause, so a burst of file events costs one
@@ -97,11 +105,12 @@ impl GitStore {
                 .spawn(async move { repo.status() })
                 .await;
             this.update(cx, |this, cx| {
-                if let Ok(status) = status
-                    && *this.status != status
-                {
-                    this.status = Arc::new(status);
-                    cx.emit(GitStoreEvent::StatusChanged);
+                if let Ok(status) = status {
+                    this.status_loaded = true;
+                    if *this.status != status {
+                        this.status = Arc::new(status);
+                        cx.emit(GitStoreEvent::StatusChanged);
+                    }
                 }
                 cx.notify();
             })

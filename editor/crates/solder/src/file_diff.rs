@@ -7,7 +7,8 @@ use gpui::{
     prelude::*, px,
 };
 use syntax::{HighlightKind, SyntaxTree};
-use text::{Rope, diff::diff_lines};
+use text::{Rope, TAB_SIZE, diff::diff_lines};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     git::{DiffScope, FileDiffSnapshot, GitError},
@@ -74,7 +75,7 @@ pub struct DiffModel {
 }
 
 impl DiffModel {
-    pub fn new(snapshot: FileDiffSnapshot, tab_width: usize) -> Self {
+    pub fn new(snapshot: FileDiffSnapshot) -> Self {
         let old: Vec<_> = snapshot.old.split_inclusive('\n').collect();
         let new: Vec<_> = snapshot.new.split_inclusive('\n').collect();
         let mut rows = Vec::new();
@@ -115,12 +116,13 @@ impl DiffModel {
             old_at += 1;
             new_at += 1;
         }
-        let old = highlighted_lines(&snapshot.old, Path::new(&snapshot.path), tab_width);
-        let new = highlighted_lines(&snapshot.new, Path::new(&snapshot.path), tab_width);
+        let old = highlighted_lines(&snapshot.old, Path::new(&snapshot.path));
+        let new = highlighted_lines(&snapshot.new, Path::new(&snapshot.path));
+        // Display cells, counted the way the editor counts columns.
         let width_columns = old
             .iter()
             .chain(&new)
-            .map(|line| line.text.chars().count())
+            .map(|line| line.text.graphemes(true).count())
             .max()
             .unwrap_or(0);
         Self {
@@ -138,20 +140,54 @@ impl DiffModel {
     }
 }
 
-fn highlighted_lines(source: &str, path: &Path, tab_width: usize) -> Vec<DiffLine> {
+/// Expands tabs to the next tab stop, as the editor draws them. Returns the
+/// text and, for each tab, its byte offset and how many bytes it grew by.
+fn expand_tabs(raw: &str) -> (String, Vec<(usize, usize)>) {
+    if !raw.contains('\t') {
+        return (raw.to_string(), Vec::new());
+    }
+    let mut out = String::with_capacity(raw.len() + 8);
+    let mut tabs = Vec::new();
+    let mut column = 0;
+    for (at, grapheme) in raw.grapheme_indices(true) {
+        if grapheme == "\t" {
+            let width = TAB_SIZE - column % TAB_SIZE;
+            out.extend(std::iter::repeat_n(' ', width));
+            tabs.push((at, width - 1));
+            column += width;
+        } else {
+            out.push_str(grapheme);
+            column += 1;
+        }
+    }
+    (out, tabs)
+}
+
+/// Moves a byte offset in the raw line to the expanded line.
+fn expanded_offset(tabs: &[(usize, usize)], offset: usize) -> usize {
+    offset
+        + tabs
+            .iter()
+            .take_while(|(at, _)| *at < offset)
+            .map(|(_, extra)| extra)
+            .sum::<usize>()
+}
+
+fn highlighted_lines(source: &str, path: &Path) -> Vec<DiffLine> {
     if source.is_empty() {
         return Vec::new();
     }
     let rope = Rope::from_str(source);
     let tree =
         syntax::language_for_path(path).and_then(|language| SyntaxTree::parse(language, &rope));
-    let mut result: Vec<_> = source
+    let expanded: Vec<(String, Vec<(usize, usize)>)> = source
         .split_inclusive('\n')
-        .map(|line| DiffLine {
-            text: line
-                .trim_end_matches(['\r', '\n'])
-                .replace('\t', &" ".repeat(tab_width))
-                .into(),
+        .map(|line| expand_tabs(line.trim_end_matches(['\r', '\n'])))
+        .collect();
+    let mut result: Vec<DiffLine> = expanded
+        .iter()
+        .map(|(text, _)| DiffLine {
+            text: text.clone().into(),
             highlights: Vec::new(),
         })
         .collect();
@@ -159,20 +195,20 @@ fn highlighted_lines(source: &str, path: &Path, tab_width: usize) -> Vec<DiffLin
         for (range, kind) in tree.highlights(&rope, 0..rope.len_bytes()) {
             let first_row = rope.byte_to_line(range.start);
             let last_row = rope.byte_to_line(range.end.saturating_sub(1));
-            for (offset, line) in result[first_row..=last_row].iter_mut().enumerate() {
-                let row = first_row + offset;
+            for row in first_row..=last_row.min(result.len().saturating_sub(1)) {
                 let start = rope.line_to_byte(row);
-                let raw = rope.line(row).to_string();
-                let raw = raw.trim_end_matches(['\r', '\n']);
-                let from = range.start.saturating_sub(start).min(raw.len());
-                let to = range.end.saturating_sub(start).min(raw.len());
-                let expanded = |offset| {
-                    offset
-                        + raw[..offset].bytes().filter(|byte| *byte == b'\t').count()
-                            * tab_width.saturating_sub(1)
-                };
+                let raw_len = rope.line(row).len_bytes()
+                    - source[start..]
+                        .split_inclusive('\n')
+                        .next()
+                        .map_or(0, |l| l.len() - l.trim_end_matches(['\r', '\n']).len());
+                let from = range.start.saturating_sub(start).min(raw_len);
+                let to = range.end.saturating_sub(start).min(raw_len);
                 if from < to {
-                    line.highlights.push((expanded(from)..expanded(to), kind));
+                    let tabs = &expanded[row].1;
+                    result[row]
+                        .highlights
+                        .push((expanded_offset(tabs, from)..expanded_offset(tabs, to), kind));
                 }
             }
         }
@@ -190,6 +226,8 @@ pub struct FileDiff {
     selected: Option<usize>,
     horizontal: Pixels,
     column_width: Pixels,
+    /// Width of one cell in the code font, measured at paint time.
+    char_width: Pixels,
 }
 
 impl EventEmitter<FileDiffEvent> for FileDiff {}
@@ -205,6 +243,11 @@ impl FileDiff {
         self.horizontal
     }
 
+    #[cfg(test)]
+    pub fn char_width(&self) -> Pixels {
+        self.char_width
+    }
+
     pub fn new(path: std::path::PathBuf, scope: DiffScope, cx: &mut Context<Self>) -> Self {
         Self {
             path,
@@ -216,6 +259,7 @@ impl FileDiff {
             selected: None,
             horizontal: px(0.),
             column_width: px(0.),
+            char_width: px(0.),
         }
     }
 
@@ -333,12 +377,17 @@ impl FileDiff {
             }))
     }
 
-    fn pan(&mut self, delta: Pixels, cx: &mut Context<Self>) {
-        let maximum = self.model.as_ref().map_or(px(0.), |model| {
-            px(model.width_columns as f32 * Settings::get(cx).buffer_font_size * 0.65)
+    /// How far the code columns can pan: the longest line, measured in the
+    /// code font, plus the cell's right padding (`pr_4`), minus what fits.
+    pub fn pan_limit(&self) -> Pixels {
+        let content = self.model.as_ref().map_or(px(0.), |model| {
+            self.char_width * model.width_columns as f32 + px(16.)
         });
-        self.horizontal =
-            (self.horizontal + delta).clamp(px(0.), (maximum - self.column_width).max(px(0.)));
+        (content - self.column_width).max(px(0.))
+    }
+
+    fn pan(&mut self, delta: Pixels, cx: &mut Context<Self>) {
+        self.horizontal = (self.horizontal + delta).clamp(px(0.), self.pan_limit());
         cx.notify();
     }
 
@@ -640,8 +689,15 @@ impl Render for FileDiff {
                     |_, _, _| (),
                     move |bounds, _, window, cx| {
                         let focus = view.read(cx).focus.clone();
+                        let settings = Settings::get(cx);
+                        let text_system = window.text_system();
+                        let font = text_system.resolve_font(&settings.buffer_font());
+                        let char_width = text_system
+                            .advance(font, settings.buffer_font_size(), 'm')
+                            .map_or(px(8.), |size| size.width);
                         view.update(cx, |view, _| {
-                            view.column_width = (bounds.size.width / 2. - px(69.)).max(px(0.))
+                            view.column_width = (bounds.size.width / 2. - px(69.)).max(px(0.));
+                            view.char_width = char_width;
                         });
                         window.handle_input(
                             &focus,
@@ -661,15 +717,12 @@ mod tests {
     use super::*;
 
     fn model(old: &str, new: &str) -> DiffModel {
-        DiffModel::new(
-            FileDiffSnapshot {
-                path: "test.rs".into(),
-                old: old.into(),
-                new: new.into(),
-                can_open: true,
-            },
-            4,
-        )
+        DiffModel::new(FileDiffSnapshot {
+            path: "test.rs".into(),
+            old: old.into(),
+            new: new.into(),
+            can_open: true,
+        })
     }
 
     #[test]
@@ -745,6 +798,27 @@ mod tests {
         let diff = model("a\n\n", "a\n");
         assert_eq!((diff.added, diff.removed), (0, 1));
         assert_eq!(diff.rows.len(), 2);
+    }
+
+    #[test]
+    fn tabs_expand_to_tab_stops_like_the_editor() {
+        assert_eq!(expand_tabs("\tx").0, "    x");
+        assert_eq!(expand_tabs("ab\tc").0, "ab  c");
+        assert_eq!(expand_tabs("abcd\te").0, "abcd    e");
+        // A wide grapheme is one cell, as in the editor.
+        assert_eq!(expand_tabs("e\u{301}\tx").0, "e\u{301}   x");
+        let (_, tabs) = expand_tabs("a\tb\tc");
+        assert_eq!(tabs, vec![(1, 2), (3, 2)]);
+        assert_eq!(expanded_offset(&tabs, 2), 4);
+        assert_eq!(expanded_offset(&tabs, 4), 8);
+        let diff = model("", "ab\tlet x = 1;\n");
+        assert_eq!(diff.new[0].text.as_ref(), "ab  let x = 1;");
+        let keyword = diff.new[0]
+            .highlights
+            .iter()
+            .find(|(_, kind)| *kind == HighlightKind::Keyword)
+            .map(|(range, _)| range.clone());
+        assert_eq!(keyword, Some(4..7));
     }
 
     #[test]
