@@ -7,8 +7,10 @@
 
 pub mod browse;
 pub mod complete;
+pub mod ddl;
 mod detect;
 pub mod edit;
+pub mod migrations;
 mod mongo;
 mod mysql;
 mod params;
@@ -221,6 +223,9 @@ pub struct ForeignKey {
     pub ref_namespace: Option<String>,
     pub ref_table: String,
     pub ref_columns: Vec<String>,
+    /// `CASCADE`, `SET NULL`, `SET DEFAULT` or `RESTRICT`; `None` is the
+    /// default, NO ACTION.
+    pub on_delete: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -230,8 +235,22 @@ pub struct Object {
     pub name: String,
     pub kind: ObjectKind,
     pub columns: Vec<ColumnInfo>,
-    pub indexes: Vec<String>,
+    pub indexes: Vec<Index>,
     pub foreign_keys: Vec<ForeignKey>,
+    /// The primary key constraint's name where the engine has one
+    /// (Postgres `users_pkey`), needed to change the key.
+    pub primary_key_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Index {
+    pub name: String,
+    /// In index order. Empty for expression indexes, which can only be
+    /// dropped here.
+    pub columns: Vec<String>,
+    pub unique: bool,
+    /// The index behind the primary key.
+    pub primary: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -329,6 +348,26 @@ impl Session {
                 Driver::Sqlite(d) => d.apply(statements).await,
                 Driver::Redis(_) | Driver::Mongo(_) => {
                     Err("Editing works for Postgres, MySQL and SQLite results".into())
+                }
+            }
+        })
+    }
+
+    /// Runs structure changes. Postgres and SQLite run them in one
+    /// transaction; MySQL commits each one as it runs, so a failure leaves
+    /// the ones before it applied, and the error says how many.
+    pub fn apply_ddl(
+        &self,
+        statements: Vec<String>,
+    ) -> impl Future<Output = Result<()>> + Send + 'static {
+        let driver = self.driver.clone();
+        spawn(async move {
+            match &*driver {
+                Driver::Postgres(d) => d.apply_ddl(&statements).await,
+                Driver::MySql(d) => d.apply_ddl(&statements).await,
+                Driver::Sqlite(d) => d.apply_ddl(statements).await,
+                Driver::Redis(_) | Driver::Mongo(_) => {
+                    Err("Structure can be changed for Postgres, MySQL and SQLite".into())
                 }
             }
         })

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 
 use crate::{
-    Column, ColumnInfo, ConnectionSpec, ForeignKey, Object, ObjectKind, QueryResult, Result,
+    Column, ColumnInfo, ConnectionSpec, ForeignKey, Index, Object, ObjectKind, QueryResult, Result,
     Schema, Value,
 };
 
@@ -49,6 +49,25 @@ impl Sqlite {
                     // Dropping the transaction rolls it back.
                     return Err(crate::unmatched(i, statements.len(), affected as u64));
                 }
+            }
+            tx.commit().map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    pub async fn apply_ddl(&self, statements: Vec<String>) -> Result<()> {
+        let conn = self.conn.clone();
+        blocking(move || {
+            let mut conn = conn.lock().unwrap();
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            for (i, statement) in statements.iter().enumerate() {
+                tx.execute_batch(statement).map_err(|e| {
+                    format!(
+                        "Statement {} of {}: {e}. Nothing was changed.",
+                        i + 1,
+                        statements.len()
+                    )
+                })?;
             }
             tx.commit().map_err(|e| e.to_string())
         })
@@ -149,24 +168,25 @@ fn read_schema(conn: &Connection) -> Result<Schema> {
         }
         let mut list = conn
             .prepare(
-                "SELECT id, \"table\", \"from\", \"to\" FROM pragma_foreign_key_list(?1) ORDER BY id, seq",
+                "SELECT id, \"table\", \"from\", \"to\", on_delete FROM pragma_foreign_key_list(?1) ORDER BY id, seq",
             )
             .map_err(err)?;
-        let links: Vec<(i64, String, String, Option<String>)> = list
+        let links: Vec<(i64, String, String, Option<String>, String)> = list
             .query_map([&name], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })
             .map_err(err)?
             .collect::<std::result::Result<_, _>>()
             .map_err(err)?;
         let mut foreign_keys: Vec<(i64, ForeignKey)> = Vec::new();
-        for (id, table, from, to) in links {
+        for (id, table, from, to, on_delete) in links {
             if foreign_keys.last().is_none_or(|(last, _)| *last != id) {
                 foreign_keys.push((
                     id,
                     ForeignKey {
                         name: format!("{name}_fk_{id}"),
                         ref_table: table,
+                        on_delete: (on_delete != "NO ACTION").then_some(on_delete),
                         ..Default::default()
                     },
                 ));
@@ -177,13 +197,37 @@ fn read_schema(conn: &Connection) -> Result<Schema> {
             fk.ref_columns.extend(to);
         }
         let mut list = conn
-            .prepare("SELECT name FROM pragma_index_list(?1) ORDER BY name")
+            .prepare("SELECT name, \"unique\", origin FROM pragma_index_list(?1) ORDER BY name")
             .map_err(err)?;
-        let indexes = list
-            .query_map([&name], |r| r.get(0))
+        let listed: Vec<(String, bool, String)> = list
+            .query_map([&name], |r| {
+                Ok((r.get(0)?, r.get::<_, i64>(1)? == 1, r.get(2)?))
+            })
             .map_err(err)?
             .collect::<std::result::Result<_, _>>()
             .map_err(err)?;
+        let mut indexes = Vec::new();
+        for (index, unique, origin) in listed {
+            let mut info = conn
+                .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+                .map_err(err)?;
+            let columns: Vec<Option<String>> = info
+                .query_map([&index], |r| r.get(0))
+                .map_err(err)?
+                .collect::<std::result::Result<_, _>>()
+                .map_err(err)?;
+            indexes.push(Index {
+                name: index,
+                // An expression column has no name.
+                columns: if columns.iter().any(Option::is_none) {
+                    Vec::new()
+                } else {
+                    columns.into_iter().flatten().collect()
+                },
+                unique,
+                primary: origin == "pk",
+            });
+        }
         objects.push(Object {
             namespace: None,
             name,
@@ -195,6 +239,7 @@ fn read_schema(conn: &Connection) -> Result<Schema> {
             columns,
             indexes,
             foreign_keys: foreign_keys.into_iter().map(|(_, fk)| fk).collect(),
+            primary_key_name: None,
         });
     }
     // `REFERENCES t` without columns means t's primary key.
@@ -295,7 +340,8 @@ mod tests {
         let schema = block(session.schema()).unwrap();
         let users = schema.objects.iter().find(|o| o.name == "users").unwrap();
         assert!(users.columns[0].primary_key && !users.columns[1].nullable);
-        assert_eq!(users.indexes, ["users_name"]);
+        assert_eq!(users.indexes[0].name, "users_name");
+        assert_eq!(users.indexes[0].columns, ["name"]);
         assert!(
             schema
                 .objects

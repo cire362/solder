@@ -184,6 +184,26 @@ a third time for the default order (the primary key). Foreign key columns show
 the table they point at; `alt-enter` on such a cell opens the row it references and
 `alt-left` goes back. Browsed SQL tables stay editable.
 
+### Table structure
+
+**Structure** on a table in the Database tab (or **Table** on a connection, for a
+new one) opens a form in place of the editors: the table's name, its columns (name,
+type, default, required, key), indexes and foreign keys (with ON DELETE). Renaming a
+column carries its indexes and keys along. Nothing runs while you edit.
+
+**Review** (`cmd-s`) shows the DDL for Postgres, MySQL or SQLite, and the DDL that
+undoes it. Then:
+
+- **Apply to database** runs it. Postgres and SQLite run it in one transaction;
+  MySQL commits each structure change as it runs, which the review points out. SQLite
+  cannot change a column's type, nullability or default, keys or foreign keys in
+  place, so those rebuild the table: a new table, the rows copied over, a swap.
+- **Save as migration** writes it into the project in the format it already uses:
+  Prisma (`prisma/migrations/<time>_<name>/migration.sql`), Drizzle (the next
+  numbered file plus its journal entry), Supabase, up/down pairs (golang-migrate and
+  similar, with the undo as the down file), dbmate (`-- migrate:up` and `down`), or
+  timestamped SQL files in `migrations/`. The file opens in the editor.
+
 ### Editing rows
 
 Rows from a plain `SELECT` on one table with a primary key can be edited in

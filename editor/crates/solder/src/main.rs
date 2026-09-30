@@ -28,6 +28,7 @@ mod search;
 mod services;
 mod services_panel;
 mod settings;
+mod structure;
 mod terminal;
 mod theme;
 mod ui;

@@ -32,6 +32,12 @@ pub enum DatabasePanelEvent {
         engine: Engine,
         spec: db::browse::Browse,
     },
+    /// Edit a table's structure, or create a table when `object` is `None`.
+    Structure {
+        connection: SharedString,
+        engine: Engine,
+        object: Option<Object>,
+    },
     /// Open the connection's scratch query file.
     NewQuery { connection: SharedString },
 }
@@ -318,6 +324,32 @@ impl DatabasePanel {
                                 });
                             })),
                     )
+                    .when(conn.spec.engine.is_sql(), |d| {
+                        let engine = conn.spec.engine;
+                        let connection: SharedString = conn.spec.name.clone().into();
+                        d.child(
+                            div()
+                                .id(("db-new-table", i))
+                                .flex_none()
+                                .h(px(20.))
+                                .px_1p5()
+                                .flex()
+                                .items_center()
+                                .rounded(px(6.))
+                                .text_size(px(11.))
+                                .text_color(theme.fg_subtle)
+                                .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                                .child("Table")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(DatabasePanelEvent::Structure {
+                                        connection: connection.clone(),
+                                        engine,
+                                        object: None,
+                                    });
+                                })),
+                        )
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_connection(i, cx)))
                     .into_any_element()
             }
@@ -365,6 +397,35 @@ impl DatabasePanel {
                             .text_color(theme.fg_subtle)
                             .child(detail),
                     )
+                    .when(engine.is_sql() && object.kind == ObjectKind::Table, |d| {
+                        let object = object.clone();
+                        d.child(div().flex_1()).child(
+                            div()
+                                .id(("db-structure", ix))
+                                .flex_none()
+                                .h(px(20.))
+                                .px_1p5()
+                                .flex()
+                                .items_center()
+                                .rounded(px(6.))
+                                .text_size(px(11.))
+                                .text_color(theme.fg_subtle)
+                                .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                                .child("Structure")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    let Some((engine, connection, _)) = this.object(i, j, cx)
+                                    else {
+                                        return;
+                                    };
+                                    cx.emit(DatabasePanelEvent::Structure {
+                                        connection,
+                                        engine,
+                                        object: Some(object.clone()),
+                                    });
+                                })),
+                        )
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| this.open_object(i, j, cx)))
                     .into_any_element()
             }
