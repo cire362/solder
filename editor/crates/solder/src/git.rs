@@ -191,13 +191,25 @@ impl Repo {
         self.show(&format!(":{rel}"))
     }
 
+    /// Both sides of a file comparison. `status` is the repository status
+    /// the caller already has; pass `None` to run `git status` here. A full
+    /// status walks the whole working tree, which is slow in a large
+    /// repository, so the workspace passes its cached copy.
     pub fn file_diff(
         &self,
         rel: &str,
         scope: DiffScope,
         working_text: Option<String>,
+        status: Option<&RepoStatus>,
     ) -> Result<FileDiffSnapshot> {
-        let status = self.status()?;
+        let fetched;
+        let status = match status {
+            Some(status) => status,
+            None => {
+                fetched = self.status()?;
+                &fetched
+            }
+        };
         let file = status.files.iter().find(|file| file.path == rel);
         if file.is_some_and(|file| file.conflicted) {
             return Err(GitError("Resolve this file in the conflict view.".into()));
@@ -540,29 +552,33 @@ u UU N... 100644 100644 100644 100644 f1 f2 f3 both.rs\0\
         let path = repo.workdir.join("file with spaces π.txt");
         let rel = repo.relative(&path).unwrap();
         std::fs::write(&path, "one\ntwo\n").unwrap();
-        let untracked = repo.file_diff(&rel, DiffScope::Working, None).unwrap();
+        let untracked = repo
+            .file_diff(&rel, DiffScope::Working, None, None)
+            .unwrap();
         assert_eq!(
             (untracked.old.as_str(), untracked.new.as_str()),
             ("", "one\ntwo\n")
         );
         repo.stage(&[&rel]).unwrap();
-        let first = repo.file_diff(&rel, DiffScope::Staged, None).unwrap();
+        let first = repo.file_diff(&rel, DiffScope::Staged, None, None).unwrap();
         assert_eq!((first.old.as_str(), first.new.as_str()), ("", "one\ntwo\n"));
         repo.commit("initial", false).unwrap();
         std::fs::write(&path, "one\nstaged\n").unwrap();
         repo.stage(&[&rel]).unwrap();
         std::fs::write(&path, "one\nworking\n").unwrap();
-        let working = repo.file_diff(&rel, DiffScope::Working, None).unwrap();
+        let working = repo
+            .file_diff(&rel, DiffScope::Working, None, None)
+            .unwrap();
         assert_eq!(
             (working.old.as_str(), working.new.as_str()),
             ("one\nstaged\n", "one\nworking\n")
         );
         let buffer = repo
-            .file_diff(&rel, DiffScope::Working, Some("unsaved\n".into()))
+            .file_diff(&rel, DiffScope::Working, Some("unsaved\n".into()), None)
             .unwrap();
         assert_eq!(buffer.new, "unsaved\n");
         let staged = repo
-            .file_diff(&rel, DiffScope::Staged, Some("unsaved\n".into()))
+            .file_diff(&rel, DiffScope::Staged, Some("unsaved\n".into()), None)
             .unwrap();
         assert_eq!(
             (staged.old.as_str(), staged.new.as_str()),
@@ -572,23 +588,54 @@ u UU N... 100644 100644 100644 100644 f1 f2 f3 both.rs\0\
         repo.discard(&[&rel]).unwrap();
         repo.run(&["mv", "--", &rel, "renamed.txt"]).unwrap();
         let renamed = repo
-            .file_diff("renamed.txt", DiffScope::Staged, None)
+            .file_diff("renamed.txt", DiffScope::Staged, None, None)
             .unwrap();
         assert_eq!(renamed.old, "one\nstaged\n");
         assert_eq!(renamed.old, renamed.new);
         repo.commit("rename", false).unwrap();
         std::fs::remove_file(repo.workdir.join("renamed.txt")).unwrap();
         let deleted = repo
-            .file_diff("renamed.txt", DiffScope::Working, None)
+            .file_diff("renamed.txt", DiffScope::Working, None, None)
             .unwrap();
         assert_eq!(deleted.old, "one\nstaged\n");
         assert!(deleted.new.is_empty());
         repo.stage(&["renamed.txt"]).unwrap();
         let deleted = repo
-            .file_diff("renamed.txt", DiffScope::Staged, None)
+            .file_diff("renamed.txt", DiffScope::Staged, None, None)
             .unwrap();
         assert_eq!(deleted.old, "one\nstaged\n");
         assert!(deleted.new.is_empty());
+        std::fs::remove_dir_all(repo.workdir).unwrap();
+    }
+
+    #[test]
+    fn diff_uses_the_status_it_is_given() {
+        let repo = diff_repo("cached-status");
+        std::fs::write(repo.workdir.join("a.txt"), "one\n").unwrap();
+        repo.stage(&["a.txt"]).unwrap();
+        repo.commit("initial", false).unwrap();
+        std::fs::write(repo.workdir.join("a.txt"), "two\n").unwrap();
+        // A status that calls the tracked file untracked: the index side comes
+        // out empty, which proves git status did not run again.
+        let cached = RepoStatus {
+            files: vec![FileStatus {
+                path: "a.txt".into(),
+                original_path: None,
+                staged: None,
+                unstaged: None,
+                untracked: true,
+                conflicted: false,
+            }],
+            ..Default::default()
+        };
+        let diff = repo
+            .file_diff("a.txt", DiffScope::Working, None, Some(&cached))
+            .unwrap();
+        assert_eq!((diff.old.as_str(), diff.new.as_str()), ("", "two\n"));
+        let fresh = repo
+            .file_diff("a.txt", DiffScope::Working, None, None)
+            .unwrap();
+        assert_eq!(fresh.old, "one\n");
         std::fs::remove_dir_all(repo.workdir).unwrap();
     }
 
@@ -597,7 +644,7 @@ u UU N... 100644 100644 100644 100644 f1 f2 f3 both.rs\0\
         let repo = diff_repo("errors");
         std::fs::write(repo.workdir.join("binary.txt"), b"text\0data").unwrap();
         assert!(
-            repo.file_diff("binary.txt", DiffScope::Working, None)
+            repo.file_diff("binary.txt", DiffScope::Working, None, None)
                 .err()
                 .unwrap()
                 .0
@@ -605,14 +652,14 @@ u UU N... 100644 100644 100644 100644 f1 f2 f3 both.rs\0\
         );
         std::fs::write(repo.workdir.join("encoding.txt"), [0xff]).unwrap();
         assert!(
-            repo.file_diff("encoding.txt", DiffScope::Working, None)
+            repo.file_diff("encoding.txt", DiffScope::Working, None, None)
                 .err()
                 .unwrap()
                 .0
                 .contains("UTF-8")
         );
         assert!(
-            repo.file_diff("absent.txt", DiffScope::Working, None)
+            repo.file_diff("absent.txt", DiffScope::Working, None, None)
                 .err()
                 .unwrap()
                 .0

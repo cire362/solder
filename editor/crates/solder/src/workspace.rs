@@ -794,7 +794,9 @@ impl Workspace {
         } else {
             None
         };
-        let tab_width = Settings::get(cx).indent_unit().len();
+        // Reuse the status the workspace keeps fresh; a status change reloads
+        // this comparison anyway.
+        let status = self.git.read(cx).loaded_status();
         self.diff_task = Some(cx.spawn(async move |_, cx| {
             let result = cx
                 .background_executor()
@@ -806,8 +808,9 @@ impl Workspace {
                             "\n" => rope.to_string(),
                             ending => rope.to_string().replace('\n', ending),
                         }),
+                        status.as_deref(),
                     )
-                    .map(|snapshot| DiffModel::new(snapshot, tab_width))
+                    .map(DiffModel::new)
                 })
                 .await;
             view.update(cx, |view, cx| view.set_result(result, cx)).ok();
@@ -2754,6 +2757,24 @@ mod tests {
         assert!(cx.read(|cx| view.read(cx).horizontal_offset()) > px(0.));
         cx.simulate_keystrokes("alt-left");
         assert_eq!(cx.read(|cx| view.read(cx).horizontal_offset()), px(0.));
+        // Panning stops exactly at the end of the 1000-character line,
+        // measured with the code font rather than an estimate.
+        for _ in 0..200 {
+            cx.simulate_keystrokes("alt-right");
+        }
+        let (offset, limit, char_width) = cx.read(|cx| {
+            let view = view.read(cx);
+            (
+                view.horizontal_offset(),
+                view.pan_limit(),
+                view.char_width(),
+            )
+        });
+        assert!(char_width > px(0.));
+        assert!(limit > char_width * 900.);
+        assert_eq!(offset, limit);
+        cx.simulate_keystrokes("alt-left");
+        assert!(cx.read(|cx| view.read(cx).horizontal_offset()) < limit);
         std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
         cx.simulate_keystrokes("secondary-r");
         wait_for(cx, "refreshed diff", &|cx| {
