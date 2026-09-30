@@ -780,10 +780,12 @@ impl Workspace {
             return;
         };
         let working = if scope == DiffScope::Working {
-            self.document_for_path(&path, cx).map(|document| {
-                let text = document.read(cx).text();
-                (text.rope().clone(), text.line_ending().as_str())
-            })
+            self.document_for_path(&path, cx)
+                .filter(|document| document.read(cx).is_dirty())
+                .map(|document| {
+                    let text = document.read(cx).text();
+                    (text.rope().clone(), text.line_ending().as_str())
+                })
         } else {
             None
         };
@@ -2629,6 +2631,55 @@ mod tests {
     }
 
     #[gpui::test]
+    fn git_diff_uses_disk_when_a_clean_open_file_is_deleted(cx: &mut TestAppContext) {
+        let root = git_fixture("diff-clean-deleted");
+        let (workspace, cx) = setup(cx, root.clone());
+        cx.executor().allow_parking();
+        wait_for(cx, "repository", &|cx| {
+            workspace.read(cx).git.read(cx).repo().is_some()
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(root.join("a.txt"), None, window, cx)
+        });
+        wait_for(cx, "file", &|cx| {
+            workspace.read(cx).active_editor().is_some()
+        });
+        assert!(!cx.read(|cx| {
+            workspace
+                .read(cx)
+                .active_editor()
+                .unwrap()
+                .read(cx)
+                .doc(cx)
+                .is_dirty()
+        }));
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        cx.simulate_keystrokes("secondary-alt-d");
+        wait_for(cx, "diff", &|cx| {
+            workspace
+                .read(cx)
+                .file_diff
+                .as_ref()
+                .is_some_and(|view| view.read(cx).model.is_some())
+        });
+        cx.read(|cx| {
+            let model = workspace
+                .read(cx)
+                .file_diff
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .model
+                .as_ref()
+                .unwrap();
+            assert_eq!(model.changes.len(), 1);
+            assert_eq!(model.rows.len(), 2);
+            assert!(model.rows.iter().all(|row| row.new.is_none()));
+        });
+        assert_eq!(active_text(&workspace, cx), "one\ntwo\n");
+    }
+
+    #[gpui::test]
     fn git_diff_navigation_refresh_and_open_file(cx: &mut TestAppContext) {
         let root = git_fixture("diff-navigation");
         std::fs::write(
@@ -2652,6 +2703,15 @@ mod tests {
                 .is_some_and(|view| view.read(cx).model.is_some())
         });
         let view = cx.read(|cx| workspace.read(cx).file_diff.as_ref().unwrap().clone());
+        cx.update(|window, cx| window.focus(&workspace.focus_handle(cx)));
+        let position = cx.update(|window, _| {
+            gpui::point(
+                window.viewport_size().width * 0.75,
+                window.viewport_size().height / 2.,
+            )
+        });
+        cx.simulate_click(position, gpui::Modifiers::default());
+        assert!(cx.update(|window, cx| view.focus_handle(cx).is_focused(window)));
         cx.simulate_keystrokes("alt-down");
         assert_eq!(cx.read(|cx| view.read(cx).selected_change()), Some(1));
         cx.simulate_keystrokes("alt-up");

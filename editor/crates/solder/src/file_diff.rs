@@ -75,16 +75,8 @@ pub struct DiffModel {
 
 impl DiffModel {
     pub fn new(snapshot: FileDiffSnapshot, tab_width: usize) -> Self {
-        let old: Vec<_> = if snapshot.old.is_empty() {
-            Vec::new()
-        } else {
-            snapshot.old.split('\n').collect()
-        };
-        let new: Vec<_> = if snapshot.new.is_empty() {
-            Vec::new()
-        } else {
-            snapshot.new.split('\n').collect()
-        };
+        let old: Vec<_> = snapshot.old.split_inclusive('\n').collect();
+        let new: Vec<_> = snapshot.new.split_inclusive('\n').collect();
         let mut rows = Vec::new();
         let mut changes = Vec::new();
         let mut added = 0;
@@ -154,10 +146,10 @@ fn highlighted_lines(source: &str, path: &Path, tab_width: usize) -> Vec<DiffLin
     let tree =
         syntax::language_for_path(path).and_then(|language| SyntaxTree::parse(language, &rope));
     let mut result: Vec<_> = source
-        .split('\n')
+        .split_inclusive('\n')
         .map(|line| DiffLine {
             text: line
-                .trim_end_matches('\r')
+                .trim_end_matches(['\r', '\n'])
                 .replace('\t', &" ".repeat(tab_width))
                 .into(),
             highlights: Vec::new(),
@@ -725,12 +717,34 @@ mod tests {
     #[test]
     fn empty_files_and_missing_final_newlines() {
         assert!(model("", "").rows.is_empty());
-        assert!(model("", "new\n").rows.iter().all(|row| row.old.is_none()));
-        assert!(model("old\n", "").rows.iter().all(|row| row.new.is_none()));
+        let added = model("", "new\n");
+        assert_eq!((added.added, added.removed), (1, 0));
+        assert_eq!(added.rows.len(), 1);
+        assert!(added.rows.iter().all(|row| row.old.is_none()));
+        let removed = model("old\n", "");
+        assert_eq!((removed.added, removed.removed), (0, 1));
+        assert_eq!(removed.rows.len(), 1);
+        assert!(removed.rows.iter().all(|row| row.new.is_none()));
         let diff = model("a\r\n", "a");
         assert!(!diff.old_no_newline);
         assert!(diff.new_no_newline);
         assert_eq!(diff.old[0].text.as_ref(), "a");
+    }
+
+    #[test]
+    fn final_newline_changes_modify_the_last_real_row() {
+        for (old, new) in [("a\n", "a"), ("a", "a\n")] {
+            let diff = model(old, new);
+            assert_eq!((diff.added, diff.removed), (1, 1));
+            assert_eq!(diff.changes, vec![0]);
+            assert_eq!(diff.rows.len(), 1);
+            assert_eq!((diff.rows[0].old, diff.rows[0].new), (Some(0), Some(0)));
+            assert_eq!(diff.old[0].text.as_ref(), diff.new[0].text.as_ref());
+            assert_ne!(diff.old_no_newline, diff.new_no_newline);
+        }
+        let diff = model("a\n\n", "a\n");
+        assert_eq!((diff.added, diff.removed), (0, 1));
+        assert_eq!(diff.rows.len(), 2);
     }
 
     #[test]
