@@ -77,10 +77,8 @@ impl Pg {
                         .collect();
                     result.push_row(values);
                 }
-                SimpleQueryMessage::CommandComplete(n) => {
-                    if result.columns.is_empty() {
-                        result.affected = Some(n);
-                    }
+                SimpleQueryMessage::CommandComplete(affected) if result.columns.is_empty() => {
+                    result.affected = Some(affected);
                 }
                 _ => {}
             }
