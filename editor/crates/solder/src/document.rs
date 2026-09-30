@@ -11,7 +11,10 @@ use std::{
 
 use gpui::{Context, EntityId, EventEmitter, Task};
 use syntax::SyntaxTree;
-use text::{Buffer, Selection};
+use text::{
+    Buffer, Selection,
+    diff::{Hunk, diff_lines, lines},
+};
 
 /// Files up to this size parse on the UI thread when opened, so the first frame
 /// is already highlighted. Larger files show plain text for a moment instead.
@@ -49,7 +52,61 @@ pub enum DocumentEvent {
     PathChanged,
     Saved,
     DiagnosticsChanged,
+    /// Git hunks or conflict regions were recomputed.
+    GitChanged,
 }
+
+/// A merge conflict in the text, by row: `<<<<<<<`, the optional `|||||||`
+/// base marker, `=======` and `>>>>>>>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Conflict {
+    pub start: usize,
+    pub base: Option<usize>,
+    pub middle: usize,
+    pub end: usize,
+}
+
+impl Conflict {
+    pub fn ours(&self) -> Range<usize> {
+        self.start + 1..self.base.unwrap_or(self.middle)
+    }
+
+    pub fn theirs(&self) -> Range<usize> {
+        self.middle + 1..self.end
+    }
+}
+
+/// Finds conflict blocks. Unfinished or nested markers are ignored.
+pub fn parse_conflicts(text: &str) -> Vec<Conflict> {
+    let mut out = Vec::new();
+    let mut open: Option<(usize, Option<usize>, Option<usize>)> = None;
+    for (row, line) in text.split('\n').enumerate() {
+        if line.starts_with("<<<<<<<") {
+            open = Some((row, None, None));
+        } else if line.starts_with("|||||||") {
+            if let Some((_, base @ None, None)) = open.as_mut() {
+                *base = Some(row);
+            }
+        } else if line.starts_with("=======") {
+            if let Some((_, _, middle @ None)) = open.as_mut() {
+                *middle = Some(row);
+            }
+        } else if line.starts_with(">>>>>>>")
+            && let Some((start, base, Some(middle))) = open.take()
+        {
+            out.push(Conflict {
+                start,
+                base,
+                middle,
+                end: row,
+            });
+        }
+    }
+    out
+}
+
+/// How long git state waits after the last edit before recomputing.
+const GIT_DEBOUNCE: Duration = Duration::from_millis(120);
 
 impl EventEmitter<DocumentEvent> for Document {}
 
@@ -64,6 +121,16 @@ pub struct Document {
     was_dirty: bool,
     /// Sorted by start.
     diagnostics: Arc<Vec<Diagnostic>>,
+    /// The staged version of the file; hunks are relative to it.
+    diff_base: Option<Arc<str>>,
+    hunks: Arc<Vec<Hunk>>,
+    conflicts: Arc<Vec<Conflict>>,
+    git_task: Option<Task<()>>,
+    read_only: bool,
+    /// Title for documents without a path (a conflict side, a diff base).
+    title_override: Option<String>,
+    /// Picks the grammar when there is no path.
+    language_path: Option<PathBuf>,
 }
 
 impl Document {
@@ -82,9 +149,99 @@ impl Document {
             indent_unit,
             was_dirty: false,
             diagnostics: Arc::default(),
+            diff_base: None,
+            hunks: Arc::default(),
+            conflicts: Arc::default(),
+            git_task: None,
+            read_only: false,
+            title_override: None,
+            language_path: None,
         };
         doc.initial_parse(cx);
+        doc.conflicts = Arc::new(parse_conflicts(content));
         doc
+    }
+
+    /// A read-only document that is not a file on disk: one side of a merge
+    /// conflict, for example. `language_path` picks the highlighting.
+    pub fn virtual_file(
+        title: String,
+        language_path: PathBuf,
+        content: &str,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut doc = Self::new(None, content, cx);
+        doc.read_only = true;
+        doc.title_override = Some(title);
+        doc.language_path = Some(language_path);
+        doc.initial_parse(cx);
+        doc
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub fn hunks(&self) -> &Arc<Vec<Hunk>> {
+        &self.hunks
+    }
+
+    pub fn conflicts(&self) -> &Arc<Vec<Conflict>> {
+        &self.conflicts
+    }
+
+    pub fn diff_base(&self) -> Option<&Arc<str>> {
+        self.diff_base.as_ref()
+    }
+
+    /// Sets the version to diff against (the index), or `None` for files git
+    /// does not track.
+    pub fn set_diff_base(&mut self, base: Option<String>, cx: &mut Context<Self>) {
+        let base: Option<Arc<str>> = base.map(|b| b.replace("\r\n", "\n").into());
+        if base == self.diff_base {
+            return;
+        }
+        self.diff_base = base;
+        self.schedule_git_refresh(Duration::ZERO, true, cx);
+    }
+
+    /// Recomputes hunks and conflicts in the background. Documents with no
+    /// base and no conflicts skip it unless `force` (a marker was just typed
+    /// or pasted), so untracked files cost nothing per keystroke.
+    fn schedule_git_refresh(&mut self, delay: Duration, force: bool, cx: &mut Context<Self>) {
+        let idle = self.diff_base.is_none() && self.conflicts.is_empty() && self.hunks.is_empty();
+        if idle && !force {
+            return;
+        }
+        let base = self.diff_base.clone();
+        let rope = self.text.rope().clone();
+        let version = self.text.version();
+        self.git_task = Some(cx.spawn(async move |this, cx| {
+            if !delay.is_zero() {
+                cx.background_executor().timer(delay).await;
+            }
+            let (hunks, conflicts) = cx
+                .background_executor()
+                .spawn(async move {
+                    let current = rope.to_string();
+                    let hunks = base
+                        .as_deref()
+                        .map(|base| diff_lines(&lines(base), &lines(&current)))
+                        .unwrap_or_default();
+                    (hunks, parse_conflicts(&current))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.text.version() != version {
+                    return;
+                }
+                this.hunks = Arc::new(hunks);
+                this.conflicts = Arc::new(conflicts);
+                cx.emit(DocumentEvent::GitChanged);
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     pub fn text(&self) -> &Buffer {
@@ -127,6 +284,7 @@ impl Document {
         self.syntax.as_ref().map(|s| s.language().name).or_else(|| {
             self.path
                 .as_deref()
+                .or(self.language_path.as_deref())
                 .and_then(syntax::language_for_path)
                 .map(|l| l.name)
         })
@@ -193,6 +351,9 @@ impl Document {
     }
 
     pub fn title(&self) -> String {
+        if let Some(title) = &self.title_override {
+            return title.clone();
+        }
         self.path
             .as_deref()
             .and_then(|p| p.file_name())
@@ -210,6 +371,9 @@ impl Document {
         origin: Option<EntityId>,
         cx: &mut Context<Self>,
     ) -> Arc<[text::Edit]> {
+        if self.read_only {
+            return Arc::from([]);
+        }
         let applied: Arc<[text::Edit]> = self
             .text
             .edit(edits, selections_before, Instant::now())
@@ -266,7 +430,9 @@ impl Document {
                 .collect();
             self.diagnostics = Arc::new(moved);
         }
+        let marker_added = edits.iter().any(|e| e.new_text.contains("<<<<<<<"));
         cx.emit(DocumentEvent::Edited { edits, origin });
+        self.schedule_git_refresh(GIT_DEBOUNCE, marker_added, cx);
         self.update_dirty(cx);
     }
 
@@ -338,7 +504,12 @@ impl Document {
     // ------------------------------------------------------------ syntax
 
     fn initial_parse(&mut self, cx: &mut Context<Self>) {
-        let Some(language) = self.path.as_deref().and_then(syntax::language_for_path) else {
+        let Some(language) = self
+            .path
+            .as_deref()
+            .or(self.language_path.as_deref())
+            .and_then(syntax::language_for_path)
+        else {
             return;
         };
         if self.text.len() <= SYNC_PARSE_LIMIT {
@@ -442,6 +613,23 @@ pub fn map_offset(offset: usize, edits: &[text::Edit]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_conflict_blocks() {
+        let text = "a\n<<<<<<< HEAD\nours\n||||||| base\nold\n=======\ntheirs\n>>>>>>> branch\nz\n<<<<<<< x\nunfinished";
+        let c = parse_conflicts(text);
+        assert_eq!(
+            c,
+            vec![Conflict {
+                start: 1,
+                base: Some(3),
+                middle: 5,
+                end: 7
+            }]
+        );
+        assert_eq!(c[0].ours(), 2..3);
+        assert_eq!(c[0].theirs(), 6..7);
+    }
 
     #[test]
     fn offsets_follow_edits_from_other_views() {

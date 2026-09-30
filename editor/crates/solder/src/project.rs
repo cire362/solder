@@ -15,6 +15,9 @@ use notify::{EventKind, RecursiveMode, Watcher};
 pub enum ProjectEvent {
     /// Files whose contents or existence changed on disk.
     Changed(Vec<PathBuf>),
+    /// Something under `.git` that affects status changed: the index, HEAD
+    /// or a ref (a commit, checkout, stage from the command line).
+    GitChanged,
     /// The file list was rebuilt.
     Scanned,
 }
@@ -111,6 +114,7 @@ impl Project {
                 }
                 let mut changed = HashSet::new();
                 let mut structural = false;
+                let mut git_changed = false;
                 for e in events {
                     if matches!(e.kind, EventKind::Access(_)) {
                         continue;
@@ -121,6 +125,10 @@ impl Project {
                             EventKind::Modify(notify::event::ModifyKind::Name(_))
                         );
                     for p in e.paths {
+                        if is_git_state(&p) {
+                            git_changed = true;
+                            continue;
+                        }
                         let excluded = p
                             .components()
                             .any(|c| c.as_os_str().to_str().is_some_and(is_excluded_dir));
@@ -129,14 +137,19 @@ impl Project {
                         }
                     }
                 }
-                if changed.is_empty() {
+                if changed.is_empty() && !git_changed {
                     continue;
                 }
                 let result = this.update(cx, |this, cx| {
-                    if structural {
+                    if structural && !changed.is_empty() {
                         this.rescan(cx);
                     }
-                    cx.emit(ProjectEvent::Changed(changed.into_iter().collect()));
+                    if !changed.is_empty() {
+                        cx.emit(ProjectEvent::Changed(changed.into_iter().collect()));
+                    }
+                    if git_changed {
+                        cx.emit(ProjectEvent::GitChanged);
+                    }
                 });
                 if result.is_err() {
                     break;
@@ -144,6 +157,19 @@ impl Project {
             }
         }));
     }
+}
+
+/// Files inside `.git` whose changes can change `git status`.
+fn is_git_state(path: &Path) -> bool {
+    let mut components = path.components().map(|c| c.as_os_str().to_string_lossy());
+    if !components.any(|c| c == ".git") {
+        return false;
+    }
+    let rest: Vec<_> = components.collect();
+    matches!(
+        rest.first().map(|c| c.as_ref()),
+        Some("index" | "HEAD" | "MERGE_HEAD" | "refs")
+    )
 }
 
 /// Walks the tree in parallel, honoring `.gitignore`, `.ignore` and global
@@ -180,6 +206,14 @@ pub fn scan(root: &Path) -> Vec<Arc<str>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_git_state_files() {
+        assert!(is_git_state(Path::new("/p/.git/index")));
+        assert!(is_git_state(Path::new("/p/.git/refs/heads/main")));
+        assert!(!is_git_state(Path::new("/p/.git/objects/ab/cd")));
+        assert!(!is_git_state(Path::new("/p/src/index")));
+    }
 
     #[test]
     fn scan_respects_gitignore_and_exclusions() {

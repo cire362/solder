@@ -20,6 +20,8 @@ use crate::{
     editor::{self, Editor, EditorEvent},
     editor_lsp::LspLocation,
     file_finder::FileFinder,
+    git_panel::{self, BranchPicker, GitPanel, GitPanelEvent},
+    git_store::{GitStore, GitStoreEvent},
     go_to_line::GoToLine as GoToLineDelegate,
     locations::{CodeActionPicker, LocationPicker, RenamePrompt},
     lsp_store::{LspStore, from_range},
@@ -62,6 +64,7 @@ actions!(
         FocusPrevPane,
         ToggleTerminal,
         NewTerminal,
+        ShowGit,
     ]
 );
 
@@ -94,6 +97,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-k secondary-left", FocusPrevPane, None),
         KeyBinding::new("ctrl-`", ToggleTerminal, None),
         KeyBinding::new("ctrl-shift-`", NewTerminal, None),
+        KeyBinding::new("ctrl-shift-g", ShowGit, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
@@ -127,6 +131,7 @@ pub enum Jump {
 enum SidebarTab {
     Files,
     Search,
+    Git,
 }
 
 struct Modal {
@@ -162,6 +167,8 @@ pub struct Workspace {
     project: Entity<Project>,
     project_panel: Entity<ProjectPanel>,
     project_search: Entity<ProjectSearch>,
+    git: Entity<GitStore>,
+    git_panel: Entity<GitPanel>,
     search_bar: Entity<BufferSearchBar>,
     panes: Vec<Pane>,
     active_pane: usize,
@@ -179,6 +186,8 @@ impl Workspace {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let project = cx.new(|cx| Project::new(root.clone(), cx));
         let project_panel = cx.new(|cx| ProjectPanel::new(root.clone(), cx));
+        let git = cx.new(|cx| GitStore::new(root.clone(), cx));
+        let git_panel = cx.new(|cx| GitPanel::new(root.clone(), git.clone(), cx));
         let project_search = cx.new(|cx| ProjectSearch::new(root, window, cx));
         let search_bar = cx.new(|cx| BufferSearchBar::new(window, cx));
         let subscriptions = vec![
@@ -204,9 +213,26 @@ impl Workspace {
                 },
             ),
             cx.subscribe(&project, |this, _, event, cx| match event {
-                ProjectEvent::Changed(paths) => this.files_changed(paths.clone(), cx),
+                ProjectEvent::Changed(paths) => {
+                    this.files_changed(paths.clone(), cx);
+                    this.git.update(cx, |g, cx| g.refresh(cx));
+                }
+                ProjectEvent::GitChanged => this.git.update(cx, |g, cx| g.refresh(cx)),
                 ProjectEvent::Scanned => cx.notify(),
             }),
+            cx.subscribe(&git, |this, _, event, cx| match event {
+                GitStoreEvent::StatusChanged => this.git_status_changed(cx),
+            }),
+            cx.subscribe_in(
+                &git_panel,
+                window,
+                |this, _, event, window, cx| match event {
+                    GitPanelEvent::OpenFile(path) => this.open_path(path.clone(), None, window, cx),
+                    GitPanelEvent::OpenConflict(path) => {
+                        this.open_conflict(path.clone(), window, cx)
+                    }
+                },
+            ),
             cx.observe_window_appearance(window, |_, window, cx| {
                 let theme = Settings::get(cx).theme(window.appearance());
                 cx.set_global(theme);
@@ -260,6 +286,8 @@ impl Workspace {
             dock_open: false,
             _subscriptions: subscriptions,
             _hud_tick: hud_tick,
+            git,
+            git_panel,
         }
     }
 
@@ -330,6 +358,7 @@ impl Workspace {
                 EditorEvent::ApplyWorkspaceEdit { edit, encoding } => {
                     this.apply_workspace_edit(edit.clone(), *encoding, cx)
                 }
+                EditorEvent::StageRows { rows } => this.stage_rows(editor, rows.clone(), cx),
                 EditorEvent::ShowCodeActions { actions, encoding } => {
                     if actions.is_empty() {
                         return;
@@ -359,6 +388,10 @@ impl Workspace {
                 }
             }
         });
+        let document = editor.read(cx).document().clone();
+        if self.view_count(document.entity_id(), cx) == 0 {
+            self.load_diff_base(&document, cx);
+        }
         let pane = &mut self.panes[self.active_pane];
         pane.tabs.push(Tab {
             editor,
@@ -620,6 +653,177 @@ impl Workspace {
             let len = pane.tabs.len();
             self.activate(self.active_pane, (ix + len - 1) % len, window, cx);
         }
+    }
+
+    // ------------------------------------------------------------ git
+
+    fn load_diff_base(&self, document: &Entity<Document>, cx: &mut Context<Self>) {
+        let Some(path) = document.read(cx).path().map(Path::to_path_buf) else {
+            return;
+        };
+        let load = self.git.update(cx, |g, cx| g.load_base(&path, cx));
+        let document = document.downgrade();
+        cx.spawn(async move |_, cx| {
+            let base = load.await;
+            document.update(cx, |d, cx| d.set_diff_base(base, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// The index may have moved: refresh every document's diff base and the
+    /// tree's colors.
+    fn git_status_changed(&mut self, cx: &mut Context<Self>) {
+        for document in self.documents(cx) {
+            self.load_diff_base(&document, cx);
+        }
+        let tints = self.git.read(cx).tints();
+        self.project_panel
+            .update(cx, |p, cx| p.set_tints(tints, cx));
+        cx.notify();
+    }
+
+    fn stage_rows(&mut self, editor: &Entity<Editor>, rows: Range<usize>, cx: &mut Context<Self>) {
+        let doc = editor.read(cx).doc(cx);
+        let (Some(path), Some(repo)) = (doc.path(), self.git.read(cx).repo()) else {
+            return;
+        };
+        let Some(rel) = repo.relative(path) else {
+            return;
+        };
+        let base = doc.diff_base().map(|b| b.to_string()).unwrap_or_default();
+        let current = doc.text().text_for_save().replace("\r\n", "\n");
+        let staged = crate::git::stage_rows(&base, &current, rows);
+        self.git.update(cx, |g, cx| {
+            g.run(move |repo| repo.stage_content(&rel, &staged), cx)
+                .detach()
+        });
+    }
+
+    fn show_git(&mut self, _: &ShowGit, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar = Some(SidebarTab::Git);
+        self.git_panel.read(cx).focus_message(window, cx);
+        self.git.update(cx, |g, cx| g.refresh_now(cx));
+        cx.notify();
+    }
+
+    fn switch_branch(
+        &mut self,
+        _: &git_panel::SwitchBranch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let git = self.git.clone();
+        self.toggle_modal(window, cx, move |window, cx| {
+            let mut picker = Picker::new(BranchPicker::new(git), window, cx);
+            BranchPicker::load(&mut picker, window, cx);
+            picker
+        });
+    }
+
+    fn git_in_terminal(
+        &mut self,
+        title: &str,
+        args: &[&str],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let command = TerminalCommand {
+            program: Some("git".into()),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            cwd: self.root(cx),
+            title: Some(title.into()),
+            ..Default::default()
+        };
+        self.spawn_terminal(command, window, cx);
+    }
+
+    fn push(&mut self, _: &git_panel::Push, window: &mut Window, cx: &mut Context<Self>) {
+        // A terminal shows progress and handles credential prompts.
+        self.git_in_terminal("git push", &["push", "-u", "origin", "HEAD"], window, cx);
+    }
+
+    fn pull(&mut self, _: &git_panel::Pull, window: &mut Window, cx: &mut Context<Self>) {
+        self.git_in_terminal("git pull", &["pull", "--ff-only"], window, cx);
+    }
+
+    fn open_pull_request(
+        &mut self,
+        _: &git_panel::OpenPullRequest,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let git = self.git.read(cx);
+        let (Some(repo), Some(branch)) = (git.repo().cloned(), git.status().branch.clone()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let url = cx
+                .background_executor()
+                .spawn(async move { repo.remote_url() })
+                .await
+                .and_then(|remote| crate::git::pull_request_url(&remote, &branch));
+            match url {
+                Some(url) => {
+                    cx.update(|cx| cx.open_url(&url)).ok();
+                }
+                None => {
+                    this.update(cx, |this, cx| {
+                        this.git.update(cx, |g, cx| {
+                            g.last_error = Some("No GitHub or GitLab remote named origin".into());
+                            cx.notify();
+                        })
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Three panes: ours (read-only) | the file | theirs (read-only).
+    fn open_conflict(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.git.read(cx).repo().cloned() else {
+            return;
+        };
+        let Some(rel) = repo.relative(&path) else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        cx.spawn_in(window, async move |this, cx| {
+            let (ours, theirs) = cx
+                .background_executor()
+                .spawn(async move {
+                    (
+                        repo.show(&format!(":2:{rel}")).unwrap_or_default(),
+                        repo.show(&format!(":3:{rel}")).unwrap_or_default(),
+                    )
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                let side = |title: String, content: &str, cx: &mut Context<Self>| {
+                    let path = path.clone();
+                    let doc = cx.new(|cx| Document::virtual_file(title, path, content, cx));
+                    cx.new(|cx| Editor::for_document(doc, cx))
+                };
+                // Ours to the left of the current pane, theirs to the right.
+                let ours_editor = side(format!("{name} (ours)"), &ours, cx);
+                let theirs_editor = side(format!("{name} (theirs)"), &theirs, cx);
+                let at = this.active_pane;
+                this.panes.insert(at, Pane::default());
+                this.active_pane = at;
+                this.add_tab(ours_editor, window, cx);
+                this.active_pane = at + 2;
+                this.panes.insert(at + 2, Pane::default());
+                this.add_tab(theirs_editor, window, cx);
+                this.active_pane = at + 1;
+                this.open_path(path.clone(), None, window, cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ------------------------------------------------------------ terminal
@@ -1445,6 +1649,7 @@ impl Workspace {
                 .on_click(cx.listener(move |this, _, window, cx| match this_tab {
                     SidebarTab::Files => this.show_files(&ShowFiles, window, cx),
                     SidebarTab::Search => this.show_search(&ShowSearch, window, cx),
+                    SidebarTab::Git => this.show_git(&ShowGit, window, cx),
                 }))
         };
         div()
@@ -1467,11 +1672,13 @@ impl Workspace {
                     .border_b_1()
                     .border_color(theme.line)
                     .child(tab_button("sidebar-files", "Files", SidebarTab::Files))
-                    .child(tab_button("sidebar-search", "Search", SidebarTab::Search)),
+                    .child(tab_button("sidebar-search", "Search", SidebarTab::Search))
+                    .child(tab_button("sidebar-git", "Git", SidebarTab::Git)),
             )
             .child(div().flex_1().min_h_0().pt_1().map(|d| match tab {
                 SidebarTab::Files => d.child(self.project_panel.clone()),
                 SidebarTab::Search => d.child(self.project_search.clone()),
+                SidebarTab::Git => d.child(self.git_panel.clone()),
             }))
     }
 
@@ -1485,6 +1692,9 @@ impl Workspace {
             left.push(format!("Ln {line}, Col {col}"));
             if cursors > 1 {
                 left.push(format!("{cursors} cursors"));
+            }
+            if doc.is_read_only() {
+                left.push("Read-only".into());
             }
             left.push(doc.indent_label().to_string());
             left.push(doc.language_name().unwrap_or("Plain text").to_string());
@@ -1647,6 +1857,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::focus_next_pane))
             .on_action(cx.listener(Self::focus_prev_pane))
             .on_action(cx.listener(Self::toggle_terminal))
+            .on_action(cx.listener(Self::show_git))
+            .on_action(cx.listener(Self::switch_branch))
+            .on_action(cx.listener(Self::push))
+            .on_action(cx.listener(Self::pull))
+            .on_action(cx.listener(Self::open_pull_request))
             .on_action(cx.listener(Self::new_terminal))
             .relative()
             .size_full()
@@ -1745,12 +1960,7 @@ mod tests {
             cx.set_global(Perf::new(Instant::now()));
             cx.set_global(crate::theme::Theme::dark());
             cx.set_global(Settings::default());
-            editor::bind_keys(cx);
-            bind_keys(cx);
-            crate::picker::bind_keys(cx);
-            buffer_search::bind_keys(cx);
-            crate::project_search::bind_keys(cx);
-            crate::project_panel::bind_keys(cx);
+            settings::bind_defaults(cx);
             crate::lsp_store::init(cx);
         });
         let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(root, window, cx));
@@ -2105,6 +2315,177 @@ mod tests {
             ws.read(cx).terminals.is_empty()
         });
         assert!(!cx.read(|cx| ws.read(cx).dock_open));
+    }
+
+    fn git_fixture(name: &str) -> PathBuf {
+        let dir = fixture(name);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        dir
+    }
+
+    fn wait_for(cx: &mut VisualTestContext, what: &str, f: &dyn Fn(&App) -> bool) {
+        for _ in 0..500 {
+            // Debounce timers run on the test executor's virtual clock.
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+            if cx.read(|cx| f(cx)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[gpui::test]
+    fn git_stage_lines_revert_and_commit(cx: &mut TestAppContext) {
+        let root = git_fixture("git-flow");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let file = root.join("a.txt");
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(file.clone()), "one\ntwo\n", None, window, cx)
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        wait_for(cx, "diff base", &|cx| {
+            editor.read(cx).doc(cx).diff_base().is_some()
+        });
+
+        // Two new lines in the middle show up as one inserted hunk.
+        cx.simulate_keystrokes("down");
+        cx.simulate_input("mid1\nmid2\n");
+        wait_for(cx, "hunk", &|cx| {
+            editor
+                .read(cx)
+                .doc(cx)
+                .hunks()
+                .first()
+                .map(|h| (h.old.clone(), h.new.clone()))
+                == Some((1..1, 1..3))
+        });
+
+        // Stage only "mid2".
+        cx.simulate_keystrokes("up");
+        cx.simulate_keystrokes("secondary-alt-y");
+        let repo = crate::git::Repo::discover(&root).unwrap();
+        wait_for(cx, "staged line", &|_| {
+            repo.index_text("a.txt").as_deref() == Some("one\nmid2\ntwo\n")
+        });
+        // The new base arrives and only "mid1" is left unstaged.
+        wait_for(cx, "rebased hunks", &|cx| {
+            editor
+                .read(cx)
+                .doc(cx)
+                .hunks()
+                .iter()
+                .map(|h| (h.new.start, h.new.end))
+                .collect::<Vec<_>>()
+                == [(1, 2)]
+        });
+
+        // Revert "mid1" back to the staged text.
+        cx.simulate_keystrokes("up");
+        cx.simulate_keystrokes("secondary-alt-z");
+        assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), "one\nmid2\ntwo\n");
+
+        // Save, then commit from the panel.
+        cx.simulate_keystrokes("cmd-s");
+        cx.simulate_keystrokes("ctrl-shift-g");
+        cx.simulate_input("Add mid2");
+        cx.simulate_keystrokes("secondary-enter");
+        wait_for(cx, "clean status", &|cx| {
+            let g = ws.read(cx).git.read(cx);
+            g.status().files.is_empty() && g.last_error.is_none()
+        });
+        let log = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["log", "-1", "--format=%s"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "Add mid2");
+    }
+
+    #[gpui::test]
+    fn git_conflict_three_way_and_accept(cx: &mut TestAppContext) {
+        let root = git_fixture("git-conflict");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["switch", "-q", "-c", "theirs"]);
+        std::fs::write(root.join("a.txt"), "one\nTHEIRS\n").unwrap();
+        git(&["commit", "-qam", "theirs"]);
+        git(&["switch", "-q", "main"]);
+        std::fs::write(root.join("a.txt"), "one\nOURS\n").unwrap();
+        git(&["commit", "-qam", "ours"]);
+        git(&["merge", "-q", "theirs"]);
+
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "conflict status", &|cx| {
+            ws.read(cx)
+                .git
+                .read(cx)
+                .status()
+                .files
+                .iter()
+                .any(|f| f.conflicted)
+        });
+        let file = root.join("a.txt");
+        ws.update_in(cx, |w, window, cx| {
+            w.open_conflict(file.clone(), window, cx)
+        });
+        wait_for(cx, "three panes", &|cx| {
+            let w = ws.read(cx);
+            w.panes.len() == 3 && w.panes.iter().all(|p| p.active_editor().is_some())
+        });
+        let titles: Vec<String> = cx.read(|cx| {
+            ws.read(cx)
+                .panes
+                .iter()
+                .map(|p| p.active_editor().unwrap().read(cx).doc(cx).title())
+                .collect()
+        });
+        assert_eq!(titles, ["a.txt (ours)", "a.txt", "a.txt (theirs)"]);
+        // The sides are read-only.
+        let ours = cx.read(|cx| ws.read(cx).panes[0].active_editor().unwrap().clone());
+        ours.update_in(cx, |e, window, cx| window.focus(&e.focus_handle(cx)));
+        cx.simulate_input("x");
+        assert_eq!(cx.read(|cx| ours.read(cx).text(cx)), "one\nOURS\n");
+
+        // In the file, take theirs.
+        let result = cx.read(|cx| ws.read(cx).panes[1].active_editor().unwrap().clone());
+        wait_for(cx, "conflict regions", &|cx| {
+            !result.read(cx).doc(cx).conflicts().is_empty()
+        });
+        result.update_in(cx, |e, window, cx| {
+            window.focus(&e.focus_handle(cx));
+            e.go_to_point(2, 0, cx);
+        });
+        cx.simulate_keystrokes("secondary-k 2");
+        assert_eq!(cx.read(|cx| result.read(cx).text(cx)), "one\nTHEIRS\n");
     }
 
     #[gpui::test]

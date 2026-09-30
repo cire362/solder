@@ -31,10 +31,11 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 - [x] Split panes (`cmd-\\`), focus between panes (`cmd-k cmd-left/right`)
 
 ## 3. Git built for review
-- [ ] Status in the file tree and gutter diff markers
-- [ ] Stage and unstage single lines and hunks, commit
-- [ ] Three-way conflict view
-- [ ] Open a pull request from the current branch
+- [x] Status in the file tree and gutter diff markers (against the index)
+- [x] Stage selected lines (`cmd-alt-y`), revert a hunk (`cmd-alt-z`), step through hunks, commit and amend from the Git tab (`ctrl-shift-g`)
+- [x] Three-way conflict view (ours | file | theirs) with accept ours, theirs or both (`cmd-k 1/2/3`)
+- [x] Switch or create branches, push and pull in the terminal, open a pull request for GitHub and GitLab remotes
+- [ ] Side-by-side diff for a whole file
 
 ## 4. Services and containers
 - [ ] Detect services from `package.json`, `go.mod`, `Cargo.toml`, `pyproject.toml`, compose files
