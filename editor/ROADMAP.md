@@ -1,0 +1,61 @@
+# Roadmap
+
+Everything the website promises, grouped into phases. Each phase only depends on
+the ones above it. Optimization work (see README) starts after phase 7.
+
+Status: `[x]` done, `[~]` partial, `[ ]` not started.
+
+## 0. Editor core
+- [x] Rope buffer, undo/redo, multi-cursor, IME, clipboard
+- [x] Tree-sitter highlighting for Rust, TS/TSX, JS, JSON, CSS, Go, Python
+- [x] File tree, tabs, status bar, save
+
+## 1. Navigation and search
+- [x] Single-line editor mode (reused by every text field)
+- [x] Command palette (`cmd-shift-p`, `f1`)
+- [x] File finder with fuzzy matching over the project, respecting `.gitignore` (`cmd-p`)
+- [x] Find and replace in file, regex, case and whole-word options (`cmd-f`, `cmd-alt-f`)
+- [x] Search across the project with ripgrep's engine (`cmd-shift-f`)
+- [x] Go to line (`ctrl-g`)
+- [x] Auto-closing brackets and quotes, matching bracket highlight
+- [x] File tree: new, rename, move to trash, copy path, reveal in Finder, keyboard navigation
+- [x] Reload files changed on disk, refresh the tree
+- [x] Ask before closing unsaved tabs and windows; untitled files and Save As
+- [x] Settings file and keymap file, applied on save (`cmd-,`)
+
+## 2. Language intelligence and terminal
+- [x] Shared buffers: one file, many views
+- [x] LSP client: diagnostics, completion with snippets, hover, go to definition (F12, cmd-click), references, rename, format (and on save)
+- [x] LSP: code actions (`cmd-.`, with resolve and server-driven edits), signature help
+- [x] Integrated terminal: PTY, 256 colors and truecolor, selection, scrollback, several tabs (`ctrl-\``)
+- [x] Split panes (`cmd-\\`), focus between panes (`cmd-k cmd-left/right`)
+
+## 3. Git built for review
+- [ ] Status in the file tree and gutter diff markers
+- [ ] Stage and unstage single lines and hunks, commit
+- [ ] Three-way conflict view
+- [ ] Open a pull request from the current branch
+
+## 4. Services and containers
+- [ ] Detect services from `package.json`, `go.mod`, `Cargo.toml`, `pyproject.toml`, compose files
+- [ ] Services panel: start, stop, ports, log tails, Run stack (`cmd-shift-s`)
+- [ ] Containers in the sidebar
+
+## 5. Database and HTTP clients
+- [ ] Connections from `.env` and compose; Postgres, MySQL, SQLite, Redis, MongoDB
+- [ ] Query runner (`cmd-enter` runs the statement under the cursor), schema-aware completion
+- [ ] Results grid with staged edits applied as one transaction; read-only production
+- [ ] HTTP client with requests generated from API routes, OpenAPI 3.1 import
+
+## 6. Solder AI
+- [ ] Providers: hosted, Ollama, LM Studio, OpenAI-compatible; model per task; offline mode
+- [ ] Project map for context; `.solderignore`; `.env` always excluded
+- [ ] Ask the codebase (chat), inline edits, streaming completions
+- [ ] Agent tasks in sandboxed branches with an editable plan
+- [ ] AI review before push
+
+## 7. Debugger, plugins, onboarding
+- [ ] Debugger over DAP; one session across browser and server; query timeline
+- [ ] Plugin host: WebAssembly sandbox, declared permissions, per-frame time budget
+- [ ] Import settings from VS Code, Cursor, JetBrains
+- [ ] Preview environments per branch (needs the hosted service)
