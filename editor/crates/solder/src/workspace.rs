@@ -314,6 +314,32 @@ impl Workspace {
                 },
             ),
             cx.subscribe_in(
+                &results,
+                window,
+                |this, results, event, window, cx| match event {
+                    crate::results::ResultsEvent::PickReference {
+                        row,
+                        column,
+                        connection,
+                        query,
+                        title,
+                    } => {
+                        let picker = crate::reference_picker::ReferencePicker::new(
+                            results.downgrade(),
+                            this.database.clone(),
+                            *row,
+                            *column,
+                            connection.clone(),
+                            query.clone(),
+                            title.clone(),
+                        );
+                        this.toggle_modal(window, cx, move |window, cx| {
+                            Picker::new(picker, window, cx)
+                        });
+                    }
+                },
+            ),
+            cx.subscribe_in(
                 &database,
                 window,
                 |this, _, _: &DatabaseEvent, window, cx| {
@@ -3767,6 +3793,88 @@ mod tests {
         });
         // Still staged, so it can be discarded or retried.
         assert_eq!(cx.read(|cx| results.read(cx).changes.len()), 1);
+    }
+
+    /// Lets background work (database drivers, pickers loading) finish.
+    fn settle(cx: &mut VisualTestContext) {
+        for _ in 0..30 {
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[gpui::test]
+    fn results_grid_adds_duplicates_and_picks_references(cx: &mut TestAppContext) {
+        use crate::results::{ApplyChanges, State};
+        let root = sqlite_fixture("grid-rows");
+        futures::executor::block_on(async {
+            let session = db::Session::connect(db::ConnectionSpec {
+                name: "seed".into(),
+                engine: db::Engine::Sqlite,
+                url: root.join("dev.db").display().to_string(),
+                source: "test".into(),
+                read_only: false,
+            })
+            .await
+            .unwrap();
+            for q in [
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id), \
+                 title TEXT NOT NULL, status TEXT DEFAULT 'draft')",
+                "INSERT INTO posts (user_id, title, status) VALUES (1, 'hello', 'live')",
+            ] {
+                session.query(q.into()).await.unwrap();
+            }
+        });
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        let results = show_rows(
+            &ws,
+            cx,
+            "DATABASE_URL",
+            "SELECT id, user_id, title, status FROM posts ORDER BY id",
+        );
+
+        // A new row starts typing at user_id: id is filled in by SQLite.
+        cx.simulate_keystrokes("secondary-n");
+        assert_eq!(cx.read(|cx| results.read(cx).selected), Some((1, 1)));
+        // user_id references users: Enter picks one of them by name.
+        cx.simulate_keystrokes("escape enter");
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        cx.simulate_input("bob");
+        settle(cx);
+        cx.simulate_keystrokes("enter");
+        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+        cx.simulate_keystrokes("right enter");
+        cx.simulate_input("second");
+        cx.simulate_keystrokes("enter");
+
+        // A copy of the first post, and an added row dropped again.
+        cx.simulate_keystrokes("up secondary-d escape");
+        cx.simulate_keystrokes("secondary-n escape secondary-backspace");
+
+        cx.simulate_keystrokes("secondary-s");
+        let statements = results.update(cx, |r, cx| r.statements(cx)).unwrap();
+        assert_eq!(
+            statements,
+            [
+                "INSERT INTO \"posts\" (\"user_id\", \"title\") VALUES ('2', 'second')",
+                "INSERT INTO \"posts\" (\"user_id\", \"title\", \"status\") VALUES ('1', 'hello', 'live')",
+            ]
+        );
+        cx.dispatch_action(ApplyChanges);
+        wait_for(cx, "saved", &|cx| {
+            let r = results.read(cx);
+            r.changes.is_empty() && matches!(&r.state, State::Done(d) if d.rows.len() == 3)
+        });
+        assert_eq!(
+            rows_of(&results, cx),
+            [
+                ["1", "1", "hello", "live"],
+                ["2", "2", "second", "draft"],
+                ["3", "1", "hello", "live"],
+            ]
+        );
     }
 
     #[gpui::test]

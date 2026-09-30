@@ -181,6 +181,12 @@ to edit it, `enter` again to keep the value, `escape` to drop it. `shift-backspa
 sets NULL and `cmd-backspace` marks the row for deletion. Nothing is written yet:
 changed cells are highlighted and deleted rows struck through.
 
+`cmd-n` (or **Add row**) adds a row at the bottom and `cmd-d` copies the selected
+one. Columns you leave alone get their defaults (shown as DEFAULT), and columns the
+server fills in (serial, identity, auto_increment, SQLite's rowid) are left out of
+new rows. In a foreign key column `enter` opens a picker of the rows it can point
+at, searchable by key and name; `f2` types the value instead.
+
 **Review** (`cmd-s`) shows the SQL that will run, with the values each update
 replaces. **Apply in one transaction** runs it all or nothing. Every statement
 targets one row by its primary key and the values the grid showed, so a row that

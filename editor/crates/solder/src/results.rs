@@ -40,8 +40,32 @@ actions!(
         ReviewChanges,
         DiscardChanges,
         ApplyChanges,
+        EditInline,
+        InsertRow,
+        DuplicateRow,
     ]
 );
+
+/// Asks the workspace to open a picker of the rows a foreign key points at.
+pub enum ResultsEvent {
+    PickReference {
+        row: usize,
+        column: usize,
+        connection: SharedString,
+        query: String,
+        title: SharedString,
+    },
+}
+
+impl gpui::EventEmitter<ResultsEvent> for ResultsView {}
+
+/// What a cell shows: the value read, a staged value, or (new rows only)
+/// the column's default.
+enum Shown {
+    Read(Value),
+    Staged(Option<String>),
+    Default,
+}
 
 pub fn bind_keys(cx: &mut App) {
     let context = Some("ResultsGrid");
@@ -53,7 +77,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-c", CopyCell, Some("ResultsGrid && !editing")),
         // Enter reaches the grid from the single-line cell editor too.
         KeyBinding::new("enter", EditCell, context),
-        KeyBinding::new("f2", EditCell, context),
+        // F2 always types the value, even where Enter would open a picker.
+        KeyBinding::new("f2", EditInline, context),
+        KeyBinding::new("secondary-n", InsertRow, Some("ResultsGrid && !editing")),
+        KeyBinding::new("secondary-d", DuplicateRow, Some("ResultsGrid && !editing")),
         KeyBinding::new("escape", CancelEdit, context),
         KeyBinding::new("shift-backspace", SetNull, Some("ResultsGrid && !editing")),
         KeyBinding::new(
@@ -214,11 +241,11 @@ impl ResultsView {
         let Some(result) = self.result() else {
             return;
         };
-        if result.rows.is_empty() || result.columns.is_empty() {
+        if result.columns.is_empty() || self.row_count() == 0 {
             return;
         }
         let (row, column) = self.selected.unwrap_or((0, 0));
-        let row = row.saturating_add_signed(rows).min(result.rows.len() - 1);
+        let row = row.saturating_add_signed(rows).min(self.row_count() - 1);
         let column = column
             .saturating_add_signed(columns)
             .min(result.columns.len() - 1);
@@ -244,21 +271,133 @@ impl ResultsView {
 
     fn copy_cell(&mut self, _: &CopyCell, _: &mut Window, cx: &mut Context<Self>) {
         let value = self
-            .result()
-            .zip(self.selected)
-            .and_then(|(result, (row, column))| {
-                result
-                    .rows
-                    .get(row)
-                    .and_then(|r| r.get(column))
-                    .map(|v| match v {
-                        Value::Null => String::new(),
-                        other => other.display(),
-                    })
+            .selected
+            .map(|(row, column)| match self.shown(row, column) {
+                Shown::Read(Value::Null) | Shown::Staged(None) | Shown::Default => String::new(),
+                Shown::Read(value) => value.display(),
+                Shown::Staged(Some(text)) => text,
             });
         if let Some(value) = value {
             cx.write_to_clipboard(ClipboardItem::new_string(value));
         }
+    }
+
+    /// Rows read plus rows added.
+    fn row_count(&self) -> usize {
+        self.result().map_or(0, |r| r.rows.len()) + self.changes.inserted.len()
+    }
+
+    /// Which added row `row` is, if it is one.
+    fn new_row(&self, row: usize) -> Option<usize> {
+        row.checked_sub(self.result()?.rows.len())
+    }
+
+    fn shown(&self, row: usize, column: usize) -> Shown {
+        if let Some(new) = self.new_row(row) {
+            return match self.changes.inserted.get(new).and_then(|r| r.get(&column)) {
+                Some(value) => Shown::Staged(value.clone()),
+                None => Shown::Default,
+            };
+        }
+        if let Some(staged) = self.changes.cells.get(&(row, column)) {
+            return Shown::Staged(staged.clone());
+        }
+        Shown::Read(
+            self.result()
+                .and_then(|r| r.rows.get(row)?.get(column).cloned())
+                .unwrap_or(Value::Null),
+        )
+    }
+
+    /// Stages `value` for a cell (`None` is NULL), in a read row or an
+    /// added one.
+    pub fn stage(
+        &mut self,
+        row: usize,
+        column: usize,
+        value: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        match self.new_row(row) {
+            Some(new) => {
+                if let Some(cells) = self.changes.inserted.get_mut(new) {
+                    cells.insert(column, value);
+                }
+            }
+            None => {
+                let original = self
+                    .result()
+                    .and_then(|r| r.rows.get(row)?.get(column))
+                    .cloned();
+                let unchanged = match (&original, &value) {
+                    (Some(Value::Null), None) => true,
+                    (Some(Value::Null), Some(_)) => false,
+                    (Some(read), Some(text)) => read.display() == *text,
+                    _ => false,
+                };
+                if unchanged {
+                    self.changes.cells.remove(&(row, column));
+                } else {
+                    self.changes.cells.insert((row, column), value);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn insert_row(&mut self, _: &InsertRow, window: &mut Window, cx: &mut Context<Self>) {
+        match self.edit_target(cx) {
+            Ok(target) => {
+                self.set_notice(None, cx);
+                self.changes.inserted.push(Default::default());
+                self.start_new_row(&target, window, cx);
+            }
+            Err(reason) => self.set_notice(Some(reason), cx),
+        }
+    }
+
+    /// A copy of the selected row, leaving out what the server fills in.
+    fn duplicate_row(&mut self, _: &DuplicateRow, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((row, _)) = self.selected else {
+            return;
+        };
+        let target = match self.edit_target(cx) {
+            Ok(target) => target,
+            Err(reason) => return self.set_notice(Some(reason), cx),
+        };
+        let copy = match self.new_row(row) {
+            Some(new) => {
+                let mut cells = self.changes.inserted[new].clone();
+                cells.retain(|c, _| !target.auto.contains(c));
+                cells
+            }
+            None => {
+                let Some(values) = self.result().and_then(|r| r.rows.get(row)).cloned() else {
+                    return;
+                };
+                let mut cells = db::edit::duplicate(&target, &values);
+                // Edits staged on the source row come along.
+                for ((r, c), v) in &self.changes.cells {
+                    if *r == row && !target.auto.contains(c) {
+                        cells.insert(*c, v.clone());
+                    }
+                }
+                cells
+            }
+        };
+        self.set_notice(None, cx);
+        self.changes.inserted.push(copy);
+        self.start_new_row(&target, window, cx);
+    }
+
+    /// Selects the last added row at its first column the server does not
+    /// fill in, and starts typing there.
+    fn start_new_row(&mut self, target: &EditTarget, window: &mut Window, cx: &mut Context<Self>) {
+        let columns = self.result().map_or(0, |r| r.columns.len());
+        let column = (0..columns).find(|c| !target.auto.contains(c)).unwrap_or(0);
+        let row = self.row_count() - 1;
+        self.select(row, column, cx);
+        self.edit_inline(&EditInline, window, cx);
     }
 
     /// The table these rows can be saved to, or why they cannot.
@@ -300,7 +439,38 @@ impl ResultsView {
         cx.notify();
     }
 
+    /// Enter: types the value, or for a foreign key column picks one of the
+    /// rows it can point at.
     fn edit_cell(&mut self, _: &EditCell, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            self.commit_edit(cx);
+            window.focus(&self.focus);
+            return;
+        }
+        let Some((row, column)) = self.selected else {
+            return;
+        };
+        let target = match self.edit_target(cx) {
+            Ok(target) => target,
+            Err(_) => return self.edit_inline(&EditInline, window, cx),
+        };
+        let reference = target.references.iter().find(|(c, _)| *c == column);
+        let schema = self.store.read(cx).schema_of(&self.connection);
+        match (reference, schema) {
+            (Some((_, fk)), Some((engine, schema))) if !self.changes.deleted.contains(&row) => {
+                cx.emit(ResultsEvent::PickReference {
+                    row,
+                    column,
+                    connection: self.connection.clone(),
+                    query: db::edit::reference_query(engine, &schema, fk),
+                    title: format!("{}.{}", fk.ref_table, fk.ref_columns[0]).into(),
+                });
+            }
+            _ => self.edit_inline(&EditInline, window, cx),
+        }
+    }
+
+    fn edit_inline(&mut self, _: &EditInline, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing.is_some() {
             self.commit_edit(cx);
             window.focus(&self.focus);
@@ -319,12 +489,10 @@ impl ResultsView {
             return;
         }
         self.notice = None;
-        let current = match self.changes.cells.get(&(row, column)) {
-            Some(staged) => staged.clone().unwrap_or_default(),
-            None => match self.result().and_then(|r| r.rows.get(row)?.get(column)) {
-                Some(Value::Null) | None => String::new(),
-                Some(value) => value.display(),
-            },
+        let current = match self.shown(row, column) {
+            Shown::Read(Value::Null) | Shown::Staged(None) | Shown::Default => String::new(),
+            Shown::Read(value) => value.display(),
+            Shown::Staged(Some(text)) => text,
         };
         let editor = cx.new(|cx| {
             let mut editor = Editor::single_line("NULL", cx);
@@ -344,28 +512,18 @@ impl ResultsView {
         cx.notify();
     }
 
-    /// Stages what the cell editor holds. An unchanged value stages nothing.
+    /// Stages what the cell editor holds. An unchanged value stages nothing,
+    /// and an empty cell in a new row keeps its default.
     fn commit_edit(&mut self, cx: &mut Context<Self>) {
         let Some(editing) = self.editing.take() else {
             return;
         };
         let text = editing.editor.read(cx).text(cx);
-        let key = (editing.row, editing.column);
-        let original = self
-            .result()
-            .and_then(|r| r.rows.get(editing.row)?.get(editing.column))
-            .cloned();
-        let unchanged = match &original {
-            Some(Value::Null) => false,
-            Some(value) => value.display() == text,
-            None => true,
-        };
-        if unchanged {
-            self.changes.cells.remove(&key);
-        } else {
-            self.changes.cells.insert(key, Some(text));
+        if text.is_empty() && matches!(self.shown(editing.row, editing.column), Shown::Default) {
+            cx.notify();
+            return;
         }
-        cx.notify();
+        self.stage(editing.row, editing.column, Some(text), cx);
     }
 
     fn cancel_edit(&mut self, _: &CancelEdit, window: &mut Window, cx: &mut Context<Self>) {
@@ -386,15 +544,7 @@ impl ResultsView {
         if let Err(reason) = self.edit_target(cx) {
             return self.set_notice(Some(reason), cx);
         }
-        let was_null = matches!(
-            self.result().and_then(|r| r.rows.get(row)?.get(column)),
-            Some(Value::Null)
-        );
-        if was_null {
-            self.changes.cells.remove(&(row, column));
-        } else {
-            self.changes.cells.insert((row, column), None);
-        }
+        self.stage(row, column, None, cx);
         self.set_notice(None, cx);
     }
 
@@ -405,6 +555,14 @@ impl ResultsView {
         };
         if let Err(reason) = self.edit_target(cx) {
             return self.set_notice(Some(reason), cx);
+        }
+        // An added row is simply dropped.
+        if let Some(new) = self.new_row(row) {
+            self.changes.inserted.remove(new);
+            let count = self.row_count();
+            self.selected =
+                (count > 0).then(|| (row.min(count - 1), self.selected.map_or(0, |s| s.1)));
+            return self.set_notice(None, cx);
         }
         if !self.changes.deleted.remove(&row) {
             self.changes.deleted.insert(row);
@@ -628,10 +786,11 @@ impl ResultsView {
                     .collect();
                 Some(parts.join(", "))
             })
+            .chain(self.changes.inserted.iter().map(|_| None))
             .collect()
     }
 
-    fn render_status(&self, theme: &Theme) -> impl IntoElement {
+    fn render_status(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let (text, color): (SharedString, _) = match &self.state {
             State::Empty => ("".into(), theme.fg_subtle),
             State::Running => ("Running...".into(), theme.fg_subtle),
@@ -692,6 +851,25 @@ impl ResultsView {
                     .text_color(color)
                     .child(text),
             )
+            .when(
+                matches!(&self.state, State::Done(r) if !r.columns.is_empty()),
+                |d| {
+                    d.child(
+                        div()
+                            .id("results-add-row")
+                            .flex_none()
+                            .px_1p5()
+                            .rounded(px(6.))
+                            .text_color(theme.fg_subtle)
+                            .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                            .child("Add row")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                window.focus(&this.focus);
+                                this.insert_row(&InsertRow, window, cx)
+                            })),
+                    )
+                },
+            )
     }
 
     fn render_header(&self, result: &QueryResult, theme: &Theme) -> impl IntoElement {
@@ -739,26 +917,33 @@ impl ResultsView {
         };
         range
             .filter_map(|ix| {
-                let row = result.rows.get(ix)?;
-                let cells = row
+                if ix >= self.row_count() {
+                    return None;
+                }
+                let added = self.new_row(ix).is_some();
+                let cells = self
+                    .widths
                     .iter()
-                    .zip(&self.widths)
                     .enumerate()
-                    .map(|(col, (value, w))| {
+                    .take(result.columns.len())
+                    .map(|(col, w)| {
                         let selected = self.selected == Some((ix, col));
-                        let staged = self.changes.cells.get(&(ix, col));
                         let deleted = self.changes.deleted.contains(&ix);
                         let editor = self
                             .editing
                             .as_ref()
                             .filter(|e| e.row == ix && e.column == col)
                             .map(|e| e.editor.clone());
-                        let shown = match staged {
-                            Some(Some(text)) => text.clone(),
-                            Some(None) => "NULL".into(),
-                            None => value.display(),
+                        let shown = self.shown(ix, col);
+                        let staged = !matches!(shown, Shown::Read(_));
+                        let (text, value) = match shown {
+                            Shown::Read(value) => (value.display(), value),
+                            Shown::Staged(Some(text)) => (text, Value::Null),
+                            Shown::Staged(None) => ("NULL".into(), Value::Null),
+                            Shown::Default => ("DEFAULT".into(), Value::Null),
                         };
-                        let text: String = shown
+                        let default = text == "DEFAULT" && added;
+                        let text: String = text
                             .chars()
                             .take(CELL_CHARS)
                             .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
@@ -776,7 +961,8 @@ impl ResultsView {
                             .border_color(theme.line)
                             .text_color(match value {
                                 _ if deleted => theme.error,
-                                _ if staged.is_some() => theme.accent,
+                                _ if default => theme.fg_subtle,
+                                _ if staged => theme.accent,
                                 Value::Null => theme.fg_subtle,
                                 Value::Int(_) | Value::Float(_) | Value::Number(_) => {
                                     theme.syntax.number
@@ -784,7 +970,7 @@ impl ResultsView {
                                 Value::Bool(_) => theme.syntax.keyword,
                                 _ => theme.fg,
                             })
-                            .when(staged.is_some() && !deleted, |d| d.bg(theme.accent_soft))
+                            .when((staged || added) && !deleted, |d| d.bg(theme.accent_soft))
                             .when(deleted, |d| d.line_through())
                             .when(selected, |d| {
                                 d.bg(theme.selection).border_1().border_color(theme.accent)
@@ -832,7 +1018,11 @@ impl ResultsView {
                                         .items_center()
                                         .justify_end()
                                         .text_color(theme.fg_subtle)
-                                        .child((ix + 1).to_string()),
+                                        .child(if added {
+                                            "+".to_string()
+                                        } else {
+                                            (ix + 1).to_string()
+                                        }),
                                 )
                                 .children(cells),
                         )
@@ -889,7 +1079,7 @@ impl Render for ResultsView {
                     .child(
                         uniform_list(
                             "result-rows",
-                            result.rows.len(),
+                            self.row_count(),
                             cx.processor(|this, range, _, cx| this.render_rows(range, cx)),
                         )
                         .track_scroll(self.scroll.clone())
@@ -915,6 +1105,9 @@ impl Render for ResultsView {
             .key_context(context)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::edit_cell))
+            .on_action(cx.listener(Self::edit_inline))
+            .on_action(cx.listener(Self::insert_row))
+            .on_action(cx.listener(Self::duplicate_row))
             .on_action(cx.listener(Self::cancel_edit))
             .on_action(cx.listener(Self::set_null))
             .on_action(cx.listener(Self::delete_row))
@@ -934,7 +1127,7 @@ impl Render for ResultsView {
             .bg(theme.bg)
             .font_family(settings.buffer_font_family.clone())
             .text_size(settings.buffer_font_size() - px(1.))
-            .child(self.render_status(&theme))
+            .child(self.render_status(&theme, cx))
             .children(changes_bar)
             .child(body)
             .child(

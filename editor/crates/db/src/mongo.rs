@@ -209,6 +209,7 @@ impl Mongo {
                                 type_name: type_name(v).into(),
                                 nullable: true,
                                 primary_key: k == "_id",
+                                ..Default::default()
                             })
                             .collect()
                     })
@@ -221,7 +222,7 @@ impl Mongo {
                 name: collection,
                 kind: ObjectKind::Collection,
                 columns,
-                indexes: Vec::new(),
+                ..Default::default()
             });
         }
         Ok(Schema {

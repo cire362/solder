@@ -22,6 +22,7 @@ mod picker;
 mod project;
 mod project_panel;
 mod project_search;
+mod reference_picker;
 mod results;
 mod search;
 mod services;

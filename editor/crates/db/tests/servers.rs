@@ -527,9 +527,10 @@ fn check_apply(session: &Session, table: &str) {
         format!("UPDATE {t} SET name = 'Ada' WHERE id = 1"),
         format!("UPDATE {t} SET name = 'cy' WHERE id = 3"),
         format!("DELETE FROM {t} WHERE id = 2"),
+        format!("INSERT INTO {t} (id, name) VALUES (4, 'di')"),
     ]))
     .unwrap();
-    assert_eq!(names(session), ["Ada", "cy"]);
+    assert_eq!(names(session), ["Ada", "cy", "di"]);
     let err = block(session.apply(vec![
         format!("UPDATE {t} SET name = 'changed' WHERE id = 1"),
         format!("UPDATE {t} SET name = 'gone' WHERE id = 2"),
@@ -538,14 +539,14 @@ fn check_apply(session: &Session, table: &str) {
     assert!(err.contains("Change 2 of 2 matched no row"), "{err}");
     assert_eq!(
         names(session),
-        ["Ada", "cy"],
+        ["Ada", "cy", "di"],
         "the first change was rolled back"
     );
     let err =
         block(session.apply(vec![format!("UPDATE {t} SET nope = 1 WHERE id = 1")])).unwrap_err();
     assert!(err.contains("Nothing was saved"), "{err}");
     // The connection is usable after a rollback.
-    assert_eq!(names(session), ["Ada", "cy"]);
+    assert_eq!(names(session), ["Ada", "cy", "di"]);
     run(session, &format!("DROP TABLE {t}"));
 }
 
@@ -565,7 +566,7 @@ fn mysql_apply() {
 
 #[test]
 fn sqlite_apply() {
-    let path = std::env::temp_dir().join(format!("solder-apply-{}.db", std::process::id()));
+    let path = db::testing::dir("sqlite-apply").join("test.db");
     std::fs::write(&path, b"").unwrap();
     let spec = ConnectionSpec {
         name: "apply".into(),
@@ -575,4 +576,89 @@ fn sqlite_apply() {
         read_only: false,
     };
     check_apply(&block(Session::connect(spec)).unwrap(), "solder_apply");
+}
+
+/// Defaults, server-filled columns and foreign keys come back in the schema.
+fn check_schema_details(session: &Session, ddl: &[&str]) {
+    for statement in [
+        "DROP TABLE IF EXISTS solder_o",
+        "DROP TABLE IF EXISTS solder_c",
+    ]
+    .iter()
+    .chain(ddl)
+    {
+        run(session, statement);
+    }
+    let schema = block(session.schema()).unwrap();
+    let table = |name: &str| schema.objects.iter().find(|o| o.name == name).unwrap();
+    let customers = table("solder_c");
+    assert!(customers.columns[0].auto, "{:?}", customers.columns[0]);
+    assert!(
+        customers.columns[1]
+            .default
+            .as_deref()
+            .is_some_and(|d| d.contains("anon")),
+        "{:?}",
+        customers.columns[1]
+    );
+    let orders = table("solder_o");
+    let [fk] = orders.foreign_keys.as_slice() else {
+        panic!("{:?}", orders.foreign_keys)
+    };
+    assert_eq!(fk.columns, ["c_id"]);
+    assert_eq!(fk.ref_table, "solder_c");
+    assert_eq!(fk.ref_columns, ["id"]);
+    assert!(!orders.columns[1].auto);
+    run(session, "DROP TABLE solder_o");
+    run(session, "DROP TABLE solder_c");
+}
+
+#[test]
+fn postgres_schema_details() {
+    if let Some(spec) = spec("SOLDER_TEST_POSTGRES", Engine::Postgres, false) {
+        check_schema_details(
+            &block(Session::connect(spec)).unwrap(),
+            &[
+                "CREATE TABLE solder_c (id SERIAL PRIMARY KEY, name TEXT NOT NULL DEFAULT 'anon')",
+                "CREATE TABLE solder_o (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                 c_id INT REFERENCES solder_c(id), status TEXT DEFAULT 'new')",
+            ],
+        );
+    }
+}
+
+#[test]
+fn mysql_schema_details() {
+    if let Some(spec) = spec("SOLDER_TEST_MYSQL", Engine::MySql, false) {
+        check_schema_details(
+            &block(Session::connect(spec)).unwrap(),
+            &[
+                "CREATE TABLE solder_c (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20) NOT NULL DEFAULT 'anon')",
+                "CREATE TABLE solder_o (id INT AUTO_INCREMENT PRIMARY KEY, c_id INT, status VARCHAR(10) DEFAULT 'new', \
+                 CONSTRAINT solder_o_c FOREIGN KEY (c_id) REFERENCES solder_c(id))",
+            ],
+        );
+    }
+}
+
+#[test]
+fn sqlite_schema_details() {
+    let path = db::testing::dir("sqlite-details").join("test.db");
+    std::fs::write(&path, b"").unwrap();
+    let session = block(Session::connect(ConnectionSpec {
+        name: "details".into(),
+        engine: Engine::Sqlite,
+        url: path.display().to_string(),
+        source: "test".into(),
+        read_only: false,
+    }))
+    .unwrap();
+    check_schema_details(
+        &session,
+        &[
+            "CREATE TABLE solder_c (id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT 'anon')",
+            // No column named: the referenced table's key.
+            "CREATE TABLE solder_o (id INTEGER PRIMARY KEY, c_id INTEGER REFERENCES solder_c, status TEXT DEFAULT 'new')",
+        ],
+    );
 }
