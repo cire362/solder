@@ -1,6 +1,8 @@
 mod buffer_search;
 mod command_palette;
 mod completion;
+mod database;
+mod database_panel;
 mod document;
 mod editor;
 mod editor_git;
@@ -20,6 +22,7 @@ mod picker;
 mod project;
 mod project_panel;
 mod project_search;
+mod results;
 mod search;
 mod services;
 mod services_panel;

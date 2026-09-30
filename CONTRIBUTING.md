@@ -50,6 +50,36 @@ through GPUI's test context (see `workspace.rs` tests); features that talk
 to external processes (language servers, the terminal) are tested against
 real processes or the mock server in `editor/crates/solder/tests/fixtures`.
 
+Database drivers are tested against real servers in
+`editor/crates/db/tests/servers.rs`. CI starts Postgres, MySQL, Redis and
+MongoDB as service containers; locally each test is skipped unless its URL is
+set. With Docker or OrbStack:
+
+```bash
+docker run -d --name solder-pg -e POSTGRES_PASSWORD=solder -e POSTGRES_DB=solder -p 55432:5432 postgres:17-alpine
+docker run -d --name solder-mysql -e MYSQL_ROOT_PASSWORD=solder -e MYSQL_DATABASE=solder -p 53306:3306 mysql:8.4
+docker run -d --name solder-redis -p 56379:6379 redis:7-alpine
+docker run -d --name solder-mongo -p 57017:27017 mongo:8
+export SOLDER_TEST_POSTGRES=postgres://postgres:solder@localhost:55432/solder
+export SOLDER_TEST_MYSQL=mysql://root:solder@localhost:53306/solder
+export SOLDER_TEST_REDIS=redis://localhost:56379
+export SOLDER_TEST_MONGO=mongodb://localhost:57017/solder
+```
+
+TLS tests also run in CI. Run the same checks locally with:
+
+```bash
+bash editor/scripts/test-db-tls.sh
+```
+
+The script needs Docker and OpenSSL. It creates a one-day test CA and four
+temporary servers on random loopback ports, then removes only those containers,
+their volumes and certificates. Existing `solder-*` containers are untouched.
+Tests check encryption, rejection of an untrusted certificate, a trusted private
+CA, hostname mismatches, Postgres channel binding and Prisma URL parameters.
+They use real handshakes but do not verify hosted Neon, RDS or Atlas deployments,
+MongoDB SRV DNS discovery or client-certificate authentication.
+
 ## Performance
 
 The website promises specific numbers. Run `editor/scripts/bench.sh` before

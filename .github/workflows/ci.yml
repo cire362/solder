@@ -32,6 +32,37 @@ jobs:
     defaults:
       run:
         working-directory: editor
+    # Real servers for the database drivers (crates/db/tests/servers.rs).
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: solder
+          POSTGRES_DB: solder
+        ports: ["55432:5432"]
+        options: --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 30
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: solder
+          MYSQL_DATABASE: solder
+        ports: ["53306:3306"]
+        options: --health-cmd "mysqladmin ping -h 127.0.0.1 -psolder" --health-interval 2s --health-retries 60
+      redis:
+        image: redis:7-alpine
+        ports: ["56379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 2s --health-retries 30
+      mongo:
+        image: mongo:8
+        ports: ["57017:27017"]
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping: 1})'"
+          --health-interval 2s --health-retries 30
+    env:
+      SOLDER_TEST_POSTGRES: postgres://postgres:solder@localhost:55432/solder
+      SOLDER_TEST_MYSQL: mysql://root:solder@localhost:53306/solder
+      SOLDER_TEST_REDIS: redis://localhost:56379
+      SOLDER_TEST_MONGO: mongodb://localhost:57017/solder
     steps:
       - uses: actions/checkout@v4
       - name: System libraries for GPUI
@@ -56,3 +87,6 @@ jobs:
       - name: Run Rust tests
         timeout-minutes: 5
         run: cargo test --workspace --profile ci --locked
+      - name: Verify database TLS
+        timeout-minutes: 5
+        run: bash scripts/test-db-tls.sh

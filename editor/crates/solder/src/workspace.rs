@@ -16,6 +16,8 @@ use gpui::{
 use crate::{
     buffer_search::{self, BufferSearchBar},
     command_palette::CommandPalette,
+    database::{self, DatabaseStore},
+    database_panel::{DatabasePanel, DatabasePanelEvent, NewConnection, NewConnectionPrompt},
     document::Document,
     editor::{self, Editor, EditorEvent},
     editor_lsp::LspLocation,
@@ -32,6 +34,7 @@ use crate::{
     project::{Project, ProjectEvent},
     project_panel::{ProjectPanel, ProjectPanelEvent},
     project_search::{OpenMatch, ProjectSearch},
+    results::ResultsView,
     services::{self, ServiceSpec},
     services_panel::{RunStack, ServicesEvent, ServicesPanel, StopAll},
     settings::{self, Settings},
@@ -70,6 +73,7 @@ actions!(
         NewTerminal,
         ShowGit,
         ShowServices,
+        ShowDatabase,
         ShowFileDiff,
     ]
 );
@@ -105,6 +109,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-`", NewTerminal, None),
         KeyBinding::new("ctrl-shift-g", ShowGit, None),
         KeyBinding::new("secondary-shift-s", ShowServices, None),
+        KeyBinding::new("ctrl-shift-d", ShowDatabase, None),
         KeyBinding::new("secondary-alt-d", ShowFileDiff, None),
     ]);
     #[cfg(target_os = "macos")]
@@ -115,7 +120,7 @@ pub fn bind_keys(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
 
-const SIDEBAR_WIDTH: f32 = 260.;
+const SIDEBAR_WIDTH: f32 = 300.;
 const TITLEBAR_HEIGHT: f32 = 38.;
 const TAB_BAR_HEIGHT: f32 = 34.;
 const STATUS_HEIGHT: f32 = 26.;
@@ -146,6 +151,7 @@ enum SidebarTab {
     Search,
     Git,
     Services,
+    Database,
 }
 
 struct Modal {
@@ -184,6 +190,13 @@ pub struct Workspace {
     git: Entity<GitStore>,
     git_panel: Entity<GitPanel>,
     services: Entity<ServicesPanel>,
+    database: Entity<DatabaseStore>,
+    database_panel: Entity<DatabasePanel>,
+    results: Entity<ResultsView>,
+    /// The Results tab is in the dock (a query has run and it was not closed).
+    show_results: bool,
+    /// The dock shows Results rather than a terminal.
+    results_active: bool,
     file_diff: Option<Entity<FileDiff>>,
     diff_task: Option<Task<()>>,
     diff_subscription: Option<Subscription>,
@@ -207,6 +220,9 @@ impl Workspace {
         let git = cx.new(|cx| GitStore::new(root.clone(), cx));
         let git_panel = cx.new(|cx| GitPanel::new(root.clone(), git.clone(), cx));
         let services = cx.new(|cx| ServicesPanel::new(root.clone(), cx));
+        let database = cx.new(|_| DatabaseStore::new(root.clone()));
+        let database_panel = cx.new(|cx| DatabasePanel::new(database.clone(), cx));
+        let results = cx.new(|cx| ResultsView::new(database.clone(), cx));
         let project_search = cx.new(|cx| ProjectSearch::new(root, window, cx));
         let search_bar = cx.new(|cx| BufferSearchBar::new(window, cx));
         let subscriptions = vec![
@@ -238,6 +254,11 @@ impl Workspace {
                     if paths.iter().any(|p| is_service_manifest(p)) {
                         this.services.update(cx, |s, cx| s.redetect(cx));
                     }
+                    if paths.iter().any(|p| database::is_connection_source(p))
+                        && this.database.read(cx).detected()
+                    {
+                        this.database.update(cx, |d, cx| d.redetect(cx));
+                    }
                 }
                 ProjectEvent::GitChanged => this.git.update(cx, |g, cx| g.refresh(cx)),
                 ProjectEvent::Scanned => cx.notify(),
@@ -265,6 +286,15 @@ impl Workspace {
                             ..Default::default()
                         };
                         this.spawn_terminal(command, window, cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &database_panel,
+                window,
+                |this, _, event, window, cx| match event {
+                    DatabasePanelEvent::Run { connection, query } => {
+                        this.run_query(connection.clone(), query.clone(), false, window, cx)
                     }
                 },
             ),
@@ -340,6 +370,11 @@ impl Workspace {
             git,
             git_panel,
             services,
+            database,
+            database_panel,
+            results,
+            show_results: false,
+            results_active: false,
             file_diff: None,
             diff_task: None,
             diff_subscription: None,
@@ -1047,6 +1082,7 @@ impl Workspace {
         );
         self.terminals.push((terminal.clone(), subscription));
         self.active_terminal = self.terminals.len() - 1;
+        self.results_active = false;
         self.dock_open = true;
         if focus {
             window.focus(&terminal.focus_handle(cx));
@@ -1086,6 +1122,7 @@ impl Workspace {
     ) {
         if let Some(ix) = self.terminals.iter().position(|(t, _)| t == terminal) {
             self.active_terminal = ix;
+            self.results_active = false;
             self.dock_open = true;
             window.focus(&terminal.focus_handle(cx));
             cx.notify();
@@ -1103,6 +1140,62 @@ impl Workspace {
         self.sidebar = tab;
         let visible = tab == Some(SidebarTab::Services);
         self.services.update(cx, |s, cx| s.set_visible(visible, cx));
+        if tab == Some(SidebarTab::Database) {
+            self.database_panel.update(cx, |p, cx| p.shown(cx));
+        }
+        cx.notify();
+    }
+
+    fn show_database(&mut self, _: &ShowDatabase, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_sidebar(Some(SidebarTab::Database), cx);
+        window.focus(&self.database_panel.focus_handle(cx));
+    }
+
+    fn new_connection(&mut self, _: &NewConnection, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = NewConnectionPrompt::new(self.database.clone());
+        self.toggle_modal(window, cx, move |window, cx| {
+            Picker::new(prompt, window, cx)
+        });
+    }
+
+    /// Runs `query` and shows the Results tab. `focus` moves the keyboard
+    /// there; running from an editor keeps it in the editor.
+    pub fn run_query(
+        &mut self,
+        connection: SharedString,
+        query: String,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.results
+            .update(cx, |r, cx| r.run(connection, query, cx));
+        self.show_results = true;
+        self.results_active = true;
+        self.dock_open = true;
+        if focus {
+            window.focus(&self.results.focus_handle(cx));
+        }
+        cx.notify();
+    }
+
+    fn close_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_focused = self.results.focus_handle(cx).contains_focused(window, cx);
+        self.show_results = false;
+        self.results_active = false;
+        if self.terminals.is_empty() {
+            self.dock_open = false;
+        }
+        if was_focused {
+            match (
+                self.terminals.get(self.active_terminal),
+                self.active_editor(),
+            ) {
+                (Some((t, _)), _) => window.focus(&t.focus_handle(cx)),
+                (None, Some(e)) => window.focus(&e.focus_handle(cx)),
+                (None, None) => window.focus(&self.focus_handle),
+            }
+        }
         cx.notify();
     }
 
@@ -1118,7 +1211,8 @@ impl Workspace {
         let was_focused = terminal.focus_handle(cx).contains_focused(window, cx);
         drop(self.terminals.remove(ix));
         if self.terminals.is_empty() {
-            self.dock_open = false;
+            self.dock_open = self.dock_open && self.show_results;
+            self.results_active = self.show_results;
             self.active_terminal = 0;
         } else {
             self.active_terminal = self.active_terminal.min(self.terminals.len() - 1);
@@ -1128,6 +1222,7 @@ impl Workspace {
                 self.terminals.get(self.active_terminal),
                 self.active_editor(),
             ) {
+                _ if self.results_active => window.focus(&self.results.focus_handle(cx)),
                 (Some((t, _)), _) => window.focus(&t.focus_handle(cx)),
                 (None, Some(e)) => window.focus(&e.focus_handle(cx)),
                 (None, None) => window.focus(&self.focus_handle),
@@ -1153,7 +1248,11 @@ impl Workspace {
                 let command = self.default_terminal(cx);
                 self.spawn_terminal(command, window, cx);
             }
-            Some(t) if self.dock_open && t.focus_handle(cx).contains_focused(window, cx) => {
+            Some(t)
+                if self.dock_open
+                    && !self.results_active
+                    && t.focus_handle(cx).contains_focused(window, cx) =>
+            {
                 self.dock_open = false;
                 if let Some(e) = self.active_editor() {
                     window.focus(&e.focus_handle(cx));
@@ -1162,6 +1261,7 @@ impl Workspace {
             }
             Some(t) => {
                 self.dock_open = true;
+                self.results_active = false;
                 window.focus(&t.focus_handle(cx));
                 cx.notify();
             }
@@ -1180,7 +1280,7 @@ impl Workspace {
             .iter()
             .enumerate()
             .map(|(ix, (terminal, _))| {
-                let active = ix == self.active_terminal;
+                let active = ix == self.active_terminal && !self.results_active;
                 let close = terminal.clone();
                 div()
                     .id(("terminal-tab", ix))
@@ -1197,6 +1297,7 @@ impl Workspace {
                     .hover(|d| d.text_color(theme.fg))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.active_terminal = ix;
+                        this.results_active = false;
                         if let Some((t, _)) = this.terminals.get(ix) {
                             window.focus(&t.focus_handle(cx));
                         }
@@ -1246,6 +1347,9 @@ impl Workspace {
                     .bg(theme.bg_sunken)
                     .border_b_1()
                     .border_color(theme.line)
+                    .when(self.show_results, |d| {
+                        d.child(self.render_results_tab(&theme, cx))
+                    })
                     .children(tabs)
                     .child(
                         div()
@@ -1263,12 +1367,58 @@ impl Workspace {
                             })),
                     ),
             )
+            .child(div().flex_1().min_h_0().map(|d| {
+                if self.results_active {
+                    d.child(self.results.clone())
+                } else {
+                    d.children(
+                        self.terminals
+                            .get(self.active_terminal)
+                            .map(|(t, _)| t.clone()),
+                    )
+                }
+            }))
+    }
+
+    fn render_results_tab(
+        &self,
+        theme: &crate::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.results_active;
+        div()
+            .id("results-tab")
+            .h(px(24.))
+            .pl_2p5()
+            .pr_1()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .rounded(px(8.))
+            .text_size(UI_FONT_SIZE)
+            .text_color(if active { theme.fg } else { theme.fg_subtle })
+            .when(active, |d| d.bg(theme.bg_elev))
+            .hover(|d| d.text_color(theme.fg))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.results_active = true;
+                window.focus(&this.results.focus_handle(cx));
+                cx.notify();
+            }))
+            .child("Results")
             .child(
-                div().flex_1().min_h_0().children(
-                    self.terminals
-                        .get(self.active_terminal)
-                        .map(|(t, _)| t.clone()),
-                ),
+                div()
+                    .id("results-close")
+                    .size(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .hover(|d| d.bg(theme.line))
+                    .child("×")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_results(window, cx);
+                    })),
             )
     }
 
@@ -1892,7 +2042,7 @@ impl Workspace {
             div()
                 .id(id)
                 .h(px(24.))
-                .px_2()
+                .px_1p5()
                 .flex()
                 .items_center()
                 .rounded(px(8.))
@@ -1906,6 +2056,7 @@ impl Workspace {
                     SidebarTab::Search => this.show_search(&ShowSearch, window, cx),
                     SidebarTab::Git => this.show_git(&ShowGit, window, cx),
                     SidebarTab::Services => this.show_services(&ShowServices, window, cx),
+                    SidebarTab::Database => this.show_database(&ShowDatabase, window, cx),
                 }))
         };
         div()
@@ -1934,6 +2085,11 @@ impl Workspace {
                         "sidebar-services",
                         "Services",
                         SidebarTab::Services,
+                    ))
+                    .child(tab_button(
+                        "sidebar-database",
+                        "Database",
+                        SidebarTab::Database,
                     )),
             )
             .child(div().flex_1().min_h_0().pt_1().map(|d| match tab {
@@ -1941,6 +2097,7 @@ impl Workspace {
                 SidebarTab::Search => d.child(self.project_search.clone()),
                 SidebarTab::Git => d.child(self.git_panel.clone()),
                 SidebarTab::Services => d.child(self.services.clone()),
+                SidebarTab::Database => d.child(self.database_panel.clone()),
             }))
     }
 
@@ -2163,6 +2320,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::show_git))
             .on_action(cx.listener(Self::show_services))
+            .on_action(cx.listener(Self::show_database))
+            .on_action(cx.listener(Self::new_connection))
             // Available from anywhere (command palette), not just the tab.
             .on_action(cx.listener(|this, _: &RunStack, _, cx| {
                 this.services.update(cx, |s, cx| s.start_all(cx))
@@ -2216,9 +2375,10 @@ impl Render for Workspace {
                     .children(self.sidebar.map(|tab| self.render_sidebar(tab, cx)))
                     .children(panes),
             )
-            .when(self.dock_open && !self.terminals.is_empty(), |d| {
-                d.child(self.render_dock(cx))
-            })
+            .when(
+                self.dock_open && (!self.terminals.is_empty() || self.show_results),
+                |d| d.child(self.render_dock(cx)),
+            )
             .child(self.render_status(cx))
             .children(self.modal.as_ref().map(|modal| {
                 deferred(
@@ -3098,5 +3258,93 @@ mod tests {
         cx.simulate_input("hello");
         assert_eq!(active_text(&ws, cx), "hello");
         assert_eq!(active_path(&ws, cx), None);
+    }
+
+    #[gpui::test]
+    fn database_tab_previews_tables_in_results(cx: &mut TestAppContext) {
+        use crate::{database::SchemaState, results::State};
+        let root = fixture("database");
+        let path = root.join("dev.db");
+        // An empty file is an empty SQLite database; fill it with the driver
+        // the app uses.
+        std::fs::write(&path, b"").unwrap();
+        futures::executor::block_on(async {
+            let session = db::Session::connect(db::ConnectionSpec {
+                name: "seed".into(),
+                engine: db::Engine::Sqlite,
+                url: path.display().to_string(),
+                source: "test".into(),
+                read_only: false,
+            })
+            .await
+            .unwrap();
+            for q in [
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+                "INSERT INTO users (name) VALUES ('ada'), ('bob')",
+            ] {
+                session.query(q.into()).await.unwrap();
+            }
+        });
+        std::fs::write(root.join(".env"), "DATABASE_URL=file:./dev.db\n").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        let (store, panel, results) = cx.read(|cx| {
+            let ws = ws.read(cx);
+            (
+                ws.database.clone(),
+                ws.database_panel.clone(),
+                ws.results.clone(),
+            )
+        });
+        // Nothing is read until the tab is opened.
+        assert!(!cx.read(|cx| store.read(cx).detected()));
+        cx.simulate_keystrokes("ctrl-shift-d");
+        assert!(cx.read(|cx| ws.read(cx).sidebar == Some(SidebarTab::Database)));
+        wait_for(cx, "detection", &|cx| store.read(cx).detected());
+        // The file named in .env and found on disk is one connection.
+        assert_eq!(cx.read(|cx| store.read(cx).connections().len()), 1);
+
+        panel.update(cx, |p, cx| p.toggle_connection(0, cx));
+        wait_for(cx, "schema", &|cx| {
+            matches!(
+                store.read(cx).connections()[0].schema,
+                SchemaState::Loaded(_)
+            )
+        });
+        panel.update(cx, |p, cx| p.open_object(0, 0, cx));
+        wait_for(
+            cx,
+            "preview rows",
+            &|cx| matches!(&results.read(cx).state, State::Done(r) if r.rows.len() == 2),
+        );
+        cx.read(|cx| {
+            let ws = ws.read(cx);
+            assert!(ws.dock_open && ws.show_results && ws.results_active);
+        });
+
+        cx.update(|window, cx| window.focus(&results.focus_handle(cx)));
+        cx.simulate_keystrokes("down right secondary-c");
+        assert_eq!(cx.read(|cx| results.read(cx).selected), Some((1, 1)));
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|i| i.text()).as_deref(),
+            Some("bob")
+        );
+
+        ws.update_in(cx, |ws, window, cx| {
+            ws.run_query(
+                "DATABASE_URL".into(),
+                "SELECT nope FROM users".into(),
+                true,
+                window,
+                cx,
+            )
+        });
+        wait_for(
+            cx,
+            "error",
+            &|cx| matches!(&results.read(cx).state, State::Failed(e) if e.contains("nope")),
+        );
+        ws.update_in(cx, |ws, window, cx| ws.close_results(window, cx));
+        assert!(!cx.read(|cx| ws.read(cx).dock_open));
     }
 }

@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 alacritty_terminal = "0.26"
+db = { path = "../db" }
 dirs = "7.0.0"
 futures = "0.3.34"
 gpui.workspace = true
