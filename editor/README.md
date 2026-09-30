@@ -6,6 +6,7 @@ The native editor behind the website in `../src`. Rust, GPU-rendered UI, no Elec
 crates/
   text/     rope buffer, edits, undo history, cursor movement (no UI, fully unit-tested)
   syntax/   tree-sitter parsing and highlighting for Rust, TS/TSX, JS, JSON, CSS, Go, Python
+  db/       database connections: detection, drivers, statement splitting (no UI)
   solder/   the app: GPUI window, editor element, file tree, tabs, status bar
 ```
 
@@ -79,6 +80,35 @@ Add or override services in `.solder/services.json`:
 Containers are listed below the services when a Docker runtime is running: Docker
 Desktop, OrbStack or Colima. Solder uses the `docker` CLI and its current context,
 and finds OrbStack's CLI in `~/.orbstack/bin` even without the `/usr/local/bin` links.
+
+## Databases
+
+Open the Database tab with `ctrl-shift-d`. Solder lists the databases it finds:
+connection URLs in `.env` files (Postgres, MySQL, SQLite, Redis, MongoDB,
+Prisma's `file:` paths), database images in compose files with their published
+ports and credentials, and SQLite files in the project. Nothing is read until the
+tab is opened, and a connection opens the first time you expand it.
+
+Expand a connection to see its tables, views, collections or keys. Click one to
+list its columns in the tab and show its first 200 rows in the Results tab of the
+bottom dock. In the grid, arrow keys move the selected cell and
+`cmd-c` copies its value.
+
+Connections from `.env.production`, or whose name contains "prod", are read-only:
+the session itself refuses writes (Postgres and MySQL read-only transactions,
+SQLite opened read-only, write commands blocked for Redis and MongoDB).
+
+**New connection** takes a URL or a SQLite path and saves it to
+`~/.config/solder/connections.json` (readable by you only), outside the project so
+passwords are never committed. Shared connections belong in
+`.solder/connections.json`, where `${VAR}` comes from the project's `.env`:
+
+```json
+{ "connections": [{ "name": "analytics", "url": "postgres://ro@${DB_HOST}/stats", "readOnly": true }] }
+```
+
+TLS uses rustls. For Postgres, `sslmode=require` encrypts without checking the
+certificate, as libpq does; `verify-full` checks it against the Mozilla roots.
 
 ## Measured so far
 

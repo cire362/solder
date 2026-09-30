@@ -24,7 +24,7 @@ stack and the measured performance numbers.
   `docs/<topic>`, `chore/<topic>`, `ci/<topic>`. One roadmap item or bug
   per branch.
 - Commits follow Conventional Commits with a scope: `site`, `editor`, `text`,
-  `syntax`, `lsp`, `terminal`, `git`, `ci`. Example:
+  `syntax`, `lsp`, `terminal`, `git`, `services`, `db`, `ci`. Example:
   `fix(lsp): send didChange before completion requests`. Explain *why* in
   the body when the diff does not.
 - Every commit builds and passes tests on its own. Do not commit dead code
@@ -81,6 +81,11 @@ Never guess a signature.
 - Git goes through `git.rs`, which shells out to `git` with stable
   `--porcelain=v2 -z` formats. Everything in it blocks: call it from
   `cx.background_executor()`.
+- Databases live in `crates/db` (no GPUI). Drivers run on a Tokio runtime
+  that starts with the first connection; every public future is spawned
+  there and can be awaited from GPUI. `DatabaseStore` (`database.rs`) owns
+  connections in the app. TLS is rustls with the ring provider: keep
+  `default-features = false` on driver crates so aws-lc is never built.
 
 ### Performance rules
 
@@ -111,7 +116,8 @@ pattern for new widgets instead of calling `cx.propagate()` everywhere.
 - Features that talk to processes are tested against real ones: the
   terminal runs `/bin/sh`, language features run
   `crates/solder/tests/fixtures/mock_lsp.py`, git tests create a throwaway
-  repository. Call `cx.executor().allow_parking()` and poll with a timeout.
+  repository, database drivers run against the servers CI starts
+  (`crates/db/tests/servers.rs`, see CONTRIBUTING.md). Call `cx.executor().allow_parking()` and poll with a timeout.
 - Tests must not depend on tools that may be missing on CI (CI is Ubuntu:
   `git`, `python3` and `/bin/sh` are there; `rust-analyzer` is not).
 
