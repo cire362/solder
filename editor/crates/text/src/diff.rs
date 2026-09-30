@@ -89,6 +89,41 @@ pub fn diff_lines(old: &[&str], new: &[&str]) -> Vec<Hunk> {
     hunks
 }
 
+/// The byte edit that replaces rows `rows` of `text` with `new_lines`,
+/// keeping the newline structure intact at the start and end of the file.
+pub fn replace_rows(text: &str, rows: Range<usize>, new_lines: &[&str]) -> (Range<usize>, String) {
+    let mut starts = vec![0];
+    starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
+    let row_count = starts.len();
+    let rows = rows.start.min(row_count)..rows.end.min(row_count);
+    if rows.end < row_count {
+        // Rows followed by more text: each line carries its own newline.
+        let span = starts[rows.start]..starts[rows.end];
+        let replacement = new_lines.iter().map(|l| format!("{l}\n")).collect();
+        (span, replacement)
+    } else if rows.start == row_count {
+        // Appending after the last row.
+        let replacement = if new_lines.is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", new_lines.join("\n"))
+        };
+        (text.len()..text.len(), replacement)
+    } else if rows.start == 0 {
+        (0..text.len(), new_lines.join("\n"))
+    } else {
+        // Up to the end of the file: take the newline before the first row
+        // instead, so no trailing newline appears or disappears.
+        let span = starts[rows.start] - 1..text.len();
+        let replacement = if new_lines.is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", new_lines.join("\n"))
+        };
+        (span, replacement)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Op {
     Equal,
@@ -192,7 +227,43 @@ mod tests {
     fn middle_edits_find_the_shortest_script() {
         // After trimming, "b c d" -> "c d e": one deletion and one insertion,
         // not a three-line replacement.
-        assert_eq!(d("a\nb\nc\nd\nz", "a\nc\nd\ne\nz"), vec![(1..2, 1..1), (4..4, 3..4)]);
+        assert_eq!(
+            d("a\nb\nc\nd\nz", "a\nc\nd\ne\nz"),
+            vec![(1..2, 1..1), (4..4, 3..4)]
+        );
+    }
+
+    fn apply(text: &str, rows: Range<usize>, new: &[&str]) -> String {
+        let (span, replacement) = replace_rows(text, rows, new);
+        format!(
+            "{}{}{}",
+            &text[..span.start],
+            replacement,
+            &text[span.end..]
+        )
+    }
+
+    #[test]
+    fn replacing_rows_keeps_newlines() {
+        assert_eq!(apply("a\nb\nc\n", 1..2, &["X", "Y"]), "a\nX\nY\nc\n");
+        assert_eq!(apply("a\nb\nc", 2..3, &["Z"]), "a\nb\nZ");
+        assert_eq!(apply("a\nb\nc", 1..3, &[]), "a");
+        assert_eq!(apply("a\nb", 2..2, &["c"]), "a\nb\nc");
+        assert_eq!(apply("a\nb\n", 1..1, &["new"]), "a\nnew\nb\n");
+        assert_eq!(apply("x", 0..1, &["y"]), "y");
+    }
+
+    #[test]
+    fn reverting_every_hunk_restores_the_base() {
+        let base = "one\ntwo\nthree\nfour\n";
+        let current = "zero\none\n2\nthree\n";
+        let mut text = current.to_string();
+        // Revert from the bottom so earlier rows stay valid.
+        for h in diff_lines(&lines(base), &lines(current)).into_iter().rev() {
+            let base_lines = lines(base);
+            text = apply(&text, h.new.clone(), &base_lines[h.old.clone()]);
+        }
+        assert_eq!(text, base);
     }
 
     #[test]
