@@ -283,8 +283,15 @@ pub struct Editor {
     pub(crate) hover_task: Option<Task<()>>,
     pub(crate) signature: Option<crate::editor_lsp::SignatureHint>,
     pub(crate) signature_task: Option<Task<()>>,
+    /// Completion from a database schema instead of a language server
+    /// (query files bound to a connection).
+    pub(crate) schema_source: Option<SchemaSource>,
     _document_subscription: Subscription,
 }
+
+/// The engine and current schema for completion, read when it is needed so
+/// a schema that loads later is picked up.
+pub type SchemaSource = std::rc::Rc<dyn Fn(&App) -> Option<(db::Engine, Arc<db::Schema>)>>;
 
 impl Editor {
     /// An editor on a new document.
@@ -295,6 +302,10 @@ impl Editor {
             crate::lsp_store::LspStore::register(&document, cx);
         }
         Self::for_document(document, cx)
+    }
+
+    pub fn set_schema_source(&mut self, source: Option<SchemaSource>) {
+        self.schema_source = source;
     }
 
     /// Another view of an existing document, e.g. the second half of a split.
@@ -331,6 +342,7 @@ impl Editor {
             active_match: None,
             completion: None,
             completion_task: None,
+            schema_source: None,
             hover: None,
             hover_task: None,
             signature: None,

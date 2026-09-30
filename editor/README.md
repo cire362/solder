@@ -156,6 +156,22 @@ MongoDB it reports the TLS settings enforced by the driver, not a negotiated
 cipher or TLS version. Checking a `mongodb+srv` URL includes its real DNS lookup;
 the local tests do not replace a connection to Atlas or another hosted service.
 
+### Queries
+
+`cmd-enter` in a `.sql` file runs the statement under the cursor, or the
+selection, and shows the rows in Results while the cursor stays in the editor.
+`.redis` files run the command on the current line and `.mongodb` files the shell
+call under the cursor (`db.users.find({age: {$gt: 30}}).sort({name: 1})`). A file
+runs on the connection it was given; a new file gets the last connection used or
+the only one that fits, and otherwise asks. The connection shows in the status
+bar; click it (or run **Select connection**) to change it. **Query** on a
+connection opens its scratch file, kept in `~/.config/solder/scratch`.
+
+Completion comes from the schema: columns of the tables in the statement (with
+aliases and `table.`), tables after `FROM`, `JOIN`, `INTO` and `UPDATE`, index
+names after `INDEX`, and keywords. Redis files complete commands and keys, MongoDB
+files collections, methods and fields.
+
 ## Measured so far
 
 Apple M4, 16 GB, built-in 60 Hz display, release build.

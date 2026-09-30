@@ -1,19 +1,21 @@
 //! The Database tab: detected connections, their tables, collections or
 //! keys, and a preview of each in the Results tab.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, path::PathBuf};
 
 use db::{Engine, Object, ObjectKind};
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    SharedString, Task, Window, actions, div, prelude::*, px, uniform_list,
+    SharedString, Task, WeakEntity, Window, actions, div, prelude::*, px, uniform_list,
 };
 
 use crate::{
     database::{DatabaseEvent, DatabaseStore, SchemaState, Status},
+    fuzzy,
     picker::{Picker, PickerDelegate},
     theme::{ActiveTheme, Theme, UI_FONT_SIZE},
     ui,
+    workspace::Workspace,
 };
 
 actions!(database, [NewConnection, RefreshDatabases]);
@@ -24,6 +26,8 @@ pub enum DatabasePanelEvent {
         connection: SharedString,
         query: String,
     },
+    /// Open the connection's scratch query file.
+    NewQuery { connection: SharedString },
 }
 
 impl EventEmitter<DatabasePanelEvent> for DatabasePanel {}
@@ -129,6 +133,7 @@ impl DatabasePanel {
             return;
         }
         self.expanded.insert(name.clone());
+        self.store.update(cx, |s, _| s.set_last_used(&name));
         if load {
             self.store.update(cx, |s, cx| s.load_schema(&name, cx));
         }
@@ -157,6 +162,7 @@ impl DatabasePanel {
                 self.expanded_objects.insert(key);
             }
         }
+        self.store.update(cx, |s, _| s.set_last_used(&connection));
         cx.emit(DatabasePanelEvent::Run {
             connection,
             query: db::preview_query(engine, &object),
@@ -215,6 +221,7 @@ impl DatabasePanel {
                     Status::Failed(_) => theme.error,
                 };
                 let i = *i;
+                let query_name: SharedString = conn.spec.name.clone().into();
                 base.hover(|d| d.bg(theme.accent_soft))
                     .child(
                         div()
@@ -259,6 +266,26 @@ impl DatabasePanel {
                             .text_size(px(11.))
                             .text_color(theme.fg_subtle)
                             .child(conn.spec.source.clone()),
+                    )
+                    .child(
+                        div()
+                            .id(("db-query", i))
+                            .flex_none()
+                            .h(px(20.))
+                            .px_1p5()
+                            .flex()
+                            .items_center()
+                            .rounded(px(6.))
+                            .text_size(px(11.))
+                            .text_color(theme.fg_subtle)
+                            .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                            .child("Query")
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.emit(DatabasePanelEvent::NewQuery {
+                                    connection: query_name.clone(),
+                                });
+                            })),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_connection(i, cx)))
                     .into_any_element()
@@ -484,5 +511,128 @@ impl PickerDelegate for NewConnectionPrompt {
 
     fn width(&self) -> gpui::Pixels {
         px(560.)
+    }
+}
+
+/// Picks the connection a query file runs on (`SelectConnection`, or the
+/// first `cmd-enter` in a file that has none).
+pub struct ConnectionPicker {
+    workspace: WeakEntity<Workspace>,
+    path: PathBuf,
+    /// Run the statement under the cursor once chosen.
+    run: bool,
+    names: Vec<(String, &'static str, String)>,
+    matches: Vec<usize>,
+    selected: usize,
+}
+
+impl ConnectionPicker {
+    pub fn new(
+        workspace: WeakEntity<Workspace>,
+        store: &DatabaseStore,
+        path: PathBuf,
+        run: bool,
+    ) -> Self {
+        let engines = crate::database::query_file_engines(&path);
+        let names: Vec<_> = store
+            .connections()
+            .iter()
+            .filter(|c| engines.is_none_or(|e| e.contains(&c.spec.engine)))
+            .map(|c| {
+                (
+                    c.spec.name.clone(),
+                    c.spec.engine.label(),
+                    c.spec.source.clone(),
+                )
+            })
+            .collect();
+        Self {
+            workspace,
+            path,
+            run,
+            matches: (0..names.len()).collect(),
+            names,
+            selected: 0,
+        }
+    }
+}
+
+impl PickerDelegate for ConnectionPicker {
+    fn placeholder(&self) -> SharedString {
+        "Run this file on...".into()
+    }
+
+    fn match_count(&self) -> usize {
+        self.matches.len()
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected
+    }
+
+    fn set_selected_index(&mut self, ix: usize, _: &mut Context<Picker<Self>>) {
+        self.selected = ix;
+    }
+
+    fn update_matches(
+        &mut self,
+        query: String,
+        _: &mut Window,
+        _: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        self.matches = if query.is_empty() {
+            (0..self.names.len()).collect()
+        } else {
+            fuzzy::fuzzy_match(self.names.iter().map(|n| n.0.as_str()), &query, 100, false)
+                .into_iter()
+                .map(|m| m.index)
+                .collect()
+        };
+        self.selected = 0;
+        Task::ready(())
+    }
+
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let Some(name) = self
+            .matches
+            .get(self.selected)
+            .map(|&i| self.names[i].0.clone())
+        else {
+            return;
+        };
+        let (path, run) = (self.path.clone(), self.run);
+        cx.emit(DismissEvent);
+        self.workspace
+            .update(cx, |ws, cx| {
+                ws.connection_chosen(path, name, run, window, cx)
+            })
+            .ok();
+    }
+
+    fn render_match(
+        &self,
+        ix: usize,
+        _: bool,
+        _: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let (name, engine, source) = &self.names[self.matches[ix]];
+        div()
+            .flex()
+            .gap_2()
+            .text_size(UI_FONT_SIZE)
+            .child(div().text_color(theme.fg).child(name.clone()))
+            .child(div().text_color(theme.fg_subtle).child(*engine))
+            .child(div().text_color(theme.fg_subtle).child(source.clone()))
+            .into_any_element()
+    }
+
+    fn empty_text(&self) -> SharedString {
+        "No connections for this kind of file. Add one in the Database tab.".into()
+    }
+
+    fn width(&self) -> gpui::Pixels {
+        px(460.)
     }
 }
