@@ -8,6 +8,7 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -477,16 +478,26 @@ pub fn list_containers() -> Result<Vec<Container>, String> {
         .output()
         .map_err(|e| e.to_string())?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(
-            if stderr.contains("Cannot connect") || stderr.contains("daemon") {
-                "Docker is not running".into()
-            } else {
-                stderr.lines().next().unwrap_or("docker failed").to_string()
-            },
-        );
+        return Err(docker_error(&String::from_utf8_lossy(&out.stderr)));
     }
     Ok(parse_docker_ps(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// A short reason from docker's stderr. The CLI is the same for Docker
+/// Desktop, OrbStack and Colima; the socket path in the message says which
+/// runtime is down.
+fn docker_error(stderr: &str) -> String {
+    if !(stderr.contains("Cannot connect") || stderr.contains("daemon")) {
+        return stderr.lines().next().unwrap_or("docker failed").to_string();
+    }
+    let runtime = if stderr.contains(".orbstack") {
+        "OrbStack"
+    } else if stderr.contains(".colima") {
+        "Colima"
+    } else {
+        "Docker"
+    };
+    format!("{runtime} is not running")
 }
 
 pub fn container_action(id: &str, action: &str) -> Result<(), String> {
@@ -508,20 +519,29 @@ pub fn container_action(id: &str, action: &str) -> Result<(), String> {
 /// The docker binary. Apps started from the Dock get a minimal `PATH`, so
 /// the usual install locations are checked too.
 pub fn docker_path() -> Option<PathBuf> {
-    std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-        .unwrap_or_default()
+    docker_candidates(std::env::var_os("PATH"), std::env::var_os("HOME"))
         .into_iter()
-        .chain(
-            [
-                "/usr/local/bin",
-                "/opt/homebrew/bin",
-                "/Applications/Docker.app/Contents/Resources/bin",
-            ]
-            .map(PathBuf::from),
-        )
-        .map(|d| d.join("docker"))
         .find(|p| p.is_file())
+}
+
+fn docker_candidates(path: Option<OsString>, home: Option<OsString>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = path
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    dirs.extend(
+        [
+            "/usr/local/bin",
+            "/opt/homebrew/bin",
+            "/Applications/Docker.app/Contents/Resources/bin",
+            // OrbStack links into /usr/local/bin only when given admin rights.
+            "/Applications/OrbStack.app/Contents/MacOS/xbin",
+        ]
+        .map(PathBuf::from),
+    );
+    if let Some(home) = home {
+        dirs.push(Path::new(&home).join(".orbstack/bin"));
+    }
+    dirs.into_iter().map(|d| d.join("docker")).collect()
 }
 
 /// The shell that runs service commands: the user's login shell with `-lc`.
@@ -690,5 +710,25 @@ not json"#;
         assert!(containers[0].running());
         assert!(!containers[1].running());
         assert_eq!(containers[1].name, "old");
+    }
+
+    #[test]
+    fn finds_orbstack_without_admin_links() {
+        let candidates = docker_candidates(Some("/bin".into()), Some("/Users/me".into()));
+        assert_eq!(candidates[0], PathBuf::from("/bin/docker"));
+        assert!(candidates.contains(&PathBuf::from("/Users/me/.orbstack/bin/docker")));
+        assert!(candidates.contains(&PathBuf::from(
+            "/Applications/OrbStack.app/Contents/MacOS/xbin/docker"
+        )));
+    }
+
+    #[test]
+    fn names_the_runtime_that_is_down() {
+        let orb = "Cannot connect to the Docker daemon at unix:///Users/me/.orbstack/run/docker.sock. Is the docker daemon running?";
+        assert_eq!(docker_error(orb), "OrbStack is not running");
+        let desktop =
+            "Cannot connect to the Docker daemon at unix:///Users/me/.docker/run/docker.sock.";
+        assert_eq!(docker_error(desktop), "Docker is not running");
+        assert_eq!(docker_error("permission denied\nmore"), "permission denied");
     }
 }

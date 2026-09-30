@@ -76,7 +76,9 @@ Add or override services in `.solder/services.json`:
 { "services": [{ "name": "api", "command": "make run", "dir": "apps/api", "ports": [8080] }] }
 ```
 
-Docker containers are listed below the services when Docker is running.
+Containers are listed below the services when a Docker runtime is running: Docker
+Desktop, OrbStack or Colima. Solder uses the `docker` CLI and its current context,
+and finds OrbStack's CLI in `~/.orbstack/bin` even without the `/usr/local/bin` links.
 
 ## Measured so far
 
