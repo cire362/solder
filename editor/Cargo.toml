@@ -12,12 +12,10 @@ publish = false
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 ropey = "1.6"
 tree-sitter = "0.25"
-tree-sitter-highlight = "0.25"
 mimalloc = { version = "0.1", default-features = false }
 unicode-segmentation = "1.12"
 text = { path = "crates/text" }
 syntax = { path = "crates/syntax" }
-lsp = { path = "crates/lsp" }
 
 # Release is what the site's numbers are measured on: one codegen unit, fat LTO,
 # no unwinding tables. Cold start and input latency both benefit.
