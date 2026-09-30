@@ -36,6 +36,15 @@ when the diff does not make it obvious.
 - website: ESLint and TypeScript
 - editor: `cargo fmt --check`, `cargo clippy` with warnings as errors, `cargo test`
 
+The checks use the `ci` Cargo profile and the committed lockfile. This profile
+keeps debug assertions and overflow checks, but disables dependency optimization
+and uses line-table debug information for faster builds. Normal development and
+release profiles are unchanged.
+
+GitHub Actions reports test compilation separately from test execution. Rust
+dependency artifacts are cached even when tests fail, so failures do not force
+another full dependency build on the next run.
+
 New editor behavior comes with a test. UI behavior is tested headlessly
 through GPUI's test context (see `workspace.rs` tests); features that talk
 to external processes (language servers, the terminal) are tested against

@@ -1890,7 +1890,7 @@ mod tests {
     #[gpui::test]
     fn enter_between_brackets_splits_block(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx, "a.ts", "if (a) {}");
-        cx.simulate_keystrokes("secondary-right left enter");
+        cx.simulate_keystrokes("end left enter");
         assert_eq!(text(&editor, cx), "if (a) {\n  \n}".replace("  ", "    "));
         assert_eq!(cursors(&editor, cx), vec![13..13]);
     }
@@ -1942,7 +1942,7 @@ mod tests {
     #[gpui::test]
     fn backspace_removes_one_indent_level(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx, "a.rs", "        x");
-        cx.simulate_keystrokes("secondary-right secondary-left backspace");
+        cx.simulate_keystrokes("end home backspace");
         assert_eq!(text(&editor, cx), "    x");
     }
 
