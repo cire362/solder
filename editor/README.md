@@ -96,7 +96,8 @@ bottom dock. In the grid, arrow keys move the selected cell and
 
 Connections from `.env.production`, or whose name contains "prod", are read-only:
 the session itself refuses writes (Postgres and MySQL read-only transactions,
-SQLite opened read-only, write commands blocked for Redis and MongoDB).
+SQLite opened read-only, write commands blocked for Redis and MongoDB). Click the
+**read-only** tag, or **Allow changes** in Results, to allow writes until Solder quits.
 
 **New connection** takes a URL or a SQLite path and saves it to
 `~/.config/solder/connections.json` (readable by you only), outside the project so
@@ -171,6 +172,19 @@ Completion comes from the schema: columns of the tables in the statement (with
 aliases and `table.`), tables after `FROM`, `JOIN`, `INTO` and `UPDATE`, index
 names after `INDEX`, and keywords. Redis files complete commands and keys, MongoDB
 files collections, methods and fields.
+
+### Editing rows
+
+Rows from a plain `SELECT` on one table with a primary key can be edited in
+Results (Postgres, MySQL, SQLite). Select a cell and press `enter` (or double-click)
+to edit it, `enter` again to keep the value, `escape` to drop it. `shift-backspace`
+sets NULL and `cmd-backspace` marks the row for deletion. Nothing is written yet:
+changed cells are highlighted and deleted rows struck through.
+
+**Review** (`cmd-s`) shows the SQL that will run, with the values each update
+replaces. **Apply in one transaction** runs it all or nothing. Every statement
+targets one row by its primary key and the values the grid showed, so a row that
+someone changed or deleted since it was read stops the save and nothing is written.
 
 ## Measured so far
 

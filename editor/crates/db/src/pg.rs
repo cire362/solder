@@ -12,6 +12,9 @@ use crate::{
 pub struct Pg {
     client: Client,
     prepare: bool,
+    /// The client pipelines requests; a transaction must not interleave
+    /// with other queries on the same connection.
+    busy: tokio::sync::Mutex<()>,
 }
 
 impl Pg {
@@ -33,6 +36,7 @@ impl Pg {
         Ok(Self {
             client,
             prepare: params.prepare,
+            busy: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -40,6 +44,7 @@ impl Pg {
     /// the statement first (without running it) tells the column types, so
     /// numbers, booleans and JSON are shown as such.
     pub async fn query(&self, text: &str) -> Result<QueryResult> {
+        let _busy = self.busy.lock().await;
         let types: Option<Vec<Type>> = if self.prepare {
             self.client
                 .prepare(text)
@@ -86,7 +91,33 @@ impl Pg {
         Ok(result)
     }
 
+    pub async fn apply(&self, statements: &[String]) -> Result<()> {
+        let _busy = self.busy.lock().await;
+        self.client.batch_execute("BEGIN").await.map_err(error)?;
+        for (i, statement) in statements.iter().enumerate() {
+            let affected = match self.client.simple_query(statement).await {
+                Ok(messages) => messages
+                    .iter()
+                    .find_map(|m| match m {
+                        SimpleQueryMessage::CommandComplete(n) => Some(*n),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+                Err(e) => {
+                    let _ = self.client.batch_execute("ROLLBACK").await;
+                    return Err(format!("{} Nothing was saved.", error(e)));
+                }
+            };
+            if affected != 1 {
+                let _ = self.client.batch_execute("ROLLBACK").await;
+                return Err(crate::unmatched(i, statements.len(), affected));
+            }
+        }
+        self.client.batch_execute("COMMIT").await.map_err(error)
+    }
+
     pub async fn schema(&self) -> Result<Schema> {
+        let _busy = self.busy.lock().await;
         let columns = self
             .rows(
                 "SELECT c.table_schema, c.table_name, t.table_type, c.column_name, c.data_type, c.is_nullable \

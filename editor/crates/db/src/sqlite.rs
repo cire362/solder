@@ -35,6 +35,25 @@ impl Sqlite {
         blocking(move || run(&conn.lock().unwrap(), &text)).await
     }
 
+    pub async fn apply(&self, statements: Vec<String>) -> Result<()> {
+        let conn = self.conn.clone();
+        blocking(move || {
+            let mut conn = conn.lock().unwrap();
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            for (i, statement) in statements.iter().enumerate() {
+                let affected = tx
+                    .execute(statement, [])
+                    .map_err(|e| format!("{e}. Nothing was saved."))?;
+                if affected != 1 {
+                    // Dropping the transaction rolls it back.
+                    return Err(crate::unmatched(i, statements.len(), affected as u64));
+                }
+            }
+            tx.commit().map_err(|e| e.to_string())
+        })
+        .await
+    }
+
     pub async fn schema(&self) -> Result<Schema> {
         let conn = self.conn.clone();
         blocking(move || read_schema(&conn.lock().unwrap())).await

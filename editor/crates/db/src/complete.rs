@@ -234,7 +234,7 @@ fn columns(object: &Object, qualify_detail: bool) -> Vec<Candidate> {
 
 /// Tables named after FROM (a comma-separated list), JOIN, UPDATE and INTO,
 /// with their aliases.
-fn table_refs(statement: &str) -> Vec<(String, Option<String>)> {
+pub(crate) fn table_refs(statement: &str) -> Vec<(String, Option<String>)> {
     let words = tokens(statement);
     let mut refs = Vec::new();
     for (i, word) in words.iter().enumerate() {
@@ -306,7 +306,7 @@ fn is_keyword(word: &str) -> bool {
 
 /// Identifiers, keywords and commas, with quotes removed; strings and
 /// comments skipped.
-fn tokens(text: &str) -> Vec<String> {
+pub(crate) fn tokens(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut chars = text.char_indices().peekable();
     while let Some((i, c)) = chars.next() {

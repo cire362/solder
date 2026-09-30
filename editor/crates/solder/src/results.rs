@@ -1,24 +1,46 @@
 //! The Results tab in the bottom dock: the last query's rows in a grid.
 //! Rows are virtualized; columns pan together with the header.
+//!
+//! Rows from a single table with a primary key can be edited. Changes are
+//! staged in the grid, reviewed as the SQL that will run, and applied in one
+//! transaction; a row that changed since it was read aborts the whole save.
 
 use std::{ops::Range, sync::Arc};
 
-use db::{QueryResult, Value};
+use db::{
+    QueryResult, Value,
+    edit::{Changes, EditTarget},
+};
 use gpui::{
     App, ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyBinding, MouseButton, Pixels,
-    ScrollStrategy, ScrollWheelEvent, SharedString, Task, UniformListScrollHandle, Window, actions,
-    canvas, div, prelude::*, px, uniform_list,
+    ScrollStrategy, ScrollWheelEvent, SharedString, Subscription, Task, UniformListScrollHandle,
+    Window, actions, canvas, div, prelude::*, px, uniform_list,
 };
 
 use crate::{
-    database::DatabaseStore,
+    database::{self, DatabaseStore, SchemaState},
+    editor::Editor,
     settings::Settings,
     theme::{ActiveTheme, Theme, UI_FONT_SIZE},
+    ui,
 };
 
 actions!(
     results,
-    [SelectUp, SelectDown, SelectLeft, SelectRight, CopyCell]
+    [
+        SelectUp,
+        SelectDown,
+        SelectLeft,
+        SelectRight,
+        CopyCell,
+        EditCell,
+        CancelEdit,
+        SetNull,
+        DeleteRow,
+        ReviewChanges,
+        DiscardChanges,
+        ApplyChanges,
+    ]
 );
 
 pub fn bind_keys(cx: &mut App) {
@@ -26,10 +48,28 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("up", SelectUp, context),
         KeyBinding::new("down", SelectDown, context),
-        KeyBinding::new("left", SelectLeft, context),
-        KeyBinding::new("right", SelectRight, context),
-        KeyBinding::new("secondary-c", CopyCell, context),
+        KeyBinding::new("left", SelectLeft, Some("ResultsGrid && !editing")),
+        KeyBinding::new("right", SelectRight, Some("ResultsGrid && !editing")),
+        KeyBinding::new("secondary-c", CopyCell, Some("ResultsGrid && !editing")),
+        // Enter reaches the grid from the single-line cell editor too.
+        KeyBinding::new("enter", EditCell, context),
+        KeyBinding::new("f2", EditCell, context),
+        KeyBinding::new("escape", CancelEdit, context),
+        KeyBinding::new("shift-backspace", SetNull, Some("ResultsGrid && !editing")),
+        KeyBinding::new(
+            "secondary-backspace",
+            DeleteRow,
+            Some("ResultsGrid && !editing"),
+        ),
+        KeyBinding::new("secondary-s", ReviewChanges, context),
     ]);
+}
+
+struct Editing {
+    row: usize,
+    column: usize,
+    editor: Entity<Editor>,
+    _blur: Subscription,
 }
 
 const ROW_HEIGHT: Pixels = px(24.);
@@ -58,6 +98,15 @@ pub struct ResultsView {
     viewport: Pixels,
     pub selected: Option<(usize, usize)>,
     task: Option<Task<()>>,
+    pub changes: Changes,
+    editing: Option<Editing>,
+    /// Showing the SQL the staged changes will run.
+    pub reviewing: bool,
+    /// Why editing is not possible, or why saving failed.
+    pub notice: Option<SharedString>,
+    /// The notice is about a read-only connection that can be unlocked.
+    locked_notice: bool,
+    applying: Option<Task<()>>,
 }
 
 impl ResultsView {
@@ -75,6 +124,12 @@ impl ResultsView {
             viewport: px(0.),
             selected: None,
             task: None,
+            changes: Changes::default(),
+            editing: None,
+            reviewing: false,
+            notice: None,
+            locked_notice: false,
+            applying: None,
         }
     }
 
@@ -85,6 +140,11 @@ impl ResultsView {
         self.state = State::Running;
         self.selected = None;
         self.pan = px(0.);
+        self.changes = Changes::default();
+        self.editing = None;
+        self.reviewing = false;
+        self.notice = None;
+        self.locked_notice = false;
         let task = self
             .store
             .update(cx, |store, cx| store.run(&connection, query, cx));
@@ -136,6 +196,7 @@ impl ResultsView {
     }
 
     fn select(&mut self, row: usize, column: usize, cx: &mut Context<Self>) {
+        self.commit_edit(cx);
         self.selected = Some((row, column));
         self.scroll.scroll_to_item(row, ScrollStrategy::Top);
         // Keep the selected column on screen.
@@ -164,16 +225,20 @@ impl ResultsView {
         self.select(row, column, cx);
     }
 
-    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
         self.move_selection(-1, 0, cx);
     }
-    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_down(&mut self, _: &SelectDown, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
         self.move_selection(1, 0, cx);
     }
-    fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_left(&mut self, _: &SelectLeft, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
         self.move_selection(0, -1, cx);
     }
-    fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_right(&mut self, _: &SelectRight, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
         self.move_selection(0, 1, cx);
     }
 
@@ -194,6 +259,376 @@ impl ResultsView {
         if let Some(value) = value {
             cx.write_to_clipboard(ClipboardItem::new_string(value));
         }
+    }
+
+    /// The table these rows can be saved to, or why they cannot.
+    fn edit_target(&mut self, cx: &mut Context<Self>) -> Result<EditTarget, SharedString> {
+        let Some(result) = self.result().cloned() else {
+            return Err("Nothing to edit".into());
+        };
+        let store = self.store.read(cx);
+        let Some(conn) = store.connection(&self.connection) else {
+            return Err("The connection is gone".into());
+        };
+        let engine = conn.spec.engine;
+        let locked = conn.locked();
+        match &conn.schema {
+            SchemaState::Loaded(schema) => {
+                let target = db::edit::edit_target(engine, schema, &self.query, &result.columns)?;
+                if locked {
+                    self.locked_notice = true;
+                    return Err(
+                        "This connection is read-only. Allow changes to edit its rows.".into(),
+                    );
+                }
+                Ok(target)
+            }
+            SchemaState::Failed(e) => Err(e.clone()),
+            SchemaState::NotLoaded | SchemaState::Loading => {
+                let name = self.connection.clone();
+                self.store.update(cx, |s, cx| s.ensure_schema(&name, cx));
+                Err("Reading the schema, try again in a moment".into())
+            }
+        }
+    }
+
+    fn set_notice(&mut self, notice: Option<SharedString>, cx: &mut Context<Self>) {
+        if notice.is_none() {
+            self.locked_notice = false;
+        }
+        self.notice = notice;
+        cx.notify();
+    }
+
+    fn edit_cell(&mut self, _: &EditCell, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            self.commit_edit(cx);
+            window.focus(&self.focus);
+            return;
+        }
+        let Some((row, column)) = self.selected else {
+            return;
+        };
+        if self.changes.deleted.contains(&row) {
+            return;
+        }
+        self.locked_notice = false;
+        if let Err(reason) = self.edit_target(cx) {
+            self.notice = Some(reason);
+            cx.notify();
+            return;
+        }
+        self.notice = None;
+        let current = match self.changes.cells.get(&(row, column)) {
+            Some(staged) => staged.clone().unwrap_or_default(),
+            None => match self.result().and_then(|r| r.rows.get(row)?.get(column)) {
+                Some(Value::Null) | None => String::new(),
+                Some(value) => value.display(),
+            },
+        };
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line("NULL", cx);
+            editor.set_text(&current, true, cx);
+            editor
+        });
+        let focus = editor.focus_handle(cx);
+        // Clicking elsewhere keeps what was typed.
+        let blur = cx.on_blur(&focus, window, |this, _, cx| this.commit_edit(cx));
+        window.focus(&focus);
+        self.editing = Some(Editing {
+            row,
+            column,
+            editor,
+            _blur: blur,
+        });
+        cx.notify();
+    }
+
+    /// Stages what the cell editor holds. An unchanged value stages nothing.
+    fn commit_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(editing) = self.editing.take() else {
+            return;
+        };
+        let text = editing.editor.read(cx).text(cx);
+        let key = (editing.row, editing.column);
+        let original = self
+            .result()
+            .and_then(|r| r.rows.get(editing.row)?.get(editing.column))
+            .cloned();
+        let unchanged = match &original {
+            Some(Value::Null) => false,
+            Some(value) => value.display() == text,
+            None => true,
+        };
+        if unchanged {
+            self.changes.cells.remove(&key);
+        } else {
+            self.changes.cells.insert(key, Some(text));
+        }
+        cx.notify();
+    }
+
+    fn cancel_edit(&mut self, _: &CancelEdit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.take().is_some() {
+            window.focus(&self.focus);
+        } else if self.reviewing {
+            self.reviewing = false;
+        } else {
+            cx.propagate();
+        }
+        cx.notify();
+    }
+
+    fn set_null(&mut self, _: &SetNull, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((row, column)) = self.selected else {
+            return;
+        };
+        if let Err(reason) = self.edit_target(cx) {
+            return self.set_notice(Some(reason), cx);
+        }
+        let was_null = matches!(
+            self.result().and_then(|r| r.rows.get(row)?.get(column)),
+            Some(Value::Null)
+        );
+        if was_null {
+            self.changes.cells.remove(&(row, column));
+        } else {
+            self.changes.cells.insert((row, column), None);
+        }
+        self.set_notice(None, cx);
+    }
+
+    /// Marks the selected row for deletion, or unmarks it.
+    fn delete_row(&mut self, _: &DeleteRow, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((row, _)) = self.selected else {
+            return;
+        };
+        if let Err(reason) = self.edit_target(cx) {
+            return self.set_notice(Some(reason), cx);
+        }
+        if !self.changes.deleted.remove(&row) {
+            self.changes.deleted.insert(row);
+        }
+        self.set_notice(None, cx);
+    }
+
+    /// The statements the staged changes run, in order.
+    pub fn statements(&mut self, cx: &mut Context<Self>) -> Result<Vec<String>, SharedString> {
+        let target = self.edit_target(cx)?;
+        let result = self.result().cloned().ok_or("Nothing to edit")?;
+        let engine = self
+            .store
+            .read(cx)
+            .engine_of(&self.connection)
+            .ok_or("The connection is gone")?;
+        Ok(db::edit::statements(
+            engine,
+            &target,
+            &result.columns,
+            &result.rows,
+            &self.changes,
+        ))
+    }
+
+    fn review(&mut self, _: &ReviewChanges, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_edit(cx);
+        window.focus(&self.focus);
+        if self.changes.is_empty() {
+            return;
+        }
+        self.reviewing = true;
+        cx.notify();
+    }
+
+    fn discard(&mut self, _: &DiscardChanges, _: &mut Window, cx: &mut Context<Self>) {
+        self.editing = None;
+        self.changes = Changes::default();
+        self.reviewing = false;
+        self.set_notice(None, cx);
+    }
+
+    fn apply(&mut self, _: &ApplyChanges, _: &mut Window, cx: &mut Context<Self>) {
+        if self.applying.is_some() {
+            return;
+        }
+        let statements = match self.statements(cx) {
+            Ok(statements) if !statements.is_empty() => statements,
+            Ok(_) => return,
+            Err(reason) => return self.set_notice(Some(reason), cx),
+        };
+        let name = self.connection.clone();
+        let task = self
+            .store
+            .update(cx, |s, cx| s.apply(&name, statements, cx));
+        self.applying = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.applying = None;
+                match result {
+                    // Show the rows as they are now.
+                    Ok(()) => this.run(this.connection.clone(), this.query.to_string(), cx),
+                    Err(e) => this.set_notice(Some(e.into()), cx),
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn render_changes_bar(&self, theme: &Theme) -> Option<gpui::AnyElement> {
+        if self.changes.is_empty() && self.notice.is_none() {
+            return None;
+        }
+        let rows = self.changes.len();
+        let summary = match rows {
+            0 => String::new(),
+            1 => "1 changed row".into(),
+            n => format!("{n} changed rows"),
+        };
+        let store = self.store.clone();
+        let name = self.connection.to_string();
+        Some(
+            div()
+                .flex_none()
+                .h(px(34.))
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_2()
+                .border_b_1()
+                .border_color(theme.line)
+                .bg(theme.bg_sunken)
+                .text_size(UI_FONT_SIZE)
+                .font_family(crate::theme::UI_FONT)
+                .when(!summary.is_empty(), |d| {
+                    d.child(div().flex_none().text_color(theme.accent).child(summary))
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme.error)
+                        .children(self.notice.clone()),
+                )
+                .when(self.locked_notice, |d| {
+                    d.child(ui::button(
+                        "results-unlock",
+                        "Allow changes",
+                        false,
+                        theme,
+                        move |_, window, cx| {
+                            database::confirm_unlock(store.clone(), name.clone(), window, cx)
+                        },
+                    ))
+                })
+                .when(rows > 0 && !self.reviewing, |d| {
+                    d.child(ui::button(
+                        "results-discard",
+                        "Discard",
+                        false,
+                        theme,
+                        |_, window, cx| window.dispatch_action(Box::new(DiscardChanges), cx),
+                    ))
+                    .child(ui::button(
+                        "results-review",
+                        "Review",
+                        true,
+                        theme,
+                        |_, window, cx| window.dispatch_action(Box::new(ReviewChanges), cx),
+                    ))
+                })
+                .when(self.reviewing, |d| {
+                    d.child(ui::button(
+                        "results-back",
+                        "Back",
+                        false,
+                        theme,
+                        |_, window, cx| window.dispatch_action(Box::new(CancelEdit), cx),
+                    ))
+                    .child(ui::button(
+                        "results-apply",
+                        if self.applying.is_some() {
+                            "Saving..."
+                        } else {
+                            "Apply in one transaction"
+                        },
+                        true,
+                        theme,
+                        |_, window, cx| window.dispatch_action(Box::new(ApplyChanges), cx),
+                    ))
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn render_review(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let statements = self.statements(cx).unwrap_or_default();
+        let before = self.review_notes();
+        div()
+            .id("results-review")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(statements.into_iter().zip(before).map(|(s, note)| {
+                let color = if s.starts_with("DELETE") {
+                    theme.error
+                } else {
+                    theme.fg
+                };
+                div()
+                    .pb_1()
+                    .child(div().text_color(color).child(format!("{s};")))
+                    .children(
+                        note.map(|n| div().text_color(theme.fg_subtle).child(format!("-- {n}"))),
+                    )
+            }))
+            .into_any_element()
+    }
+
+    /// For each statement, in the same row order, what an update replaces:
+    /// `status: 'pending' -> 'paid'`. Deletes need no note.
+    fn review_notes(&self) -> Vec<Option<String>> {
+        let Some(result) = self.result() else {
+            return Vec::new();
+        };
+        let mut rows: std::collections::BTreeSet<usize> =
+            self.changes.cells.keys().map(|(row, _)| *row).collect();
+        rows.extend(&self.changes.deleted);
+        let show = |v: Option<&Value>| match v {
+            None | Some(Value::Null) => "NULL".to_string(),
+            Some(v @ (Value::Int(_) | Value::Float(_) | Value::Number(_) | Value::Bool(_))) => {
+                v.display()
+            }
+            Some(v) => format!("'{}'", v.display()),
+        };
+        rows.into_iter()
+            .map(|row| {
+                if self.changes.deleted.contains(&row) {
+                    return None;
+                }
+                let parts: Vec<String> = self
+                    .changes
+                    .cells
+                    .range((row, 0)..(row + 1, 0))
+                    .map(|(&(_, col), new)| {
+                        let old = result.rows.get(row).and_then(|r| r.get(col));
+                        let new = new.as_ref().map(|t| Value::Text(t.clone()));
+                        format!(
+                            "{}: {} -> {}",
+                            result.columns[col].name,
+                            show(old),
+                            show(new.as_ref())
+                        )
+                    })
+                    .collect();
+                Some(parts.join(", "))
+            })
+            .collect()
     }
 
     fn render_status(&self, theme: &Theme) -> impl IntoElement {
@@ -311,8 +746,19 @@ impl ResultsView {
                     .enumerate()
                     .map(|(col, (value, w))| {
                         let selected = self.selected == Some((ix, col));
-                        let text: String = value
-                            .display()
+                        let staged = self.changes.cells.get(&(ix, col));
+                        let deleted = self.changes.deleted.contains(&ix);
+                        let editor = self
+                            .editing
+                            .as_ref()
+                            .filter(|e| e.row == ix && e.column == col)
+                            .map(|e| e.editor.clone());
+                        let shown = match staged {
+                            Some(Some(text)) => text.clone(),
+                            Some(None) => "NULL".into(),
+                            None => value.display(),
+                        };
+                        let text: String = shown
                             .chars()
                             .take(CELL_CHARS)
                             .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
@@ -329,6 +775,8 @@ impl ResultsView {
                             .border_r_1()
                             .border_color(theme.line)
                             .text_color(match value {
+                                _ if deleted => theme.error,
+                                _ if staged.is_some() => theme.accent,
                                 Value::Null => theme.fg_subtle,
                                 Value::Int(_) | Value::Float(_) | Value::Number(_) => {
                                     theme.syntax.number
@@ -336,16 +784,33 @@ impl ResultsView {
                                 Value::Bool(_) => theme.syntax.keyword,
                                 _ => theme.fg,
                             })
+                            .when(staged.is_some() && !deleted, |d| d.bg(theme.accent_soft))
+                            .when(deleted, |d| d.line_through())
                             .when(selected, |d| {
                                 d.bg(theme.selection).border_1().border_color(theme.accent)
                             })
-                            .child(div().truncate().child(text))
+                            .map(|d| match editor {
+                                Some(editor) => d.bg(theme.bg).child(div().flex_1().child(editor)),
+                                None => d.child(div().truncate().child(text)),
+                            })
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, _, window, cx| {
-                                    window.focus(&this.focus);
-                                    this.select(ix, col, cx);
-                                }),
+                                cx.listener(
+                                    move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                        if this
+                                            .editing
+                                            .as_ref()
+                                            .is_some_and(|e| e.row == ix && e.column == col)
+                                        {
+                                            return;
+                                        }
+                                        window.focus(&this.focus);
+                                        this.select(ix, col, cx);
+                                        if event.click_count == 2 {
+                                            this.edit_cell(&EditCell, window, cx);
+                                        }
+                                    },
+                                ),
                             )
                     });
                 Some(
@@ -409,8 +874,10 @@ impl Focusable for ResultsView {
 impl Render for ResultsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let settings = Settings::get(cx);
+        let settings = Settings::get(cx).clone();
+        let changes_bar = self.render_changes_bar(&theme);
         let body = match &self.state {
+            State::Done(_) if self.reviewing => self.render_review(&theme, cx),
             State::Done(result) if !result.columns.is_empty() => {
                 let result = result.clone();
                 div()
@@ -438,10 +905,22 @@ impl Render for ResultsView {
             _ => div().into_any_element(),
         };
         let view = cx.entity();
+        let mut context = gpui::KeyContext::new_with_defaults();
+        context.add("ResultsGrid");
+        if self.editing.is_some() {
+            context.add("editing");
+        }
         div()
             .id("results")
-            .key_context("ResultsGrid")
+            .key_context(context)
             .track_focus(&self.focus)
+            .on_action(cx.listener(Self::edit_cell))
+            .on_action(cx.listener(Self::cancel_edit))
+            .on_action(cx.listener(Self::set_null))
+            .on_action(cx.listener(Self::delete_row))
+            .on_action(cx.listener(Self::review))
+            .on_action(cx.listener(Self::discard))
+            .on_action(cx.listener(Self::apply))
             .on_action(cx.listener(Self::select_up))
             .on_action(cx.listener(Self::select_down))
             .on_action(cx.listener(Self::select_left))
@@ -456,6 +935,7 @@ impl Render for ResultsView {
             .font_family(settings.buffer_font_family.clone())
             .text_size(settings.buffer_font_size() - px(1.))
             .child(self.render_status(&theme))
+            .children(changes_bar)
             .child(body)
             .child(
                 canvas(

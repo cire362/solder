@@ -38,7 +38,16 @@ pub struct Connection {
     pub spec: ConnectionSpec,
     pub status: Status,
     pub schema: SchemaState,
+    /// A read-only connection the user unlocked for writes until quit.
+    pub unlocked: bool,
     session: Option<Connecting>,
+}
+
+impl Connection {
+    /// Writes are refused: a production connection nobody unlocked.
+    pub fn locked(&self) -> bool {
+        self.spec.read_only && !self.unlocked
+    }
 }
 
 pub enum DatabaseEvent {
@@ -193,6 +202,7 @@ impl DatabaseStore {
                             spec,
                             status: Status::Idle,
                             schema: SchemaState::NotLoaded,
+                            unlocked: false,
                             session: None,
                         },
                     })
@@ -213,7 +223,11 @@ impl DatabaseStore {
         if let Some(session) = &conn.session {
             return Some(session.clone());
         }
-        let connecting: Connecting = Session::connect(conn.spec.clone()).boxed().shared();
+        let spec = ConnectionSpec {
+            read_only: conn.locked(),
+            ..conn.spec.clone()
+        };
+        let connecting: Connecting = Session::connect(spec).boxed().shared();
         conn.session = Some(connecting.clone());
         conn.status = Status::Connecting;
         let name = name.to_string();
@@ -251,6 +265,35 @@ impl DatabaseStore {
             return Task::ready(Err(format!("No connection named {name}")));
         };
         cx.background_spawn(async move { session.await?.query(query).await })
+    }
+
+    /// Applies staged edits in one transaction.
+    pub fn apply(
+        &mut self,
+        name: &str,
+        statements: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), String>> {
+        let Some(session) = self.session(name, cx) else {
+            return Task::ready(Err(format!("No connection named {name}")));
+        };
+        cx.background_spawn(async move { session.await?.apply(statements).await })
+    }
+
+    pub fn connection(&self, name: &str) -> Option<&Connection> {
+        self.connections.iter().find(|c| c.spec.name == name)
+    }
+
+    /// Allows writes on a read-only connection until Solder quits. The
+    /// session reopens without its read-only setting.
+    pub fn unlock(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Some(conn) = self.connections.iter_mut().find(|c| c.spec.name == name) {
+            conn.unlocked = true;
+            conn.session = None;
+            conn.status = Status::Idle;
+            cx.emit(DatabaseEvent::Changed);
+            cx.notify();
+        }
     }
 
     pub fn load_schema(&mut self, name: &str, cx: &mut Context<Self>) {
@@ -345,6 +388,28 @@ pub fn is_connection_source(path: &Path) -> bool {
         || [".sqlite", ".sqlite3", ".db"]
             .iter()
             .any(|e| name.ends_with(e))
+}
+
+/// Asks before unlocking a read-only connection for this session.
+pub fn confirm_unlock(
+    store: gpui::Entity<DatabaseStore>,
+    name: String,
+    window: &mut gpui::Window,
+    cx: &mut gpui::App,
+) {
+    let answer = window.prompt(
+        gpui::PromptLevel::Warning,
+        &format!("Allow changes to {name}?"),
+        Some("This connection is read-only because it looks like production. Changes stay allowed until Solder quits."),
+        &["Allow changes", "Cancel"],
+        cx,
+    );
+    cx.spawn(async move |cx| {
+        if answer.await.ok() == Some(0) {
+            store.update(cx, |s, cx| s.unlock(&name, cx)).ok();
+        }
+    })
+    .detach();
 }
 
 #[cfg(test)]

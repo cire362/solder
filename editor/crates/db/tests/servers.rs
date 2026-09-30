@@ -500,3 +500,79 @@ fn mongo_tls() {
         .unwrap();
     assert!(error.to_lowercase().contains("certificate"), "{error}");
 }
+
+/// Staged edits: all statements in one transaction, rolled back when one
+/// does not match exactly one row.
+fn check_apply(session: &Session, table: &str) {
+    let q = |ident: &str| db::sql::quote_ident(session.engine(), ident);
+    let t = q(table);
+    run(session, &format!("DROP TABLE IF EXISTS {t}"));
+    run(
+        session,
+        &format!("CREATE TABLE {t} (id INT PRIMARY KEY, name VARCHAR(20))"),
+    );
+    run(
+        session,
+        &format!("INSERT INTO {t} (id, name) VALUES (1, 'ada'), (2, 'bob'), (3, 'cy')"),
+    );
+    let names = |session: &Session| {
+        run(session, &format!("SELECT name FROM {t} ORDER BY id"))
+            .rows
+            .into_iter()
+            .map(|r| r[0].display())
+            .collect::<Vec<_>>()
+    };
+    // Setting a value to what it already is still counts as one row.
+    block(session.apply(vec![
+        format!("UPDATE {t} SET name = 'Ada' WHERE id = 1"),
+        format!("UPDATE {t} SET name = 'cy' WHERE id = 3"),
+        format!("DELETE FROM {t} WHERE id = 2"),
+    ]))
+    .unwrap();
+    assert_eq!(names(session), ["Ada", "cy"]);
+    let err = block(session.apply(vec![
+        format!("UPDATE {t} SET name = 'changed' WHERE id = 1"),
+        format!("UPDATE {t} SET name = 'gone' WHERE id = 2"),
+    ]))
+    .unwrap_err();
+    assert!(err.contains("Change 2 of 2 matched no row"), "{err}");
+    assert_eq!(
+        names(session),
+        ["Ada", "cy"],
+        "the first change was rolled back"
+    );
+    let err =
+        block(session.apply(vec![format!("UPDATE {t} SET nope = 1 WHERE id = 1")])).unwrap_err();
+    assert!(err.contains("Nothing was saved"), "{err}");
+    // The connection is usable after a rollback.
+    assert_eq!(names(session), ["Ada", "cy"]);
+    run(session, &format!("DROP TABLE {t}"));
+}
+
+#[test]
+fn postgres_apply() {
+    if let Some(spec) = spec("SOLDER_TEST_POSTGRES", Engine::Postgres, false) {
+        check_apply(&block(Session::connect(spec)).unwrap(), "solder_apply");
+    }
+}
+
+#[test]
+fn mysql_apply() {
+    if let Some(spec) = spec("SOLDER_TEST_MYSQL", Engine::MySql, false) {
+        check_apply(&block(Session::connect(spec)).unwrap(), "solder_apply");
+    }
+}
+
+#[test]
+fn sqlite_apply() {
+    let path = std::env::temp_dir().join(format!("solder-apply-{}.db", std::process::id()));
+    std::fs::write(&path, b"").unwrap();
+    let spec = ConnectionSpec {
+        name: "apply".into(),
+        engine: Engine::Sqlite,
+        url: path.display().to_string(),
+        source: "test".into(),
+        read_only: false,
+    };
+    check_apply(&block(Session::connect(spec)).unwrap(), "solder_apply");
+}

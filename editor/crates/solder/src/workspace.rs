@@ -3650,6 +3650,173 @@ mod tests {
         );
     }
 
+    /// Opens `query` in Results once the connection and its schema are ready.
+    fn show_rows(
+        ws: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+        connection: &'static str,
+        query: &'static str,
+    ) -> Entity<crate::results::ResultsView> {
+        use crate::{database::SchemaState, results::State};
+        let (store, results) = cx.read(|cx| {
+            let ws = ws.read(cx);
+            (ws.database.clone(), ws.results.clone())
+        });
+        store.update(cx, |s, cx| s.ensure_detected(cx));
+        wait_for(cx, "detection", &|cx| store.read(cx).detected());
+        store.update(cx, |s, cx| s.ensure_schema(connection, cx));
+        wait_for(cx, "schema", &|cx| {
+            matches!(
+                store.read(cx).connection(connection).map(|c| &c.schema),
+                Some(SchemaState::Loaded(_))
+            )
+        });
+        ws.update_in(cx, |ws, window, cx| {
+            ws.run_query(connection.into(), query.into(), true, window, cx)
+        });
+        wait_for(cx, "rows", &|cx| {
+            matches!(&results.read(cx).state, State::Done(_))
+        });
+        results
+    }
+
+    fn rows_of(
+        results: &Entity<crate::results::ResultsView>,
+        cx: &VisualTestContext,
+    ) -> Vec<Vec<String>> {
+        cx.read(|cx| match &results.read(cx).state {
+            crate::results::State::Done(r) => r
+                .rows
+                .iter()
+                .map(|row| row.iter().map(db::Value::display).collect())
+                .collect(),
+            _ => Vec::new(),
+        })
+    }
+
+    #[gpui::test]
+    fn results_grid_stages_reviews_and_applies_edits(cx: &mut TestAppContext) {
+        use crate::results::{ApplyChanges, State};
+        let root = sqlite_fixture("grid-edits");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let results = show_rows(
+            &ws,
+            cx,
+            "DATABASE_URL",
+            "SELECT id, name FROM users ORDER BY id",
+        );
+
+        // Edit bob's name: select, Enter, type, Enter.
+        cx.simulate_keystrokes("down right enter");
+        cx.simulate_input("Bobby");
+        cx.simulate_keystrokes("enter");
+        // Delete ada's row.
+        cx.simulate_keystrokes("up secondary-backspace");
+        cx.read(|cx| {
+            let r = results.read(cx);
+            assert_eq!(
+                r.changes.cells.get(&(1, 1)),
+                Some(&Some("Bobby".to_string()))
+            );
+            assert!(r.changes.deleted.contains(&0));
+        });
+        // Nothing is written before Apply.
+        assert_eq!(rows_of(&results, cx), [["1", "ada"], ["2", "bob"]]);
+
+        cx.simulate_keystrokes("secondary-s");
+        assert!(cx.read(|cx| results.read(cx).reviewing));
+        let statements = results.update(cx, |r, cx| r.statements(cx)).unwrap();
+        assert_eq!(
+            statements,
+            [
+                "DELETE FROM \"users\" WHERE \"id\" = 1",
+                "UPDATE \"users\" SET \"name\" = 'Bobby' WHERE \"id\" = 2",
+            ]
+        );
+        cx.dispatch_action(ApplyChanges);
+        wait_for(cx, "applied", &|cx| {
+            let r = results.read(cx);
+            r.changes.is_empty() && matches!(&r.state, State::Done(d) if d.rows.len() == 1)
+        });
+        assert_eq!(rows_of(&results, cx), [["2", "Bobby"]]);
+
+        // A row that changed since it was read stops the whole save.
+        cx.simulate_keystrokes("down right enter");
+        cx.simulate_input("Rob");
+        cx.simulate_keystrokes("enter");
+        futures::executor::block_on(async {
+            let other = db::Session::connect(db::ConnectionSpec {
+                name: "other".into(),
+                engine: db::Engine::Sqlite,
+                url: root.join("dev.db").display().to_string(),
+                source: "test".into(),
+                read_only: false,
+            })
+            .await
+            .unwrap();
+            other.query("DELETE FROM users".into()).await.unwrap();
+        });
+        cx.simulate_keystrokes("secondary-s");
+        cx.dispatch_action(ApplyChanges);
+        wait_for(cx, "conflict", &|cx| {
+            results
+                .read(cx)
+                .notice
+                .as_ref()
+                .is_some_and(|n| n.contains("matched no row"))
+        });
+        // Still staged, so it can be discarded or retried.
+        assert_eq!(cx.read(|cx| results.read(cx).changes.len()), 1);
+    }
+
+    #[gpui::test]
+    fn read_only_results_need_unlocking(cx: &mut TestAppContext) {
+        use crate::results::ApplyChanges;
+        let root = sqlite_fixture("grid-locked");
+        std::fs::copy(root.join("dev.db"), root.join("prod.db")).unwrap();
+        std::fs::create_dir_all(root.join(".solder")).unwrap();
+        std::fs::write(
+            root.join(".solder/connections.json"),
+            r#"{"connections": [{"name": "prod", "url": "./prod.db", "readOnly": true}]}"#,
+        )
+        .unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        let results = show_rows(&ws, cx, "prod", "SELECT id, name FROM users ORDER BY id");
+        cx.simulate_keystrokes("down right enter");
+        assert!(
+            cx.read(|cx| results.read(cx).notice.clone())
+                .is_some_and(|n| n.contains("read-only"))
+        );
+
+        let store = cx.read(|cx| ws.read(cx).database.clone());
+        cx.update(|window, cx| {
+            crate::database::confirm_unlock(store.clone(), "prod".into(), window, cx)
+        });
+        cx.simulate_prompt_answer("Allow changes");
+        wait_for(cx, "unlocked", &|cx| {
+            store
+                .read(cx)
+                .connection("prod")
+                .is_some_and(|c| !c.locked())
+        });
+        let results = show_rows(&ws, cx, "prod", "SELECT id, name FROM users ORDER BY id");
+        cx.simulate_keystrokes("down right enter");
+        cx.simulate_input("Bobby");
+        cx.simulate_keystrokes("enter secondary-s");
+        cx.dispatch_action(ApplyChanges);
+        wait_for(cx, "saved", &|cx| {
+            results.read(cx).changes.is_empty() && results.read(cx).notice.is_none()
+        });
+        wait_for(
+            cx,
+            "reloaded",
+            &|cx| matches!(&results.read(cx).state, crate::results::State::Done(r) if r.rows.len() == 2),
+        );
+        assert_eq!(rows_of(&results, cx), [["1", "ada"], ["2", "Bobby"]]);
+    }
+
     #[gpui::test]
     fn database_tab_previews_tables_in_results(cx: &mut TestAppContext) {
         use crate::{database::SchemaState, results::State};
