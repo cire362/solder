@@ -1,6 +1,8 @@
 use redis::aio::MultiplexedConnection;
 
-use crate::{Column, ConnectionSpec, Object, ObjectKind, QueryResult, Result, Schema, Value};
+use crate::{
+    Column, ConnectionSpec, Object, ObjectKind, QueryResult, Result, Schema, Value, params,
+};
 
 /// Keys listed in the schema; SCAN stops after this many.
 const KEY_LIMIT: usize = 2_000;
@@ -12,7 +14,18 @@ pub struct Redis {
 
 impl Redis {
     pub async fn connect(spec: &ConnectionSpec) -> Result<Self> {
-        let client = redis::Client::open(spec.url.as_str()).map_err(|e| e.to_string())?;
+        let params = params::redis(&spec.url)?;
+        let client = match params.root {
+            Some(root) => redis::Client::build_with_tls(
+                params.url.as_str(),
+                redis::TlsCertificates {
+                    client_tls: None,
+                    root_cert: Some(std::fs::read(root).map_err(|error| error.to_string())?),
+                },
+            ),
+            None => redis::Client::open(params.url.as_str()),
+        }
+        .map_err(|error| error.to_string())?;
         let conn = client
             .get_multiplexed_async_connection()
             .await

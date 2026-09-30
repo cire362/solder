@@ -4,21 +4,23 @@ use tokio_postgres::{Client, SimpleQueryMessage, types::Type};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::{
-    Column, ColumnInfo, ConnectionSpec, Object, ObjectKind, QueryResult, Result, Schema, Value, tls,
+    Column, ColumnInfo, ConnectionSpec, Object, ObjectKind, QueryResult, Result, Schema, Value,
+    params::{self, Tls},
+    tls,
 };
 
 pub struct Pg {
     client: Client,
+    prepare: bool,
 }
 
 impl Pg {
     pub async fn connect(spec: &ConnectionSpec) -> Result<Self> {
-        let (url, verify) = ssl_mode(&spec.url);
-        let config: tokio_postgres::Config = url.parse().map_err(|e| format!("{e}"))?;
-        let tls = MakeRustlsConnect::new(if verify {
-            tls::verified()
-        } else {
-            tls::unverified()
+        let params = params::postgres(&spec.url)?;
+        let config: tokio_postgres::Config = params.url.parse().map_err(|e| format!("{e}"))?;
+        let tls = MakeRustlsConnect::new(match &params.tls {
+            Tls::Verified(root) => tls::verified(root.as_deref())?,
+            Tls::Off | Tls::Unverified => tls::unverified(),
         });
         let (client, connection) = config.connect(tls).await.map_err(error)?;
         tokio::spawn(connection);
@@ -28,19 +30,25 @@ impl Pg {
                 .await
                 .map_err(error)?;
         }
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            prepare: params.prepare,
+        })
     }
 
     /// The simple protocol runs any statement and returns text; preparing
     /// the statement first (without running it) tells the column types, so
     /// numbers, booleans and JSON are shown as such.
     pub async fn query(&self, text: &str) -> Result<QueryResult> {
-        let types: Option<Vec<Type>> = self
-            .client
-            .prepare(text)
-            .await
-            .ok()
-            .map(|s| s.columns().iter().map(|c| c.type_().clone()).collect());
+        let types: Option<Vec<Type>> = if self.prepare {
+            self.client
+                .prepare(text)
+                .await
+                .ok()
+                .map(|s| s.columns().iter().map(|c| c.type_().clone()).collect())
+        } else {
+            None
+        };
         let messages = self.client.simple_query(text).await.map_err(error)?;
         let mut result = QueryResult::default();
         for message in messages {
@@ -209,18 +217,6 @@ fn hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// tokio-postgres knows `disable`, `prefer` and `require`. The `verify-*`
-/// modes become `require` with certificate checks.
-fn ssl_mode(url: &str) -> (String, bool) {
-    for mode in ["verify-full", "verify-ca"] {
-        let param = format!("sslmode={mode}");
-        if url.contains(&param) {
-            return (url.replace(&param, "sslmode=require"), true);
-        }
-    }
-    (url.to_string(), false)
-}
-
 fn error(e: tokio_postgres::Error) -> String {
     match e.as_db_error() {
         Some(db) => match db.detail() {
@@ -261,9 +257,5 @@ mod tests {
             Value::Json("{\"a\":1}".into())
         );
         assert_eq!(decode("2024-01-01", None), Value::Text("2024-01-01".into()));
-        assert_eq!(
-            ssl_mode("postgres://h/db?sslmode=verify-full"),
-            ("postgres://h/db?sslmode=require".into(), true)
-        );
     }
 }

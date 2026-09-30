@@ -1,11 +1,15 @@
 use mysql_async::{
-    Conn, Opts, Row,
+    Conn, Opts, OptsBuilder, Row, SslOpts,
     consts::{ColumnFlags, ColumnType},
     prelude::Queryable,
 };
 use tokio::sync::Mutex;
 
-use crate::{Column, ConnectionSpec, QueryResult, Result, Schema, Value, pg::build_schema};
+use crate::{
+    Column, ConnectionSpec, QueryResult, Result, Schema, Value,
+    params::{self, Tls},
+    pg::build_schema,
+};
 
 pub struct MySql {
     conn: Mutex<Conn>,
@@ -13,8 +17,19 @@ pub struct MySql {
 
 impl MySql {
     pub async fn connect(spec: &ConnectionSpec) -> Result<Self> {
-        let url = spec.url.replacen("mariadb://", "mysql://", 1);
-        let opts = Opts::from_url(&url).map_err(|e| e.to_string())?;
+        let params = params::mysql(&spec.url)?;
+        let opts = Opts::from_url(&params.url).map_err(|e| e.to_string())?;
+        let ssl = match params.tls {
+            Tls::Off => None,
+            Tls::Unverified => Some(SslOpts::default().with_danger_accept_invalid_certs(true)),
+            Tls::Verified(None) => Some(SslOpts::default()),
+            Tls::Verified(Some(root)) => Some(
+                SslOpts::default()
+                    .with_root_certs(vec![root.into()])
+                    .with_disable_built_in_roots(true),
+            ),
+        };
+        let opts = OptsBuilder::from_opts(opts).ssl_opts(ssl);
         let mut conn = Conn::new(opts).await.map_err(|e| e.to_string())?;
         if spec.read_only {
             conn.query_drop("SET SESSION TRANSACTION READ ONLY")

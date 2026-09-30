@@ -1,24 +1,39 @@
 //! TLS settings shared by the drivers that take a rustls config.
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use rustls::{
     ClientConfig, DigitallySignedStruct, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature},
-    pki_types::{CertificateDer, ServerName, UnixTime},
+    pki_types::{CertificateDer, ServerName, UnixTime, pem::PemObject},
 };
 
-/// Certificates checked against the Mozilla roots.
-pub fn verified() -> ClientConfig {
-    let roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+/// Certificates checked against the CA in `root` (a PEM file, as managed
+/// databases hand out), or the Mozilla roots.
+pub fn verified(root: Option<&Path>) -> Result<ClientConfig, String> {
+    let roots = match root {
+        Some(path) => {
+            let mut store = rustls::RootCertStore::empty();
+            let certs = CertificateDer::pem_file_iter(path)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            for cert in certs {
+                let cert = cert.map_err(|e| format!("{}: {e}", path.display()))?;
+                store
+                    .add(cert)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+            }
+            store
+        }
+        None => rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        },
     };
-    ClientConfig::builder_with_provider(provider())
+    Ok(ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .expect("TLS versions")
         .with_root_certificates(roots)
-        .with_no_client_auth()
+        .with_no_client_auth())
 }
 
 /// Encrypted but not authenticated, which is what libpq's `sslmode=require`

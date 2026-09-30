@@ -66,6 +66,20 @@ export SOLDER_TEST_REDIS=redis://localhost:56379
 export SOLDER_TEST_MONGO=mongodb://localhost:57017/solder
 ```
 
+TLS tests also run in CI. Run the same checks locally with:
+
+```bash
+bash editor/scripts/test-db-tls.sh
+```
+
+The script needs Docker and OpenSSL. It creates a one-day test CA and four
+temporary servers on random loopback ports, then removes only those containers,
+their volumes and certificates. Existing `solder-*` containers are untouched.
+Tests check encryption, rejection of an untrusted certificate, a trusted private
+CA, hostname mismatches, Postgres channel binding and Prisma URL parameters.
+They use real handshakes but do not verify hosted Neon, RDS or Atlas deployments,
+MongoDB SRV DNS discovery or client-certificate authentication.
+
 ## Performance
 
 The website promises specific numbers. Run `editor/scripts/bench.sh` before

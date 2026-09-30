@@ -9,6 +9,7 @@ pub mod complete;
 mod detect;
 mod mongo;
 mod mysql;
+mod params;
 mod pg;
 mod redis;
 pub mod sql;
