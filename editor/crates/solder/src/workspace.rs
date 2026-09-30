@@ -83,8 +83,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-g", GoToLine, Some("Editor")),
         KeyBinding::new("secondary-f", Find, None),
         KeyBinding::new("secondary-alt-f", FindReplace, None),
-        KeyBinding::new("secondary-g", FindNext, None),
-        KeyBinding::new("secondary-shift-g", FindPrev, None),
+        KeyBinding::new("f3", FindNext, None),
+        KeyBinding::new("shift-f3", FindPrev, None),
         KeyBinding::new("secondary-shift-e", ShowFiles, None),
         KeyBinding::new("secondary-shift-f", ShowSearch, None),
         KeyBinding::new("secondary-b", ToggleSidebar, None),
@@ -98,6 +98,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-`", ToggleTerminal, None),
         KeyBinding::new("ctrl-shift-`", NewTerminal, None),
         KeyBinding::new("ctrl-shift-g", ShowGit, None),
+    ]);
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([
+        KeyBinding::new("cmd-g", FindNext, None),
+        KeyBinding::new("cmd-shift-g", FindPrev, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
@@ -1985,7 +1990,7 @@ mod tests {
     fn file_finder_opens_fuzzy_match(cx: &mut TestAppContext) {
         let root = fixture("finder");
         let (ws, cx) = setup(cx, root.clone());
-        cx.simulate_keystrokes("cmd-p");
+        cx.simulate_keystrokes("secondary-p");
         cx.simulate_input("utstr");
         cx.run_until_parked();
         cx.simulate_keystrokes("enter");
@@ -2001,7 +2006,7 @@ mod tests {
         ws.update_in(cx, |w, window, cx| {
             w.add_editor(Some(root.join("x.txt")), "one\ntwo", None, window, cx)
         });
-        cx.simulate_keystrokes("cmd-shift-p");
+        cx.simulate_keystrokes("secondary-shift-p");
         cx.simulate_input("duplicate line");
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
@@ -2016,6 +2021,7 @@ mod tests {
             w.add_editor(Some(root.join("x.txt")), "a\nb\nc\nd", None, window, cx)
         });
         cx.simulate_keystrokes("ctrl-g");
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
         cx.simulate_input("3");
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
@@ -2045,18 +2051,18 @@ mod tests {
                 cx,
             )
         });
-        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_keystrokes("secondary-f");
         cx.simulate_input("foo");
         cx.run_until_parked();
         let matches = cx.read(|cx| ws.read(cx).search_bar.read(cx).matches.len());
         assert_eq!(matches, 3);
-        cx.simulate_keystrokes("alt-cmd-c");
+        cx.simulate_keystrokes("alt-secondary-c");
         cx.run_until_parked();
         let matches = cx.read(|cx| ws.read(cx).search_bar.read(cx).matches.len());
         assert_eq!(matches, 2);
         cx.simulate_keystrokes("tab");
         cx.simulate_input("qux");
-        cx.simulate_keystrokes("cmd-enter");
+        cx.simulate_keystrokes("secondary-enter");
         cx.run_until_parked();
         assert_eq!(active_text(&ws, cx), "qux bar Foo baz qux");
         cx.simulate_keystrokes("escape");
@@ -2064,10 +2070,36 @@ mod tests {
     }
 
     #[gpui::test]
+    fn search_navigation_keys_preserve_go_to_line(cx: &mut TestAppContext) {
+        let root = fixture("find-shortcuts");
+        let (workspace, cx) = setup(cx, root.clone());
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_editor(Some(root.join("x.txt")), "one one one", None, window, cx)
+        });
+        let editor = cx.read(|cx| workspace.read(cx).active_editor().unwrap().clone());
+        cx.simulate_keystrokes("secondary-f");
+        cx.simulate_input("one");
+        cx.simulate_keystrokes("f3");
+        assert_eq!(cx.read(|cx| editor.read(cx).newest_range()), 4..7);
+        cx.simulate_keystrokes("shift-f3");
+        assert_eq!(cx.read(|cx| editor.read(cx).newest_range()), 0..3);
+        #[cfg(target_os = "macos")]
+        {
+            cx.simulate_keystrokes("cmd-g");
+            assert_eq!(cx.read(|cx| editor.read(cx).newest_range()), 4..7);
+            cx.simulate_keystrokes("cmd-shift-g");
+            assert_eq!(cx.read(|cx| editor.read(cx).newest_range()), 0..3);
+        }
+        cx.simulate_keystrokes("escape ctrl-g");
+        assert!(cx.read(|cx| workspace.read(cx).modal.is_some()));
+        assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), "one one one");
+    }
+
+    #[gpui::test]
     fn project_search_finds_matches(cx: &mut TestAppContext) {
         let root = fixture("search");
         let (ws, cx) = setup(cx, root.clone());
-        cx.simulate_keystrokes("cmd-shift-f");
+        cx.simulate_keystrokes("secondary-shift-f");
         cx.simulate_input("needle");
         cx.executor().advance_clock(Duration::from_millis(400));
         cx.run_until_parked();
@@ -2081,7 +2113,7 @@ mod tests {
         let (ws, cx) = setup(cx, root.clone());
         let panel = cx.read(|cx| ws.read(cx).project_panel.clone());
         // New file at the root: type a name, confirm, it opens.
-        cx.simulate_keystrokes("cmd-shift-e");
+        cx.simulate_keystrokes("secondary-shift-e");
         cx.dispatch_action(crate::project_panel::NewFile);
         cx.simulate_input("notes.md");
         cx.simulate_keystrokes("enter");
@@ -2095,7 +2127,7 @@ mod tests {
             window.focus(&p.focus_handle(cx));
         });
         cx.simulate_keystrokes("f2");
-        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_keystrokes("secondary-a");
         cx.simulate_input("todo.md");
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
@@ -2112,21 +2144,21 @@ mod tests {
             w.add_editor(Some(root.join("x.txt")), "abc", None, window, cx)
         });
         let left = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
-        cx.simulate_keystrokes("cmd-right");
-        cx.simulate_keystrokes("cmd-\\");
+        cx.simulate_keystrokes("end");
+        cx.simulate_keystrokes("secondary-\\");
         let right = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
         assert_ne!(left, right);
         assert_eq!(cx.read(|cx| ws.read(cx).panes.len()), 2);
         // Type at the start in the right view; the left view's cursor (at the
         // end) moves with the text, and both show the same contents.
-        cx.simulate_keystrokes("cmd-left");
+        cx.simulate_keystrokes("home");
         cx.simulate_input(">> ");
         let (left_text, left_cursor) =
             cx.read(|cx| (left.read(cx).text(cx), left.read(cx).newest_range()));
         assert_eq!(left_text, ">> abc");
         assert_eq!(left_cursor, 6..6);
         // Closing one view of a dirty document does not prompt.
-        cx.simulate_keystrokes("cmd-w");
+        cx.simulate_keystrokes("secondary-w");
         assert_eq!(cx.read(|cx| ws.read(cx).panes.len()), 1);
         assert_eq!(active_text(&ws, cx), ">> abc");
     }
@@ -2178,7 +2210,7 @@ mod tests {
         assert_eq!(diag.severity, crate::document::Severity::Warning);
 
         // Incremental sync: a new "boom" becomes an error.
-        cx.simulate_keystrokes("cmd-down");
+        cx.dispatch_action(crate::editor::MoveToEnd);
         cx.simulate_input("boom");
         wait(cx, "error diagnostic", &|cx| {
             editor
@@ -2216,7 +2248,8 @@ mod tests {
         assert_eq!(cursor.start, text.len() - 2);
 
         // Go to definition selects the symbol.
-        cx.simulate_keystrokes("cmd-up f12");
+        cx.dispatch_action(crate::editor::MoveToStart);
+        cx.simulate_keystrokes("f12");
         wait(cx, "definition", &|cx| {
             editor.read(cx).newest_range() == (3..9)
         });
@@ -2230,7 +2263,7 @@ mod tests {
         });
 
         // Formatting strips trailing spaces through a server edit.
-        cx.simulate_keystrokes("cmd-right");
+        cx.simulate_keystrokes("end");
         cx.simulate_input("   ");
         cx.simulate_keystrokes("shift-alt-f");
         wait(cx, "formatting", &|cx| {
@@ -2239,13 +2272,13 @@ mod tests {
 
         // Code actions: one resolved lazily, one run as a server command that
         // edits the file through workspace/applyEdit.
-        cx.simulate_keystrokes("cmd-.");
+        cx.simulate_keystrokes("secondary-.");
         wait(cx, "code actions", &|cx| ws.read(cx).modal.is_some());
         cx.simulate_keystrokes("enter");
         wait(cx, "resolved edit", &|cx| {
             editor.read(cx).text(cx).starts_with("// header\n")
         });
-        cx.simulate_keystrokes("cmd-.");
+        cx.simulate_keystrokes("secondary-.");
         wait(cx, "code actions", &|cx| ws.read(cx).modal.is_some());
         cx.simulate_input("touch");
         cx.simulate_keystrokes("enter");
@@ -2254,7 +2287,8 @@ mod tests {
         });
 
         // Signature help follows the argument under the cursor.
-        cx.simulate_keystrokes("cmd-down enter");
+        cx.dispatch_action(crate::editor::MoveToEnd);
+        cx.simulate_keystrokes("enter");
         cx.simulate_input("assist(");
         let active = |cx: &App| {
             editor
@@ -2406,7 +2440,7 @@ mod tests {
         assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), "one\nmid2\ntwo\n");
 
         // Save, then commit from the panel.
-        cx.simulate_keystrokes("cmd-s");
+        cx.simulate_keystrokes("secondary-s");
         cx.simulate_keystrokes("ctrl-shift-g");
         cx.simulate_input("Add mid2");
         cx.simulate_keystrokes("secondary-enter");
@@ -2492,7 +2526,7 @@ mod tests {
     fn new_file_is_untitled_until_saved(cx: &mut TestAppContext) {
         let root = fixture("untitled");
         let (ws, cx) = setup(cx, root);
-        cx.simulate_keystrokes("cmd-n");
+        cx.simulate_keystrokes("secondary-n");
         cx.simulate_input("hello");
         assert_eq!(active_text(&ws, cx), "hello");
         assert_eq!(active_path(&ws, cx), None);

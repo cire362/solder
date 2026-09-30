@@ -6,13 +6,15 @@ cd "$(dirname "$0")/.."
 echo "== website: lint"
 npm run lint --silent
 echo "== website: types"
-npx tsc --noEmit
+npm run typecheck --silent
 
 echo "== editor: format"
 (cd editor && cargo fmt --all --check)
 echo "== editor: clippy"
-(cd editor && cargo clippy --workspace --all-targets --quiet -- -D warnings)
+(cd editor && cargo clippy --workspace --all-targets --profile ci --locked --quiet -- -D warnings)
+echo "== editor: test build"
+(cd editor && cargo test --workspace --profile ci --locked --no-run --quiet)
 echo "== editor: tests"
-(cd editor && cargo test --workspace --quiet)
+(cd editor && cargo test --workspace --profile ci --locked --quiet)
 
 echo "All checks passed."
