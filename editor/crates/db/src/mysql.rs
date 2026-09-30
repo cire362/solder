@@ -29,7 +29,11 @@ impl MySql {
                     .with_disable_built_in_roots(true),
             ),
         };
-        let opts = OptsBuilder::from_opts(opts).ssl_opts(ssl);
+        // Report matched rows, not changed ones, so saving an unchanged value
+        // still counts as the one row it targets.
+        let opts = OptsBuilder::from_opts(opts)
+            .ssl_opts(ssl)
+            .client_found_rows(true);
         let mut conn = Conn::new(opts).await.map_err(|e| e.to_string())?;
         if spec.read_only {
             conn.query_drop("SET SESSION TRANSACTION READ ONLY")
@@ -63,6 +67,31 @@ impl MySql {
         // Later result sets (a multi-statement selection) are dropped.
         drop(rows);
         Ok(result)
+    }
+
+    pub async fn apply(&self, statements: &[String]) -> Result<()> {
+        let mut conn = self.conn.lock().await;
+        conn.query_drop("START TRANSACTION")
+            .await
+            .map_err(|e| e.to_string())?;
+        for (i, statement) in statements.iter().enumerate() {
+            let affected = match conn.query_iter(statement.as_str()).await {
+                Ok(result) => {
+                    let affected = result.affected_rows();
+                    result.drop_result().await.map_err(|e| e.to_string())?;
+                    affected
+                }
+                Err(e) => {
+                    let _ = conn.query_drop("ROLLBACK").await;
+                    return Err(format!("{e}. Nothing was saved."));
+                }
+            };
+            if affected != 1 {
+                let _ = conn.query_drop("ROLLBACK").await;
+                return Err(crate::unmatched(i, statements.len(), affected));
+            }
+        }
+        conn.query_drop("COMMIT").await.map_err(|e| e.to_string())
     }
 
     pub async fn schema(&self) -> Result<Schema> {

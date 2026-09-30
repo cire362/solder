@@ -191,8 +191,8 @@ impl DatabasePanel {
         let store = self.store.read(cx);
         let base = div()
             .id(ix)
+            .w_full()
             .h(ROW_HEIGHT)
-            .mx_1p5()
             .px_2()
             .flex()
             .items_center()
@@ -247,15 +247,32 @@ impl DatabasePanel {
                             .child(conn.spec.engine.label()),
                     )
                     .when(conn.spec.read_only, |d| {
+                        let store = self.store.clone();
+                        let name = conn.spec.name.clone();
+                        let locked = conn.locked();
                         d.child(
                             div()
+                                .id(("db-lock", i))
                                 .flex_none()
                                 .px_1()
                                 .rounded(px(6.))
                                 .bg(theme.bg_elev)
                                 .text_size(px(10.5))
-                                .text_color(theme.warning)
-                                .child("read-only"),
+                                .text_color(if locked { theme.warning } else { theme.error })
+                                .hover(|d| d.bg(theme.line))
+                                // Unlocked lasts until quit; locking again is a restart.
+                                .child(if locked { "read-only" } else { "writable" })
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    if locked {
+                                        crate::database::confirm_unlock(
+                                            store.clone(),
+                                            name.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                }),
                         )
                     })
                     .child(
@@ -417,7 +434,15 @@ impl Render for DatabasePanel {
                         let rows = this.rows(cx);
                         range
                             .filter_map(|ix| {
-                                rows.get(ix).map(|r| this.render_row(ix, r, &theme, cx))
+                                // The row fills the list's width so long names truncate
+                                // instead of pushing the buttons out of view.
+                                rows.get(ix).map(|r| {
+                                    div()
+                                        .w_full()
+                                        .px_1p5()
+                                        .child(this.render_row(ix, r, &theme, cx))
+                                        .into_any_element()
+                                })
                             })
                             .collect()
                     }),

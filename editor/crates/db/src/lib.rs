@@ -7,6 +7,7 @@
 
 pub mod complete;
 mod detect;
+pub mod edit;
 mod mongo;
 mod mysql;
 mod params;
@@ -293,6 +294,25 @@ impl Session {
         })
     }
 
+    /// Runs `statements` in one transaction. Each must change exactly one
+    /// row; otherwise, or on any error, everything is rolled back.
+    pub fn apply(
+        &self,
+        statements: Vec<String>,
+    ) -> impl Future<Output = Result<()>> + Send + 'static {
+        let driver = self.driver.clone();
+        spawn(async move {
+            match &*driver {
+                Driver::Postgres(d) => d.apply(&statements).await,
+                Driver::MySql(d) => d.apply(&statements).await,
+                Driver::Sqlite(d) => d.apply(statements).await,
+                Driver::Redis(_) | Driver::Mongo(_) => {
+                    Err("Editing works for Postgres, MySQL and SQLite results".into())
+                }
+            }
+        })
+    }
+
     /// The query that shows the first rows of `object`.
     pub fn preview_query(&self, object: &Object) -> String {
         preview_query(self.engine(), object)
@@ -322,6 +342,17 @@ pub fn preview_query(engine: Engine, object: &Object) -> String {
         }
         Engine::Mongo => mongo::preview_query(object),
     }
+}
+
+/// Why a staged change could not be saved: statement `index` (from 0) of
+/// `total` matched `affected` rows instead of one.
+pub(crate) fn unmatched(index: usize, total: usize, affected: u64) -> String {
+    let what = if affected == 0 {
+        "matched no row (it changed or was deleted since it was read)".to_string()
+    } else {
+        format!("matched {affected} rows")
+    };
+    format!("Change {} of {total} {what}. Nothing was saved.", index + 1)
 }
 
 fn runtime() -> &'static tokio::runtime::Runtime {
