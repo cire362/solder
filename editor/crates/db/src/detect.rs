@@ -545,10 +545,7 @@ mod tests {
     use super::*;
 
     fn fixture(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("solder-db-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testing::dir(&format!("db-{name}"))
     }
 
     #[test]

@@ -535,9 +535,7 @@ u UU N... 100644 100644 100644 100644 f1 f2 f3 both.rs\0\
     }
 
     fn diff_repo(name: &str) -> Repo {
-        let dir = std::env::temp_dir().join(format!("solder-diff-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = db::testing::dir(&format!("diff-{name}"));
         let repo = Repo { workdir: dir };
         repo.run(&["init", "-q", "-b", "main"]).unwrap();
         repo.run(&["config", "user.name", "Test"]).unwrap();
@@ -702,9 +700,7 @@ u UU N... 100644 100644 100644 100644 f1 f2 f3 both.rs\0\
     /// A throwaway repository driven through the real `git` binary.
     #[test]
     fn stage_commit_and_status_round_trip() {
-        let dir = std::env::temp_dir().join(format!("solder-git-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = db::testing::dir("git");
         let git = |args: &[&str]| {
             let ok = Command::new("git")
                 .arg("-C")

@@ -217,8 +217,7 @@ mod tests {
 
     #[test]
     fn scan_respects_gitignore_and_exclusions() {
-        let dir = std::env::temp_dir().join(format!("solder-scan-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = db::testing::dir("scan");
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
         std::fs::create_dir_all(dir.join("build")).unwrap();

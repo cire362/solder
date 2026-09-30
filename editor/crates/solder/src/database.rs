@@ -428,8 +428,7 @@ mod tests {
 
     #[test]
     fn added_connections_are_per_project_and_private() {
-        let dir = std::env::temp_dir().join(format!("solder-conn-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = db::testing::dir("conn");
         let file = dir.join("connections.json");
         add_to_file(&file, Path::new("/work/a"), "one", "postgres://localhost/a").unwrap();
         add_to_file(&file, Path::new("/work/b"), "two", "postgres://localhost/b").unwrap();

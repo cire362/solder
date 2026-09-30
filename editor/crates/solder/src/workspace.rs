@@ -2657,8 +2657,7 @@ mod tests {
     use std::time::Instant;
 
     fn fixture(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("solder-ws-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = db::testing::dir(&format!("ws-{name}"));
         std::fs::create_dir_all(dir.join("src/util")).unwrap();
         std::fs::write(dir.join("src/main.rs"), "fn main() {\n    helper();\n}\n").unwrap();
         std::fs::write(

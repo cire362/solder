@@ -558,8 +558,7 @@ mod tests {
     use super::*;
 
     fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("solder-svc-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = db::testing::dir(&format!("svc-{name}"));
         for (path, content) in files {
             let path = dir.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
