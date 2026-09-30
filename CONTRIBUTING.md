@@ -1,5 +1,8 @@
 # Contributing
 
+Coding agents: read [AGENTS.md](AGENTS.md) first; it adds the rules that
+keep automated changes safe.
+
 ## Branches
 
 `main` is always releasable. Work happens on short-lived branches:
