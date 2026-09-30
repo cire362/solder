@@ -38,9 +38,9 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 - [x] Side-by-side diff for a whole file
 
 ## 4. Services and containers
-- [ ] Detect services from `package.json`, `go.mod`, `Cargo.toml`, `pyproject.toml`, compose files
-- [ ] Services panel: start, stop, ports, log tails, Run stack (`cmd-shift-s`)
-- [ ] Containers in the sidebar
+- [x] Detect services from `package.json` (npm, pnpm, yarn, bun), `go.mod`, `Cargo.toml`, Django/FastAPI/Flask entry points and compose files; add or override them in `.solder/services.json`
+- [x] Services tab (`cmd-shift-s`): start, stop (Ctrl+C, then hang up), restart, ports read from the output, logs in a real terminal, Run stack and Stop all (also in the command palette)
+- [x] Containers in the Services tab: status, start, stop, restart, follow logs
 
 ## 5. Database and HTTP clients
 - [ ] Connections from `.env` and compose; Postgres, MySQL, SQLite, Redis, MongoDB

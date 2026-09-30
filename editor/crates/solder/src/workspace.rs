@@ -32,6 +32,8 @@ use crate::{
     project::{Project, ProjectEvent},
     project_panel::{ProjectPanel, ProjectPanelEvent},
     project_search::{OpenMatch, ProjectSearch},
+    services::{self, ServiceSpec},
+    services_panel::{RunStack, ServicesEvent, ServicesPanel, StopAll},
     settings::{self, Settings},
     terminal::{Terminal, TerminalCommand, TerminalEvent},
     theme::{ActiveTheme, UI_FONT, UI_FONT_SIZE},
@@ -67,6 +69,7 @@ actions!(
         ToggleTerminal,
         NewTerminal,
         ShowGit,
+        ShowServices,
         ShowFileDiff,
     ]
 );
@@ -101,6 +104,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-`", ToggleTerminal, None),
         KeyBinding::new("ctrl-shift-`", NewTerminal, None),
         KeyBinding::new("ctrl-shift-g", ShowGit, None),
+        KeyBinding::new("secondary-shift-s", ShowServices, None),
         KeyBinding::new("secondary-alt-d", ShowFileDiff, None),
     ]);
     #[cfg(target_os = "macos")]
@@ -141,6 +145,7 @@ enum SidebarTab {
     Files,
     Search,
     Git,
+    Services,
 }
 
 struct Modal {
@@ -178,6 +183,7 @@ pub struct Workspace {
     project_search: Entity<ProjectSearch>,
     git: Entity<GitStore>,
     git_panel: Entity<GitPanel>,
+    services: Entity<ServicesPanel>,
     file_diff: Option<Entity<FileDiff>>,
     diff_task: Option<Task<()>>,
     diff_subscription: Option<Subscription>,
@@ -200,6 +206,7 @@ impl Workspace {
         let project_panel = cx.new(|cx| ProjectPanel::new(root.clone(), cx));
         let git = cx.new(|cx| GitStore::new(root.clone(), cx));
         let git_panel = cx.new(|cx| GitPanel::new(root.clone(), git.clone(), cx));
+        let services = cx.new(|cx| ServicesPanel::new(root.clone(), cx));
         let project_search = cx.new(|cx| ProjectSearch::new(root, window, cx));
         let search_bar = cx.new(|cx| BufferSearchBar::new(window, cx));
         let subscriptions = vec![
@@ -228,10 +235,39 @@ impl Workspace {
                 ProjectEvent::Changed(paths) => {
                     this.files_changed(paths.clone(), cx);
                     this.git.update(cx, |g, cx| g.refresh(cx));
+                    if paths.iter().any(|p| is_service_manifest(p)) {
+                        this.services.update(cx, |s, cx| s.redetect(cx));
+                    }
                 }
                 ProjectEvent::GitChanged => this.git.update(cx, |g, cx| g.refresh(cx)),
                 ProjectEvent::Scanned => cx.notify(),
             }),
+            cx.subscribe_in(
+                &services,
+                window,
+                |this, _, event, window, cx| match event {
+                    ServicesEvent::Start(spec) => this.start_service(spec.clone(), window, cx),
+                    ServicesEvent::Reveal(terminal) => this.reveal_terminal(terminal, window, cx),
+                    ServicesEvent::Kill(terminal) => this.remove_terminal(terminal, window, cx),
+                    ServicesEvent::ContainerLogs(container) => {
+                        let command = TerminalCommand {
+                            program: services::docker_path().map(|p| p.display().to_string()),
+                            args: vec![
+                                "logs".into(),
+                                "-f".into(),
+                                "--tail".into(),
+                                "200".into(),
+                                container.id.clone(),
+                            ],
+                            cwd: this.root(cx),
+                            title: Some(format!("logs {}", container.name)),
+                            keep_on_exit: true,
+                            ..Default::default()
+                        };
+                        this.spawn_terminal(command, window, cx);
+                    }
+                },
+            ),
             cx.subscribe(&git, |this, _, event, cx| match event {
                 GitStoreEvent::StatusChanged => this.git_status_changed(cx),
             }),
@@ -303,6 +339,7 @@ impl Workspace {
             _hud_tick: hud_tick,
             git,
             git_panel,
+            services,
             file_diff: None,
             diff_task: None,
             diff_subscription: None,
@@ -841,7 +878,7 @@ impl Workspace {
     }
 
     fn show_git(&mut self, _: &ShowGit, window: &mut Window, cx: &mut Context<Self>) {
-        self.sidebar = Some(SidebarTab::Git);
+        self.set_sidebar(Some(SidebarTab::Git), cx);
         self.git_panel.read(cx).focus_message(window, cx);
         self.git.update(cx, |g, cx| g.refresh_now(cx));
         cx.notify();
@@ -977,6 +1014,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<Terminal>> {
+        self.spawn_terminal_with(command, true, window, cx)
+    }
+
+    /// Like `spawn_terminal`; without `focus` the dock opens on the new tab
+    /// but keyboard focus stays where it was (starting a whole stack from the
+    /// services tab).
+    fn spawn_terminal_with(
+        &mut self,
+        command: TerminalCommand,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Terminal>> {
         let started = match Terminal::start(command) {
             Ok(t) => t,
             Err(err) => {
@@ -990,15 +1040,70 @@ impl Workspace {
             window,
             |this, terminal, event, window, cx| match event {
                 TerminalEvent::TitleChanged => cx.notify(),
+                // Services keep their tab so a crash's output stays readable.
+                TerminalEvent::Exited if terminal.read(cx).keep_on_exit => cx.notify(),
                 TerminalEvent::Exited => this.remove_terminal(terminal, window, cx),
             },
         );
         self.terminals.push((terminal.clone(), subscription));
         self.active_terminal = self.terminals.len() - 1;
         self.dock_open = true;
-        window.focus(&terminal.focus_handle(cx));
+        if focus {
+            window.focus(&terminal.focus_handle(cx));
+        }
         cx.notify();
         Some(terminal)
+    }
+
+    /// Runs a detected service in a dock terminal through the login shell.
+    fn start_service(&mut self, spec: ServiceSpec, window: &mut Window, cx: &mut Context<Self>) {
+        let (shell, mut args) = services::login_shell();
+        args.push(spec.command.clone());
+        let mut env: std::collections::HashMap<String, String> =
+            spec.env.clone().into_iter().collect();
+        // Most dev servers only color their output when asked.
+        env.entry("FORCE_COLOR".into())
+            .or_insert_with(|| "1".into());
+        let command = TerminalCommand {
+            program: Some(shell),
+            args,
+            cwd: self.root(cx).join(&spec.dir),
+            env,
+            title: Some(spec.name.clone()),
+            keep_on_exit: true,
+        };
+        if let Some(terminal) = self.spawn_terminal_with(command, false, window, cx) {
+            self.services
+                .update(cx, |s, cx| s.attach(&spec.name, &terminal, cx));
+        }
+    }
+
+    fn reveal_terminal(
+        &mut self,
+        terminal: &Entity<Terminal>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ix) = self.terminals.iter().position(|(t, _)| t == terminal) {
+            self.active_terminal = ix;
+            self.dock_open = true;
+            window.focus(&terminal.focus_handle(cx));
+            cx.notify();
+        }
+    }
+
+    fn show_services(&mut self, _: &ShowServices, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_sidebar(Some(SidebarTab::Services), cx);
+        window.focus(&self.services.focus_handle(cx));
+    }
+
+    /// Changes the sidebar tab and tells panels that poll whether they are
+    /// on screen.
+    fn set_sidebar(&mut self, tab: Option<SidebarTab>, cx: &mut Context<Self>) {
+        self.sidebar = tab;
+        let visible = tab == Some(SidebarTab::Services);
+        self.services.update(cx, |s, cx| s.set_visible(visible, cx));
+        cx.notify();
     }
 
     fn remove_terminal(
@@ -1097,7 +1202,15 @@ impl Workspace {
                         }
                         cx.notify();
                     }))
-                    .child(terminal.read(cx).title())
+                    .child({
+                        let t = terminal.read(cx);
+                        match (t.exited, t.exit_code) {
+                            (false, _) => t.title().to_string(),
+                            (true, Some(0)) => format!("{} (exited)", t.title()),
+                            (true, Some(code)) => format!("{} (exited {code})", t.title()),
+                            (true, None) => format!("{} (killed)", t.title()),
+                        }
+                    })
                     .child(
                         div()
                             .id(("terminal-close", ix))
@@ -1607,13 +1720,13 @@ impl Workspace {
     }
 
     fn show_files(&mut self, _: &ShowFiles, window: &mut Window, cx: &mut Context<Self>) {
-        self.sidebar = Some(SidebarTab::Files);
+        self.set_sidebar(Some(SidebarTab::Files), cx);
         window.focus(&self.project_panel.focus_handle(cx));
         cx.notify();
     }
 
     fn show_search(&mut self, _: &ShowSearch, window: &mut Window, cx: &mut Context<Self>) {
-        self.sidebar = Some(SidebarTab::Search);
+        self.set_sidebar(Some(SidebarTab::Search), cx);
         let selected = self
             .active_editor()
             .and_then(|e| e.read(cx).selected_text(cx));
@@ -1623,10 +1736,11 @@ impl Workspace {
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
-        self.sidebar = match self.sidebar {
+        let tab = match self.sidebar {
             Some(_) => None,
             None => Some(SidebarTab::Files),
         };
+        self.set_sidebar(tab, cx);
         cx.notify();
     }
 
@@ -1642,7 +1756,7 @@ impl Workspace {
         else {
             return;
         };
-        self.sidebar = Some(SidebarTab::Files);
+        self.set_sidebar(Some(SidebarTab::Files), cx);
         self.project_panel.update(cx, |p, cx| p.reveal(&path, cx));
         window.focus(&self.project_panel.focus_handle(cx));
         cx.notify();
@@ -1791,6 +1905,7 @@ impl Workspace {
                     SidebarTab::Files => this.show_files(&ShowFiles, window, cx),
                     SidebarTab::Search => this.show_search(&ShowSearch, window, cx),
                     SidebarTab::Git => this.show_git(&ShowGit, window, cx),
+                    SidebarTab::Services => this.show_services(&ShowServices, window, cx),
                 }))
         };
         div()
@@ -1814,12 +1929,18 @@ impl Workspace {
                     .border_color(theme.line)
                     .child(tab_button("sidebar-files", "Files", SidebarTab::Files))
                     .child(tab_button("sidebar-search", "Search", SidebarTab::Search))
-                    .child(tab_button("sidebar-git", "Git", SidebarTab::Git)),
+                    .child(tab_button("sidebar-git", "Git", SidebarTab::Git))
+                    .child(tab_button(
+                        "sidebar-services",
+                        "Services",
+                        SidebarTab::Services,
+                    )),
             )
             .child(div().flex_1().min_h_0().pt_1().map(|d| match tab {
                 SidebarTab::Files => d.child(self.project_panel.clone()),
                 SidebarTab::Search => d.child(self.project_search.clone()),
                 SidebarTab::Git => d.child(self.git_panel.clone()),
+                SidebarTab::Services => d.child(self.services.clone()),
             }))
     }
 
@@ -1938,6 +2059,26 @@ impl Workspace {
     }
 }
 
+/// Files whose change can add, remove or alter a detected service.
+fn is_service_manifest(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    matches!(
+        name,
+        "package.json"
+            | "go.mod"
+            | "main.go"
+            | "Cargo.toml"
+            | "manage.py"
+            | "main.py"
+            | "app.py"
+            | "services.json"
+            | "compose.yaml"
+            | "compose.yml"
+            | "docker-compose.yaml"
+            | "docker-compose.yml"
+    )
+}
+
 fn apply_jump(editor: &Entity<Editor>, jump: Jump, cx: &mut App) {
     editor.update(cx, |e, cx| match jump {
         Jump::Point { row, column } => e.go_to_point(row, column, cx),
@@ -2021,6 +2162,14 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::focus_prev_pane))
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::show_git))
+            .on_action(cx.listener(Self::show_services))
+            // Available from anywhere (command palette), not just the tab.
+            .on_action(cx.listener(|this, _: &RunStack, _, cx| {
+                this.services.update(cx, |s, cx| s.start_all(cx))
+            }))
+            .on_action(cx.listener(|this, _: &StopAll, _, cx| {
+                this.services.update(cx, |s, cx| s.stop_all_services(cx))
+            }))
             .on_action(cx.listener(Self::show_file_diff))
             .on_action(cx.listener(Self::switch_branch))
             .on_action(cx.listener(Self::push))
@@ -2894,6 +3043,51 @@ mod tests {
         });
         cx.simulate_keystrokes("secondary-k 2");
         assert_eq!(cx.read(|cx| result.read(cx).text(cx)), "one\nTHEIRS\n");
+    }
+
+    /// Real processes through the login shell: one service announces a port,
+    /// one fails, then Ctrl+C stops the first.
+    #[gpui::test]
+    fn services_run_stack_ports_failures_and_stop(cx: &mut TestAppContext) {
+        use crate::services_panel::Status as ServiceStatus;
+        let root = fixture("services");
+        std::fs::create_dir_all(root.join(".solder")).unwrap();
+        std::fs::write(
+            root.join(".solder/services.json"),
+            r#"{"services": [
+                {"name": "web", "command": "printf 'ready on http://localhost:4321\\n'; sleep 30"},
+                {"name": "broken", "command": "echo boom; exit 3"}
+            ]}"#,
+        )
+        .unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let services = cx.read(|cx| ws.read(cx).services.clone());
+        wait_for(cx, "detection", &|cx| services.read(cx).specs().len() == 2);
+
+        cx.simulate_keystrokes("secondary-shift-s");
+        assert!(cx.read(|cx| ws.read(cx).sidebar == Some(SidebarTab::Services)));
+        cx.dispatch_action(RunStack);
+        wait_for(cx, "port from the log", &|cx| {
+            services.read(cx).ports("web") == [4321]
+        });
+        wait_for(cx, "failed service", &|cx| {
+            services.read(cx).status("broken", cx) == ServiceStatus::Exited(Some(3))
+        });
+        assert_eq!(
+            cx.read(|cx| services.read(cx).status("web", cx)),
+            ServiceStatus::Running
+        );
+        // The failed service keeps its terminal so its output can be read.
+        assert_eq!(cx.read(|cx| ws.read(cx).terminals.len()), 2);
+
+        cx.dispatch_action(StopAll);
+        wait_for(cx, "web to stop", &|cx| {
+            matches!(
+                services.read(cx).status("web", cx),
+                ServiceStatus::Exited(_)
+            )
+        });
     }
 
     #[gpui::test]
