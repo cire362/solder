@@ -35,7 +35,7 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 - [x] Stage selected lines (`cmd-alt-y`), revert a hunk (`cmd-alt-z`), step through hunks, commit and amend from the Git tab (`ctrl-shift-g`)
 - [x] Three-way conflict view (ours | file | theirs) with accept ours, theirs or both (`cmd-k 1/2/3`)
 - [x] Switch or create branches, push and pull in the terminal, open a pull request for GitHub and GitLab remotes
-- [ ] Side-by-side diff for a whole file
+- [x] Side-by-side diff for a whole file
 
 ## 4. Services and containers
 - [ ] Detect services from `package.json`, `go.mod`, `Cargo.toml`, `pyproject.toml`, compose files

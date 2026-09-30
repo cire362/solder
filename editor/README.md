@@ -39,6 +39,23 @@ scripts/bench.sh [file]
 
 The status bar shows live input latency, frame time, memory and startup time. Toggle it with `cmd-alt-p`.
 
+## Review changes
+
+Open the Git sidebar with `ctrl-shift-g` and click a file to compare both versions.
+Staged files compare HEAD with the index; Changes and Untracked compare the index
+with the working copy, including unsaved text in open editors. Added and deleted
+lines stay aligned with blank cells on the other side. Both columns share scrolling.
+
+- `cmd-alt-d`: compare the current file with the index.
+- `alt-up` / `alt-down`: previous / next change.
+- `alt-left` / `alt-right` or horizontal scrolling: pan both code columns together.
+- `cmd-r`: refresh the comparison after external changes.
+- `enter`: open the working file; `escape` or `cmd-w`: return to the previous editor.
+
+The comparison is read-only. Deleted files remain reviewable without a working
+file; binary and non-UTF-8 files show an explanation rather than corrupted text.
+Conflicted files still open the three-way conflict view.
+
 ## Measured so far
 
 Apple M4, 16 GB, built-in 60 Hz display, release build.

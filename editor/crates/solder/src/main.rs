@@ -6,6 +6,7 @@ mod editor;
 mod editor_git;
 mod editor_lsp;
 mod element;
+mod file_diff;
 mod file_finder;
 mod fuzzy;
 mod git;

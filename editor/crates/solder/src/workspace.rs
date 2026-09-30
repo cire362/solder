@@ -19,7 +19,9 @@ use crate::{
     document::Document,
     editor::{self, Editor, EditorEvent},
     editor_lsp::LspLocation,
+    file_diff::{DiffModel, FileDiff, FileDiffEvent},
     file_finder::FileFinder,
+    git::DiffScope,
     git_panel::{self, BranchPicker, GitPanel, GitPanelEvent},
     git_store::{GitStore, GitStoreEvent},
     go_to_line::GoToLine as GoToLineDelegate,
@@ -65,6 +67,7 @@ actions!(
         ToggleTerminal,
         NewTerminal,
         ShowGit,
+        ShowFileDiff,
     ]
 );
 
@@ -98,6 +101,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-`", ToggleTerminal, None),
         KeyBinding::new("ctrl-shift-`", NewTerminal, None),
         KeyBinding::new("ctrl-shift-g", ShowGit, None),
+        KeyBinding::new("secondary-alt-d", ShowFileDiff, None),
     ]);
     #[cfg(target_os = "macos")]
     cx.bind_keys([
@@ -174,6 +178,9 @@ pub struct Workspace {
     project_search: Entity<ProjectSearch>,
     git: Entity<GitStore>,
     git_panel: Entity<GitPanel>,
+    file_diff: Option<Entity<FileDiff>>,
+    diff_task: Option<Task<()>>,
+    diff_subscription: Option<Subscription>,
     search_bar: Entity<BufferSearchBar>,
     panes: Vec<Pane>,
     active_pane: usize,
@@ -236,6 +243,9 @@ impl Workspace {
                     GitPanelEvent::OpenConflict(path) => {
                         this.open_conflict(path.clone(), window, cx)
                     }
+                    GitPanelEvent::ReviewDiff(path, scope) => {
+                        this.open_file_diff(path.clone(), *scope, window, cx)
+                    }
                 },
             ),
             cx.observe_window_appearance(window, |_, window, cx| {
@@ -293,6 +303,9 @@ impl Workspace {
             _hud_tick: hud_tick,
             git,
             git_panel,
+            file_diff: None,
+            diff_task: None,
+            diff_subscription: None,
         }
     }
 
@@ -343,7 +356,14 @@ impl Workspace {
             window,
             |this, editor, event, window, cx| match event {
                 EditorEvent::TitleChanged | EditorEvent::SelectionsChanged => cx.notify(),
-                EditorEvent::Edited | EditorEvent::Saved => {}
+                EditorEvent::Edited | EditorEvent::Saved => {
+                    if this.file_diff.as_ref().is_some_and(|view| {
+                        view.read(cx).scope == DiffScope::Working
+                            && editor.read(cx).path(cx) == Some(view.read(cx).path.as_path())
+                    }) {
+                        this.load_file_diff(cx);
+                    }
+                }
                 EditorEvent::OpenLocations {
                     title,
                     locations,
@@ -439,6 +459,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.close_file_diff(window, cx);
         let pane = &self.panes[self.active_pane];
         if let Some(ix) = pane
             .tabs
@@ -487,6 +508,7 @@ impl Workspace {
             return;
         };
         let editor = tab.editor.clone();
+        self.close_file_diff(window, cx);
         self.active_pane = pane;
         self.panes[pane].active = Some(ix);
         if let Some(path) = editor.read(cx).path(cx).map(Path::to_path_buf) {
@@ -506,6 +528,10 @@ impl Workspace {
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.file_diff.is_some() {
+            self.close_file_diff(window, cx);
+            return;
+        }
         if let Some(editor) = self.active_editor().cloned() {
             self.close(&editor, window, cx);
         }
@@ -684,6 +710,7 @@ impl Workspace {
         let tints = self.git.read(cx).tints();
         self.project_panel
             .update(cx, |p, cx| p.set_tints(tints, cx));
+        self.load_file_diff(cx);
         cx.notify();
     }
 
@@ -702,6 +729,112 @@ impl Workspace {
             g.run(move |repo| repo.stage_content(&rel, &staged), cx)
                 .detach()
         });
+    }
+
+    fn open_file_diff(
+        &mut self,
+        path: PathBuf,
+        scope: DiffScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.new(|cx| FileDiff::new(path, scope, cx));
+        self.diff_subscription =
+            Some(
+                cx.subscribe_in(&view, window, |this, view, event, window, cx| match event {
+                    FileDiffEvent::Close => this.close_file_diff(window, cx),
+                    FileDiffEvent::Refresh => this.load_file_diff(cx),
+                    FileDiffEvent::OpenFile => {
+                        let path = view.read(cx).path.clone();
+                        this.open_path(path, None, window, cx);
+                    }
+                }),
+            );
+        window.focus(&view.focus_handle(cx));
+        self.file_diff = Some(view);
+        self.load_file_diff(cx);
+        cx.notify();
+    }
+
+    fn load_file_diff(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.file_diff.clone() else {
+            return;
+        };
+        let Some(repo) = self.git.read(cx).repo().cloned() else {
+            view.update(cx, |view, cx| {
+                view.set_result(
+                    Err(crate::git::GitError(
+                        "Open a file inside a Git repository.".into(),
+                    )),
+                    cx,
+                )
+            });
+            return;
+        };
+        let path = view.read(cx).path.clone();
+        let scope = view.read(cx).scope;
+        let Some(rel) = repo.relative(&path) else {
+            view.update(cx, |view, cx| {
+                view.set_result(
+                    Err(crate::git::GitError(
+                        "This file is outside the Git repository.".into(),
+                    )),
+                    cx,
+                )
+            });
+            return;
+        };
+        let working = if scope == DiffScope::Working {
+            self.document_for_path(&path, cx)
+                .filter(|document| document.read(cx).is_dirty())
+                .map(|document| {
+                    let text = document.read(cx).text();
+                    (text.rope().clone(), text.line_ending().as_str())
+                })
+        } else {
+            None
+        };
+        let tab_width = Settings::get(cx).indent_unit().len();
+        self.diff_task = Some(cx.spawn(async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    repo.file_diff(
+                        &rel,
+                        scope,
+                        working.map(|(rope, ending)| match ending {
+                            "\n" => rope.to_string(),
+                            ending => rope.to_string().replace('\n', ending),
+                        }),
+                    )
+                    .map(|snapshot| DiffModel::new(snapshot, tab_width))
+                })
+                .await;
+            view.update(cx, |view, cx| view.set_result(result, cx)).ok();
+        }));
+    }
+
+    fn close_file_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.file_diff.take().is_none() {
+            return;
+        }
+        self.diff_task = None;
+        self.diff_subscription = None;
+        if let Some(editor) = self.active_editor() {
+            window.focus(&editor.focus_handle(cx));
+        } else {
+            window.focus(&self.focus_handle);
+        }
+        cx.notify();
+    }
+
+    fn show_file_diff(&mut self, _: &ShowFileDiff, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self
+            .active_editor()
+            .and_then(|editor| editor.read(cx).path(cx).map(Path::to_path_buf));
+        if let Some(path) = path {
+            self.open_file_diff(path, DiffScope::Working, window, cx);
+        }
     }
 
     fn show_git(&mut self, _: &ShowGit, window: &mut Window, cx: &mut Context<Self>) {
@@ -1690,7 +1823,10 @@ impl Workspace {
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let mut left: Vec<String> = Vec::new();
-        if let Some(editor) = self.active_editor() {
+        if self.file_diff.is_some() {
+            left.push("Git diff".into());
+            left.push("Read-only".into());
+        } else if let Some(editor) = self.active_editor() {
             let e = editor.read(cx);
             let doc = e.doc(cx);
             let (line, col, cursors) = e.cursor_position(cx);
@@ -1825,13 +1961,32 @@ impl Render for Workspace {
             |n| n.to_string_lossy().into_owned(),
         );
         let title = self
-            .active_editor()
-            .and_then(|e| e.read(cx).path(cx).map(|p| p.display().to_string()))
+            .file_diff
+            .as_ref()
+            .map(|view| view.read(cx).path.display().to_string())
+            .or_else(|| {
+                self.active_editor().and_then(|editor| {
+                    editor
+                        .read(cx)
+                        .path(cx)
+                        .map(|path| path.display().to_string())
+                })
+            })
             .unwrap_or_else(|| root.display().to_string());
         window.set_window_title(&title);
-        let panes: Vec<_> = (0..self.panes.len())
-            .map(|p| self.render_pane(p, window, cx).into_any_element())
-            .collect();
+        let panes: Vec<_> = match &self.file_diff {
+            Some(view) => vec![
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(view.clone())
+                    .into_any_element(),
+            ],
+            None => (0..self.panes.len())
+                .map(|p| self.render_pane(p, window, cx).into_any_element())
+                .collect(),
+        };
 
         div()
             .id("workspace")
@@ -1863,6 +2018,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::focus_prev_pane))
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::show_git))
+            .on_action(cx.listener(Self::show_file_diff))
             .on_action(cx.listener(Self::switch_branch))
             .on_action(cx.listener(Self::push))
             .on_action(cx.listener(Self::pull))
@@ -2455,6 +2611,203 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "Add mid2");
+    }
+
+    #[gpui::test]
+    fn git_diff_keeps_unsaved_buffers_and_restores_editor_focus(cx: &mut TestAppContext) {
+        let root = git_fixture("diff-buffer");
+        let (workspace, cx) = setup(cx, root.clone());
+        cx.executor().allow_parking();
+        wait_for(cx, "repository", &|cx| {
+            workspace.read(cx).git.read(cx).repo().is_some()
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(root.join("a.txt"), None, window, cx)
+        });
+        wait_for(cx, "file", &|cx| {
+            workspace.read(cx).active_editor().is_some()
+        });
+        cx.simulate_input("unsaved ");
+        let before = active_text(&workspace, cx);
+        cx.simulate_keystrokes("ctrl-shift-g secondary-alt-d");
+        wait_for(cx, "diff", &|cx| {
+            workspace
+                .read(cx)
+                .file_diff
+                .as_ref()
+                .is_some_and(|view| view.read(cx).model.is_some())
+        });
+        let changes = cx.read(|cx| {
+            workspace
+                .read(cx)
+                .file_diff
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .model
+                .as_ref()
+                .unwrap()
+                .changes
+                .len()
+        });
+        assert_eq!(changes, 1);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+        cx.simulate_input("cannot edit this snapshot");
+        assert_eq!(active_text(&workspace, cx), before);
+        cx.simulate_keystrokes("secondary-w");
+        assert!(cx.read(|cx| workspace.read(cx).file_diff.is_none()));
+        assert_eq!(cx.read(|cx| workspace.read(cx).all_editors().count()), 1);
+        cx.simulate_input("more ");
+        assert_eq!(active_text(&workspace, cx), "unsaved more one\ntwo\n");
+    }
+
+    #[gpui::test]
+    fn git_diff_uses_disk_when_a_clean_open_file_is_deleted(cx: &mut TestAppContext) {
+        let root = git_fixture("diff-clean-deleted");
+        let (workspace, cx) = setup(cx, root.clone());
+        cx.executor().allow_parking();
+        wait_for(cx, "repository", &|cx| {
+            workspace.read(cx).git.read(cx).repo().is_some()
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(root.join("a.txt"), None, window, cx)
+        });
+        wait_for(cx, "file", &|cx| {
+            workspace.read(cx).active_editor().is_some()
+        });
+        assert!(!cx.read(|cx| {
+            workspace
+                .read(cx)
+                .active_editor()
+                .unwrap()
+                .read(cx)
+                .doc(cx)
+                .is_dirty()
+        }));
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        cx.simulate_keystrokes("secondary-alt-d");
+        wait_for(cx, "diff", &|cx| {
+            workspace
+                .read(cx)
+                .file_diff
+                .as_ref()
+                .is_some_and(|view| view.read(cx).model.is_some())
+        });
+        cx.read(|cx| {
+            let model = workspace
+                .read(cx)
+                .file_diff
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .model
+                .as_ref()
+                .unwrap();
+            assert_eq!(model.changes.len(), 1);
+            assert_eq!(model.rows.len(), 2);
+            assert!(model.rows.iter().all(|row| row.new.is_none()));
+        });
+        assert_eq!(active_text(&workspace, cx), "one\ntwo\n");
+    }
+
+    #[gpui::test]
+    fn git_diff_navigation_refresh_and_open_file(cx: &mut TestAppContext) {
+        let root = git_fixture("diff-navigation");
+        std::fs::write(
+            root.join("a.txt"),
+            format!("ONE\ntwo\n{}\n", "extra".repeat(200)),
+        )
+        .unwrap();
+        let (workspace, cx) = setup(cx, root.clone());
+        cx.executor().allow_parking();
+        wait_for(cx, "repository", &|cx| {
+            workspace.read(cx).git.read(cx).repo().is_some()
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_file_diff(root.join("a.txt"), DiffScope::Working, window, cx)
+        });
+        wait_for(cx, "diff", &|cx| {
+            workspace
+                .read(cx)
+                .file_diff
+                .as_ref()
+                .is_some_and(|view| view.read(cx).model.is_some())
+        });
+        let view = cx.read(|cx| workspace.read(cx).file_diff.as_ref().unwrap().clone());
+        cx.update(|window, cx| window.focus(&workspace.focus_handle(cx)));
+        let position = cx.update(|window, _| {
+            gpui::point(
+                window.viewport_size().width * 0.75,
+                window.viewport_size().height / 2.,
+            )
+        });
+        cx.simulate_click(position, gpui::Modifiers::default());
+        assert!(cx.update(|window, cx| view.focus_handle(cx).is_focused(window)));
+        cx.simulate_keystrokes("alt-down");
+        assert_eq!(cx.read(|cx| view.read(cx).selected_change()), Some(1));
+        cx.simulate_keystrokes("alt-up");
+        assert_eq!(cx.read(|cx| view.read(cx).selected_change()), Some(0));
+        cx.simulate_keystrokes("alt-right");
+        assert!(cx.read(|cx| view.read(cx).horizontal_offset()) > px(0.));
+        cx.simulate_keystrokes("alt-left");
+        assert_eq!(cx.read(|cx| view.read(cx).horizontal_offset()), px(0.));
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        cx.simulate_keystrokes("secondary-r");
+        wait_for(cx, "refreshed diff", &|cx| {
+            view.read(cx)
+                .model
+                .as_ref()
+                .is_some_and(|model| model.changes.is_empty())
+        });
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "editor", &|cx| {
+            workspace.read(cx).file_diff.is_none() && workspace.read(cx).active_editor().is_some()
+        });
+        assert_eq!(active_path(&workspace, cx), Some(root.join("a.txt")));
+    }
+
+    #[gpui::test]
+    fn git_diff_preserves_crlf_when_using_an_open_buffer(cx: &mut TestAppContext) {
+        let root = git_fixture("diff-crlf");
+        let repo = crate::git::Repo::discover(&root).unwrap();
+        std::fs::write(root.join("crlf.txt"), "one\r\ntwo\r\n").unwrap();
+        repo.stage(&["crlf.txt"]).unwrap();
+        repo.commit("CRLF", false).unwrap();
+        let (workspace, cx) = setup(cx, root.clone());
+        cx.executor().allow_parking();
+        wait_for(cx, "repository", &|cx| {
+            workspace.read(cx).git.read(cx).repo().is_some()
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(root.join("crlf.txt"), None, window, cx)
+        });
+        wait_for(cx, "file", &|cx| {
+            workspace.read(cx).active_editor().is_some()
+        });
+        cx.simulate_keystrokes("secondary-alt-d");
+        wait_for(cx, "diff", &|cx| {
+            workspace
+                .read(cx)
+                .file_diff
+                .as_ref()
+                .is_some_and(|view| view.read(cx).model.is_some())
+        });
+        assert!(cx.read(|cx| {
+            workspace
+                .read(cx)
+                .file_diff
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .model
+                .as_ref()
+                .unwrap()
+                .changes
+                .is_empty()
+        }));
     }
 
     #[gpui::test]

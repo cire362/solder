@@ -49,6 +49,7 @@ impl Change {
 pub struct FileStatus {
     /// Relative to the repository root, `/`-separated.
     pub path: String,
+    pub original_path: Option<String>,
     pub staged: Option<Change>,
     pub unstaged: Option<Change>,
     pub untracked: bool,
@@ -67,6 +68,19 @@ pub struct RepoStatus {
 
 #[derive(Clone, Debug)]
 pub struct GitError(pub String);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffScope {
+    Working,
+    Staged,
+}
+
+pub struct FileDiffSnapshot {
+    pub path: String,
+    pub old: String,
+    pub new: String,
+    pub can_open: bool,
+}
 
 impl std::fmt::Display for GitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -175,6 +189,71 @@ impl Repo {
 
     pub fn index_text(&self, rel: &str) -> Option<String> {
         self.show(&format!(":{rel}"))
+    }
+
+    pub fn file_diff(
+        &self,
+        rel: &str,
+        scope: DiffScope,
+        working_text: Option<String>,
+    ) -> Result<FileDiffSnapshot> {
+        let status = self.status()?;
+        let file = status.files.iter().find(|file| file.path == rel);
+        if file.is_some_and(|file| file.conflicted) {
+            return Err(GitError("Resolve this file in the conflict view.".into()));
+        }
+        let decode = |bytes: Vec<u8>| {
+            if bytes.contains(&0) {
+                return Err(GitError("Binary files cannot be compared as text.".into()));
+            }
+            String::from_utf8(bytes).map_err(|_| GitError("This file is not UTF-8 text.".into()))
+        };
+        let index = || {
+            if file.is_some_and(|file| file.untracked || file.staged == Some(Change::Deleted)) {
+                Ok(String::new())
+            } else {
+                decode(self.run(&["show", &format!(":0:{rel}")])?)
+            }
+        };
+        let (old, new) = match scope {
+            DiffScope::Staged => {
+                let old = if file
+                    .is_some_and(|file| file.untracked || file.staged == Some(Change::Added))
+                {
+                    String::new()
+                } else {
+                    let original = file
+                        .filter(|file| file.staged == Some(Change::Renamed))
+                        .and_then(|file| file.original_path.as_deref())
+                        .unwrap_or(rel);
+                    decode(self.run(&["show", &format!("HEAD:{original}")])?)?
+                };
+                (old, index()?)
+            }
+            DiffScope::Working => {
+                let new = match working_text {
+                    Some(text) => decode(text.into_bytes())?,
+                    None => match std::fs::read(self.workdir.join(rel)) {
+                        Ok(bytes) => decode(bytes)?,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::NotFound
+                                && file
+                                    .is_some_and(|file| file.unstaged == Some(Change::Deleted)) =>
+                        {
+                            String::new()
+                        }
+                        Err(error) => return Err(GitError(format!("Cannot read {rel}: {error}"))),
+                    },
+                };
+                (index()?, new)
+            }
+        };
+        Ok(FileDiffSnapshot {
+            path: rel.to_string(),
+            old,
+            new,
+            can_open: self.workdir.join(rel).is_file(),
+        })
     }
 
     pub fn stage(&self, paths: &[&str]) -> Result<()> {
@@ -310,13 +389,17 @@ pub fn parse_status(out: &[u8]) -> RepoStatus {
                 let mut parts = rest.splitn(skip + 1, ' ');
                 let xy = parts.next().unwrap_or("..").as_bytes().to_vec();
                 let path = parts.nth(skip - 1).unwrap_or_default().to_string();
-                if kind == "2" {
-                    // The original path follows as its own record.
-                    records.next();
-                }
+                let original_path = (kind == "2")
+                    .then(|| {
+                        records
+                            .next()
+                            .map(|path| String::from_utf8_lossy(path).into_owned())
+                    })
+                    .flatten();
                 let conflicted = kind == "u";
                 status.files.push(FileStatus {
                     path,
+                    original_path,
                     staged: if conflicted {
                         None
                     } else {
@@ -333,6 +416,7 @@ pub fn parse_status(out: &[u8]) -> RepoStatus {
             }
             "?" => status.files.push(FileStatus {
                 path: rest.to_string(),
+                original_path: None,
                 staged: None,
                 unstaged: None,
                 untracked: true,
@@ -433,8 +517,108 @@ u UU N... 100644 100644 100644 100644 f1 f2 f3 both.rs\0\
         assert_eq!(s.files[0].staged, None);
         assert_eq!(s.files[1].staged, Some(Change::Added));
         assert_eq!(s.files[2].staged, Some(Change::Renamed));
+        assert_eq!(s.files[2].original_path.as_deref(), Some("old.rs"));
         assert!(s.files[3].conflicted);
         assert!(s.files[4].untracked);
+    }
+
+    fn diff_repo(name: &str) -> Repo {
+        let dir = std::env::temp_dir().join(format!("solder-diff-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = Repo { workdir: dir };
+        repo.run(&["init", "-q", "-b", "main"]).unwrap();
+        repo.run(&["config", "user.name", "Test"]).unwrap();
+        repo.run(&["config", "user.email", "test@example.com"])
+            .unwrap();
+        repo
+    }
+
+    #[test]
+    fn diff_compares_head_index_and_working_text_independently() {
+        let repo = diff_repo("versions");
+        let path = repo.workdir.join("file with spaces π.txt");
+        let rel = repo.relative(&path).unwrap();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let untracked = repo.file_diff(&rel, DiffScope::Working, None).unwrap();
+        assert_eq!(
+            (untracked.old.as_str(), untracked.new.as_str()),
+            ("", "one\ntwo\n")
+        );
+        repo.stage(&[&rel]).unwrap();
+        let first = repo.file_diff(&rel, DiffScope::Staged, None).unwrap();
+        assert_eq!((first.old.as_str(), first.new.as_str()), ("", "one\ntwo\n"));
+        repo.commit("initial", false).unwrap();
+        std::fs::write(&path, "one\nstaged\n").unwrap();
+        repo.stage(&[&rel]).unwrap();
+        std::fs::write(&path, "one\nworking\n").unwrap();
+        let working = repo.file_diff(&rel, DiffScope::Working, None).unwrap();
+        assert_eq!(
+            (working.old.as_str(), working.new.as_str()),
+            ("one\nstaged\n", "one\nworking\n")
+        );
+        let buffer = repo
+            .file_diff(&rel, DiffScope::Working, Some("unsaved\n".into()))
+            .unwrap();
+        assert_eq!(buffer.new, "unsaved\n");
+        let staged = repo
+            .file_diff(&rel, DiffScope::Staged, Some("unsaved\n".into()))
+            .unwrap();
+        assert_eq!(
+            (staged.old.as_str(), staged.new.as_str()),
+            ("one\ntwo\n", "one\nstaged\n")
+        );
+        repo.commit("staged", false).unwrap();
+        repo.discard(&[&rel]).unwrap();
+        repo.run(&["mv", "--", &rel, "renamed.txt"]).unwrap();
+        let renamed = repo
+            .file_diff("renamed.txt", DiffScope::Staged, None)
+            .unwrap();
+        assert_eq!(renamed.old, "one\nstaged\n");
+        assert_eq!(renamed.old, renamed.new);
+        repo.commit("rename", false).unwrap();
+        std::fs::remove_file(repo.workdir.join("renamed.txt")).unwrap();
+        let deleted = repo
+            .file_diff("renamed.txt", DiffScope::Working, None)
+            .unwrap();
+        assert_eq!(deleted.old, "one\nstaged\n");
+        assert!(deleted.new.is_empty());
+        repo.stage(&["renamed.txt"]).unwrap();
+        let deleted = repo
+            .file_diff("renamed.txt", DiffScope::Staged, None)
+            .unwrap();
+        assert_eq!(deleted.old, "one\nstaged\n");
+        assert!(deleted.new.is_empty());
+        std::fs::remove_dir_all(repo.workdir).unwrap();
+    }
+
+    #[test]
+    fn diff_rejects_binary_non_utf8_and_missing_files() {
+        let repo = diff_repo("errors");
+        std::fs::write(repo.workdir.join("binary.txt"), b"text\0data").unwrap();
+        assert!(
+            repo.file_diff("binary.txt", DiffScope::Working, None)
+                .err()
+                .unwrap()
+                .0
+                .contains("Binary")
+        );
+        std::fs::write(repo.workdir.join("encoding.txt"), [0xff]).unwrap();
+        assert!(
+            repo.file_diff("encoding.txt", DiffScope::Working, None)
+                .err()
+                .unwrap()
+                .0
+                .contains("UTF-8")
+        );
+        assert!(
+            repo.file_diff("absent.txt", DiffScope::Working, None)
+                .err()
+                .unwrap()
+                .0
+                .contains("Cannot read")
+        );
+        std::fs::remove_dir_all(repo.workdir).unwrap();
     }
 
     #[test]
