@@ -24,6 +24,10 @@ pub struct Theme {
     pub bracket: Hsla,
     pub error: Hsla,
     pub warning: Hsla,
+    pub git_added: Hsla,
+    pub git_modified: Hsla,
+    pub conflict_ours: Hsla,
+    pub conflict_theirs: Hsla,
     pub syntax: SyntaxColors,
 }
 
@@ -77,6 +81,10 @@ impl Theme {
             bracket: rgba(0xffffff1f).into(),
             error: rgb(0xf87171).into(),
             warning: rgb(0xfbbf24).into(),
+            git_added: rgb(0x4ade80).into(),
+            git_modified: rgb(0x60a5fa).into(),
+            conflict_ours: rgba(0x4ade801a).into(),
+            conflict_theirs: rgba(0x60a5fa1a).into(),
             syntax: SyntaxColors {
                 keyword: rgb(0xe8743f).into(),
                 string: rgb(0xd9b8a3).into(),
@@ -110,6 +118,10 @@ impl Theme {
             bracket: rgba(0x18181b1a).into(),
             error: rgb(0xdc2626).into(),
             warning: rgb(0xb45309).into(),
+            git_added: rgb(0x16a34a).into(),
+            git_modified: rgb(0x2563eb).into(),
+            conflict_ours: rgba(0x16a34a17).into(),
+            conflict_theirs: rgba(0x2563eb17).into(),
             syntax: SyntaxColors {
                 keyword: rgb(0xb24a1c).into(),
                 string: rgb(0x87573a).into(),

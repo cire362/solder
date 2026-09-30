@@ -100,6 +100,7 @@ pub struct ProjectPanel {
     menu: Option<(Point<Pixels>, Option<PathBuf>)>,
     edit: Option<EditState>,
     _edit_subscription: Option<Subscription>,
+    tints: std::collections::HashMap<PathBuf, crate::git_store::Tint>,
 }
 
 const ROW: Pixels = px(24.);
@@ -148,6 +149,19 @@ impl ProjectPanel {
             menu: None,
             edit: None,
             _edit_subscription: None,
+            tints: Default::default(),
+        }
+    }
+
+    /// Git colors for changed files and the folders that contain them.
+    pub fn set_tints(
+        &mut self,
+        tints: std::collections::HashMap<PathBuf, crate::git_store::Tint>,
+        cx: &mut Context<Self>,
+    ) {
+        if tints != self.tints {
+            self.tints = tints;
+            cx.notify();
         }
     }
 
@@ -699,6 +713,14 @@ impl Render for ProjectPanel {
                                     }
                                 };
                                 let selected = path.is_some() && this.selected == path;
+                                let tint =
+                                    path.as_ref().and_then(|p| this.tints.get(p)).map(
+                                        |t| match t {
+                                            crate::git_store::Tint::Added => theme.git_added,
+                                            crate::git_store::Tint::Modified => theme.git_modified,
+                                            crate::git_store::Tint::Conflict => theme.error,
+                                        },
+                                    );
                                 let renaming = this.edit.as_ref().filter(|e| {
                                     e.kind == EditKind::Rename && Some(&e.target) == path.as_ref()
                                 });
@@ -751,7 +773,11 @@ impl Render for ProjectPanel {
                                     .gap_1p5()
                                     .rounded(px(8.))
                                     .text_size(UI_FONT_SIZE)
-                                    .text_color(if selected { theme.fg } else { theme.fg_muted })
+                                    .text_color(tint.unwrap_or(if selected {
+                                        theme.fg
+                                    } else {
+                                        theme.fg_muted
+                                    }))
                                     .when(selected, |d| {
                                         d.bg(if panel_focused {
                                             theme.accent_soft

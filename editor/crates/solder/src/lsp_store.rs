@@ -212,7 +212,9 @@ impl LspStore {
                     this.close(doc.entity_id());
                     this.attach(doc.entity_id(), cx);
                 }
-                DocumentEvent::DirtyChanged | DocumentEvent::DiagnosticsChanged => {}
+                DocumentEvent::DirtyChanged
+                | DocumentEvent::DiagnosticsChanged
+                | DocumentEvent::GitChanged => {}
             }),
             cx.observe_release(document, move |this, _, _| {
                 this.close(id);

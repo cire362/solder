@@ -82,6 +82,14 @@ actions!(
         PrevDiagnostic,
         ShowHover,
         CodeActions,
+        StageLines,
+        RevertHunk,
+        NextHunk,
+        PrevHunk,
+        AcceptOurs,
+        AcceptTheirs,
+        AcceptBoth,
+        NextConflict,
     ]
 );
 
@@ -151,6 +159,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-f8", PrevDiagnostic, full),
         KeyBinding::new("secondary-k secondary-i", ShowHover, full),
         KeyBinding::new("secondary-.", CodeActions, full),
+        KeyBinding::new("secondary-alt-y", StageLines, full),
+        KeyBinding::new("secondary-alt-z", RevertHunk, full),
+        KeyBinding::new("secondary-alt-]", NextHunk, full),
+        KeyBinding::new("secondary-alt-[", PrevHunk, full),
+        KeyBinding::new("secondary-k 1", AcceptOurs, full),
+        KeyBinding::new("secondary-k 2", AcceptTheirs, full),
+        KeyBinding::new("secondary-k 3", AcceptBoth, full),
+        KeyBinding::new("secondary-k n", NextConflict, full),
     ]);
     #[cfg(target_os = "macos")]
     cx.bind_keys([
@@ -204,6 +220,8 @@ pub enum EditorEvent {
         actions: Vec<lsp::types::CodeActionOrCommand>,
         encoding: lsp::Encoding,
     },
+    /// Stage these rows of the file (the workspace owns the repository).
+    StageRows { rows: Range<usize> },
     /// A rename (or other refactor) that may touch several files.
     ApplyWorkspaceEdit {
         edit: lsp::types::WorkspaceEdit,
@@ -294,7 +312,7 @@ impl Editor {
                 cx.notify();
             }
             DocumentEvent::Saved => cx.emit(EditorEvent::Saved),
-            DocumentEvent::DiagnosticsChanged => cx.notify(),
+            DocumentEvent::DiagnosticsChanged | DocumentEvent::GitChanged => cx.notify(),
         });
         Self {
             mode: EditorMode::Full,
@@ -1749,6 +1767,14 @@ impl Render for Editor {
             .on_action(cx.listener(Self::prev_diagnostic))
             .on_action(cx.listener(Self::show_hover))
             .on_action(cx.listener(Self::code_actions))
+            .on_action(cx.listener(Self::stage_lines))
+            .on_action(cx.listener(Self::revert_hunk))
+            .on_action(cx.listener(Self::next_hunk))
+            .on_action(cx.listener(Self::prev_hunk))
+            .on_action(cx.listener(Self::accept_ours))
+            .on_action(cx.listener(Self::accept_theirs))
+            .on_action(cx.listener(Self::accept_both))
+            .on_action(cx.listener(Self::next_conflict))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))

@@ -598,6 +598,61 @@ fn layout(
             background.push(quad);
         }
     }
+    if !single_line {
+        // Git: a bar per changed row range, a notch where lines were deleted.
+        let visible_rows = first_row..end_row;
+        for hunk in doc.hunks().iter() {
+            if hunk.is_deletion() {
+                if visible_rows.contains(&hunk.new.start) || hunk.new.start == end_row {
+                    background.push(fill(
+                        Bounds::new(
+                            point(bounds.left(), row_y(hunk.new.start) - px(1.5)),
+                            size(px(8.), px(3.)),
+                        ),
+                        theme.error,
+                    ));
+                }
+                continue;
+            }
+            let start = hunk.new.start.max(first_row);
+            let end = hunk.new.end.min(end_row);
+            if start >= end {
+                continue;
+            }
+            let color = if hunk.is_insertion() {
+                theme.git_added
+            } else {
+                theme.git_modified
+            };
+            background.push(fill(
+                Bounds::new(
+                    point(bounds.left() + px(1.), row_y(start)),
+                    size(px(3.), lh * (end - start) as f32),
+                ),
+                color,
+            ));
+        }
+        // Merge conflicts: tint each side across the full width.
+        for conflict in doc.conflicts().iter() {
+            let sides = [
+                (conflict.start..conflict.middle, theme.conflict_ours),
+                (conflict.middle + 1..conflict.end + 1, theme.conflict_theirs),
+            ];
+            for (rows, color) in sides {
+                let start = rows.start.max(first_row);
+                let end = rows.end.min(end_row);
+                if start < end {
+                    background.push(fill(
+                        Bounds::new(
+                            point(bounds.left(), row_y(start)),
+                            size(bounds.size.width, lh * (end - start) as f32),
+                        ),
+                        color,
+                    ));
+                }
+            }
+        }
+    }
     for row in (first_row..end_row).filter(|_| !single_line) {
         let active = cursor_rows.contains(&row);
         let label: SharedString = (row + 1).to_string().into();

@@ -224,8 +224,9 @@ fn parse_keymap(source: &str, cx: &App) -> (Vec<KeyBinding>, Vec<String>) {
     (bindings, errors)
 }
 
-/// Default bindings from every module.
-fn bind_defaults(cx: &mut App) {
+/// Default bindings from every module. Tests call this too, so a new
+/// module's bindings cannot be missing from them.
+pub fn bind_defaults(cx: &mut App) {
     crate::editor::bind_keys(cx);
     crate::workspace::bind_keys(cx);
     crate::picker::bind_keys(cx);
@@ -233,6 +234,7 @@ fn bind_defaults(cx: &mut App) {
     crate::project_search::bind_keys(cx);
     crate::project_panel::bind_keys(cx);
     crate::terminal::bind_keys(cx);
+    crate::git_panel::bind_keys(cx);
 }
 
 fn read(path: &Path) -> String {
