@@ -99,8 +99,7 @@ impl Redis {
                     namespace: None,
                     name,
                     kind: ObjectKind::Key(kind),
-                    columns: Vec::new(),
-                    indexes: Vec::new(),
+                    ..Default::default()
                 })
                 .collect(),
             truncated,

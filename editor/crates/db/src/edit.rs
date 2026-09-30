@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{Column, Engine, Object, Schema, Value, complete, sql};
+use crate::{Column, Engine, ForeignKey, Object, Schema, Value, complete, sql};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditTarget {
@@ -13,6 +13,12 @@ pub struct EditTarget {
     pub table: String,
     /// Result columns that hold the primary key, by index.
     pub key: Vec<usize>,
+    /// Result columns the server fills in (serial, identity, auto_increment):
+    /// left out of new and duplicated rows.
+    pub auto: Vec<usize>,
+    /// Result columns that reference one column of another table, with the
+    /// key they belong to; new values can be picked from that table.
+    pub references: Vec<(usize, ForeignKey)>,
 }
 
 /// The table a result came from, if its rows can be written back: a plain
@@ -101,32 +107,67 @@ pub fn edit_target(
                 .ok_or_else(|| format!("Select the key column {k} to edit rows"))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let position = |name: &str| columns.iter().position(|c| c.name == name);
+    let auto = object
+        .columns
+        .iter()
+        .filter(|c| c.auto)
+        .filter_map(|c| position(&c.name))
+        .collect();
+    let references = object
+        .foreign_keys
+        .iter()
+        .filter(|fk| fk.columns.len() == 1 && fk.ref_columns.len() == 1)
+        .filter_map(|fk| Some((position(&fk.columns[0])?, fk.clone())))
+        .collect();
     Ok(EditTarget {
         namespace: object.namespace.clone(),
         table: object.name.clone(),
         key,
+        auto,
+        references,
     })
 }
 
-/// Staged changes to a result: new cell values (`None` is NULL) and rows to
-/// delete. A deleted row's cell edits are ignored.
+/// Staged changes to a result: new cell values (`None` is NULL), rows to
+/// delete, and new rows. A deleted row's cell edits are ignored. A new row
+/// holds only the columns given a value; the rest get their defaults.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Changes {
     pub cells: BTreeMap<(usize, usize), Option<String>>,
     pub deleted: BTreeSet<usize>,
+    pub inserted: Vec<BTreeMap<usize, Option<String>>>,
 }
 
 impl Changes {
     pub fn is_empty(&self) -> bool {
-        self.cells.is_empty() && self.deleted.is_empty()
+        self.cells.is_empty() && self.deleted.is_empty() && self.inserted.is_empty()
     }
 
-    /// Changed rows, each counted once.
+    /// Changed rows, each counted once, new rows included.
     pub fn len(&self) -> usize {
         let mut rows: BTreeSet<usize> = self.cells.keys().map(|(row, _)| *row).collect();
         rows.extend(&self.deleted);
-        rows.len()
+        rows.len() + self.inserted.len()
     }
+}
+
+/// The values for a copy of `row`: everything but the columns the server
+/// fills in, which get fresh values.
+pub fn duplicate(target: &EditTarget, row: &[Value]) -> BTreeMap<usize, Option<String>> {
+    row.iter()
+        .enumerate()
+        .filter(|(i, _)| !target.auto.contains(i))
+        .map(|(i, v)| {
+            (
+                i,
+                match v {
+                    Value::Null => None,
+                    v => Some(v.display()),
+                },
+            )
+        })
+        .collect()
 }
 
 /// One statement per changed row, in row order.
@@ -189,7 +230,60 @@ pub fn statements(
             );
         }
     }
-    out.into_values().collect()
+    let mut statements: Vec<String> = out.into_values().collect();
+    for new in &changes.inserted {
+        statements.push(if new.is_empty() {
+            match engine {
+                Engine::MySql => format!("INSERT INTO {table} () VALUES ()"),
+                _ => format!("INSERT INTO {table} DEFAULT VALUES"),
+            }
+        } else {
+            let names: Vec<String> = new
+                .keys()
+                .map(|&c| sql::quote_ident(engine, &columns[c].name))
+                .collect();
+            let values: Vec<String> = new
+                .values()
+                .map(|v| {
+                    v.as_deref()
+                        .map_or_else(|| "NULL".into(), |v| text_literal(engine, v))
+                })
+                .collect();
+            format!(
+                "INSERT INTO {table} ({}) VALUES ({})",
+                names.join(", "),
+                values.join(", ")
+            )
+        });
+    }
+    statements
+}
+
+/// Rows of the table a foreign key points at, to pick a value from: the key
+/// and, when there is one, the first text column as a label.
+pub fn reference_query(engine: Engine, schema: &Schema, fk: &ForeignKey) -> String {
+    let key = &fk.ref_columns[0];
+    let table = sql::qualified_name(engine, fk.ref_namespace.as_deref(), &fk.ref_table);
+    let label = schema
+        .objects
+        .iter()
+        .find(|o| o.name == fk.ref_table)
+        .and_then(|o| {
+            o.columns.iter().find(|c| {
+                c.name != *key
+                    && ["char", "text", "string", "name"]
+                        .iter()
+                        .any(|t| c.type_name.to_ascii_lowercase().contains(t))
+            })
+        });
+    let key = sql::quote_ident(engine, key);
+    match label {
+        Some(label) => format!(
+            "SELECT {key}, {} FROM {table} ORDER BY {key} LIMIT 1000",
+            sql::quote_ident(engine, &label.name)
+        ),
+        None => format!("SELECT {key} FROM {table} ORDER BY {key} LIMIT 1000"),
+    }
 }
 
 /// A typed value as it came back, for matching the row it came from.
@@ -238,6 +332,7 @@ mod tests {
             type_name: "text".into(),
             nullable: !key,
             primary_key: key,
+            ..Default::default()
         };
         Schema {
             objects: vec![
@@ -251,6 +346,7 @@ mod tests {
                         column("bio", false),
                     ],
                     indexes: Vec::new(),
+                    ..Default::default()
                 },
                 Object {
                     namespace: Some("public".into()),
@@ -258,6 +354,7 @@ mod tests {
                     kind: ObjectKind::Table,
                     columns: vec![column("line", false)],
                     indexes: Vec::new(),
+                    ..Default::default()
                 },
             ],
             truncated: false,
@@ -310,6 +407,8 @@ mod tests {
             namespace: Some("public".into()),
             table: "users".into(),
             key: vec![0],
+            auto: Vec::new(),
+            references: Vec::new(),
         };
         let cols = columns(&["id", "name", "bio"]);
         let rows = vec![
@@ -356,5 +455,70 @@ mod tests {
             "'\\x00ff'::bytea"
         );
         assert_eq!(literal(Engine::MySql, &Value::Bytes(vec![1])), "X'01'");
+    }
+
+    #[test]
+    fn inserts_name_given_columns_and_default_the_rest() {
+        let target = EditTarget {
+            namespace: None,
+            table: "users".into(),
+            key: vec![0],
+            auto: vec![0],
+            references: Vec::new(),
+        };
+        let cols = columns(&["id", "name", "bio"]);
+        let rows = vec![vec![Value::Int(7), Value::Text("ada".into()), Value::Null]];
+        let copy = duplicate(&target, &rows[0]);
+        assert_eq!(copy, BTreeMap::from([(1, Some("ada".into())), (2, None)]));
+        let changes = Changes {
+            inserted: vec![copy, BTreeMap::new()],
+            ..Default::default()
+        };
+        assert_eq!(changes.len(), 2);
+        assert_eq!(
+            statements(Engine::Sqlite, &target, &cols, &rows, &changes),
+            [
+                "INSERT INTO \"users\" (\"name\", \"bio\") VALUES ('ada', NULL)",
+                "INSERT INTO \"users\" DEFAULT VALUES",
+            ]
+        );
+        assert_eq!(
+            statements(Engine::MySql, &target, &cols, &rows, &changes)[1],
+            "INSERT INTO `users` () VALUES ()"
+        );
+    }
+
+    #[test]
+    fn references_and_their_lookup_query() {
+        let mut s = schema();
+        s.objects[0].foreign_keys = vec![ForeignKey {
+            name: "users_bio".into(),
+            columns: vec!["bio".into()],
+            ref_namespace: Some("public".into()),
+            ref_table: "logs".into(),
+            ref_columns: vec!["line".into()],
+        }];
+        let target = edit_target(
+            Engine::Postgres,
+            &s,
+            "select id, bio from users",
+            &columns(&["id", "bio"]),
+        )
+        .unwrap();
+        assert_eq!(target.references.len(), 1);
+        assert_eq!(target.references[0].0, 1);
+        assert_eq!(
+            reference_query(Engine::Postgres, &s, &target.references[0].1),
+            "SELECT \"line\" FROM \"logs\" ORDER BY \"line\" LIMIT 1000"
+        );
+        let fk = ForeignKey {
+            ref_table: "users".into(),
+            ref_columns: vec!["id".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            reference_query(Engine::Postgres, &s, &fk),
+            "SELECT \"id\", \"name\" FROM \"users\" ORDER BY \"id\" LIMIT 1000"
+        );
     }
 }

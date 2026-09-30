@@ -101,7 +101,9 @@ impl MySql {
              AND c.TABLE_SCHEMA NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')";
         let columns: Vec<Row> = conn
             .query(format!(
-                "SELECT c.TABLE_SCHEMA, c.TABLE_NAME, t.TABLE_TYPE, c.COLUMN_NAME, c.COLUMN_TYPE, c.IS_NULLABLE \
+                "SELECT c.TABLE_SCHEMA, c.TABLE_NAME, t.TABLE_TYPE, c.COLUMN_NAME, c.COLUMN_TYPE, c.IS_NULLABLE, \
+                   COALESCE(c.COLUMN_DEFAULT, ''), \
+                   IF(c.EXTRA LIKE '%auto_increment%' OR c.EXTRA LIKE '%GENERATED%', '1', '') \
                  FROM information_schema.COLUMNS c \
                  JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME \
                  WHERE {filter} ORDER BY c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION"
@@ -122,10 +124,25 @@ impl MySql {
             ))
             .await
             .map_err(|e| e.to_string())?;
+        let foreign_keys: Vec<Row> = conn
+            .query(format!(
+                "SELECT c.CONSTRAINT_NAME, c.TABLE_SCHEMA, c.TABLE_NAME, \
+                   GROUP_CONCAT(c.COLUMN_NAME ORDER BY c.ORDINAL_POSITION SEPARATOR 0x1f), \
+                   c.REFERENCED_TABLE_SCHEMA, c.REFERENCED_TABLE_NAME, \
+                   GROUP_CONCAT(c.REFERENCED_COLUMN_NAME ORDER BY c.ORDINAL_POSITION SEPARATOR 0x1f) \
+                 FROM information_schema.KEY_COLUMN_USAGE c \
+                 WHERE {filter} AND c.REFERENCED_TABLE_NAME IS NOT NULL \
+                 GROUP BY c.CONSTRAINT_NAME, c.TABLE_SCHEMA, c.TABLE_NAME, \
+                   c.REFERENCED_TABLE_SCHEMA, c.REFERENCED_TABLE_NAME \
+                 ORDER BY c.CONSTRAINT_NAME"
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(build_schema(
             strings(columns),
             strings(keys),
             strings(indexes),
+            strings(foreign_keys),
         ))
     }
 }

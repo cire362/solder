@@ -430,9 +430,11 @@ mod tests {
                     type_name: "text".into(),
                     nullable: true,
                     primary_key: *c == "id",
+                    ..Default::default()
                 })
                 .collect(),
             indexes: vec![format!("{name}_pkey")],
+            ..Default::default()
         };
         Schema {
             objects: vec![

@@ -4,7 +4,8 @@ use tokio_postgres::{Client, SimpleQueryMessage, types::Type};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::{
-    Column, ColumnInfo, ConnectionSpec, Object, ObjectKind, QueryResult, Result, Schema, Value,
+    Column, ColumnInfo, ConnectionSpec, ForeignKey, Object, ObjectKind, QueryResult, Result,
+    Schema, Value,
     params::{self, Tls},
     tls,
 };
@@ -120,7 +121,10 @@ impl Pg {
         let _busy = self.busy.lock().await;
         let columns = self
             .rows(
-                "SELECT c.table_schema, c.table_name, t.table_type, c.column_name, c.data_type, c.is_nullable \
+                "SELECT c.table_schema, c.table_name, t.table_type, c.column_name, c.data_type, c.is_nullable, \
+                   coalesce(c.column_default, ''), \
+                   CASE WHEN c.is_identity = 'YES' OR c.column_default LIKE 'nextval(%' \
+                     OR c.is_generated = 'ALWAYS' THEN '1' ELSE '' END \
                  FROM information_schema.columns c \
                  JOIN information_schema.tables t USING (table_schema, table_name) \
                  WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema') \
@@ -143,7 +147,24 @@ impl Pg {
                  WHERE schemaname NOT IN ('pg_catalog', 'information_schema') ORDER BY indexname",
             )
             .await?;
-        Ok(build_schema(columns, keys, indexes))
+        // Column lists in key order, joined with the unit separator so names
+        // with commas survive.
+        let foreign_keys = self
+            .rows(
+                "SELECT con.conname, ns.nspname, cl.relname, \
+                   array_to_string(ARRAY(SELECT a.attname FROM unnest(con.conkey) WITH ORDINALITY k(n, i) \
+                     JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.n ORDER BY k.i), chr(31)), \
+                   fns.nspname, fcl.relname, \
+                   array_to_string(ARRAY(SELECT a.attname FROM unnest(con.confkey) WITH ORDINALITY k(n, i) \
+                     JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.n ORDER BY k.i), chr(31)) \
+                 FROM pg_constraint con \
+                 JOIN pg_class cl ON cl.oid = con.conrelid JOIN pg_namespace ns ON ns.oid = cl.relnamespace \
+                 JOIN pg_class fcl ON fcl.oid = con.confrelid JOIN pg_namespace fns ON fns.oid = fcl.relnamespace \
+                 WHERE con.contype = 'f' AND ns.nspname NOT IN ('pg_catalog', 'information_schema') \
+                 ORDER BY con.conname",
+            )
+            .await?;
+        Ok(build_schema(columns, keys, indexes, foreign_keys))
     }
 
     async fn rows(&self, query: &str) -> Result<Vec<Vec<String>>> {
@@ -162,13 +183,16 @@ impl Pg {
     }
 }
 
-/// Builds objects from `(namespace, table, kind, column, type, nullable)`
-/// rows plus primary keys and index names. Shared with MySQL, whose
+/// Builds objects from `(namespace, table, kind, column, type, nullable,
+/// default, auto)` rows, primary keys, index names and foreign keys
+/// `(name, namespace, table, columns, ref namespace, ref table, ref columns)`
+/// with column lists separated by U+001F. Shared with MySQL, whose
 /// information schema has the same shape.
 pub(crate) fn build_schema(
     columns: Vec<Vec<String>>,
     keys: Vec<Vec<String>>,
     indexes: Vec<Vec<String>>,
+    foreign_keys: Vec<Vec<String>>,
 ) -> Schema {
     let key = |r: &[String]| (r[0].clone(), r[1].clone());
     let mut primary: HashMap<(String, String), Vec<String>> = HashMap::new();
@@ -181,6 +205,25 @@ pub(crate) fn build_schema(
             .entry(key(&row))
             .or_default()
             .push(row[2].clone());
+    }
+    let split = |s: &str| -> Vec<String> {
+        s.split('\u{1f}')
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let mut references: HashMap<(String, String), Vec<ForeignKey>> = HashMap::new();
+    for row in foreign_keys {
+        references
+            .entry((row[1].clone(), row[2].clone()))
+            .or_default()
+            .push(ForeignKey {
+                name: row[0].clone(),
+                columns: split(&row[3]),
+                ref_namespace: Some(row[4].clone()),
+                ref_table: row[5].clone(),
+                ref_columns: split(&row[6]),
+            });
     }
     let mut objects: Vec<Object> = Vec::new();
     for row in columns {
@@ -199,6 +242,7 @@ pub(crate) fn build_schema(
                 },
                 columns: Vec::new(),
                 indexes: index_names.remove(&id).unwrap_or_default(),
+                foreign_keys: references.remove(&id).unwrap_or_default(),
             });
         }
         let pk = primary.get(&id).is_some_and(|cols| cols.contains(&row[3]));
@@ -208,6 +252,8 @@ pub(crate) fn build_schema(
                 type_name: row[4].clone(),
                 nullable: row[5] == "YES",
                 primary_key: pk,
+                default: row.get(6).filter(|d| !d.is_empty()).cloned(),
+                auto: row.get(7).is_some_and(|a| a == "1"),
             });
         }
     }

@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 
 use crate::{
-    Column, ColumnInfo, ConnectionSpec, Object, ObjectKind, QueryResult, Result, Schema, Value,
+    Column, ColumnInfo, ConnectionSpec, ForeignKey, Object, ObjectKind, QueryResult, Result,
+    Schema, Value,
 };
 
 /// rusqlite is blocking: every call runs on Tokio's blocking pool.
@@ -119,20 +120,62 @@ fn read_schema(conn: &Connection) -> Result<Schema> {
     let mut objects = Vec::new();
     for (name, kind) in tables {
         let mut info = conn
-            .prepare("SELECT name, type, \"notnull\", pk FROM pragma_table_info(?1)")
+            .prepare(
+                "SELECT name, type, \"notnull\", pk, dflt_value FROM pragma_table_info(?1) ORDER BY cid",
+            )
             .map_err(err)?;
-        let columns = info
+        let mut columns: Vec<ColumnInfo> = info
             .query_map([&name], |r| {
                 Ok(ColumnInfo {
                     name: r.get(0)?,
                     type_name: r.get::<_, String>(1)?.to_ascii_lowercase(),
                     nullable: r.get::<_, i64>(2)? == 0,
                     primary_key: r.get::<_, i64>(3)? > 0,
+                    default: r.get(4)?,
+                    auto: false,
                 })
             })
             .map_err(err)?
             .collect::<std::result::Result<_, _>>()
             .map_err(err)?;
+        // A lone INTEGER PRIMARY KEY is the rowid: SQLite fills it in.
+        let keys: Vec<usize> = (0..columns.len())
+            .filter(|&i| columns[i].primary_key)
+            .collect();
+        if let [only] = keys[..]
+            && columns[only].type_name == "integer"
+        {
+            columns[only].auto = true;
+        }
+        let mut list = conn
+            .prepare(
+                "SELECT id, \"table\", \"from\", \"to\" FROM pragma_foreign_key_list(?1) ORDER BY id, seq",
+            )
+            .map_err(err)?;
+        let links: Vec<(i64, String, String, Option<String>)> = list
+            .query_map([&name], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .map_err(err)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(err)?;
+        let mut foreign_keys: Vec<(i64, ForeignKey)> = Vec::new();
+        for (id, table, from, to) in links {
+            if foreign_keys.last().is_none_or(|(last, _)| *last != id) {
+                foreign_keys.push((
+                    id,
+                    ForeignKey {
+                        name: format!("{name}_fk_{id}"),
+                        ref_table: table,
+                        ..Default::default()
+                    },
+                ));
+            }
+            let (_, fk) = foreign_keys.last_mut().expect("pushed above");
+            fk.columns.push(from);
+            // No `to` means the referenced table's primary key.
+            fk.ref_columns.extend(to);
+        }
         let mut list = conn
             .prepare("SELECT name FROM pragma_index_list(?1) ORDER BY name")
             .map_err(err)?;
@@ -151,7 +194,37 @@ fn read_schema(conn: &Connection) -> Result<Schema> {
             },
             columns,
             indexes,
+            foreign_keys: foreign_keys.into_iter().map(|(_, fk)| fk).collect(),
         });
+    }
+    // `REFERENCES t` without columns means t's primary key.
+    let keys_of = |table: &str| -> Vec<String> {
+        objects
+            .iter()
+            .find(|o: &&Object| o.name == table)
+            .map(|o| {
+                o.columns
+                    .iter()
+                    .filter(|c| c.primary_key)
+                    .map(|c| c.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let implied: Vec<(usize, usize, Vec<String>)> = objects
+        .iter()
+        .enumerate()
+        .flat_map(|(i, o)| {
+            o.foreign_keys
+                .iter()
+                .enumerate()
+                .filter(|(_, fk)| fk.ref_columns.is_empty())
+                .map(move |(j, fk)| (i, j, fk.ref_table.clone()))
+        })
+        .map(|(i, j, table)| (i, j, keys_of(&table)))
+        .collect();
+    for (i, j, columns) in implied {
+        objects[i].foreign_keys[j].ref_columns = columns;
     }
     Ok(Schema {
         objects,

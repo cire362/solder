@@ -188,8 +188,9 @@ impl QueryResult {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ObjectKind {
+    #[default]
     Table,
     View,
     Collection,
@@ -197,15 +198,31 @@ pub enum ObjectKind {
     Key(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ColumnInfo {
     pub name: String,
     pub type_name: String,
     pub nullable: bool,
     pub primary_key: bool,
+    /// The default expression as the server shows it (`now()`, `'draft'`).
+    pub default: Option<String>,
+    /// Filled in by the server: serial, identity, auto_increment, SQLite's
+    /// rowid alias.
+    pub auto: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A foreign key: `columns` of this table point at `ref_columns` of
+/// `ref_table`, in the same order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ForeignKey {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub ref_namespace: Option<String>,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Object {
     /// Postgres schema, MySQL or Mongo database. `None` where there is one.
     pub namespace: Option<String>,
@@ -213,6 +230,7 @@ pub struct Object {
     pub kind: ObjectKind,
     pub columns: Vec<ColumnInfo>,
     pub indexes: Vec<String>,
+    pub foreign_keys: Vec<ForeignKey>,
 }
 
 #[derive(Clone, Debug, Default)]
