@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 echo "== website: lint"
 npm run lint --silent
 echo "== website: types"
-npx tsc --noEmit
+npm run typecheck --silent
 
 echo "== editor: format"
 (cd editor && cargo fmt --all --check)

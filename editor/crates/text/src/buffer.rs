@@ -224,7 +224,7 @@ impl Buffer {
         if edits.is_empty() {
             return Vec::new();
         }
-        edits.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+        edits.sort_by_key(|edit| std::cmp::Reverse(edit.0.start));
 
         let mut applied = Vec::with_capacity(edits.len());
         let mut record = Vec::with_capacity(edits.len());
