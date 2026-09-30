@@ -5,6 +5,7 @@
 //! (bytes to chars) and it happens inside the rope.
 
 mod buffer;
+pub mod diff;
 mod history;
 mod movement;
 
