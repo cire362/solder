@@ -194,7 +194,8 @@ impl Editor {
             .and_then(|c| c.completion_provider)
             .and_then(|p| p.trigger_characters)
             .unwrap_or_default();
-        let is_trigger = triggers.iter().any(|t| t.ends_with(c));
+        let is_trigger =
+            triggers.iter().any(|t| t.ends_with(c)) || (c == '.' && self.schema_source.is_some());
         if is_trigger {
             self.request_completions(Some(c), cx);
         } else if is_word_char(c) {
@@ -241,6 +242,10 @@ impl Editor {
     fn request_completions(&mut self, trigger: Option<char>, cx: &mut Context<Self>) {
         let head = self.newest_range().end;
         let start = word_start(self.document.read(cx).text(), head);
+        if let Some(source) = self.schema_source.clone() {
+            self.schema_completions(&source, start, head, cx);
+            return;
+        }
         let Some((encoding, request)) =
             self.lsp_request::<lt::request::Completion>(cx, |id, enc, buf| lt::CompletionParams {
                 text_document_position: Self::position_params(id, enc, buf, head),
@@ -284,6 +289,49 @@ impl Editor {
             })
             .ok();
         }));
+    }
+
+    fn schema_completions(
+        &mut self,
+        source: &crate::editor::SchemaSource,
+        start: usize,
+        head: usize,
+        cx: &mut Context<Self>,
+    ) {
+        use db::complete::CandidateKind;
+        let Some((engine, schema)) = source(cx) else {
+            self.completion = None;
+            return;
+        };
+        let buffer = self.document.read(cx).text();
+        let text = buffer.text_for_range(0..buffer.len());
+        let items: Vec<lt::CompletionItem> = db::complete::candidates(engine, &schema, &text, head)
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| lt::CompletionItem {
+                label: c.label,
+                kind: Some(match c.kind {
+                    CandidateKind::Keyword => lt::CompletionItemKind::KEYWORD,
+                    CandidateKind::Table => lt::CompletionItemKind::CLASS,
+                    CandidateKind::Column => lt::CompletionItemKind::FIELD,
+                    CandidateKind::Index => lt::CompletionItemKind::REFERENCE,
+                    CandidateKind::Method => lt::CompletionItemKind::METHOD,
+                }),
+                detail: (!c.detail.is_empty()).then_some(c.detail),
+                // Candidates come best first.
+                sort_text: Some(format!("{i:06}")),
+                ..Default::default()
+            })
+            .collect();
+        if items.is_empty() {
+            self.completion = None;
+            cx.notify();
+            return;
+        }
+        let mut menu = CompletionMenu::new(items, lsp::Encoding::Utf8, start);
+        let query = buffer.text_for_range(start..head);
+        self.completion = menu.filter(&query).then_some(menu);
+        cx.notify();
     }
 
     pub(crate) fn select_next_completion(

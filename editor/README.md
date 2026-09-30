@@ -110,6 +110,22 @@ passwords are never committed. Shared connections belong in
 TLS uses rustls. For Postgres, `sslmode=require` encrypts without checking the
 certificate, as libpq does; `verify-full` checks it against the Mozilla roots.
 
+### Queries
+
+`cmd-enter` in a `.sql` file runs the statement under the cursor, or the
+selection, and shows the rows in Results while the cursor stays in the editor.
+`.redis` files run the command on the current line and `.mongodb` files the shell
+call under the cursor (`db.users.find({age: {$gt: 30}}).sort({name: 1})`). A file
+runs on the connection it was given; a new file gets the last connection used or
+the only one that fits, and otherwise asks. The connection shows in the status
+bar; click it (or run **Select connection**) to change it. **Query** on a
+connection opens its scratch file, kept in `~/.config/solder/scratch`.
+
+Completion comes from the schema: columns of the tables in the statement (with
+aliases and `table.`), tables after `FROM`, `JOIN`, `INTO` and `UPDATE`, index
+names after `INDEX`, and keywords. Redis files complete commands and keys, MongoDB
+files collections, methods and fields.
+
 ## Measured so far
 
 Apple M4, 16 GB, built-in 60 Hz display, release build.

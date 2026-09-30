@@ -5,6 +5,7 @@
 //! first connection, so opening the editor never pays for it. Every public
 //! future is spawned onto that runtime and can be awaited from any executor.
 
+pub mod complete;
 mod detect;
 mod mongo;
 mod mysql;

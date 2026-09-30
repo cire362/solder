@@ -4,11 +4,12 @@
 //! never touch a database pay nothing.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use db::{ConnectionSpec, QueryResult, Schema, Session};
+use db::{ConnectionSpec, Engine, QueryResult, Schema, Session};
 use futures::{
     FutureExt,
     future::{BoxFuture, Shared},
@@ -52,6 +53,21 @@ pub struct DatabaseStore {
     connections: Vec<Connection>,
     detected: bool,
     detect_task: Option<Task<()>>,
+    /// Which connection each query file runs on.
+    bindings: HashMap<PathBuf, String>,
+    /// The connection used most recently, the default for new query files.
+    last_used: Option<String>,
+}
+
+/// Files `cmd-enter` runs, and the engines each kind of file suits.
+pub fn query_file_engines(path: &Path) -> Option<&'static [Engine]> {
+    const SQL: &[Engine] = &[Engine::Postgres, Engine::MySql, Engine::Sqlite];
+    match path.extension()?.to_str()? {
+        "sql" | "psql" | "pgsql" | "mysql" => Some(SQL),
+        "redis" => Some(&[Engine::Redis]),
+        "mongodb" | "mongo" => Some(&[Engine::Mongo]),
+        _ => None,
+    }
 }
 
 /// Connections added with New connection live outside the project.
@@ -66,7 +82,81 @@ impl DatabaseStore {
             connections: Vec::new(),
             detected: false,
             detect_task: None,
+            bindings: HashMap::new(),
+            last_used: None,
         }
+    }
+
+    pub fn binding(&self, path: &Path) -> Option<&str> {
+        self.bindings
+            .get(path)
+            .map(String::as_str)
+            .filter(|name| self.connections.iter().any(|c| c.spec.name == *name))
+    }
+
+    pub fn bind(&mut self, path: PathBuf, name: String, cx: &mut Context<Self>) {
+        self.last_used = Some(name.clone());
+        let load = self
+            .connections
+            .iter()
+            .find(|c| c.spec.name == name)
+            .is_some_and(|c| matches!(c.schema, SchemaState::NotLoaded));
+        self.bindings.insert(path, name.clone());
+        if load {
+            self.load_schema(&name, cx);
+        }
+        cx.emit(DatabaseEvent::Changed);
+        cx.notify();
+    }
+
+    /// The connection a new query file of this kind should use: the last one
+    /// used if it suits, or the only one that does.
+    pub fn default_for(&self, engines: &[Engine]) -> Option<String> {
+        let suits = |c: &&Connection| engines.contains(&c.spec.engine);
+        if let Some(last) = &self.last_used
+            && self
+                .connections
+                .iter()
+                .filter(suits)
+                .any(|c| &c.spec.name == last)
+        {
+            return Some(last.clone());
+        }
+        let mut suitable = self.connections.iter().filter(suits);
+        match (suitable.next(), suitable.next()) {
+            (Some(only), None) => Some(only.spec.name.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn engine_of(&self, name: &str) -> Option<Engine> {
+        self.connections
+            .iter()
+            .find(|c| c.spec.name == name)
+            .map(|c| c.spec.engine)
+    }
+
+    pub fn schema_of(&self, name: &str) -> Option<(Engine, Arc<Schema>)> {
+        let conn = self.connections.iter().find(|c| c.spec.name == name)?;
+        match &conn.schema {
+            SchemaState::Loaded(schema) => Some((conn.spec.engine, schema.clone())),
+            _ => None,
+        }
+    }
+
+    /// Loads the schema unless it is loaded, loading or failed.
+    pub fn ensure_schema(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self
+            .connections
+            .iter()
+            .any(|c| c.spec.name == name && matches!(c.schema, SchemaState::NotLoaded))
+        {
+            self.load_schema(name, cx);
+        }
+    }
+
+    pub fn set_last_used(&mut self, name: &str) {
+        self.last_used = Some(name.to_string());
     }
 
     pub fn detected(&self) -> bool {

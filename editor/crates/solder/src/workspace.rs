@@ -16,8 +16,10 @@ use gpui::{
 use crate::{
     buffer_search::{self, BufferSearchBar},
     command_palette::CommandPalette,
-    database::{self, DatabaseStore},
-    database_panel::{DatabasePanel, DatabasePanelEvent, NewConnection, NewConnectionPrompt},
+    database::{self, DatabaseEvent, DatabaseStore},
+    database_panel::{
+        ConnectionPicker, DatabasePanel, DatabasePanelEvent, NewConnection, NewConnectionPrompt,
+    },
     document::Document,
     editor::{self, Editor, EditorEvent},
     editor_lsp::LspLocation,
@@ -74,6 +76,8 @@ actions!(
         ShowGit,
         ShowServices,
         ShowDatabase,
+        RunStatement,
+        SelectConnection,
         ShowFileDiff,
     ]
 );
@@ -110,6 +114,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-g", ShowGit, None),
         KeyBinding::new("secondary-shift-s", ShowServices, None),
         KeyBinding::new("ctrl-shift-d", ShowDatabase, None),
+        KeyBinding::new(
+            "secondary-enter",
+            RunStatement,
+            Some("Editor && mode == full"),
+        ),
         KeyBinding::new("secondary-alt-d", ShowFileDiff, None),
     ]);
     #[cfg(target_os = "macos")]
@@ -197,6 +206,9 @@ pub struct Workspace {
     show_results: bool,
     /// The dock shows Results rather than a terminal.
     results_active: bool,
+    /// A query file waiting for detection before it can run (`true`) or
+    /// pick its connection (`false`).
+    pending_query: Option<(PathBuf, bool)>,
     file_diff: Option<Entity<FileDiff>>,
     diff_task: Option<Task<()>>,
     diff_subscription: Option<Subscription>,
@@ -296,6 +308,22 @@ impl Workspace {
                     DatabasePanelEvent::Run { connection, query } => {
                         this.run_query(connection.clone(), query.clone(), false, window, cx)
                     }
+                    DatabasePanelEvent::NewQuery { connection } => {
+                        this.open_scratch_query(connection.to_string(), window, cx)
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &database,
+                window,
+                |this, _, _: &DatabaseEvent, window, cx| {
+                    this.attach_query_editors(cx);
+                    if this.database.read(cx).detected()
+                        && let Some((path, run)) = this.pending_query.take()
+                    {
+                        this.query_file_action(path, run, window, cx);
+                    }
+                    cx.notify();
                 },
             ),
             cx.subscribe(&git, |this, _, event, cx| match event {
@@ -375,6 +403,7 @@ impl Workspace {
             results,
             show_results: false,
             results_active: false,
+            pending_query: None,
             file_diff: None,
             diff_task: None,
             diff_subscription: None,
@@ -489,6 +518,7 @@ impl Workspace {
         if self.view_count(document.entity_id(), cx) == 0 {
             self.load_diff_base(&document, cx);
         }
+        self.attach_query_editor(&editor, cx);
         let pane = &mut self.panes[self.active_pane];
         pane.tabs.push(Tab {
             editor,
@@ -1177,6 +1207,199 @@ impl Workspace {
             window.focus(&self.results.focus_handle(cx));
         }
         cx.notify();
+    }
+
+    // ------------------------------------------------------------ query files
+
+    /// Gives a query file its connection's schema for completion, choosing
+    /// the default connection for a file that has none.
+    fn attach_query_editor(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        let Some(path) = editor.read(cx).path(cx).map(Path::to_path_buf) else {
+            return;
+        };
+        let store = self.database.clone();
+        let bound = store.read(cx).binding(&path).map(str::to_string);
+        let name = match bound {
+            Some(name) => {
+                store.update(cx, |s, cx| s.ensure_schema(&name, cx));
+                name
+            }
+            None => {
+                let Some(engines) = database::query_file_engines(&path) else {
+                    return;
+                };
+                if !store.read(cx).detected() {
+                    // Attached again when detection finishes.
+                    store.update(cx, |s, cx| s.ensure_detected(cx));
+                    return;
+                }
+                let Some(name) = store.read(cx).default_for(engines) else {
+                    return;
+                };
+                store.update(cx, |s, cx| s.bind(path, name.clone(), cx));
+                name
+            }
+        };
+        let source: editor::SchemaSource =
+            std::rc::Rc::new(move |cx: &App| store.read(cx).schema_of(&name));
+        editor.update(cx, |e, _| e.set_schema_source(Some(source)));
+    }
+
+    fn attach_query_editors(&mut self, cx: &mut Context<Self>) {
+        let editors: Vec<_> = self.all_editors().cloned().collect();
+        for editor in editors {
+            self.attach_query_editor(&editor, cx);
+        }
+    }
+
+    fn run_statement(&mut self, _: &RunStatement, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self
+            .active_editor()
+            .and_then(|e| e.read(cx).path(cx).map(Path::to_path_buf));
+        let Some(path) = path.filter(|p| {
+            database::query_file_engines(p).is_some() || self.database.read(cx).binding(p).is_some()
+        }) else {
+            cx.propagate();
+            return;
+        };
+        self.query_file_action(path, true, window, cx);
+    }
+
+    fn select_connection(
+        &mut self,
+        _: &SelectConnection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self
+            .active_editor()
+            .and_then(|e| e.read(cx).path(cx).map(Path::to_path_buf));
+        if let Some(path) = path {
+            self.query_file_action(path, false, window, cx);
+        }
+    }
+
+    /// Runs the statement under the cursor (`run`) or picks a connection for
+    /// `path`, once connections are known.
+    fn query_file_action(
+        &mut self,
+        path: PathBuf,
+        run: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.database.read(cx);
+        if !store.detected() {
+            self.pending_query = Some((path, run));
+            self.database.update(cx, |s, cx| s.ensure_detected(cx));
+            return;
+        }
+        let name = store.binding(&path).map(str::to_string).or_else(|| {
+            database::query_file_engines(&path).and_then(|engines| store.default_for(engines))
+        });
+        match name {
+            Some(name) if run => self.connection_chosen(path, name, true, window, cx),
+            _ => {
+                let picker =
+                    ConnectionPicker::new(cx.weak_entity(), self.database.read(cx), path, run);
+                self.toggle_modal(window, cx, move |window, cx| {
+                    Picker::new(picker, window, cx)
+                });
+            }
+        }
+    }
+
+    /// Binds `path` to the connection and, with `run`, runs the statement
+    /// under the cursor of the active editor on it.
+    pub fn connection_chosen(
+        &mut self,
+        path: PathBuf,
+        name: String,
+        run: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.database
+            .update(cx, |s, cx| s.bind(path.clone(), name.clone(), cx));
+        self.attach_query_editors(cx);
+        let Some(editor) = self.active_editor().cloned() else {
+            return;
+        };
+        if !run || editor.read(cx).path(cx) != Some(path.as_path()) {
+            return;
+        }
+        let Some(engine) = self.database.read(cx).engine_of(&name) else {
+            return;
+        };
+        let e = editor.read(cx);
+        let range = e.newest_range();
+        let buffer = e.document().read(cx).text();
+        let text = buffer.text_for_range(0..buffer.len());
+        let query = if range.is_empty() {
+            db::sql::statement_at(engine, &text, range.end).map(|r| text[r].to_string())
+        } else {
+            Some(text[range].to_string())
+        };
+        if let Some(query) = query.filter(|q| !q.trim().is_empty()) {
+            self.run_query(name.into(), query, false, window, cx);
+        }
+    }
+
+    /// Opens the connection's scratch file, kept in the config directory so
+    /// it survives restarts without cluttering the project.
+    fn open_scratch_query(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(engine) = self.database.read(cx).engine_of(&name) else {
+            return;
+        };
+        let extension = match engine {
+            db::Engine::Redis => "redis",
+            db::Engine::Mongo => "mongodb",
+            _ => "sql",
+        };
+        let root = self.root(cx);
+        let project = root
+            .file_name()
+            .map_or("project".into(), |n| n.to_string_lossy().into_owned());
+        let safe = |s: &str| -> String {
+            s.chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        };
+        let path = settings::config_dir().join("scratch").join(format!(
+            "{}-{}.{extension}",
+            safe(&project),
+            safe(&name)
+        ));
+        let create = path.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let created = cx
+                .background_executor()
+                .spawn(async move {
+                    std::fs::create_dir_all(create.parent().unwrap_or(Path::new(".")))?;
+                    if !create.exists() {
+                        std::fs::write(&create, "")?;
+                    }
+                    std::io::Result::Ok(())
+                })
+                .await;
+            if let Err(e) = created {
+                eprintln!("could not create the scratch file: {e}");
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.database
+                    .update(cx, |s, cx| s.bind(path.clone(), name, cx));
+                this.open_path(path, None, window, cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn close_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2152,6 +2375,14 @@ impl Workspace {
             }
         }
 
+        let connection = self.active_editor().and_then(|e| {
+            let path = e.read(cx).path(cx)?;
+            let store = self.database.read(cx);
+            match store.binding(path) {
+                Some(name) => Some(name.to_string()),
+                None => database::query_file_engines(path).map(|_| "No connection".to_string()),
+            }
+        });
         let item = |text: String| div().child(text);
         div()
             .h(px(STATUS_HEIGHT))
@@ -2171,6 +2402,18 @@ impl Workspace {
                     .gap_4()
                     .min_w_0()
                     .children(left.into_iter().map(item))
+                    .children(connection.map(|name| {
+                        div()
+                            .id("status-connection")
+                            .px_1p5()
+                            .rounded(px(6.))
+                            .text_color(theme.fg_muted)
+                            .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                            .child(name)
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(SelectConnection), cx)
+                            })
+                    }))
                     .children(
                         config_error.map(|e| div().truncate().text_color(theme.error).child(e)),
                     ),
@@ -2322,6 +2565,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_services))
             .on_action(cx.listener(Self::show_database))
             .on_action(cx.listener(Self::new_connection))
+            .on_action(cx.listener(Self::run_statement))
+            .on_action(cx.listener(Self::select_connection))
             // Available from anywhere (command palette), not just the tab.
             .on_action(cx.listener(|this, _: &RunStack, _, cx| {
                 this.services.update(cx, |s, cx| s.start_all(cx))
@@ -3260,10 +3505,9 @@ mod tests {
         assert_eq!(active_path(&ws, cx), None);
     }
 
-    #[gpui::test]
-    fn database_tab_previews_tables_in_results(cx: &mut TestAppContext) {
-        use crate::{database::SchemaState, results::State};
-        let root = fixture("database");
+    /// A project whose `.env` names a SQLite database with a `users` table.
+    fn sqlite_fixture(name: &str) -> PathBuf {
+        let root = fixture(name);
         let path = root.join("dev.db");
         // An empty file is an empty SQLite database; fill it with the driver
         // the app uses.
@@ -3286,6 +3530,130 @@ mod tests {
             }
         });
         std::fs::write(root.join(".env"), "DATABASE_URL=file:./dev.db\n").unwrap();
+        root
+    }
+
+    #[gpui::test]
+    fn query_files_run_the_statement_under_the_cursor(cx: &mut TestAppContext) {
+        use crate::results::State;
+        let root = sqlite_fixture("query-file");
+        let file = root.join("report.sql");
+        let text = "select name from users order by id;\nselect count(*) as total from users;\n";
+        std::fs::write(&file, text).unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let (store, results) = cx.read(|cx| {
+            let ws = ws.read(cx);
+            (ws.database.clone(), ws.results.clone())
+        });
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(file.clone(), None, window, cx)
+        });
+        // The only SQL connection becomes the file's, with its schema.
+        wait_for(cx, "binding", &|cx| {
+            store.read(cx).binding(&file) == Some("DATABASE_URL")
+        });
+        wait_for(cx, "schema", &|cx| {
+            store.read(cx).schema_of("DATABASE_URL").is_some()
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+
+        // Cursor in the second statement.
+        let second = text.find("count").unwrap();
+        editor.update(cx, |e, cx| e.select_range(second..second, cx));
+        cx.simulate_keystrokes("secondary-enter");
+        wait_for(
+            cx,
+            "count",
+            &|cx| matches!(&results.read(cx).state, State::Done(r) if r.rows == vec![vec![db::Value::Int(2)]]),
+        );
+        assert_eq!(
+            cx.read(|cx| results.read(cx).query.to_string()),
+            "select count(*) as total from users"
+        );
+        // Running keeps the keyboard in the editor.
+        assert!(cx.update(|window, cx| editor.focus_handle(cx).is_focused(window)));
+
+        // A selection runs as is.
+        let first_end = text.find(';').unwrap();
+        editor.update(cx, |e, cx| e.select_range(0..first_end, cx));
+        cx.simulate_keystrokes("secondary-enter");
+        wait_for(
+            cx,
+            "names",
+            &|cx| matches!(&results.read(cx).state, State::Done(r) if r.rows.len() == 2 && r.columns[0].name == "name"),
+        );
+
+        // Completion knows the columns of the tables in the statement.
+        let end = text.len();
+        editor.update(cx, |e, cx| e.select_range(end..end, cx));
+        cx.simulate_input("select  from users");
+        let column = end + "select ".len();
+        editor.update(cx, |e, cx| e.select_range(column..column, cx));
+        cx.simulate_input("na");
+        cx.run_until_parked();
+        let first = cx.read(|cx| {
+            editor
+                .read(cx)
+                .completion
+                .as_ref()
+                .and_then(|m| m.selected_item().map(|i| i.label.clone()))
+        });
+        assert_eq!(first.as_deref(), Some("name"));
+        cx.simulate_keystrokes("enter");
+        assert!(
+            cx.read(|cx| editor.read(cx).text(cx))
+                .ends_with("select name from users")
+        );
+    }
+
+    #[gpui::test]
+    fn query_file_asks_which_connection_when_there_are_several(cx: &mut TestAppContext) {
+        use crate::results::State;
+        let root = sqlite_fixture("query-picker");
+        std::fs::copy(root.join("dev.db"), root.join("other.db")).unwrap();
+        std::fs::create_dir_all(root.join(".solder")).unwrap();
+        std::fs::write(
+            root.join(".solder/connections.json"),
+            r#"{"connections": [{"name": "other", "url": "./other.db"}]}"#,
+        )
+        .unwrap();
+        let file = root.join("q.sql");
+        std::fs::write(&file, "select count(*) from users").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        let (store, results) = cx.read(|cx| {
+            let ws = ws.read(cx);
+            (ws.database.clone(), ws.results.clone())
+        });
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(file.clone(), None, window, cx)
+        });
+        wait_for(cx, "detection", &|cx| {
+            store.read(cx).connections().len() == 2
+        });
+        assert!(cx.read(|cx| store.read(cx).binding(&file).is_none()));
+        wait_for(cx, "editor", &|cx| ws.read(cx).active_editor().is_some());
+        cx.simulate_keystrokes("secondary-enter");
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        cx.simulate_input("oth");
+        cx.simulate_keystrokes("enter");
+        wait_for(
+            cx,
+            "result",
+            &|cx| matches!(&results.read(cx).state, State::Done(r) if r.rows.len() == 1),
+        );
+        assert!(cx.read(|cx| store.read(cx).binding(&file) == Some("other")));
+        assert_eq!(
+            cx.read(|cx| results.read(cx).connection.to_string()),
+            "other"
+        );
+    }
+
+    #[gpui::test]
+    fn database_tab_previews_tables_in_results(cx: &mut TestAppContext) {
+        use crate::{database::SchemaState, results::State};
+        let root = sqlite_fixture("database");
         cx.executor().allow_parking();
         let (ws, cx) = setup(cx, root);
         let (store, panel, results) = cx.read(|cx| {

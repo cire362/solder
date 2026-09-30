@@ -44,7 +44,7 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 
 ## 5. Database and HTTP clients
 - [x] Connections from `.env` and compose; Postgres, MySQL, SQLite, Redis, MongoDB (Database tab, `ctrl-shift-d`; table previews in the Results tab)
-- [ ] Query runner (`cmd-enter` runs the statement under the cursor), schema-aware completion
+- [x] Query runner (`cmd-enter` runs the statement under the cursor), schema-aware completion
 - [ ] Results grid with staged edits applied as one transaction; read-only production
 - [ ] HTTP client with requests generated from API routes, OpenAPI 3.1 import
 
