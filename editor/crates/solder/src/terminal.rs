@@ -81,6 +81,9 @@ pub struct TerminalCommand {
     pub cwd: PathBuf,
     pub env: HashMap<String, String>,
     pub title: Option<String>,
+    /// Keep the tab after the process exits, so its output can be read
+    /// (services that crash).
+    pub keep_on_exit: bool,
 }
 
 pub struct Terminal {
@@ -89,6 +92,9 @@ pub struct Terminal {
     focus_handle: FocusHandle,
     title: SharedString,
     fixed_title: bool,
+    pub keep_on_exit: bool,
+    /// The process has exited; `exit_code` is `None` when a signal ended it.
+    pub exited: bool,
     pub exit_code: Option<i32>,
     grid: (usize, usize),
     cell: (Pixels, Pixels),
@@ -104,6 +110,7 @@ pub struct StartedTerminal {
     events: futures::channel::mpsc::UnboundedReceiver<TermEvent>,
     title: String,
     fixed_title: bool,
+    keep_on_exit: bool,
 }
 
 impl Terminal {
@@ -159,6 +166,7 @@ impl Terminal {
             events: rx,
             title,
             fixed_title,
+            keep_on_exit: command.keep_on_exit,
         })
     }
 
@@ -169,6 +177,7 @@ impl Terminal {
             events: mut rx,
             title,
             fixed_title,
+            keep_on_exit,
         } = started;
         let events = cx.spawn(async move |this, cx| {
             while let Some(first) = rx.next().await {
@@ -196,6 +205,8 @@ impl Terminal {
             focus_handle: cx.focus_handle(),
             title: title.into(),
             fixed_title,
+            keep_on_exit,
+            exited: false,
             exit_code: None,
             grid: (80, 24),
             cell: (px(8.), px(16.)),
@@ -207,6 +218,11 @@ impl Terminal {
 
     pub fn title(&self) -> SharedString {
         self.title.clone()
+    }
+
+    /// Ctrl+C: asks the foreground process to stop.
+    pub fn interrupt(&self) {
+        self.write(&b"\x03"[..]);
     }
 
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
@@ -251,11 +267,16 @@ impl Terminal {
                 let size = self.window_size();
                 self.write(format(size).into_bytes());
             }
-            TermEvent::ChildExit(status) => {
+            // Both events can arrive for one exit; report it once.
+            TermEvent::ChildExit(status) if !self.exited => {
+                self.exited = true;
                 self.exit_code = status.code();
                 cx.emit(TerminalEvent::Exited);
             }
-            TermEvent::Exit => cx.emit(TerminalEvent::Exited),
+            TermEvent::Exit if !self.exited => {
+                self.exited = true;
+                cx.emit(TerminalEvent::Exited);
+            }
             _ => {}
         }
     }

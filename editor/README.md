@@ -56,6 +56,28 @@ The comparison is read-only. Deleted files remain reviewable without a working
 file; binary and non-UTF-8 files show an explanation rather than corrupted text.
 Conflicted files still open the three-way conflict view.
 
+## Run the stack
+
+Open the Services tab with `cmd-shift-s` (`ctrl-shift-s` on Linux). Solder lists the
+dev servers it finds: `dev`, `start` or `serve` scripts in any `package.json`
+(with the package manager its lockfile implies), Go `main` packages, Rust binaries,
+Django, FastAPI and Flask apps, and compose services. **Run stack** starts them all.
+
+Each service runs in a terminal in the bottom dock, through your login shell so nvm,
+asdf and pyenv behave as they do in your own terminal. Ports a service prints
+(`http://localhost:3000`, "listening on port 8080") appear next to it and open in
+the browser. A service that exits keeps its terminal so the error stays readable.
+Stop sends Ctrl+C and closes the terminal if the service is still running after
+three seconds.
+
+Add or override services in `.solder/services.json`:
+
+```json
+{ "services": [{ "name": "api", "command": "make run", "dir": "apps/api", "ports": [8080] }] }
+```
+
+Docker containers are listed below the services when Docker is running.
+
 ## Measured so far
 
 Apple M4, 16 GB, built-in 60 Hz display, release build.

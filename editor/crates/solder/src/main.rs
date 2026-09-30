@@ -21,6 +21,8 @@ mod project;
 mod project_panel;
 mod project_search;
 mod search;
+mod services;
+mod services_panel;
 mod settings;
 mod terminal;
 mod theme;
