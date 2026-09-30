@@ -110,6 +110,52 @@ passwords are never committed. Shared connections belong in
 TLS uses rustls. For Postgres, `sslmode=require` encrypts without checking the
 certificate, as libpq does; `verify-full` checks it against the Mozilla roots.
 
+Use `sslrootcert=/absolute/path/ca.pem` for a private Postgres or Redis CA,
+`ssl-ca=/absolute/path/ca.pem` for MySQL, or `tlsCAFile=/absolute/path/ca.pem`
+with `tls=true` for MongoDB. Redis requires a `rediss://` URL. A CA file enables
+certificate and hostname verification. `sslrootcert=system` uses the bundled
+Mozilla roots and requires `verify-full`, not the operating system's custom roots.
+MySQL enables verified TLS by default for non-local hosts. Unverified encryption
+is available only through explicit URL settings; never use it to work around a
+failed verification on a production database.
+
+Prisma's `schema`, `sslaccept`, `sslcert` CA path and `pgbouncer` parameters are
+normalized before connecting; pool-size settings are ignored because a session
+uses one connection. Schema names must be a single alphanumeric identifier
+(underscores and `$` are supported). Unknown TLS modes and unsupported client
+certificate/PKCS12 options fail instead of silently disabling verification.
+Certificate paths must be absolute or relative to the process working directory.
+Behind PgBouncer, `pgbouncer=true` disables named prepared statements used to
+inspect result types; returned values are then displayed as text.
+
+### Check a connection
+
+The read-only probe uses the same drivers as the editor. It checks a connection,
+a small query and the schema, with bounded timeouts. It omits credentials and
+query parameters from displayed URLs and redacts passwords from errors.
+`--require-tls` requires encryption before authentication and fails if a network
+session is not encrypted. It does not upgrade an explicitly unverified mode into
+certificate verification: use the verified URL settings above.
+
+With a URL already set in `SOLDER_PROBE_URL` in your terminal:
+
+```bash
+cd editor
+cargo run --profile ci --locked -p db --example probe -- --require-tls
+```
+
+Or pass a project folder to check detected connections without requiring TLS for
+local databases:
+
+```bash
+cargo run --profile ci --locked -p db --example probe -- /path/to/project
+```
+
+For Postgres and MySQL the probe reads TLS status from the server; for Redis and
+MongoDB it reports the TLS settings enforced by the driver, not a negotiated
+cipher or TLS version. Checking a `mongodb+srv` URL includes its real DNS lookup;
+the local tests do not replace a connection to Atlas or another hosted service.
+
 ## Measured so far
 
 Apple M4, 16 GB, built-in 60 Hz display, release build.

@@ -8,6 +8,7 @@ use futures::TryStreamExt;
 use mongodb::{
     Client,
     bson::{Bson, Document},
+    options::ClientOptions,
 };
 use serde_json::{Map, Value as Json};
 use tokio::sync::Mutex;
@@ -27,9 +28,16 @@ pub struct Mongo {
 
 impl Mongo {
     pub async fn connect(spec: &ConnectionSpec) -> Result<Self> {
-        let client = Client::with_uri_str(&spec.url)
+        let mut options = ClientOptions::parse(&spec.url)
             .await
             .map_err(|e| e.to_string())?;
+        // The driver retries until server selection times out (30 s by
+        // default); give up before the editor's own timeout so its reason,
+        // such as a certificate it does not trust, is what the user sees.
+        options
+            .server_selection_timeout
+            .get_or_insert(std::time::Duration::from_secs(7));
+        let client = Client::with_options(options).map_err(|e| e.to_string())?;
         let database = client
             .default_database()
             .map_or_else(|| "test".to_string(), |db| db.name().to_string());

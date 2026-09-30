@@ -307,3 +307,196 @@ fn mongo() {
     );
     run(&session, "db.solder_people.deleteMany({})");
 }
+
+/// TLS against servers with a certificate from a throwaway CA
+/// (`SOLDER_TEST_TLS_CA`, the CA's PEM file) for `localhost`:
+///
+/// SOLDER_TEST_POSTGRES_TLS=postgres://postgres:solder@localhost:55433/solder
+/// SOLDER_TEST_REDIS_TLS=rediss://localhost:56380
+/// SOLDER_TEST_MONGO_TLS=mongodb://localhost:57018/solder
+///
+/// MySQL creates its own certificate, so `SOLDER_TEST_MYSQL` covers it.
+fn tls_ca() -> Option<String> {
+    let ca = std::env::var("SOLDER_TEST_TLS_CA")
+        .ok()
+        .filter(|c| !c.is_empty());
+    if ca.is_none() {
+        eprintln!("skipped: SOLDER_TEST_TLS_CA is not set");
+    }
+    ca
+}
+
+fn connect(spec: &ConnectionSpec, url: String) -> db::Result<Session> {
+    block(Session::connect(ConnectionSpec {
+        url,
+        ..spec.clone()
+    }))
+}
+
+fn one(session: &Session, query: &str) -> Value {
+    run(session, query).rows.remove(0).remove(0)
+}
+
+#[test]
+fn postgres_tls_modes() {
+    let (Some(spec), Some(ca)) = (
+        spec("SOLDER_TEST_POSTGRES_TLS", Engine::Postgres, false),
+        tls_ca(),
+    ) else {
+        return;
+    };
+    let url = spec.url.clone();
+    let encrypted = "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()";
+
+    // libpq's default and `require`: encrypted, certificate not checked.
+    let session = connect(&spec, url.clone()).unwrap();
+    assert_eq!(one(&session, encrypted), Value::Bool(true));
+    let session = connect(&spec, format!("{url}?sslmode=require")).unwrap();
+    assert_eq!(one(&session, encrypted), Value::Bool(true));
+    let session = connect(&spec, format!("{url}?sslmode=disable")).unwrap();
+    assert_eq!(one(&session, encrypted), Value::Bool(false));
+
+    // Checked: a private CA is not in the Mozilla roots until named.
+    let err = connect(&spec, format!("{url}?sslmode=verify-full"))
+        .err()
+        .unwrap();
+    assert!(err.to_lowercase().contains("certificate"), "{err}");
+    let session = connect(&spec, format!("{url}?sslmode=verify-full&sslrootcert={ca}")).unwrap();
+    assert_eq!(one(&session, encrypted), Value::Bool(true));
+
+    for params in [
+        "sslaccept=strict",
+        "sslrootcert=system",
+        "sslmode=require&sslaccept=strict",
+    ] {
+        let error = connect(&spec, format!("{url}?{params}")).err().unwrap();
+        assert!(error.to_lowercase().contains("certificate"), "{error}");
+    }
+    let session = connect(
+        &spec,
+        format!("{url}?sslaccept=strict&sslcert={ca}&channel_binding=require"),
+    )
+    .unwrap();
+    assert_eq!(one(&session, encrypted), Value::Bool(true));
+    let wrong_host = url.replace("localhost", "127.0.0.1");
+    let error = connect(
+        &spec,
+        format!("{wrong_host}?sslmode=verify-full&sslrootcert={ca}"),
+    )
+    .err()
+    .unwrap();
+    assert!(error.to_lowercase().contains("certificate"), "{error}");
+
+    // Prisma's parameters: `schema` sets the search path, the rest is dropped.
+    run(&session, "CREATE SCHEMA IF NOT EXISTS solder_app");
+    let prisma = connect(
+        &spec,
+        format!("{url}?schema=solder_app&connection_limit=5&pool_timeout=10"),
+    )
+    .unwrap();
+    assert_eq!(
+        one(&prisma, "SELECT current_schema()"),
+        Value::Text("solder_app".into())
+    );
+    // Behind PgBouncer no prepared statements: values come back as text.
+    let pooled = connect(&spec, format!("{url}?pgbouncer=true")).unwrap();
+    assert_eq!(one(&pooled, "SELECT 1"), Value::Text("1".into()));
+}
+
+#[test]
+fn mysql_tls_modes() {
+    let Some(spec) = spec("SOLDER_TEST_MYSQL", Engine::MySql, false) else {
+        return;
+    };
+    let url = spec.url.clone();
+    let cipher = "SELECT VARIABLE_VALUE FROM performance_schema.session_status \
+                  WHERE VARIABLE_NAME = 'Ssl_cipher'";
+    // Local servers: no TLS unless asked.
+    let plain = connect(&spec, url.clone()).unwrap();
+    assert_eq!(one(&plain, cipher), Value::Text(String::new()));
+    for asked in [
+        "ssl-mode=REQUIRED",
+        "sslaccept=accept_invalid_certs",
+        "tls=skip-verify",
+    ] {
+        let session = connect(&spec, format!("{url}?{asked}")).unwrap();
+        assert!(
+            matches!(one(&session, cipher), Value::Text(c) if !c.is_empty()),
+            "{asked}"
+        );
+    }
+    // MySQL's own certificate is self-signed: a checked connection fails.
+    let err = connect(&spec, format!("{url}?sslaccept=strict"))
+        .err()
+        .unwrap();
+    assert!(err.to_lowercase().contains("certificate"), "{err}");
+}
+
+#[test]
+fn mysql_tls_with_ca() {
+    let (Some(spec), Some(ca)) = (
+        spec("SOLDER_TEST_MYSQL_TLS", Engine::MySql, false),
+        tls_ca(),
+    ) else {
+        return;
+    };
+    let url = spec.url.clone();
+    let error = connect(&spec, format!("{url}?ssl-mode=VERIFY_IDENTITY"))
+        .err()
+        .unwrap();
+    assert!(error.to_lowercase().contains("certificate"), "{error}");
+    let session = connect(&spec, format!("{url}?ssl-mode=VERIFY_IDENTITY&ssl-ca={ca}")).unwrap();
+    let result = run(&session, "SHOW STATUS LIKE 'Ssl_cipher'");
+    assert!(!result.rows[0][1].display().is_empty());
+    let wrong_host = url.replace("localhost", "127.0.0.1");
+    let error = connect(&spec, format!("{wrong_host}?ssl-ca={ca}"))
+        .err()
+        .unwrap();
+    assert!(error.to_lowercase().contains("certificate"), "{error}");
+}
+
+#[test]
+fn redis_tls() {
+    let (Some(spec), Some(ca)) = (
+        spec("SOLDER_TEST_REDIS_TLS", Engine::Redis, false),
+        tls_ca(),
+    ) else {
+        return;
+    };
+    let err = connect(&spec, spec.url.clone()).err().unwrap();
+    assert!(err.to_lowercase().contains("certificate"), "{err}");
+    let session = connect(&spec, format!("{}/#insecure", spec.url)).unwrap();
+    assert_eq!(one(&session, "PING"), Value::Text("PONG".into()));
+    let session = connect(&spec, format!("{}/?sslrootcert={ca}", spec.url)).unwrap();
+    assert_eq!(one(&session, "PING"), Value::Text("PONG".into()));
+    let wrong_host = spec.url.replace("localhost", "127.0.0.1");
+    let error = connect(&spec, format!("{wrong_host}/?sslrootcert={ca}"))
+        .err()
+        .unwrap();
+    assert!(error.to_lowercase().contains("certificate"), "{error}");
+}
+
+#[test]
+fn mongo_tls() {
+    let (Some(spec), Some(ca)) = (
+        spec("SOLDER_TEST_MONGO_TLS", Engine::Mongo, false),
+        tls_ca(),
+    ) else {
+        return;
+    };
+    let url = spec.url.clone();
+    let err = connect(&spec, format!("{url}?tls=true")).err().unwrap();
+    assert!(err.to_lowercase().contains("certificate"), "{err}");
+    for ok in [
+        format!("{url}?tls=true&tlsCAFile={ca}"),
+        format!("{url}?tls=true&tlsAllowInvalidCertificates=true"),
+    ] {
+        let session = connect(&spec, ok.clone()).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        run(&session, "show collections");
+    }
+    let wrong_host = url.replace("localhost", "127.0.0.1");
+    let error = connect(&spec, format!("{wrong_host}?tls=true&tlsCAFile={ca}"))
+        .err()
+        .unwrap();
+    assert!(error.to_lowercase().contains("certificate"), "{error}");
+}
