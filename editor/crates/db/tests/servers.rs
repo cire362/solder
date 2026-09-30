@@ -662,3 +662,32 @@ fn sqlite_schema_details() {
         ],
     );
 }
+
+#[test]
+fn mongo_browse() {
+    use db::browse::{Browse, and, count_query, page_query, value_filter};
+    let Some(spec) = spec("SOLDER_TEST_MONGO", Engine::Mongo, false) else {
+        return;
+    };
+    let session = block(Session::connect(spec)).unwrap();
+    run(&session, "db.solder_browse.deleteMany({})");
+    run(
+        &session,
+        "db.solder_browse.insertMany([{n: 1, s: 'a'}, {n: 2, s: 'b'}, {n: 3, s: 'a'}, {n: 4, s: 'a'}])",
+    );
+    let mut browse = Browse {
+        table: "solder_browse".into(),
+        ..Default::default()
+    };
+    browse.filter = value_filter(Engine::Mongo, "s", &Value::Text("a".into()));
+    browse.filter = and(Engine::Mongo, &browse.filter, "{n: {$gt: 1}}");
+    browse.sort = Some(("n".into(), true));
+    let page = run(&session, &page_query(Engine::Mongo, &browse, 1, 1));
+    let n = page.columns.iter().position(|c| c.name == "n").unwrap();
+    assert_eq!(page.rows.len(), 1);
+    // Matching a, n > 1, descending: 4, 3; the second page of one row is 3.
+    assert_eq!(page.rows[0][n], Value::Int(3));
+    let count = run(&session, &count_query(Engine::Mongo, &browse));
+    assert_eq!(count.rows[0][0], Value::Int(2));
+    run(&session, "db.solder_browse.deleteMany({})");
+}

@@ -43,6 +43,12 @@ actions!(
         EditInline,
         InsertRow,
         DuplicateRow,
+        FocusFilter,
+        ApplyFilter,
+        FocusGrid,
+        FilterByValue,
+        FollowReference,
+        BrowseBack,
     ]
 );
 
@@ -81,6 +87,17 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("f2", EditInline, context),
         KeyBinding::new("secondary-n", InsertRow, Some("ResultsGrid && !editing")),
         KeyBinding::new("secondary-d", DuplicateRow, Some("ResultsGrid && !editing")),
+        KeyBinding::new("secondary-f", FocusFilter, context),
+        KeyBinding::new("alt-f", FilterByValue, Some("ResultsGrid && !editing")),
+        KeyBinding::new(
+            "alt-enter",
+            FollowReference,
+            Some("ResultsGrid && !editing"),
+        ),
+        KeyBinding::new("alt-left", BrowseBack, Some("ResultsGrid && !editing")),
+        // The filter field is a single-line editor inside the grid.
+        KeyBinding::new("enter", ApplyFilter, Some("ResultsFilter")),
+        KeyBinding::new("escape", FocusGrid, Some("ResultsFilter")),
         KeyBinding::new("escape", CancelEdit, context),
         KeyBinding::new("shift-backspace", SetNull, Some("ResultsGrid && !editing")),
         KeyBinding::new(
@@ -90,6 +107,18 @@ pub fn bind_keys(cx: &mut App) {
         ),
         KeyBinding::new("secondary-s", ReviewChanges, context),
     ]);
+}
+
+/// A table shown page by page with a filter and a sort, instead of a query.
+pub struct Browsing {
+    pub engine: db::Engine,
+    pub spec: db::browse::Browse,
+    /// Rows matching the filter, once counted.
+    pub total: Option<u64>,
+    /// The last page came back short: there is nothing more to load.
+    pub exhausted: bool,
+    loading_more: Option<Task<()>>,
+    _counting: Option<Task<()>>,
 }
 
 struct Editing {
@@ -134,6 +163,10 @@ pub struct ResultsView {
     /// The notice is about a read-only connection that can be unlocked.
     locked_notice: bool,
     applying: Option<Task<()>>,
+    pub browsing: Option<Browsing>,
+    /// Tables left by following a foreign key, to go back to.
+    history: Vec<(SharedString, db::Engine, db::browse::Browse)>,
+    filter: Entity<Editor>,
 }
 
 impl ResultsView {
@@ -157,11 +190,117 @@ impl ResultsView {
             notice: None,
             locked_notice: false,
             applying: None,
+            browsing: None,
+            history: Vec::new(),
+            filter: cx.new(|cx| Editor::single_line("Filter, e.g. status = 'paid'", cx)),
         }
     }
 
     /// Runs `query` on the named connection and shows what comes back.
     pub fn run(&mut self, connection: SharedString, query: String, cx: &mut Context<Self>) {
+        self.browsing = None;
+        self.history.clear();
+        self.execute(connection, query, cx);
+    }
+
+    /// Shows a table page by page, with the filter and sort in `spec`.
+    pub fn browse(
+        &mut self,
+        connection: SharedString,
+        engine: db::Engine,
+        spec: db::browse::Browse,
+        cx: &mut Context<Self>,
+    ) {
+        let placeholder = if engine == db::Engine::Mongo {
+            "Filter, e.g. {status: \"paid\"}"
+        } else {
+            "Filter, e.g. status = 'paid'"
+        };
+        self.filter = cx.new(|cx| {
+            let mut editor = Editor::single_line(placeholder, cx);
+            editor.set_text(&spec.filter, false, cx);
+            editor
+        });
+        let query = db::browse::page_query(engine, &spec, db::browse::PAGE, 0);
+        let count = db::browse::count_query(engine, &spec);
+        let counting = self.store.update(cx, |s, cx| s.run(&connection, count, cx));
+        let counting = cx.spawn(async move |this, cx| {
+            let total = counting
+                .await
+                .ok()
+                .and_then(|r| match r.rows.first()?.first()? {
+                    Value::Int(n) => u64::try_from(*n).ok(),
+                    other => other.display().parse().ok(),
+                });
+            this.update(cx, |this, cx| {
+                if let Some(b) = this.browsing.as_mut() {
+                    b.total = total;
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.browsing = Some(Browsing {
+            engine,
+            spec,
+            total: None,
+            exhausted: false,
+            loading_more: None,
+            _counting: Some(counting),
+        });
+        self.execute(connection, query, cx);
+    }
+
+    /// Shows the rows again after they changed, keeping the view.
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        match &self.browsing {
+            Some(b) => {
+                let (engine, spec) = (b.engine, b.spec.clone());
+                self.browse(self.connection.clone(), engine, spec, cx);
+            }
+            None => self.execute(self.connection.clone(), self.query.to_string(), cx),
+        }
+    }
+
+    /// Loads the next page when the last rows come into view.
+    fn load_more(&mut self, cx: &mut Context<Self>) {
+        let rows = self.result().map_or(0, |r| r.rows.len());
+        let Some(b) = self.browsing.as_mut() else {
+            return;
+        };
+        // New rows sit after the loaded ones: loading more would move them.
+        if b.exhausted || b.loading_more.is_some() || !self.changes.inserted.is_empty() {
+            return;
+        }
+        let query = db::browse::page_query(b.engine, &b.spec, db::browse::PAGE, rows);
+        let connection = self.connection.clone();
+        let task = self.store.update(cx, |s, cx| s.run(&connection, query, cx));
+        b.loading_more = Some(cx.spawn(async move |this, cx| {
+            let page = task.await;
+            this.update(cx, |this, cx| {
+                let Some(b) = this.browsing.as_mut() else {
+                    return;
+                };
+                b.loading_more = None;
+                match page {
+                    Ok(page) => {
+                        b.exhausted = page.rows.len() < db::browse::PAGE;
+                        if let State::Done(result) = &mut this.state {
+                            Arc::make_mut(result).rows.extend(page.rows);
+                        }
+                    }
+                    Err(e) => {
+                        b.exhausted = true;
+                        this.notice = Some(e.into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn execute(&mut self, connection: SharedString, query: String, cx: &mut Context<Self>) {
         self.connection = connection.clone();
         self.query = query.clone().into();
         self.state = State::Running;
@@ -182,12 +321,33 @@ impl ResultsView {
                     Ok(result) => {
                         let char_width = Settings::get(cx).buffer_font_size() * 0.6;
                         this.widths = column_widths(&result, char_width);
-                        this.number_width =
-                            char_width * result.rows.len().to_string().len() as f32 + px(20.);
+                        // Browsed tables grow page by page.
+                        let digits = if this.browsing.is_some() {
+                            6
+                        } else {
+                            result.rows.len().to_string().len()
+                        };
+                        this.number_width = char_width * digits as f32 + px(20.);
+                        if let Some(b) = this.browsing.as_mut() {
+                            b.exhausted = result.rows.len() < db::browse::PAGE;
+                        }
                         State::Done(Arc::new(result))
                     }
                     Err(e) => State::Failed(e.into()),
                 };
+                // Foreign key headers show the table they point at instead of
+                // the type; make room for it.
+                if let State::Done(result) = &this.state {
+                    let char_width = Settings::get(cx).buffer_font_size() * 0.6;
+                    for (i, fk) in this.references(cx) {
+                        let chars = result.columns[i].name.chars().count()
+                            + fk.ref_table.chars().count()
+                            + 4;
+                        let needed =
+                            px(f32::from(char_width * chars as f32 + px(20.)).min(MAX_COLUMN));
+                        this.widths[i] = this.widths[i].max(needed);
+                    }
+                }
                 this.scroll.scroll_to_item(0, ScrollStrategy::Top);
                 cx.notify();
             })
@@ -598,6 +758,150 @@ impl ResultsView {
         cx.notify();
     }
 
+    fn focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.browsing.is_some() {
+            window.focus(&self.filter.focus_handle(cx));
+        } else {
+            cx.propagate();
+        }
+    }
+
+    fn focus_grid(&mut self, _: &FocusGrid, window: &mut Window, _: &mut Context<Self>) {
+        window.focus(&self.focus);
+    }
+
+    /// Changes what is browsed. Staged changes would point at rows that
+    /// may no longer be shown, so they have to be saved or dropped first.
+    fn rebrowse(
+        &mut self,
+        change: impl FnOnce(&mut db::browse::Browse),
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.changes.is_empty() {
+            self.set_notice(Some("Apply or discard your changes first".into()), cx);
+            return false;
+        }
+        let Some(b) = self.browsing.as_ref() else {
+            return false;
+        };
+        let (engine, mut spec) = (b.engine, b.spec.clone());
+        change(&mut spec);
+        self.browse(self.connection.clone(), engine, spec, cx);
+        true
+    }
+
+    fn apply_filter(&mut self, _: &ApplyFilter, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.filter.read(cx).text(cx);
+        if self.rebrowse(|spec| spec.filter = text, cx) {
+            window.focus(&self.focus);
+        }
+    }
+
+    /// Narrows the table to rows with the selected cell's value.
+    fn filter_by_value(&mut self, _: &FilterByValue, _: &mut Window, cx: &mut Context<Self>) {
+        let (Some((row, column)), Some(b)) = (self.selected, self.browsing.as_ref()) else {
+            return;
+        };
+        let engine = b.engine;
+        let Some(name) = self.result().map(|r| r.columns[column].name.clone()) else {
+            return;
+        };
+        let value = match self.shown(row, column) {
+            Shown::Read(value) => value,
+            _ => return,
+        };
+        let condition = db::browse::value_filter(engine, &name, &value);
+        self.rebrowse(
+            |spec| spec.filter = db::browse::and(engine, &spec.filter, &condition),
+            cx,
+        );
+    }
+
+    /// Header click: ascending, descending, then the default order.
+    pub(crate) fn toggle_sort(&mut self, column: usize, cx: &mut Context<Self>) {
+        let Some(name) = self.result().map(|r| r.columns[column].name.clone()) else {
+            return;
+        };
+        if self.browsing.is_none() {
+            return self.set_notice(
+                Some("Open a table from the Database tab to sort it".into()),
+                cx,
+            );
+        }
+        self.rebrowse(
+            |spec| {
+                spec.sort = match &spec.sort {
+                    Some((c, false)) if *c == name => Some((name, true)),
+                    Some((c, true)) if *c == name => None,
+                    _ => Some((name, false)),
+                }
+            },
+            cx,
+        );
+    }
+
+    /// Foreign keys among the result's columns, whether or not the rows
+    /// can be edited right now.
+    fn references(&self, cx: &App) -> Vec<(usize, db::ForeignKey)> {
+        let (Some(result), Some((engine, schema))) = (
+            self.result(),
+            self.store.read(cx).schema_of(&self.connection),
+        ) else {
+            return Vec::new();
+        };
+        db::edit::edit_target(engine, &schema, &self.query, &result.columns)
+            .map(|t| t.references)
+            .unwrap_or_default()
+    }
+
+    /// Opens the row the selected foreign key cell points at.
+    fn follow_reference(&mut self, _: &FollowReference, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((row, column)) = self.selected else {
+            return;
+        };
+        let Some((_, fk)) = self.references(cx).into_iter().find(|(c, _)| *c == column) else {
+            return self.set_notice(
+                Some("This column does not point at another table".into()),
+                cx,
+            );
+        };
+        let value = match self.shown(row, column) {
+            Shown::Read(Value::Null) | Shown::Staged(None) | Shown::Default => return,
+            Shown::Read(value) => value,
+            Shown::Staged(Some(text)) => Value::Text(text),
+        };
+        let Some((engine, schema)) = self.store.read(cx).schema_of(&self.connection) else {
+            return;
+        };
+        let Some(object) = schema.objects.iter().find(|o| {
+            o.name == fk.ref_table
+                && (fk.ref_namespace.is_none() || o.namespace == fk.ref_namespace)
+        }) else {
+            return;
+        };
+        if !self.changes.is_empty() {
+            return self.set_notice(Some("Apply or discard your changes first".into()), cx);
+        }
+        let mut spec = db::browse::Browse::of(object);
+        spec.filter = db::browse::value_filter(engine, &fk.ref_columns[0], &value);
+        // From a browsed table, Back returns to it; a query result is not
+        // kept.
+        if let Some(b) = &self.browsing {
+            let back = (self.connection.clone(), b.engine, b.spec.clone());
+            self.history.push(back);
+        }
+        self.browse(self.connection.clone(), engine, spec, cx);
+    }
+
+    fn browse_back(&mut self, _: &BrowseBack, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.changes.is_empty() {
+            return self.set_notice(Some("Apply or discard your changes first".into()), cx);
+        }
+        if let Some((connection, engine, spec)) = self.history.pop() {
+            self.browse(connection, engine, spec, cx);
+        }
+    }
+
     fn discard(&mut self, _: &DiscardChanges, _: &mut Window, cx: &mut Context<Self>) {
         self.editing = None;
         self.changes = Changes::default();
@@ -624,7 +928,7 @@ impl ResultsView {
                 this.applying = None;
                 match result {
                     // Show the rows as they are now.
-                    Ok(()) => this.run(this.connection.clone(), this.query.to_string(), cx),
+                    Ok(()) => this.reload(cx),
                     Err(e) => this.set_notice(Some(e.into()), cx),
                 }
             })
@@ -790,6 +1094,51 @@ impl ResultsView {
             .collect()
     }
 
+    fn render_filter_bar(
+        &self,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let b = self.browsing.as_ref()?;
+        let focused = self.filter.focus_handle(cx).is_focused(window);
+        Some(
+            div()
+                .key_context("ResultsFilter")
+                .flex_none()
+                .h(px(36.))
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_2()
+                .border_b_1()
+                .border_color(theme.line)
+                .text_size(UI_FONT_SIZE)
+                .font_family(crate::theme::UI_FONT)
+                .when(!self.history.is_empty(), |d| {
+                    d.child(ui::button("results-back-table", "Back", false, theme, {
+                        let view = cx.entity();
+                        move |_, window, cx| {
+                            view.update(cx, |this, cx| this.browse_back(&BrowseBack, window, cx))
+                        }
+                    }))
+                })
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(theme.fg_subtle)
+                        .font_family(crate::theme::CODE_FONT)
+                        .child(if b.engine == db::Engine::Mongo {
+                            "find"
+                        } else {
+                            "WHERE"
+                        }),
+                )
+                .child(ui::text_field(self.filter.clone(), focused, theme))
+                .into_any_element(),
+        )
+    }
+
     fn render_status(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let (text, color): (SharedString, _) = match &self.state {
             State::Empty => ("".into(), theme.fg_subtle),
@@ -802,6 +1151,11 @@ impl ResultsView {
                         Some(1) => format!("1 row affected · {ms:.0} ms"),
                         Some(n) => format!("{n} rows affected · {ms:.0} ms"),
                         None => format!("Done · {ms:.0} ms"),
+                    }
+                } else if let Some(b) = &self.browsing {
+                    match b.total {
+                        Some(total) => format!("{} of {total} rows", result.rows.len()),
+                        None => format!("{} rows", result.rows.len()),
                     }
                 } else if result.truncated {
                     format!("First {} rows · {ms:.0} ms", result.rows.len())
@@ -872,7 +1226,14 @@ impl ResultsView {
             )
     }
 
-    fn render_header(&self, result: &QueryResult, theme: &Theme) -> impl IntoElement {
+    fn render_header(
+        &self,
+        result: &QueryResult,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let references = self.references(cx);
+        let sort = self.browsing.as_ref().and_then(|b| b.spec.sort.clone());
         div()
             .flex_none()
             .h(ROW_HEIGHT)
@@ -886,27 +1247,52 @@ impl ResultsView {
                     .flex()
                     .ml(-self.pan)
                     .child(div().flex_none().w(self.number_width))
-                    .children(result.columns.iter().zip(&self.widths).map(|(c, w)| {
-                        div()
-                            .flex_none()
-                            .w(*w)
-                            .h(ROW_HEIGHT)
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .overflow_hidden()
-                            .border_r_1()
-                            .border_color(theme.line)
-                            .child(div().flex_none().text_color(theme.fg).child(c.name.clone()))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(theme.fg_subtle)
-                                    .child(c.type_name.clone()),
-                            )
-                    })),
+                    .children(result.columns.iter().zip(&self.widths).enumerate().map(
+                        |(i, (c, w))| {
+                            let arrow = match &sort {
+                                Some((name, false)) if *name == c.name => " ↑",
+                                Some((name, true)) if *name == c.name => " ↓",
+                                _ => "",
+                            };
+                            let target = references
+                                .iter()
+                                .find(|(column, _)| *column == i)
+                                .map(|(_, fk)| format!("→ {}", fk.ref_table));
+                            div()
+                                .id(("result-header", i))
+                                .flex_none()
+                                .w(*w)
+                                .h(ROW_HEIGHT)
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .overflow_hidden()
+                                .border_r_1()
+                                .border_color(theme.line)
+                                .when(self.browsing.is_some(), |d| d.hover(|d| d.bg(theme.line)))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_color(theme.fg)
+                                        .child(format!("{}{arrow}", c.name)),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(if target.is_some() {
+                                            theme.accent
+                                        } else {
+                                            theme.fg_subtle
+                                        })
+                                        .child(target.unwrap_or_else(|| c.type_name.clone())),
+                                )
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.toggle_sort(i, cx)),
+                                )
+                        },
+                    )),
             )
     }
 
@@ -1062,7 +1448,7 @@ impl Focusable for ResultsView {
 }
 
 impl Render for ResultsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let settings = Settings::get(cx).clone();
         let changes_bar = self.render_changes_bar(&theme);
@@ -1075,12 +1461,18 @@ impl Render for ResultsView {
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .child(self.render_header(&result, &theme))
+                    .child(self.render_header(&result, &theme, cx))
                     .child(
                         uniform_list(
                             "result-rows",
                             self.row_count(),
-                            cx.processor(|this, range, _, cx| this.render_rows(range, cx)),
+                            cx.processor(|this, range: Range<usize>, _, cx| {
+                                let loaded = this.result().map_or(0, |r| r.rows.len());
+                                if range.end + 20 >= loaded {
+                                    this.load_more(cx);
+                                }
+                                this.render_rows(range, cx)
+                            }),
                         )
                         .track_scroll(self.scroll.clone())
                         .flex_1(),
@@ -1105,6 +1497,12 @@ impl Render for ResultsView {
             .key_context(context)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::edit_cell))
+            .on_action(cx.listener(Self::focus_filter))
+            .on_action(cx.listener(Self::focus_grid))
+            .on_action(cx.listener(Self::apply_filter))
+            .on_action(cx.listener(Self::filter_by_value))
+            .on_action(cx.listener(Self::follow_reference))
+            .on_action(cx.listener(Self::browse_back))
             .on_action(cx.listener(Self::edit_inline))
             .on_action(cx.listener(Self::insert_row))
             .on_action(cx.listener(Self::duplicate_row))
@@ -1128,6 +1526,7 @@ impl Render for ResultsView {
             .font_family(settings.buffer_font_family.clone())
             .text_size(settings.buffer_font_size() - px(1.))
             .child(self.render_status(&theme, cx))
+            .children(self.render_filter_bar(&theme, window, cx))
             .children(changes_bar)
             .child(body)
             .child(

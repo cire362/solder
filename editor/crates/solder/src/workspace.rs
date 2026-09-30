@@ -308,6 +308,20 @@ impl Workspace {
                     DatabasePanelEvent::Run { connection, query } => {
                         this.run_query(connection.clone(), query.clone(), false, window, cx)
                     }
+                    DatabasePanelEvent::Browse {
+                        connection,
+                        engine,
+                        spec,
+                    } => {
+                        let (connection, engine, spec) =
+                            (connection.clone(), *engine, spec.clone());
+                        this.results
+                            .update(cx, |r, cx| r.browse(connection, engine, spec, cx));
+                        this.show_results = true;
+                        this.results_active = true;
+                        this.dock_open = true;
+                        cx.notify();
+                    }
                     DatabasePanelEvent::NewQuery { connection } => {
                         this.open_scratch_query(connection.to_string(), window, cx)
                     }
@@ -3875,6 +3889,115 @@ mod tests {
                 ["3", "1", "hello", "live"],
             ]
         );
+    }
+
+    #[gpui::test]
+    fn browsing_pages_filters_sorts_and_follows_references(cx: &mut TestAppContext) {
+        use crate::results::State;
+        let root = sqlite_fixture("browse");
+        futures::executor::block_on(async {
+            let session = db::Session::connect(db::ConnectionSpec {
+                name: "seed".into(),
+                engine: db::Engine::Sqlite,
+                url: root.join("dev.db").display().to_string(),
+                source: "test".into(),
+                read_only: false,
+            })
+            .await
+            .unwrap();
+            for q in [
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id), \
+                 title TEXT, status TEXT)",
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 450) \
+                 INSERT INTO posts (user_id, title, status) \
+                 SELECT 1 + i % 2, 'post ' || i, CASE WHEN i % 3 = 0 THEN 'live' ELSE 'draft' END FROM n",
+            ] {
+                session.query(q.into()).await.unwrap();
+            }
+        });
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        let (store, panel, results) = cx.read(|cx| {
+            let ws = ws.read(cx);
+            (
+                ws.database.clone(),
+                ws.database_panel.clone(),
+                ws.results.clone(),
+            )
+        });
+        cx.simulate_keystrokes("ctrl-shift-d");
+        wait_for(cx, "detection", &|cx| store.read(cx).detected());
+        panel.update(cx, |p, cx| p.toggle_connection(0, cx));
+        wait_for(cx, "schema", &|cx| {
+            store.read(cx).schema_of("DATABASE_URL").is_some()
+        });
+        // Tables are listed by name: posts, users.
+        panel.update(cx, |p, cx| p.open_object(0, 0, cx));
+        let loaded = |cx: &App| match &results.read(cx).state {
+            State::Done(r) => r.rows.len(),
+            _ => 0,
+        };
+        let total = |cx: &App| results.read(cx).browsing.as_ref().and_then(|b| b.total);
+        wait_for(cx, "first page", &|cx| {
+            loaded(cx) == 200 && total(cx) == Some(450)
+        });
+
+        // Scrolling to the last rows loads the next pages.
+        cx.update(|window, cx| window.focus(&results.focus_handle(cx)));
+        cx.simulate_keystrokes(&["down"; 199].join(" "));
+        wait_for(cx, "second page", &|cx| loaded(cx) == 400);
+        cx.simulate_keystrokes(&["down"; 200].join(" "));
+        wait_for(cx, "last page", &|cx| {
+            loaded(cx) == 450
+                && results
+                    .read(cx)
+                    .browsing
+                    .as_ref()
+                    .is_some_and(|b| b.exhausted)
+        });
+
+        // A typed filter, then narrowing by a cell's value.
+        cx.simulate_keystrokes("secondary-f");
+        cx.simulate_input("user_id = 2");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "filtered", &|cx| {
+            total(cx) == Some(225) && loaded(cx) == 200
+        });
+        // Row 3 (id 3) is 'live'; alt-f keeps only live posts of user 2.
+        cx.simulate_keystrokes("down right right right alt-f");
+        wait_for(cx, "narrowed", &|cx| total(cx) == Some(75));
+        assert_eq!(
+            cx.read(|cx| results.read(cx).query.to_string()),
+            "SELECT * FROM \"posts\" WHERE (user_id = 2) AND \"status\" = 'live' ORDER BY \"id\" LIMIT 200"
+        );
+
+        // Sorting by title from the header: descending on the second click.
+        results.update(cx, |r, cx| r.toggle_sort(2, cx));
+        wait_for(cx, "ascending", &|cx| {
+            results.read(cx).query.contains("ORDER BY \"title\" LIMIT") && loaded(cx) == 75
+        });
+        results.update(cx, |r, cx| r.toggle_sort(2, cx));
+        wait_for(cx, "sorted", &|cx| {
+            results.read(cx).query.contains("ORDER BY \"title\" DESC") && loaded(cx) == 75
+        });
+        assert_eq!(rows_of(&results, cx)[0][2], "post 99");
+
+        // Following user_id opens that user; Back returns to the posts.
+        // Reloading clears the selection: the first row's user_id.
+        cx.simulate_keystrokes("right alt-enter");
+        wait_for(cx, "user", &|cx| {
+            results
+                .read(cx)
+                .query
+                .starts_with("SELECT * FROM \"users\"")
+                && loaded(cx) == 1
+        });
+        assert_eq!(rows_of(&results, cx), [["2", "bob"]]);
+        cx.simulate_keystrokes("alt-left");
+        wait_for(cx, "back", &|cx| {
+            results.read(cx).query.contains("FROM \"posts\"") && loaded(cx) == 75
+        });
+        assert!(cx.read(|cx| results.read(cx).query.contains("DESC")));
     }
 
     #[gpui::test]

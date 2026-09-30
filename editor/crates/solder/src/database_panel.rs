@@ -26,6 +26,12 @@ pub enum DatabasePanelEvent {
         connection: SharedString,
         query: String,
     },
+    /// Show a table page by page, filtered and sorted without SQL.
+    Browse {
+        connection: SharedString,
+        engine: Engine,
+        spec: db::browse::Browse,
+    },
     /// Open the connection's scratch query file.
     NewQuery { connection: SharedString },
 }
@@ -163,9 +169,17 @@ impl DatabasePanel {
             }
         }
         self.store.update(cx, |s, _| s.set_last_used(&connection));
-        cx.emit(DatabasePanelEvent::Run {
-            connection,
-            query: db::preview_query(engine, &object),
+        // Tables and collections open for browsing; Redis keys show their value.
+        cx.emit(match object.kind {
+            ObjectKind::Key(_) => DatabasePanelEvent::Run {
+                connection,
+                query: db::preview_query(engine, &object),
+            },
+            _ => DatabasePanelEvent::Browse {
+                connection,
+                engine,
+                spec: db::browse::Browse::of(&object),
+            },
         });
         cx.notify();
     }
