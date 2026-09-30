@@ -235,6 +235,7 @@ pub fn bind_defaults(cx: &mut App) {
     crate::project_panel::bind_keys(cx);
     crate::terminal::bind_keys(cx);
     crate::git_panel::bind_keys(cx);
+    crate::file_diff::bind_keys(cx);
 }
 
 fn read(path: &Path) -> String {

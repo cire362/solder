@@ -10,7 +10,7 @@ use gpui::{
 
 use crate::{
     editor::Editor,
-    git::{Change, FileStatus},
+    git::{Change, DiffScope, FileStatus},
     git_store::GitStore,
     theme::{ActiveTheme, Theme, UI_FONT_SIZE},
     ui,
@@ -42,6 +42,7 @@ const ROW_HEIGHT: gpui::Pixels = px(24.);
 pub enum GitPanelEvent {
     OpenFile(PathBuf),
     OpenConflict(PathBuf),
+    ReviewDiff(PathBuf, DiffScope),
 }
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
@@ -375,12 +376,21 @@ impl GitPanel {
                     )
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
                             if let Some(abs) = this.absolute(&open_path, cx) {
                                 cx.emit(if section == Section::Conflicts {
                                     GitPanelEvent::OpenConflict(abs)
-                                } else {
+                                } else if event.click_count == 2 && !deleted {
                                     GitPanelEvent::OpenFile(abs)
+                                } else {
+                                    GitPanelEvent::ReviewDiff(
+                                        abs,
+                                        if section == Section::Staged {
+                                            DiffScope::Staged
+                                        } else {
+                                            DiffScope::Working
+                                        },
+                                    )
                                 });
                             }
                         }),
