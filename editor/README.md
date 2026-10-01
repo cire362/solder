@@ -92,7 +92,8 @@ implies (scripts in subfolders are named after them, like `api: pnpm run start`)
 A Next.js `dev` script also comes as **+ browser**: the server runs under the
 debugger and, once it prints its address, the page opens in Chrome in the same
 session, so breakpoints stop in server and page code alike. Chrome gets a
-temporary profile of its own; your usual profile is never touched.
+profile of its own in the app's data folder, kept between runs; your usual
+profile is never touched.
 
 The first run downloads Microsoft's js-debug (pinned version, SHA-256 checked,
 1.2 MB) into the app's data folder; Node itself is the one on your machine. When

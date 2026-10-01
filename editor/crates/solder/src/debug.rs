@@ -648,7 +648,8 @@ impl DebugStore {
             .as_ref()
             .and_then(|c| c.request["cwd"].as_str().map(PathBuf::from))
             .unwrap_or_else(|| self.root.clone());
-        let request = crate::debug_launch::browser_request(&url, &web_root);
+        let profile = self.data_dir.join("chrome-profile");
+        let request = crate::debug_launch::browser_request(&url, &web_root, &profile);
         self.log("console", format!("Opening {url} in a browser"));
         self.open_session(adapter_port, BROWSER.into(), None, "launch", request, cx);
     }

@@ -142,15 +142,17 @@ pub fn detect(root: &Path, file: Option<&Path>) -> Vec<LaunchConfig> {
 }
 
 /// The browser half of a server-and-browser session.
-pub fn browser_request(url: &str, web_root: &Path) -> Value {
+pub fn browser_request(url: &str, web_root: &Path, profile: &Path) -> Value {
     json!({
         "type": "pwa-chrome",
         "request": "launch",
         "name": "Browser",
         "url": url,
         "webRoot": web_root,
-        // A profile of its own, so the user's browser is never touched.
-        "userDataDir": true,
+        // A profile of its own, so the user's browser is never touched. Kept
+        // and reused: with `true`, js-debug run on its own makes a new one in
+        // the temp folder per run (50 MB and more) and never removes it.
+        "userDataDir": profile,
     })
 }
 
@@ -200,9 +202,8 @@ mod tests {
         );
         assert_eq!(script_port("next dev --port=5000", 3000), 5000);
         assert_eq!(script_port("next dev", 3000), 3000);
-        assert_eq!(
-            browser_request("http://localhost:3000", &root)["type"],
-            "pwa-chrome"
-        );
+        let browser = browser_request("http://localhost:3000", &root, &root.join("profile"));
+        assert_eq!(browser["type"], "pwa-chrome");
+        assert_eq!(browser["userDataDir"], json!(root.join("profile")));
     }
 }
