@@ -17,6 +17,7 @@ pub mod hardware;
 pub mod install;
 pub mod keys;
 pub mod provider;
+pub mod review;
 pub mod server;
 pub mod tools;
 

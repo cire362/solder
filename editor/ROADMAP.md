@@ -69,7 +69,8 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 - [x] Agent tasks in their own branch and worktree with an editable plan: edits,
       commands and tests in a loop, network and outside-project commands confirmed,
       review the diff and merge (commands sandboxed with `sandbox-exec` or `bwrap`)
-- [ ] AI review before push
+- [x] AI review before push (outgoing commits' diff, findings as data, push waits
+      only when something is found)
 
 ## 7. Debugger, plugins, onboarding
 - [ ] Debugger over DAP; one session across browser and server; query timeline

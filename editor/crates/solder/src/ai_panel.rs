@@ -373,6 +373,44 @@ impl AiPanel {
             .child(list)
             .child(form)
             .child(completions)
+            .child(self.render_review_toggle(theme, cx))
+            .into_any_element()
+    }
+
+    fn render_review_toggle(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let on = self.store.read(cx).review_push;
+        let entity = self.store.clone();
+        div()
+            .px_3()
+            .pt_4()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.fg_subtle)
+                    .child("REVIEW BEFORE PUSH"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(UI_FONT_SIZE - px(1.))
+                            .text_color(theme.fg_subtle)
+                            .child("Push in the Git tab first has the chat model read what it sends; problems stop the push until you decide."),
+                    )
+                    .child(
+                        ui::toggle("ai-review-push", "on", "", on, theme, move |_, _, cx| {
+                            entity.update(cx, |s, cx| s.set_review_push(!on, cx))
+                        })
+                        .debug_selector(|| "ai-review-push".into()),
+                    ),
+            )
             .into_any_element()
     }
 

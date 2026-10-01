@@ -456,6 +456,18 @@ command (which declines that command) or after it finished. **Stop** halts it
 between steps. Files `.env` and `.solderignore` keep from AI stay unreadable to
 it, as in the chat; a task stops after 60 steps and asks how to go on.
 
+### Review before push
+
+**Push** in the Git tab first has the chat model read what the push sends: the
+commits not on the upstream yet (or on `origin/main`, `main` when there is no
+upstream) and their diff, without files `.env` or `.solderignore` keep from AI and
+within 60 KB (larger files are left out and named). The model reports problems
+through a tool, as data: file, line, bug / risk / note, and a sentence. With
+nothing found the push goes ahead; otherwise the findings show above the commit
+box, each opening its file at its line, with **Push anyway** and **Cancel**. Turn
+it off under **Review before push** in the AI tab's Providers view; without a
+chat model Push just pushes.
+
 ## Measured so far
 
 Apple M4, 16 GB, built-in 60 Hz display, release build.
