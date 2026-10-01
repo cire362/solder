@@ -170,6 +170,10 @@ pub struct PrepaintState {
     selections: Vec<PaintQuad>,
     placeholder: Option<ShapedLine>,
     cursors: Vec<PaintQuad>,
+    /// A suggestion at the cursor: its lines, and backgrounds that hide the
+    /// rows its later lines are drawn over.
+    ghost: Vec<(ShapedLine, Point<Pixels>)>,
+    ghost_background: Vec<PaintQuad>,
     gutter: Vec<(ShapedLine, Point<Pixels>)>,
 }
 
@@ -282,6 +286,12 @@ impl Element for EditorElement {
                     line.shaped
                         .paint(origin, layout.line_height, window, cx)
                         .ok();
+                }
+                for quad in state.ghost_background.drain(..) {
+                    window.paint_quad(quad);
+                }
+                for (line, origin) in state.ghost.drain(..) {
+                    line.paint(origin, layout.line_height, window, cx).ok();
                 }
                 for quad in state.cursors.drain(..) {
                     window.paint_quad(quad);
@@ -533,6 +543,54 @@ fn layout(
         }
     }
 
+    // The suggestion's first line continues the cursor's row; the rest are
+    // drawn over the rows below, on the editor's background.
+    let mut ghost = Vec::new();
+    let mut ghost_background = Vec::new();
+    if focused
+        && editor.showing_ghost()
+        && let Some(g) = &editor.ghost
+    {
+        let at = buffer.offset_to_point(g.offset);
+        for (i, text) in g.text.split('\n').enumerate() {
+            let row = at.row + i;
+            if row < first_row || row >= end_row {
+                if row >= end_row {
+                    break;
+                }
+                continue;
+            }
+            let x = if i == 0 {
+                text_x(lines[at.row - first_row].x_for(at.column))
+            } else {
+                ghost_background.push(fill(
+                    Bounds::new(
+                        point(text_bounds.left(), row_y(row)),
+                        size(text_bounds.size.width, lh),
+                    ),
+                    theme.bg,
+                ));
+                text_x(px(0.))
+            };
+            if text.is_empty() {
+                continue;
+            }
+            let text: SharedString = text.replace('\t', &" ".repeat(text::TAB_SIZE)).into();
+            let run = TextRun {
+                len: text.len(),
+                font: code_font.clone(),
+                color: theme.fg_subtle,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let shaped = window
+                .text_system()
+                .shape_line(text, font_size, &[run], None);
+            ghost.push((shaped, point(x, row_y(row))));
+        }
+    }
+
     let mut highlights = Vec::new();
     let matches = editor.search_matches.clone();
     let first_match = matches.partition_point(|m| m.end < visible.start);
@@ -700,6 +758,8 @@ fn layout(
         selections: selection_quads,
         placeholder,
         cursors,
+        ghost,
+        ghost_background,
         gutter,
     }
 }

@@ -42,8 +42,14 @@ pub struct AiStore {
     pub offline: bool,
     pub(crate) keys: Keys,
     /// The local server chat is using, and the model it is starting.
-    pub(crate) local: Option<Running>,
+    pub(crate) local: Vec<Running>,
     pub starting: Option<String>,
+    /// Suggest code at the cursor while typing, when a model has the task.
+    pub completions: bool,
+    /// Local models found unable to fill in the middle; asked through chat.
+    pub no_infill: std::collections::HashSet<String>,
+    /// Open projects, for the `.solderignore` that covers a file.
+    pub roots: Vec<PathBuf>,
     /// Models added by hand, kept in `ai.json`.
     pub custom: Vec<Model>,
     /// Models found in LM Studio's folders, read again on each start.
@@ -97,8 +103,11 @@ impl AiStore {
             providers: ai_providers::builtin(&Urls::default()),
             offline: false,
             keys,
-            local: None,
+            local: Vec::new(),
             starting: None,
+            completions: true,
+            no_infill: Default::default(),
+            roots: Vec::new(),
             custom: Vec::new(),
             found: Vec::new(),
             installed: Vec::new(),
@@ -133,6 +142,11 @@ impl AiStore {
         store
     }
 
+    /// The store, if AI has been used in this run; never creates it.
+    pub fn try_global(cx: &App) -> Option<Entity<AiStore>> {
+        cx.try_global::<GlobalAiStore>().map(|g| g.0.clone())
+    }
+
     #[cfg(test)]
     pub fn set_global(store: Entity<AiStore>, cx: &mut App) {
         cx.set_global(GlobalAiStore(store));
@@ -151,6 +165,28 @@ impl AiStore {
         self.keys = Keys::file_only(self.dirs.root.join("keys.json"));
         self.providers = ai_providers::builtin(&urls);
         self
+    }
+
+    /// Remembers an open project, whose rules apply to its files.
+    pub fn add_root(&mut self, root: PathBuf) {
+        if !self.roots.contains(&root) {
+            self.roots.push(root);
+        }
+    }
+
+    /// The deepest open project holding `path`.
+    pub fn root_for(&self, path: &std::path::Path) -> Option<PathBuf> {
+        self.roots
+            .iter()
+            .filter(|r| path.starts_with(r))
+            .max_by_key(|r| r.components().count())
+            .cloned()
+    }
+
+    pub fn set_completions(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.completions = on;
+        self.save(cx);
+        cx.notify();
     }
 
     /// The local provider lists what is installed.
@@ -214,6 +250,7 @@ impl AiStore {
                         .filter_map(Model::from_json)
                         .collect();
                     this.offline = state["offline"].as_bool().unwrap_or(false);
+                    this.completions = state["completions"].as_bool().unwrap_or(true);
                     for p in state["providers"].as_array().into_iter().flatten() {
                         if let Some(p) = ProviderInfo::compatible_from_json(p)
                             && this.provider(&p.id).is_none()
@@ -266,6 +303,7 @@ impl AiStore {
                 .map(ProviderInfo::to_json)
                 .collect::<Vec<_>>(),
             "offline": self.offline,
+            "completions": self.completions,
         });
         let path = self.dirs.state();
         cx.background_executor()
@@ -548,9 +586,7 @@ impl AiStore {
     pub fn remove(&mut self, model: Model, cx: &mut Context<Self>) {
         self.installed.retain(|id| *id != model.id);
         self.roles.retain(|_, m| *m != ModelRef::local(&model.id));
-        if self.local.as_ref().is_some_and(|r| r.model == model.id) {
-            self.stop_local();
-        }
+        self.stop_local_model(&model.id);
         self.sync_local();
         self.verified.remove(&model.id);
         self.custom.retain(|m| m.id != model.id);

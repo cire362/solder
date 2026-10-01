@@ -187,6 +187,8 @@ pub struct Running {
 
 /// A local server unused this long is stopped, to give its memory back.
 const IDLE: Duration = Duration::from_secs(10 * 60);
+/// Local servers at once: the chat model and the completion model.
+const MAX_LOCAL: usize = 2;
 
 impl AiStore {
     pub fn provider(&self, id: &str) -> Option<&ProviderInfo> {
@@ -419,16 +421,37 @@ impl AiStore {
         id: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<Endpoint, String>> {
-        if let Some(running) = &mut self.local
-            && running.model == id
-            && running.server.is_running()
-        {
+        self.local.retain_mut(|r| r.server.is_running());
+        if let Some(running) = self.local.iter_mut().find(|r| r.model == id) {
             running.used = Instant::now();
-            return Task::ready(Ok(Endpoint {
-                api: Api::OpenAi,
-                base_url: format!("{}/v1", running.server.url()),
-                key: Some(running.server.key.clone()),
-            }));
+            return Task::ready(Ok(Self::local_api(&running.server)));
+        }
+        if self.starting.as_deref() == Some(id.as_str()) {
+            // Chat and completions may ask at once: wait for the one start.
+            return cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                    let ready = this
+                        .update(cx, |this, _| {
+                            if this.starting.as_deref() == Some(id.as_str()) {
+                                return None;
+                            }
+                            Some(
+                                this.local
+                                    .iter()
+                                    .find(|r| r.model == id)
+                                    .map(|r| Self::local_api(&r.server))
+                                    .ok_or_else(|| "The model did not start".to_string()),
+                            )
+                        })
+                        .map_err(|e| e.to_string())?;
+                    if let Some(ready) = ready {
+                        return ready;
+                    }
+                }
+            });
         }
         let Some(model) = self.models().into_iter().find(|m| m.id == id) else {
             return Task::ready(Err("That model is not installed".into()));
@@ -438,12 +461,18 @@ impl AiStore {
                 "Run the benchmark in the AI tab to install llama.cpp".into()
             ));
         };
-        // One model in memory at a time.
-        self.stop_local();
+        // Room for the chat model and the completion model; a third
+        // replaces the one used longest ago.
+        while self.local.len() >= MAX_LOCAL {
+            let oldest = (0..self.local.len())
+                .min_by_key(|&i| self.local[i].used)
+                .unwrap_or(0);
+            self.local.remove(oldest).server.stop();
+        }
         self.starting = Some(id.clone());
         cx.notify();
         let path = self.dirs.model(&model);
-        let logs = self.dirs.logs();
+        let logs = self.dirs.logs().join(model.id.replace(['/', ':'], "_"));
         let context = model.context;
         cx.spawn(async move |this, cx| {
             let started = ai::spawn(ai::LocalServer::start(binary, path, context, logs)).await;
@@ -451,34 +480,63 @@ impl AiStore {
                 this.starting = None;
                 cx.notify();
                 let server = started?;
-                let endpoint = Endpoint {
-                    api: Api::OpenAi,
-                    base_url: format!("{}/v1", server.url()),
-                    key: Some(server.key.clone()),
-                };
-                this.local = Some(Running {
+                let endpoint = Self::local_api(&server);
+                this.local.push(Running {
                     model: id,
                     server,
                     used: Instant::now(),
                 });
-                this.watch_idle(cx);
+                if this.local.len() == 1 {
+                    this.watch_idle(cx);
+                }
                 Ok(endpoint)
             })
             .map_err(|e| e.to_string())?
         })
     }
 
-    /// Marks the local server as used, so it is not stopped while chatting.
-    pub fn touch(&mut self) {
-        if let Some(running) = &mut self.local {
+    fn local_api(server: &ai::LocalServer) -> Endpoint {
+        Endpoint {
+            api: Api::OpenAi,
+            base_url: format!("{}/v1", server.url()),
+            key: Some(server.key.clone()),
+        }
+    }
+
+    /// Marks a local model's server as used, so it is not stopped while in
+    /// use.
+    pub fn touch(&mut self, model: &ModelRef) {
+        if model.provider != LOCAL {
+            return;
+        }
+        if let Some(running) = self.local.iter_mut().find(|r| r.model == model.model) {
             running.used = Instant::now();
         }
     }
 
+    /// Marks the model serving `role` as used.
+    pub fn touch_role(&mut self, role: ai::Role) {
+        if let Some(model) = self.roles.get(&role).cloned() {
+            self.touch(&model);
+        }
+    }
+
+    /// Stops every local server: before measuring, and on quit.
     pub fn stop_local(&mut self) {
-        if let Some(mut running) = self.local.take() {
+        for mut running in self.local.drain(..) {
             running.server.stop();
         }
+    }
+
+    pub fn stop_local_model(&mut self, id: &str) {
+        if let Some(i) = self.local.iter().position(|r| r.model == id) {
+            self.local.remove(i).server.stop();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_running(&self, id: &str) -> bool {
+        self.local.iter().any(|r| r.model == id)
     }
 
     fn watch_idle(&mut self, cx: &mut Context<Self>) {
@@ -489,11 +547,18 @@ impl AiStore {
                     .await;
                 let running = this
                     .update(cx, |this, cx| {
-                        if this.local.as_ref().is_some_and(|r| r.used.elapsed() > IDLE) {
-                            this.stop_local();
+                        let before = this.local.len();
+                        this.local.retain_mut(|r| {
+                            let idle = r.used.elapsed() > IDLE;
+                            if idle {
+                                r.server.stop();
+                            }
+                            !idle
+                        });
+                        if this.local.len() != before {
                             cx.notify();
                         }
-                        this.local.is_some()
+                        !this.local.is_empty()
                     })
                     .unwrap_or(false);
                 if !running {

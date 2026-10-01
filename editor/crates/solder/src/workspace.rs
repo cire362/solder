@@ -268,6 +268,7 @@ impl Workspace {
         let database_panel = cx.new(|cx| DatabasePanel::new(database.clone(), cx));
         let api_panel = cx.new(|cx| crate::api_panel::ApiPanel::new(root.clone(), cx));
         let ai_store = crate::ai_store::AiStore::global(cx);
+        ai_store.update(cx, |s, _| s.add_root(root.clone()));
         let ai_panel = cx.new(|cx| crate::ai_panel::AiPanel::new(ai_store.clone(), cx));
         let weak = cx.entity().downgrade();
         let chat = cx.new(|cx| crate::chat_panel::ChatPanel::new(ai_store, weak, cx));
@@ -6982,11 +6983,167 @@ mod tests {
         assert_eq!(chat_answer(&ws, cx), "Local answer to: Explain this");
         cx.read(|cx| {
             let s = store.read(cx);
-            assert!(s.local.as_ref().is_some_and(|r| r.model == model.id));
+            assert!(s.is_running(&model.id));
         });
         // Removing the model stops its server.
         let model = model.clone();
         store.update(cx, |s, cx| s.remove(model, cx));
-        assert!(cx.read(|cx| store.read(cx).local.is_none()));
+        assert!(cx.read(|cx| store.read(cx).local.is_empty()));
+    }
+
+    /// The mock llama.cpp server installed, with the calibration model.
+    fn mock_local_model(
+        root: &Path,
+        store: &Entity<crate::ai_store::AiStore>,
+        cx: &mut VisualTestContext,
+    ) -> ai::Model {
+        let data = root.join("data");
+        let bin = data.join("llama").join(ai::install::LLAMA_BUILD);
+        std::fs::create_dir_all(&bin).unwrap();
+        let mock =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../ai/tests/fixtures/mock_llama_server.py");
+        std::fs::copy(mock, bin.join("llama-server")).unwrap();
+        let model = ai::catalog::calibration().clone();
+        let file = ai::Dirs::new(&data).model(&model);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "GGUF").unwrap();
+        store.update(cx, |s, cx| s.load(cx));
+        wait_for(cx, "the install", &|cx| {
+            store.read(cx).installed.contains(&model.id)
+        });
+        model
+    }
+
+    fn ghost_text(ws: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<String> {
+        cx.read(|cx| {
+            let editor = ws.read(cx).active_editor()?.read(cx);
+            editor
+                .showing_ghost()
+                .then(|| editor.ghost.as_ref().unwrap().text.clone())
+        })
+    }
+
+    #[gpui::test]
+    fn completions_suggest_stream_and_insert_at_the_cursor(cx: &mut TestAppContext) {
+        let (root, store, ws, cx) = ai_setup(cx, "ghost", down_urls());
+        let model = mock_local_model(&root, &store, cx);
+        store.update(cx, |s, cx| s.set_role(ai::Role::Completion, &model.id, cx));
+        let file = root.join("src/add.js");
+        std::fs::write(&file, "function add(a, b) {\n  \n}\n").unwrap();
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(file.clone(), None, window, cx)
+        });
+        cx.run_until_parked();
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let at = "function add(a, b) {\n  ".len();
+        editor.update(cx, |e, cx| {
+            e.select_ranges(std::slice::from_ref(&(at..at)), cx)
+        });
+
+        // A pause after typing asks; the answer streams in at the cursor.
+        cx.simulate_input(" ");
+        wait_for(cx, "a suggestion", &|cx| {
+            let e = ws.read(cx).active_editor().unwrap().read(cx);
+            e.showing_ghost() && e.ghost_task.is_none()
+        });
+        assert_eq!(ghost_text(&ws, cx).as_deref(), Some("return a + b;"));
+        assert!(cx.read(|cx| store.read(cx).is_running(&model.id)));
+
+        // Typing what it suggests keeps the rest; the file has only what was typed.
+        cx.simulate_input("ret");
+        assert_eq!(ghost_text(&ws, cx).as_deref(), Some("urn a + b;"));
+        assert_eq!(active_text(&ws, cx), "function add(a, b) {\n   ret\n}\n");
+
+        // Tab inserts it, one step to undo.
+        cx.simulate_keystrokes("tab");
+        assert_eq!(
+            active_text(&ws, cx),
+            "function add(a, b) {\n   return a + b;\n}\n"
+        );
+        assert_eq!(ghost_text(&ws, cx), None);
+        cx.simulate_keystrokes("secondary-z");
+        assert_eq!(active_text(&ws, cx), "function add(a, b) {\n   ret\n}\n");
+
+        // Escape dismisses; moving the cursor drops it too.
+        cx.simulate_input(" ");
+        wait_for(cx, "another suggestion", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .unwrap()
+                .read(cx)
+                .showing_ghost()
+        });
+        cx.simulate_keystrokes("escape");
+        assert_eq!(ghost_text(&ws, cx), None);
+        assert_eq!(active_text(&ws, cx), "function add(a, b) {\n   ret \n}\n");
+        cx.simulate_input("x");
+        wait_for(cx, "a third suggestion", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .unwrap()
+                .read(cx)
+                .showing_ghost()
+        });
+        cx.simulate_keystrokes("left");
+        assert_eq!(ghost_text(&ws, cx), None);
+
+        // Off: nothing is asked.
+        store.update(cx, |s, cx| s.set_completions(false, cx));
+        cx.simulate_keystrokes("end");
+        cx.simulate_input("y");
+        settle(cx);
+        assert_eq!(ghost_text(&ws, cx), None);
+        store.update(cx, |s, _| s.stop_local());
+    }
+
+    #[gpui::test]
+    fn completions_respect_exclusions_and_fall_back_to_chat(cx: &mut TestAppContext) {
+        let (root, store, ws, cx) = ai_setup(cx, "ghost-rules", down_urls());
+        mock_local_model(&root, &store, cx);
+        // A model without fill-in-the-middle tokens, added from disk.
+        let own = root.join("models/own-nofim.gguf");
+        std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+        std::fs::write(&own, tiny_gguf()).unwrap();
+        store.update(cx, |s, cx| s.add(own.display().to_string(), cx));
+        wait_for(cx, "the added model", &|cx| {
+            !store.read(cx).custom.is_empty()
+        });
+        let id = cx.read(|cx| store.read(cx).custom[0].id.clone());
+        store.update(cx, |s, cx| s.set_role(ai::Role::Completion, &id, cx));
+
+        std::fs::write(root.join(".solderignore"), "secret/\n").unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        for name in ["secret/key.js", "src/mul.js"] {
+            std::fs::write(root.join(name), "function f(a, b) {\n  \n}\n").unwrap();
+        }
+        let at = "function f(a, b) {\n  ".len();
+        let type_in = |name: &str, cx: &mut VisualTestContext| {
+            ws.update_in(cx, |w, window, cx| {
+                w.open_path(root.join(name), None, window, cx)
+            });
+            cx.run_until_parked();
+            let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+            editor.update(cx, |e, cx| {
+                e.select_ranges(std::slice::from_ref(&(at..at)), cx)
+            });
+            cx.simulate_input("r");
+        };
+
+        // A file .solderignore keeps from AI gets nothing, and nothing starts.
+        type_in("secret/key.js", cx);
+        settle(cx);
+        assert_eq!(ghost_text(&ws, cx), None);
+        assert!(cx.read(|cx| store.read(cx).local.is_empty()));
+
+        // This model cannot fill in the middle: asked through chat instead,
+        // with the fence the chat answer wraps it in removed.
+        type_in("src/mul.js", cx);
+        wait_for(cx, "a suggestion through chat", &|cx| {
+            let e = ws.read(cx).active_editor().unwrap().read(cx);
+            e.showing_ghost() && e.ghost_task.is_none()
+        });
+        assert_eq!(ghost_text(&ws, cx).as_deref(), Some("a * b;"));
+        assert!(cx.read(|cx| store.read(cx).no_infill.contains(&id)));
+        store.update(cx, |s, _| s.stop_local());
     }
 }

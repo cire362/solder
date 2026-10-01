@@ -90,6 +90,8 @@ actions!(
         AcceptTheirs,
         AcceptBoth,
         NextConflict,
+        AcceptGhost,
+        DismissGhost,
     ]
 );
 
@@ -167,6 +169,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-k 2", AcceptTheirs, full),
         KeyBinding::new("secondary-k 3", AcceptBoth, full),
         KeyBinding::new("secondary-k n", NextConflict, full),
+    ]);
+    // After the editor's own Tab and Escape, so these win while a suggestion
+    // shows.
+    let ghost = Some("Editor && showing_ghost");
+    cx.bind_keys([
+        KeyBinding::new("tab", AcceptGhost, ghost),
+        KeyBinding::new("escape", DismissGhost, ghost),
     ]);
     #[cfg(target_os = "macos")]
     cx.bind_keys([
@@ -281,6 +290,8 @@ pub struct Editor {
     pub(crate) active_match: Option<usize>,
     pub(crate) completion: Option<crate::completion::CompletionMenu>,
     pub(crate) completion_task: Option<Task<()>>,
+    pub(crate) ghost: Option<crate::inline_completion::Ghost>,
+    pub(crate) ghost_task: Option<Task<()>>,
     pub(crate) hover: Option<crate::editor_lsp::Hover>,
     pub(crate) hover_task: Option<Task<()>>,
     pub(crate) signature: Option<crate::editor_lsp::SignatureHint>,
@@ -316,6 +327,8 @@ impl Editor {
             DocumentEvent::Edited { edits, origin } => {
                 if *origin != Some(cx.entity_id()) {
                     this.follow_edits(edits, cx);
+                    // Text changed under the suggestion.
+                    this.clear_ghost(cx);
                 }
                 cx.emit(EditorEvent::Edited);
                 cx.notify();
@@ -344,6 +357,8 @@ impl Editor {
             search_matches: Arc::default(),
             active_match: None,
             completion: None,
+            ghost: None,
+            ghost_task: None,
             completion_task: None,
             schema_source: None,
             hover: None,
@@ -576,6 +591,7 @@ impl Editor {
 
     fn selections_changed(&mut self, cx: &mut Context<Self>) {
         self.autoscroll = true;
+        self.sync_ghost(cx);
         cx.emit(EditorEvent::SelectionsChanged);
         cx.notify();
     }
@@ -589,6 +605,7 @@ impl Editor {
     ) {
         Perf::input_started(cx);
         self.hide_popovers(cx);
+        self.clear_ghost(cx);
         let moved: Vec<Selection> = self
             .selections
             .iter()
@@ -1718,11 +1735,14 @@ impl Render for Editor {
         let single_line = self.is_single_line();
         div()
             .id("editor")
-            .key_context(match (single_line, self.completion.is_some()) {
-                (true, _) => "Editor mode=single_line",
-                (false, true) => "Editor mode=full showing_completions",
-                (false, false) => "Editor mode=full",
-            })
+            .key_context(
+                match (single_line, self.completion.is_some(), self.showing_ghost()) {
+                    (true, _, _) => "Editor mode=single_line",
+                    (false, true, _) => "Editor mode=full showing_completions",
+                    (false, false, true) => "Editor mode=full showing_ghost",
+                    (false, false, false) => "Editor mode=full",
+                },
+            )
             .track_focus(&self.focus_handle)
             .when(single_line, |d| {
                 d.w_full()
@@ -1730,6 +1750,8 @@ impl Render for Editor {
             })
             .when(!single_line, |d| d.size_full().bg(cx.theme().bg))
             .cursor(CursorStyle::IBeam)
+            .on_action(cx.listener(Self::accept_ghost))
+            .on_action(cx.listener(Self::dismiss_ghost))
             .on_action(cx.listener(Self::move_left))
             .on_action(cx.listener(Self::move_right))
             .on_action(cx.listener(Self::move_up))
