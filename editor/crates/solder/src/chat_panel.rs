@@ -289,7 +289,7 @@ impl ChatPanel {
             while let Some(event) = events.recv().await {
                 let keep_going = this
                     .update(cx, |this, cx| {
-                        this.store.update(cx, |s, _| s.touch());
+                        this.store.update(cx, |s, _| s.touch_role(Role::Chat));
                         let ix = this.messages.len() - 1;
                         let Some(last) = this.messages.last_mut() else {
                             return false;

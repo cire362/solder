@@ -187,6 +187,7 @@ impl Editor {
 
     fn after_typing_synced(&mut self, text: &str, cx: &mut Context<Self>) {
         self.hover = None;
+        self.schedule_ghost(cx);
         let Some(c) = text.chars().last() else { return };
         self.maybe_signature_help(c, cx);
         let triggers: Vec<String> = LspStore::global(cx)

@@ -155,6 +155,17 @@ impl Policy {
     }
 }
 
+/// Whether one file may go to a model: the `.env` rule and the project's
+/// `.solderignore`, without walking the project. Blocks on a small read.
+pub fn allows_path(root: &Path, path: &Path) -> Result<bool, String> {
+    if !ai::context::allows_file(path) {
+        return Ok(false);
+    }
+    let policy = Policy::load(root)?;
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    Ok(policy.allows(&path, false))
+}
+
 pub fn prepare(input: Input, cancelled: &AtomicBool) -> Result<Prepared, String> {
     let stopped = || cancelled.load(Ordering::Relaxed);
     if stopped() {
@@ -528,5 +539,28 @@ mod tests {
         assert!(!map.text.contains("BINARY_SECRET"));
         assert!(!map.text.contains("LARGE_SECRET"));
         assert!(map.text.contains("line\\nbreak.rs"));
+    }
+
+    #[test]
+    fn checks_one_file_without_walking_the_project() {
+        let root = fixture("ai-allows-path");
+        fs::write(root.join(".solderignore"), "secret/\n*.pem\n").unwrap();
+        fs::create_dir_all(root.join("secret")).unwrap();
+        for (path, allowed) in [
+            ("src/app.rs", true),
+            ("secret/key.rs", false),
+            ("certs/server.pem", false),
+            (".env", false),
+            ("config/.env.local", false),
+            ("node_modules/x/index.js", false),
+        ] {
+            assert_eq!(
+                allows_path(&root, &root.join(path)).unwrap(),
+                allowed,
+                "{path}"
+            );
+        }
+        // Outside the project nothing is known to be allowed.
+        assert!(!allows_path(&root, Path::new("/elsewhere/app.rs")).unwrap());
     }
 }

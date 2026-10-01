@@ -341,7 +341,7 @@ Everything lives in `~/Library/Application Support/Solder` (on Linux,
 The AI tab's **Providers** view lists local llama.cpp, Ollama, LM Studio,
 Anthropic and OpenAI. Add another OpenAI-compatible service with its name,
 address up to `/v1` and an optional key. Choose separate models for chat and
-completions; selecting a completion model does not yet enable inline completions.
+completions; two local models can run at once, so each keeps its own server.
 
 Keys come from `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`, or from the provider's
 key field. Saved keys use macOS Keychain or Linux Secret Service when available;
@@ -410,7 +410,24 @@ newer changes, including edits from another split view.
 
 Malformed, disconnected, token-limited and oversized answers cannot be applied.
 This is a single-target text edit, not an agent: it cannot run commands, change
-other files or save on its own. Inline completions remain unimplemented.
+other files or save on its own.
+
+### Completions as you type
+
+With a model chosen under **Completions** in the Providers view (or the
+**complete** toggle on a local model), a pause in typing at the end of a line
+asks it for what comes next. The suggestion streams in as faint text after the
+cursor; lines after the first are drawn over the rows below. Tab inserts it as
+one undo step, Escape dismisses it, and typing what it suggests keeps the rest.
+Moving the cursor or any other edit drops it. **as I type** turns them off.
+
+Local models fill in the middle through llama.cpp's `/infill`: they see the code
+before and after the cursor (up to 6 KB and 2 KB). A model without
+fill-in-the-middle tokens, and every other provider, is asked through chat for
+the missing text only, with any code fence and repeated start of the line
+removed. Files `.env` or `.solderignore` keeps from AI are never sent; the check
+reads only the file's own rules, not the whole project, so it costs nothing
+noticeable while typing.
 
 ## Measured so far
 

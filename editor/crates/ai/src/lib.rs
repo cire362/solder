@@ -8,6 +8,7 @@
 
 pub mod bench;
 pub mod catalog;
+pub mod complete;
 pub mod context;
 pub mod custom;
 pub mod edit;

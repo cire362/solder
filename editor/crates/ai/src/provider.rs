@@ -98,7 +98,7 @@ fn chat_url(endpoint: &Endpoint) -> String {
     }
 }
 
-fn request(endpoint: &Endpoint, url: &str) -> reqwest::RequestBuilder {
+pub(crate) fn request(endpoint: &Endpoint, url: &str) -> reqwest::RequestBuilder {
     let mut builder = client()
         .post(url)
         .header("Content-Type", "application/json");
@@ -215,7 +215,7 @@ fn decode(api: Api, data: &str) -> Result<Vec<Event>, String> {
 }
 
 /// What a failed request means, in a sentence.
-fn status_error(status: u16, body: &str) -> String {
+pub(crate) fn status_error(status: u16, body: &str) -> String {
     let detail = serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| {

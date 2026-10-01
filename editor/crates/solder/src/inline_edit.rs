@@ -317,7 +317,8 @@ impl InlineEdit {
                                 .await;
                             this.update(cx, |this, cx| {
                                 this.lines = lines;
-                                this.store.update(cx, |store, _| store.touch());
+                                this.store
+                                    .update(cx, |store, _| store.touch_role(Role::Chat));
                                 cx.notify();
                             })
                             .map_err(|error| error.to_string())?;

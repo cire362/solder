@@ -53,6 +53,7 @@ impl LocalServer {
             .spawn()
             .map_err(|e| format!("Could not start llama-server: {e}"))?;
         let _ = std::fs::write(logs.join("llama-server.pid"), child.id().to_string());
+        watch(std::process::id(), child.id());
         let mut server = Self {
             child,
             port,
@@ -113,6 +114,30 @@ impl Drop for LocalServer {
     }
 }
 
+/// Stops the server if the editor dies without stopping it (a crash or a
+/// kill), so it does not keep gigabytes of memory. A detached shell polls
+/// both processes; it only kills a process still named llama-server, in
+/// case the id was reused. On Windows the stale check below covers it.
+fn watch(editor: u32, server: u32) {
+    if !cfg!(unix) {
+        return;
+    }
+    let script = r#"(
+        while kill -0 "$1" 2>/dev/null && kill -0 "$2" 2>/dev/null; do sleep 2; done
+        if ! kill -0 "$1" 2>/dev/null && ps -p "$2" -o command= 2>/dev/null | grep -q llama-server; then
+            kill "$2"
+        fi
+    ) >/dev/null 2>&1 &"#;
+    // The outer shell exits at once, leaving the loop to init, so nothing
+    // waits on it here.
+    let _ = Command::new("sh")
+        .args(["-c", script, "sh", &editor.to_string(), &server.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// A server left by an editor that crashed still holds its memory.
 fn stop_stale(logs: &Path) {
     let Ok(pid) = std::fs::read_to_string(logs.join("llama-server.pid")) else {
@@ -155,4 +180,40 @@ fn log_tail(log: &Path) -> String {
     let text = std::fs::read_to_string(log).unwrap_or_default();
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     lines[lines.len().saturating_sub(3)..].join(" / ")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_server_outlives_no_dead_editor() {
+        // A stand-in editor (`sleep`) and server: a script named like the
+        // real one, so the name check passes. (A copy of a system binary
+        // would be killed by macOS.)
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("solder-watch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("llama-server");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut editor = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let mut server = Command::new(&fake).arg("30").spawn().unwrap();
+        watch(editor.id(), server.id());
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            server.try_wait().unwrap().is_none(),
+            "alive while the editor is"
+        );
+        editor.kill().unwrap();
+        editor.wait().unwrap();
+        let start = Instant::now();
+        while server.try_wait().unwrap().is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the server outlived the editor"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }

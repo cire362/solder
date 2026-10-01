@@ -42,6 +42,7 @@ pub struct AiPanel {
     key_for: Option<String>,
     key_field: Entity<Editor>,
     new_provider: bool,
+    completion_picker: bool,
     provider_name: Entity<Editor>,
     provider_url: Entity<Editor>,
     provider_key: Entity<Editor>,
@@ -59,6 +60,7 @@ impl AiPanel {
             key_for: None,
             key_field: cx.new(|cx| Editor::masked("Paste the API key", cx)),
             new_provider: false,
+            completion_picker: false,
             provider_name: cx.new(|cx| Editor::single_line("Name", cx)),
             provider_url: cx.new(|cx| Editor::single_line("https://host/v1", cx)),
             provider_key: cx.new(|cx| Editor::masked("API key, if it needs one", cx)),
@@ -331,6 +333,9 @@ impl AiPanel {
                 ))
                 .into_any_element()
         };
+        let completions = self.render_completions(theme, cx);
+        let store = self.store.read(cx);
+        let entity = self.store.clone();
         let offline = store.offline;
         div()
             .flex()
@@ -367,7 +372,118 @@ impl AiPanel {
             )
             .child(list)
             .child(form)
+            .child(completions)
             .into_any_element()
+    }
+
+    /// Which model suggests code while typing, and whether it does.
+    fn render_completions(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let store = self.store.read(cx);
+        let small = UI_FONT_SIZE - px(1.);
+        let current = store.roles.get(&Role::Completion).cloned();
+        let label = current
+            .as_ref()
+            .map_or("No model".to_string(), |m| store.model_label(m));
+        let on = store.completions;
+        let entity = self.store.clone();
+        let mut block = div()
+            .px_3()
+            .pt_4()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.fg_subtle)
+                    .child("COMPLETIONS"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("ai-completion-model")
+                            .debug_selector(|| "ai-completion-model".into())
+                            .flex_1()
+                            .min_w_0()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(theme.line)
+                            .hover(|d| d.bg(theme.bg_elev))
+                            .truncate()
+                            .text_size(UI_FONT_SIZE)
+                            .text_color(if current.is_some() { theme.fg } else { theme.fg_subtle })
+                            .child(label)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.completion_picker = !this.completion_picker;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        ui::toggle("ai-completions", "as I type", "", on, theme, {
+                            let entity = entity.clone();
+                            move |_, _, cx| entity.update(cx, |s, cx| s.set_completions(!on, cx))
+                        })
+                        .debug_selector(|| "ai-completions".into()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(small)
+                    .text_color(theme.fg_subtle)
+                    .child("Suggests code at the end of a line; Tab accepts, Escape dismisses. A small fast model works best."),
+            );
+        if self.completion_picker {
+            let mut menu = div()
+                .p_1()
+                .rounded(px(8.))
+                .border_1()
+                .border_color(theme.line)
+                .bg(theme.bg_elev)
+                .flex()
+                .flex_col();
+            for (provider, models) in store.choices() {
+                menu = menu.child(
+                    div()
+                        .px_2()
+                        .pt_1()
+                        .text_size(px(10.5))
+                        .text_color(theme.fg_subtle)
+                        .child(provider.name.to_uppercase()),
+                );
+                for (model, label) in models {
+                    let active = current.as_ref() == Some(&model);
+                    let selector = format!("ai-completion-{}-{}", model.provider, model.model);
+                    let entity = entity.clone();
+                    menu = menu.child(
+                        div()
+                            .id(SharedString::from(selector.clone()))
+                            .debug_selector(move || selector.clone())
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.))
+                            .text_size(UI_FONT_SIZE)
+                            .text_color(if active { theme.accent } else { theme.fg })
+                            .hover(|d| d.bg(theme.accent_soft))
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                entity.update(cx, |s, cx| {
+                                    s.choose(Role::Completion, model.clone(), cx)
+                                });
+                                this.completion_picker = false;
+                                cx.notify();
+                            })),
+                    );
+                }
+            }
+            block = block.child(menu);
+        }
+        block.into_any_element()
     }
 
     fn add(&mut self, _: &AddModel, _: &mut Window, cx: &mut Context<Self>) {
