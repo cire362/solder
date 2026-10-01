@@ -46,6 +46,8 @@ pub struct AiStore {
     pub starting: Option<String>,
     /// Suggest code at the cursor while typing, when a model has the task.
     pub completions: bool,
+    /// Review what a push sends with the chat model first.
+    pub review_push: bool,
     /// Local models found unable to fill in the middle; asked through chat.
     pub no_infill: std::collections::HashSet<String>,
     /// Open projects, for the `.solderignore` that covers a file.
@@ -106,6 +108,7 @@ impl AiStore {
             local: Vec::new(),
             starting: None,
             completions: true,
+            review_push: true,
             no_infill: Default::default(),
             roots: Vec::new(),
             custom: Vec::new(),
@@ -183,6 +186,12 @@ impl AiStore {
             .cloned()
     }
 
+    pub fn set_review_push(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.review_push = on;
+        self.save(cx);
+        cx.notify();
+    }
+
     pub fn set_completions(&mut self, on: bool, cx: &mut Context<Self>) {
         self.completions = on;
         self.save(cx);
@@ -251,6 +260,7 @@ impl AiStore {
                         .collect();
                     this.offline = state["offline"].as_bool().unwrap_or(false);
                     this.completions = state["completions"].as_bool().unwrap_or(true);
+                    this.review_push = state["review_push"].as_bool().unwrap_or(true);
                     for p in state["providers"].as_array().into_iter().flatten() {
                         if let Some(p) = ProviderInfo::compatible_from_json(p)
                             && this.provider(&p.id).is_none()
@@ -304,6 +314,7 @@ impl AiStore {
                 .collect::<Vec<_>>(),
             "offline": self.offline,
             "completions": self.completions,
+            "review_push": self.review_push,
         });
         let path = self.dirs.state();
         cx.background_executor()

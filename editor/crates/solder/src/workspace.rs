@@ -225,6 +225,9 @@ pub struct Workspace {
     agent: Entity<crate::agent_panel::AgentPanel>,
     /// The right dock shows the agent rather than the chat.
     agent_shown: bool,
+    /// Pushes started, for tests: the terminal running one may be gone.
+    #[cfg(test)]
+    pushes: usize,
     chat_open: bool,
     inline_edit: Option<(Entity<InlineEdit>, Subscription)>,
     results: Entity<ResultsView>,
@@ -475,6 +478,15 @@ impl Workspace {
                 window,
                 |this, _, event, window, cx| match event {
                     GitPanelEvent::OpenFile(path) => this.open_path(path.clone(), None, window, cx),
+                    GitPanelEvent::OpenAt(path, line) => this.open_path(
+                        path.clone(),
+                        Some(Jump::Point {
+                            row: line.saturating_sub(1) as usize,
+                            column: 0,
+                        }),
+                        window,
+                        cx,
+                    ),
                     GitPanelEvent::OpenConflict(path) => {
                         this.open_conflict(path.clone(), window, cx)
                     }
@@ -546,6 +558,8 @@ impl Workspace {
             chat,
             agent,
             agent_shown: false,
+            #[cfg(test)]
+            pushes: 0,
             chat_open: false,
             inline_edit: None,
             results,
@@ -1151,6 +1165,10 @@ impl Workspace {
     }
 
     fn push(&mut self, _: &git_panel::Push, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            self.pushes += 1;
+        }
         // A terminal shows progress and handles credential prompts.
         self.git_in_terminal("git push", &["push", "-u", "origin", "HEAD"], window, cx);
     }
@@ -7622,5 +7640,164 @@ mod tests {
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&branches.stdout).trim().is_empty());
+    }
+
+    fn review_repo(name: &str) -> PathBuf {
+        let repo = db::testing::dir(name);
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(repo.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        git(&["switch", "-q", "-c", "feature"]);
+        std::fs::write(repo.join("a.rs"), "fn a() {\n    let x = 1 / 0;\n}\n").unwrap();
+        git(&["commit", "-qam", "divide"]);
+        repo.canonicalize().unwrap()
+    }
+
+    /// Requests the scripted model received.
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+    fn review_setup<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+        model: Vec<serde_json::Value>,
+    ) -> (
+        PathBuf,
+        Entity<crate::ai_store::AiStore>,
+        Entity<Workspace>,
+        Seen,
+        &'a mut VisualTestContext,
+    ) {
+        let (api, seen) = scripted_model(model);
+        let repo = review_repo(name);
+        let data = db::testing::dir(&format!("{name}-data"));
+        cx.executor().allow_parking();
+        let store = cx.update(|cx| {
+            let store = cx.new(|_| {
+                crate::ai_store::AiStore::new(ai::Dirs::new(&data), "http://127.0.0.1:9".into())
+                    .with_scan_dirs(Vec::new())
+                    .for_tests(down_urls())
+            });
+            crate::ai_store::AiStore::set_global(store.clone(), cx);
+            store
+        });
+        let (ws, cx) = setup(cx, repo.clone());
+        store.update(cx, |s, cx| {
+            s.load(cx);
+            s.add_provider("Mock".into(), api, None, cx);
+        });
+        wait_for(cx, "the provider", &|cx| {
+            store
+                .read(cx)
+                .provider("custom-mock")
+                .is_some_and(|p| !p.models().is_empty())
+        });
+        store.update(cx, |s, cx| {
+            s.choose(
+                ai::Role::Chat,
+                crate::ai_providers::ModelRef {
+                    provider: "custom-mock".into(),
+                    model: "agent-model".into(),
+                },
+                cx,
+            )
+        });
+        (repo, store, ws, seen, cx)
+    }
+
+    #[gpui::test]
+    fn push_waits_for_review_findings(cx: &mut TestAppContext) {
+        let finding = tool_step(
+            "r1",
+            "report_findings",
+            serde_json::json!({"findings": [
+                {"file": "a.rs", "line": 2, "severity": "bug", "message": "Divides by zero."},
+            ]}),
+        );
+        let (repo, _store, ws, seen, cx) = review_setup(cx, "review-found", vec![finding]);
+        cx.simulate_keystrokes("ctrl-shift-g");
+        wait_for(cx, "the git status", &|cx| {
+            ws.read(cx).git.read(cx).status().branch.is_some()
+        });
+        let push = cx.debug_bounds("git-push").expect("push button");
+        cx.simulate_click(push.center(), gpui::Modifiers::default());
+        let panel = cx.read(|cx| ws.read(cx).git_panel.clone());
+        wait_for(cx, "the review", &|cx| {
+            matches!(
+                panel.read(cx).review,
+                Some(crate::git_panel::PushReview::Found { .. })
+            )
+        });
+        // Nothing was pushed.
+        assert_eq!(cx.read(|cx| ws.read(cx).pushes), 0);
+        let request = seen.lock().unwrap()[0].clone();
+        let asked = request["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            asked.contains("1 commit to push onto main") && asked.contains("1 / 0"),
+            "{asked}"
+        );
+        assert_eq!(request["tools"][0]["function"]["name"], "report_findings");
+
+        // A finding opens its file at its line.
+        cx.run_until_parked();
+        let finding = cx.debug_bounds("review-finding-0").expect("a finding");
+        cx.simulate_click(finding.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(active_path(&ws, cx), Some(repo.join("a.rs")));
+        let row = cx.read(|cx| {
+            let e = ws.read(cx).active_editor().unwrap().read(cx);
+            e.buf(cx).offset_to_point(e.newest_range().start).row
+        });
+        assert_eq!(row, 1);
+
+        // Cancel drops the review and pushes nothing.
+        cx.simulate_keystrokes("ctrl-shift-g");
+        cx.run_until_parked();
+        let cancel = cx.debug_bounds("review-cancel").expect("cancel");
+        cx.simulate_click(cancel.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.read(|cx| panel.read(cx).review.is_none()));
+        assert_eq!(cx.read(|cx| ws.read(cx).pushes), 0);
+    }
+
+    #[gpui::test]
+    fn a_clean_review_pushes_and_review_can_be_off(cx: &mut TestAppContext) {
+        let clean = tool_step("r1", "report_findings", serde_json::json!({"findings": []}));
+        let (_repo, store, ws, seen, cx) = review_setup(cx, "review-clean", vec![clean]);
+        cx.simulate_keystrokes("ctrl-shift-g");
+        wait_for(cx, "the git status", &|cx| {
+            ws.read(cx).git.read(cx).status().branch.is_some()
+        });
+        let push = cx.debug_bounds("git-push").expect("push button");
+        cx.simulate_click(push.center(), gpui::Modifiers::default());
+        // Nothing found: the push goes ahead in a terminal.
+        wait_for(cx, "the push", &|cx| ws.read(cx).pushes == 1);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let panel = cx.read(|cx| ws.read(cx).git_panel.clone());
+        assert!(cx.read(|cx| panel.read(cx).review.is_none()));
+
+        // With review off, Push does not ask the model. (The terminal has
+        // the focus now; Push is the Git panel's action.)
+        store.update(cx, |s, cx| s.set_review_push(false, cx));
+        cx.update(|window, cx| window.focus(&panel.focus_handle(cx)));
+        cx.dispatch_action(crate::git_panel::ReviewAndPush);
+        wait_for(cx, "the second push", &|cx| ws.read(cx).pushes == 2);
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 }

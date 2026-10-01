@@ -3,9 +3,9 @@
 use std::path::PathBuf;
 
 use gpui::{
-    App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
-    MouseButton, PromptLevel, SharedString, Subscription, Window, actions, div, prelude::*, px,
-    uniform_list,
+    AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
+    MouseButton, PromptLevel, SharedString, Subscription, Task, Window, actions, div, prelude::*,
+    px, uniform_list,
 };
 
 use crate::{
@@ -23,6 +23,7 @@ actions!(
         StageAll,
         UnstageAll,
         Push,
+        ReviewAndPush,
         Pull,
         OpenPullRequest,
         SwitchBranch,
@@ -41,6 +42,8 @@ const ROW_HEIGHT: gpui::Pixels = px(24.);
 
 pub enum GitPanelEvent {
     OpenFile(PathBuf),
+    /// A file at a 1-based line, from the review.
+    OpenAt(PathBuf, u32),
     OpenConflict(PathBuf),
     ReviewDiff(PathBuf, DiffScope),
 }
@@ -72,11 +75,24 @@ enum Row {
     File(Section, FileStatus),
 }
 
+/// The AI review of a push, shown above the commit box.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PushReview {
+    Running(String),
+    Found {
+        review: ai::review::Review,
+        summary: String,
+    },
+    Failed(SharedString),
+}
+
 pub struct GitPanel {
     root: PathBuf,
     git: Entity<GitStore>,
     pub(crate) message: Entity<Editor>,
     amend: bool,
+    pub review: Option<PushReview>,
+    review_task: Option<Task<()>>,
     focus_handle: FocusHandle,
     _subscription: Subscription,
 }
@@ -90,9 +106,237 @@ impl GitPanel {
             git,
             message,
             amend: false,
+            review: None,
+            review_task: None,
             focus_handle: cx.focus_handle(),
             _subscription: subscription,
         }
+    }
+
+    /// Push, after the chat model reviewed what it sends when review is on.
+    /// Nothing found: the push goes ahead. Something found: it waits.
+    fn review_and_push(&mut self, _: &ReviewAndPush, window: &mut Window, cx: &mut Context<Self>) {
+        let store = crate::ai_store::AiStore::try_global(cx);
+        let model = store.as_ref().and_then(|s| {
+            let s = s.read(cx);
+            s.review_push
+                .then(|| s.roles.get(&ai::Role::Chat).cloned())
+                .flatten()
+        });
+        let (Some(store), Some(model)) = (store, model) else {
+            window.dispatch_action(Box::new(Push), cx);
+            return;
+        };
+        if matches!(self.review, Some(PushReview::Running(_))) {
+            return;
+        }
+        let root = self.root.clone();
+        self.review = Some(PushReview::Running("Reading what the push sends...".into()));
+        cx.notify();
+        let outgoing = cx
+            .background_executor()
+            .spawn(async move { crate::ai_review::outgoing(&root) });
+        self.review_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let outgoing = match outgoing.await {
+                Ok(o) => o,
+                Err(e) => {
+                    this.update(cx, |this, cx| {
+                        this.review = Some(PushReview::Failed(e.into()));
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            if outgoing.commits.is_empty() || outgoing.diff.trim().is_empty() {
+                // Nothing the model could read: push as asked.
+                this.update_in(cx, |this, window, cx| {
+                    this.review = None;
+                    window.dispatch_action(Box::new(Push), cx);
+                })
+                .ok();
+                return;
+            }
+            let summary = outgoing.summary();
+            this.update(cx, |this, cx| {
+                let n = outgoing.commits.len();
+                this.review = Some(PushReview::Running(format!(
+                    "Reviewing {n} commit{} before the push...",
+                    if n == 1 { "" } else { "s" }
+                )));
+                cx.notify();
+            })
+            .ok();
+            let Ok(endpoint) = store.update(cx, |s, cx| s.endpoint(&model, cx)) else {
+                return;
+            };
+            let name = if model.provider == crate::ai_providers::LOCAL {
+                "local".to_string()
+            } else {
+                model.model.clone()
+            };
+            let result = async {
+                let endpoint = endpoint.await?;
+                ai::spawn(ai::review::review(
+                    endpoint,
+                    name,
+                    summary.clone(),
+                    outgoing.diff,
+                ))
+                .await
+            }
+            .await;
+            this.update_in(cx, |this, window, cx| {
+                this.review_task = None;
+                match result {
+                    Ok(review) if review.findings.is_empty() => {
+                        this.review = None;
+                        window.dispatch_action(Box::new(Push), cx);
+                    }
+                    Ok(review) => this.review = Some(PushReview::Found { review, summary }),
+                    Err(e) => this.review = Some(PushReview::Failed(e.into())),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn end_review(&mut self, push: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.review = None;
+        self.review_task = None;
+        if push {
+            window.dispatch_action(Box::new(Push), cx);
+        }
+        cx.notify();
+    }
+
+    fn render_review(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let review = self.review.as_ref()?;
+        let small = UI_FONT_SIZE - px(1.);
+        let mut block = div()
+            .p_2()
+            .rounded(px(8.))
+            .border_1()
+            .flex()
+            .flex_col()
+            .gap_1();
+        let buttons = |push_label: &'static str, cx: &mut Context<Self>| {
+            div()
+                .pt_1()
+                .flex()
+                .gap_1p5()
+                .child(
+                    ui::button(
+                        "review-push",
+                        push_label,
+                        false,
+                        theme,
+                        cx.listener(|this, _, window, cx| this.end_review(true, window, cx)),
+                    )
+                    .debug_selector(|| "review-push".into()),
+                )
+                .child(
+                    ui::button(
+                        "review-cancel",
+                        "Cancel",
+                        false,
+                        theme,
+                        cx.listener(|this, _, window, cx| this.end_review(false, window, cx)),
+                    )
+                    .debug_selector(|| "review-cancel".into()),
+                )
+        };
+        match review {
+            PushReview::Running(text) => {
+                block = block
+                    .border_color(theme.line)
+                    .child(
+                        div()
+                            .text_size(small)
+                            .text_color(theme.fg_muted)
+                            .child(text.clone()),
+                    )
+                    .child(buttons("Push without review", cx));
+            }
+            PushReview::Failed(e) => {
+                block = block
+                    .border_color(theme.line)
+                    .child(
+                        div()
+                            .text_size(small)
+                            .text_color(theme.error)
+                            .child(format!("The review failed: {e}")),
+                    )
+                    .child(buttons("Push anyway", cx));
+            }
+            PushReview::Found { review, .. } => {
+                let n = review.findings.len();
+                block = block.border_color(theme.warning).child(
+                    div().text_size(small).text_color(theme.fg).child(format!(
+                        "The review found {n} problem{} before the push:",
+                        if n == 1 { "" } else { "s" }
+                    )),
+                );
+                for (i, f) in review.findings.iter().enumerate() {
+                    let color = match f.severity {
+                        ai::review::Severity::Bug => theme.error,
+                        ai::review::Severity::Risk => theme.warning,
+                        ai::review::Severity::Note => theme.fg_subtle,
+                    };
+                    let place = if f.line > 0 {
+                        format!("{}:{}", f.file, f.line)
+                    } else {
+                        f.file.clone()
+                    };
+                    let (path, line) = (self.root.join(&f.file), f.line);
+                    block = block.child(
+                        div()
+                            .id(("review-finding", i))
+                            .debug_selector(move || format!("review-finding-{i}"))
+                            .px_1()
+                            .py_0p5()
+                            .rounded(px(6.))
+                            .hover(|d| d.bg(theme.bg_elev))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1p5()
+                                    .text_size(px(11.))
+                                    .child(div().text_color(color).child(f.severity.label()))
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .font_family(crate::theme::CODE_FONT)
+                                            .text_color(theme.fg_subtle)
+                                            .child(place),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(small)
+                                    .text_color(theme.fg)
+                                    .child(f.message.clone()),
+                            )
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(GitPanelEvent::OpenAt(path.clone(), line))
+                            })),
+                    );
+                }
+                if !review.note.is_empty() {
+                    block = block.child(
+                        div()
+                            .text_size(small)
+                            .text_color(theme.fg_subtle)
+                            .child(review.note.clone()),
+                    );
+                }
+                block = block.child(buttons("Push anyway", cx));
+            }
+        }
+        Some(block.into_any_element())
     }
 
     pub fn focus_message(&self, window: &mut Window, cx: &App) {
@@ -456,6 +700,7 @@ impl Render for GitPanel {
             .key_context("GitPanel")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::commit))
+            .on_action(cx.listener(Self::review_and_push))
             .on_action(cx.listener(Self::stage_all))
             .on_action(cx.listener(Self::unstage_all))
             .size_full()
@@ -494,13 +739,12 @@ impl Render for GitPanel {
                                         window.dispatch_action(Box::new(SwitchBranch), cx)
                                     }),
                             )
-                            .child(ui::button(
-                                "git-push",
-                                "Push",
-                                false,
-                                &theme,
-                                |_, window, cx| window.dispatch_action(Box::new(Push), cx),
-                            ))
+                            .child(
+                                ui::button("git-push", "Push", false, &theme, |_, window, cx| {
+                                    window.dispatch_action(Box::new(ReviewAndPush), cx)
+                                })
+                                .debug_selector(|| "git-push".into()),
+                            )
                             .child(ui::button(
                                 "git-pr",
                                 "PR",
@@ -511,6 +755,7 @@ impl Render for GitPanel {
                                 },
                             )),
                     )
+                    .children(self.render_review(&theme, cx))
                     .child(
                         ui::text_field(self.message.clone(), message_focused, &theme)
                             .flex_none()
