@@ -10,6 +10,7 @@ pub mod complete;
 pub mod ddl;
 mod detect;
 pub mod edit;
+pub mod erd;
 pub mod migrations;
 mod mongo;
 mod mysql;
