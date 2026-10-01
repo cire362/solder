@@ -9,8 +9,11 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use ai::{
     Candidate, Dirs, Hardware, Model, Progress, Role, Source, Speed, catalog, custom, install,
+    keys::Keys,
 };
 use gpui::{App, AppContext, Context, Entity, Global, SharedString, Task};
+
+use crate::ai_providers::{self, LOCAL, ModelRef, ProviderInfo, Running, Status, Urls};
 
 /// What the benchmark is doing.
 #[derive(Clone)]
@@ -32,7 +35,15 @@ pub struct AiStore {
     pub measured: Option<Speed>,
     /// Speeds measured on each installed model after its download.
     pub verified: HashMap<String, Speed>,
-    pub roles: HashMap<Role, String>,
+    /// The model each task uses, local or from a provider.
+    pub roles: HashMap<Role, ModelRef>,
+    pub providers: Vec<ProviderInfo>,
+    /// Only models on this machine (and providers on localhost) answer.
+    pub offline: bool,
+    pub(crate) keys: Keys,
+    /// The local server chat is using, and the model it is starting.
+    pub(crate) local: Option<Running>,
+    pub starting: Option<String>,
     /// Models added by hand, kept in `ai.json`.
     pub custom: Vec<Model>,
     /// Models found in LM Studio's folders, read again on each start.
@@ -72,6 +83,7 @@ fn local_path(input: &str) -> Option<PathBuf> {
 
 impl AiStore {
     pub fn new(dirs: Dirs, hub: String) -> Self {
+        let keys = Keys::new(dirs.root.join("keys.json"));
         Self {
             dirs,
             hub,
@@ -82,6 +94,11 @@ impl AiStore {
             measured: None,
             verified: HashMap::new(),
             roles: HashMap::new(),
+            providers: ai_providers::builtin(&Urls::default()),
+            offline: false,
+            keys,
+            local: None,
+            starting: None,
             custom: Vec::new(),
             found: Vec::new(),
             installed: Vec::new(),
@@ -103,6 +120,15 @@ impl AiStore {
             .unwrap_or_else(crate::settings::config_dir)
             .join("Solder");
         let store = cx.new(|_| AiStore::new(Dirs::new(root), install::HUB.into()));
+        cx.on_app_quit({
+            let store = store.clone();
+            move |cx| {
+                // The server is a child process; it would outlive the editor.
+                store.update(cx, |s, _| s.stop_local());
+                async {}
+            }
+        })
+        .detach();
         cx.set_global(GlobalAiStore(store.clone()));
         store
     }
@@ -116,6 +142,23 @@ impl AiStore {
     pub fn with_scan_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
         self.scan_dirs = dirs;
         self
+    }
+
+    /// Keys in a file and providers at other addresses, so tests touch
+    /// neither the Keychain nor the network.
+    #[cfg(test)]
+    pub fn for_tests(mut self, urls: Urls) -> Self {
+        self.keys = Keys::file_only(self.dirs.root.join("keys.json"));
+        self.providers = ai_providers::builtin(&urls);
+        self
+    }
+
+    /// The local provider lists what is installed.
+    fn sync_local(&mut self) {
+        let installed = self.installed.clone();
+        if let Some(local) = self.providers.iter_mut().find(|p| p.id == LOCAL) {
+            local.status = Status::Ready(installed);
+        }
     }
 
     /// The catalog, then models added by hand, then models found on disk.
@@ -170,17 +213,30 @@ impl AiStore {
                         .flatten()
                         .filter_map(Model::from_json)
                         .collect();
-                }
-                this.installed = install::installed_models(&this.dirs, &this.models());
-                if let Some(state) = &state {
-                    for role in [Role::Chat, Role::Completion] {
-                        if let Some(id) = state["roles"][role_key(role)].as_str()
-                            && this.installed.iter().any(|i| i == id)
+                    this.offline = state["offline"].as_bool().unwrap_or(false);
+                    for p in state["providers"].as_array().into_iter().flatten() {
+                        if let Some(p) = ProviderInfo::compatible_from_json(p)
+                            && this.provider(&p.id).is_none()
                         {
-                            this.roles.insert(role, id.to_string());
+                            this.providers.push(p);
                         }
                     }
                 }
+                this.installed = install::installed_models(&this.dirs, &this.models());
+                this.sync_local();
+                if let Some(state) = &state {
+                    for role in [Role::Chat, Role::Completion] {
+                        let Some(model) = ModelRef::from_json(&state["roles"][role_key(role)])
+                        else {
+                            continue;
+                        };
+                        // A local model deleted outside Solder is no choice.
+                        if model.provider != LOCAL || this.installed.contains(&model.model) {
+                            this.roles.insert(role, model);
+                        }
+                    }
+                }
+                this.refresh_providers(cx);
                 cx.notify();
             })
             .ok();
@@ -188,10 +244,10 @@ impl AiStore {
         .detach();
     }
 
-    fn save(&self, cx: &mut Context<Self>) {
+    pub(crate) fn save(&self, cx: &mut Context<Self>) {
         let mut roles = serde_json::Map::new();
-        for (role, id) in &self.roles {
-            roles.insert(role_key(*role).into(), id.clone().into());
+        for (role, model) in &self.roles {
+            roles.insert(role_key(*role).into(), model.to_json());
         }
         let verified: serde_json::Map<String, serde_json::Value> = self
             .verified
@@ -203,6 +259,13 @@ impl AiStore {
             "verified": verified,
             "roles": roles,
             "custom": self.custom.iter().map(Model::to_json).collect::<Vec<_>>(),
+            "providers": self
+                .providers
+                .iter()
+                .filter(|p| p.kind == ai_providers::Kind::Compatible)
+                .map(ProviderInfo::to_json)
+                .collect::<Vec<_>>(),
+            "offline": self.offline,
         });
         let path = self.dirs.state();
         cx.background_executor()
@@ -276,6 +339,8 @@ impl AiStore {
         let dirs = self.dirs.clone();
         let hub = self.hub.clone();
         let progress = Progress::new();
+        // Measurements need the memory a chat model holds.
+        self.stop_local();
         self.benchmark = Some(BenchStep::Runtime(progress.clone()));
         self.tick(cx);
         cx.spawn(async move |this, cx| {
@@ -302,6 +367,7 @@ impl AiStore {
                     if !this.installed.contains(&model.id) {
                         this.installed.push(model.id.clone());
                     }
+                    this.sync_local();
                     cx.notify();
                 })
                 .ok();
@@ -369,7 +435,12 @@ impl AiStore {
                 loop {
                     let free = this
                         .update(cx, |this, _| {
-                            this.benchmark.is_none() && this.verifying.first() == Some(&model.id)
+                            let free = this.benchmark.is_none()
+                                && this.verifying.first() == Some(&model.id);
+                            if free {
+                                this.stop_local();
+                            }
+                            free
                         })
                         .unwrap_or(true);
                     if free {
@@ -439,8 +510,11 @@ impl AiStore {
                             .map(|c| c.picks)
                             .unwrap_or_default();
                         for role in picks {
-                            this.roles.entry(role).or_insert_with(|| model.id.clone());
+                            this.roles
+                                .entry(role)
+                                .or_insert_with(|| ModelRef::local(&model.id));
                         }
+                        this.sync_local();
                         this.save(cx);
                         this.verifying.push(model.id.clone());
                         cx.notify();
@@ -473,7 +547,11 @@ impl AiStore {
     /// the list; files Solder did not download stay on disk.
     pub fn remove(&mut self, model: Model, cx: &mut Context<Self>) {
         self.installed.retain(|id| *id != model.id);
-        self.roles.retain(|_, id| *id != model.id);
+        self.roles.retain(|_, m| *m != ModelRef::local(&model.id));
+        if self.local.as_ref().is_some_and(|r| r.model == model.id) {
+            self.stop_local();
+        }
+        self.sync_local();
         self.verified.remove(&model.id);
         self.custom.retain(|m| m.id != model.id);
         self.found.retain(|m| m.id != model.id);
@@ -532,6 +610,7 @@ impl AiStore {
                                 this.installed.push(model.id.clone());
                             }
                             this.custom.push(model);
+                            this.sync_local();
                             this.save(cx);
                         }
                     }
@@ -544,11 +623,13 @@ impl AiStore {
         .detach();
     }
 
+    /// Gives a local model a task, or takes it back.
     pub fn set_role(&mut self, role: Role, model: &str, cx: &mut Context<Self>) {
-        if self.roles.get(&role).map(String::as_str) == Some(model) {
+        let model = ModelRef::local(model);
+        if self.roles.get(&role) == Some(&model) {
             self.roles.remove(&role);
         } else {
-            self.roles.insert(role, model.into());
+            self.roles.insert(role, model);
         }
         self.save(cx);
         cx.notify();

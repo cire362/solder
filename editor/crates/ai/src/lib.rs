@@ -8,10 +8,13 @@
 
 pub mod bench;
 pub mod catalog;
+pub mod context;
 pub mod custom;
 pub mod gguf;
 pub mod hardware;
 pub mod install;
+pub mod keys;
+pub mod provider;
 pub mod server;
 
 use std::{

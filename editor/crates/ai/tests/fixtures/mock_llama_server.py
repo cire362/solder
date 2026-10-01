@@ -59,6 +59,17 @@ class Handler(BaseHTTPRequestHandler):
                 "content": "x" * body.get("n_predict", 1),
                 "timings": {"prompt_per_second": 1234.5, "predicted_per_second": 67.8},
             })
+        elif self.path == "/v1/chat/completions":
+            # Streams back the last question, word by word.
+            question = body["messages"][-1]["content"].splitlines()[-1]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for word in ("Local answer to: " + question).split(" "):
+                chunk = {"choices": [{"delta": {"content": word + " "}}]}
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
         else:
             self.reply(404, {})
 

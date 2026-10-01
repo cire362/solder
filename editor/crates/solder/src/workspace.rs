@@ -78,6 +78,7 @@ actions!(
         ShowDatabase,
         ShowApi,
         ShowAi,
+        ToggleChat,
         RunStatement,
         SelectConnection,
         ShowFileDiff,
@@ -118,6 +119,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-d", ShowDatabase, None),
         KeyBinding::new("ctrl-shift-h", ShowApi, None),
         KeyBinding::new("ctrl-shift-a", ShowAi, None),
+        KeyBinding::new("secondary-shift-l", ToggleChat, None),
         KeyBinding::new(
             "secondary-enter",
             RunStatement,
@@ -134,6 +136,7 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 const SIDEBAR_WIDTH: f32 = 330.;
+const CHAT_WIDTH: f32 = 380.;
 const TITLEBAR_HEIGHT: f32 = 38.;
 const TAB_BAR_HEIGHT: f32 = 34.;
 const STATUS_HEIGHT: f32 = 26.;
@@ -209,6 +212,8 @@ pub struct Workspace {
     database_panel: Entity<DatabasePanel>,
     api_panel: Entity<crate::api_panel::ApiPanel>,
     ai_panel: Entity<crate::ai_panel::AiPanel>,
+    chat: Entity<crate::chat_panel::ChatPanel>,
+    chat_open: bool,
     results: Entity<ResultsView>,
     /// The Results tab is in the dock (a query has run and it was not closed).
     show_results: bool,
@@ -255,7 +260,9 @@ impl Workspace {
         let database_panel = cx.new(|cx| DatabasePanel::new(database.clone(), cx));
         let api_panel = cx.new(|cx| crate::api_panel::ApiPanel::new(root.clone(), cx));
         let ai_store = crate::ai_store::AiStore::global(cx);
-        let ai_panel = cx.new(|cx| crate::ai_panel::AiPanel::new(ai_store, cx));
+        let ai_panel = cx.new(|cx| crate::ai_panel::AiPanel::new(ai_store.clone(), cx));
+        let weak = cx.entity().downgrade();
+        let chat = cx.new(|cx| crate::chat_panel::ChatPanel::new(ai_store, weak, cx));
         let results = cx.new(|cx| ResultsView::new(database.clone(), cx));
         let response = cx.new(crate::response::ResponseView::new);
         let project_search = cx.new(|cx| ProjectSearch::new(root, window, cx));
@@ -519,6 +526,8 @@ impl Workspace {
             database_panel,
             api_panel: api_panel.clone(),
             ai_panel,
+            chat,
+            chat_open: false,
             results,
             show_results: false,
             results_active: false,
@@ -1624,6 +1633,60 @@ impl Workspace {
     }
 
     // ------------------------------------------------------------ HTTP
+
+    fn toggle_chat(&mut self, _: &ToggleChat, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.chat.read(cx).input();
+        if self.chat_open && !input.focus_handle(cx).is_focused(window) {
+            // Open but elsewhere: go to it rather than close it.
+            window.focus(&input.focus_handle(cx));
+            return;
+        }
+        self.chat_open = !self.chat_open;
+        if self.chat_open {
+            self.chat.update(cx, |c, cx| c.shown(cx));
+            window.focus(&input.focus_handle(cx));
+        } else if let Some(editor) = self.active_editor() {
+            window.focus(&editor.focus_handle(cx));
+        }
+        cx.notify();
+    }
+
+    /// The active file for the chat: its selection when there is one, else
+    /// the whole file, with its path from the project root.
+    pub fn file_context(&self, cx: &App) -> Option<crate::chat_panel::FileContext> {
+        let editor = self.active_editor()?.read(cx);
+        let path = editor.path(cx)?;
+        if !ai::context::allows_file(path) {
+            return None;
+        }
+        let root = self.root(cx);
+        let path = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        let range = editor.newest_range();
+        let text = editor.text(cx);
+        if range.is_empty() || range.end > text.len() {
+            return Some(crate::chat_panel::FileContext {
+                path,
+                text,
+                part: None,
+            });
+        }
+        let buffer = editor.buf(cx);
+        let first = buffer.offset_to_point(range.start).row + 1;
+        let last = buffer.offset_to_point(range.end).row + 1;
+        Some(crate::chat_panel::FileContext {
+            path,
+            text: text[range].to_string(),
+            part: Some(if first == last {
+                format!("line {first}")
+            } else {
+                format!("lines {first}-{last}")
+            }),
+        })
+    }
 
     fn show_ai(&mut self, _: &ShowAi, window: &mut Window, cx: &mut Context<Self>) {
         self.set_sidebar(Some(SidebarTab::Ai), cx);
@@ -3129,6 +3192,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_database))
             .on_action(cx.listener(Self::show_api))
             .on_action(cx.listener(Self::show_ai))
+            .on_action(cx.listener(Self::toggle_chat))
             .on_action(cx.listener(Self::open_requests))
             .on_action(cx.listener(Self::import_openapi))
             .on_action(cx.listener(Self::new_connection))
@@ -3185,7 +3249,18 @@ impl Render for Workspace {
                     .min_h_0()
                     .flex()
                     .children(self.sidebar.map(|tab| self.render_sidebar(tab, cx)))
-                    .children(panes),
+                    .children(panes)
+                    .when(self.chat_open, |d| {
+                        d.child(
+                            div()
+                                .w(px(CHAT_WIDTH))
+                                .flex_none()
+                                .h_full()
+                                .border_l_1()
+                                .border_color(theme.line)
+                                .child(self.chat.clone()),
+                        )
+                    }),
             )
             .when(
                 self.dock_open
@@ -5427,7 +5502,7 @@ mod tests {
                 if first.starts_with("HEAD") {
                     let _ = write!(
                         stream,
-                        "HTTP/1.1 302 Found\r\nLocation: /cdn\r\nX-Linked-Size: {}\r\nX-Linked-Etag: \"{sha}\"\r\nContent-Length: 0\r\n\r\n",
+                        "HTTP/1.1 302 Found\r\nLocation: /cdn\r\nX-Linked-Size: {}\r\nX-Linked-Etag: \"{sha}\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
                 } else {
@@ -5535,7 +5610,7 @@ mod tests {
         cx.simulate_click(toggle.center(), gpui::Modifiers::default());
         assert_eq!(
             cx.read(|cx| store.read(cx).roles.get(&ai::Role::Chat).cloned()),
-            Some(calibration.id.to_string())
+            Some(crate::ai_providers::ModelRef::local(&calibration.id))
         );
         settle(cx);
 
@@ -5548,7 +5623,10 @@ mod tests {
         cx.read(|cx| {
             let s = again.read(cx);
             assert!(s.measured.is_some());
-            assert_eq!(s.roles.get(&ai::Role::Chat), Some(&calibration.id));
+            assert_eq!(
+                s.roles.get(&ai::Role::Chat),
+                Some(&crate::ai_providers::ModelRef::local(&calibration.id))
+            );
         });
 
         // Delete shows on hover and removes the file and its role; the
@@ -5600,5 +5678,457 @@ mod tests {
         cx.simulate_input("not a model");
         cx.simulate_keystrokes("enter");
         wait_for(cx, "the error", &|cx| store.read(cx).error.is_some());
+    }
+
+    /// An OpenAI- and Anthropic-style API on localhost: lists `model-a`, and
+    /// streams back "Echo: <the question's last line>" for chats. Records
+    /// each request body. Returns the base URL (with `/v1`).
+    fn fake_api() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap_or(0);
+                let mut length = 0;
+                let mut auth = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                    if lower.starts_with("authorization:") || lower.starts_with("x-api-key:") {
+                        auth = line.trim().to_string();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).ok();
+                let body = String::from_utf8_lossy(&body).to_string();
+                log.lock()
+                    .unwrap()
+                    .push(format!("{} {auth}\n{body}", first.trim()));
+                if first.starts_with("GET") {
+                    let json = r#"{"data":[{"id":"model-a"}]}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                        json.len()
+                    );
+                    continue;
+                }
+                let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                let question = value["messages"]
+                    .as_array()
+                    .and_then(|m| m.last())
+                    .and_then(|m| m["content"].as_str())
+                    .and_then(|c| c.lines().last())
+                    .unwrap_or("")
+                    .to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                );
+                let anthropic = first.contains("/messages");
+                for word in format!("Echo: {question}").split(' ') {
+                    let data = if anthropic {
+                        serde_json::json!({"type":"content_block_delta","delta":{"type":"text_delta","text": format!("{word} ")}})
+                    } else {
+                        serde_json::json!({"choices":[{"delta":{"content": format!("{word} ")}}]})
+                    };
+                    let _ = write!(stream, "data: {data}\n\n");
+                    let _ = stream.flush();
+                }
+                if !anthropic {
+                    let _ = write!(stream, "data: [DONE]\n\n");
+                }
+            }
+        });
+        (base, seen)
+    }
+
+    fn ai_setup<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+        urls: crate::ai_providers::Urls,
+    ) -> (
+        PathBuf,
+        Entity<crate::ai_store::AiStore>,
+        Entity<Workspace>,
+        &'a mut VisualTestContext,
+    ) {
+        use crate::ai_store::AiStore;
+        let root = fixture(name);
+        let data = root.join("data");
+        cx.executor().allow_parking();
+        let store = cx.update(|cx| {
+            let store = cx.new(|_| {
+                AiStore::new(ai::Dirs::new(&data), "http://127.0.0.1:9".into())
+                    .with_scan_dirs(Vec::new())
+                    .for_tests(urls)
+            });
+            AiStore::set_global(store.clone(), cx);
+            store
+        });
+        let (ws, cx) = setup(cx, root.clone());
+        (root, store, ws, cx)
+    }
+
+    fn down_urls() -> crate::ai_providers::Urls {
+        // Nothing listens on port 9: local providers are "not running". The
+        // network ones have no key, so nothing is sent to them; OpenAI's
+        // address is off this machine, for offline mode to turn it off.
+        crate::ai_providers::Urls {
+            ollama: "http://127.0.0.1:9/v1".into(),
+            lm_studio: "http://127.0.0.1:9/v1".into(),
+            anthropic: "http://127.0.0.1:9/v1".into(),
+            openai: "https://api.openai.invalid/v1".into(),
+        }
+    }
+
+    fn chat_answer(ws: &Entity<Workspace>, cx: &mut VisualTestContext) -> String {
+        let chat = cx.read(|cx| ws.read(cx).chat.clone());
+        wait_for(cx, "the answer", &|cx| {
+            let c = chat.read(cx);
+            !c.streaming() && c.messages.last().is_some_and(|m| m.done)
+        });
+        cx.read(|cx| {
+            let m = chat.read(cx).messages.last().unwrap();
+            assert!(m.error.is_none(), "{:?}", m.error);
+            m.text.trim().to_string()
+        })
+    }
+
+    #[gpui::test]
+    fn chat_with_an_added_provider_and_the_open_file(cx: &mut TestAppContext) {
+        let (api, seen) = fake_api();
+        let (root, store, ws, cx) = ai_setup(cx, "chat-provider", down_urls());
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(root.join("src/main.rs"), None, window, cx)
+        });
+        cx.run_until_parked();
+
+        // Add a provider in the AI tab's providers view.
+        cx.simulate_keystrokes("ctrl-shift-a");
+        let panel = cx.read(|cx| ws.read(cx).ai_panel.clone());
+        panel.update(cx, |p, cx| p.show(crate::ai_panel::View::Providers, cx));
+        wait_for(cx, "the built-in providers", &|cx| {
+            store
+                .read(cx)
+                .provider("ollama")
+                .is_some_and(|p| matches!(p.status, crate::ai_providers::Status::Unavailable(_)))
+        });
+        cx.read(|cx| {
+            let s = store.read(cx);
+            assert_eq!(
+                s.provider("anthropic").unwrap().status,
+                crate::ai_providers::Status::NoKey
+            );
+        });
+        let open = cx.debug_bounds("ai-new-provider").unwrap();
+        cx.simulate_click(open.center(), gpui::Modifiers::default());
+        cx.simulate_input("Proxy");
+        let fields = cx.read(|cx| {
+            let p = panel.read(cx);
+            (p.provider_url_field(), p.provider_key_field())
+        });
+        cx.update(|window, cx| window.focus(&fields.0.focus_handle(cx)));
+        cx.simulate_input(&api);
+        cx.update(|window, cx| window.focus(&fields.1.focus_handle(cx)));
+        cx.simulate_input("sk-proxy");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the provider", &|cx| {
+            store
+                .read(cx)
+                .provider("custom-proxy")
+                .is_some_and(|p| p.models() == ["model-a"])
+        });
+        assert_eq!(
+            cx.read(|cx| store.read(cx).provider("custom-proxy").unwrap().key_source),
+            Some("saved")
+        );
+
+        // Open the chat, pick the model, ask.
+        cx.update(|window, cx| window.focus(&ws.focus_handle(cx)));
+        cx.simulate_keystrokes("secondary-shift-l");
+        cx.run_until_parked();
+        let pick = cx.debug_bounds("chat-model").unwrap();
+        cx.simulate_click(pick.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let model = cx
+            .debug_bounds("chat-model-custom-proxy-model-a")
+            .expect("in the picker");
+        cx.simulate_click(model.center(), gpui::Modifiers::default());
+        let chat = cx.read(|cx| ws.read(cx).chat.clone());
+        let input = cx.read(|cx| chat.read(cx).input());
+        cx.update(|window, cx| window.focus(&input.focus_handle(cx)));
+        cx.simulate_input("What does main do?");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(chat_answer(&ws, cx), "Echo: What does main do?");
+        cx.read(|cx| {
+            let c = chat.read(cx);
+            assert_eq!(c.messages[0].context.as_deref(), Some("src/main.rs"));
+        });
+        let request = seen.lock().unwrap().last().unwrap().clone();
+        assert!(
+            request.starts_with("POST /v1/chat/completions "),
+            "{request}"
+        );
+        assert!(
+            request.contains("authorization: Bearer sk-proxy"),
+            "{request}"
+        );
+        assert!(
+            request.contains("helper();"),
+            "the file goes with the question: {request}"
+        );
+        assert!(request.contains(r#""model":"model-a""#));
+
+        // A follow-up carries the conversation; without the file it is shorter.
+        let toggle = cx.debug_bounds("chat-file").unwrap();
+        cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+        cx.update(|window, cx| window.focus(&input.focus_handle(cx)));
+        cx.simulate_input("And then?");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(chat_answer(&ws, cx), "Echo: And then?");
+        let request = seen.lock().unwrap().last().unwrap().clone();
+        assert!(request.contains("Echo: What does main do?"), "{request}");
+        assert_eq!(request.matches("helper();").count(), 1, "{request}");
+        assert_eq!(cx.read(|cx| chat.read(cx).messages.len()), 4);
+        assert_eq!(cx.read(|cx| input.read(cx).text(cx)), "");
+
+        // Offline mode turns network providers off; this one is local.
+        let offline = cx.debug_bounds("ai-offline").unwrap();
+        cx.simulate_click(offline.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let s = store.read(cx);
+            assert!(s.offline);
+            assert_eq!(
+                s.provider("openai").unwrap().status,
+                crate::ai_providers::Status::Offline
+            );
+        });
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("data/ai.json")).unwrap()).unwrap();
+        assert_eq!(saved["providers"][0]["name"], "Proxy");
+        assert_eq!(saved["roles"]["chat"]["provider"], "custom-proxy");
+        assert_eq!(saved["offline"], true);
+        let keys = std::fs::read_to_string(root.join("data/keys.json")).unwrap();
+        assert!(keys.contains("sk-proxy") && !saved.to_string().contains("sk-proxy"));
+    }
+
+    #[gpui::test]
+    fn chat_never_attaches_env_files_or_their_selections(cx: &mut TestAppContext) {
+        let (api, seen) = fake_api();
+        let urls = crate::ai_providers::Urls {
+            lm_studio: api,
+            ..down_urls()
+        };
+        let (root, store, ws, cx) = ai_setup(cx, "chat-private-context", urls);
+        let secret = "API_KEY=private-context-test-marker\n";
+        let paths = [
+            ".env",
+            ".ENV.local",
+            "config/.env.production",
+            ".envrc",
+            ".env.d/settings.json",
+        ];
+        for path in paths {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, secret).unwrap();
+        }
+        cx.simulate_keystrokes("secondary-shift-l");
+        wait_for(cx, "the local provider", &|cx| {
+            store
+                .read(cx)
+                .provider("lmstudio")
+                .is_some_and(|provider| provider.models() == ["model-a"])
+        });
+        store.update(cx, |store, cx| {
+            store.choose(
+                ai::Role::Chat,
+                crate::ai_providers::ModelRef {
+                    provider: "lmstudio".into(),
+                    model: "model-a".into(),
+                },
+                cx,
+            );
+        });
+        let chat = cx.read(|cx| ws.read(cx).chat.clone());
+        let input = cx.read(|cx| chat.read(cx).input());
+        for path in paths {
+            let path = root.join(path);
+            ws.update_in(cx, |workspace, window, cx| {
+                workspace.open_path(path.clone(), None, window, cx);
+            });
+            wait_for(cx, "the private file", &|cx| {
+                ws.read(cx)
+                    .active_editor()
+                    .is_some_and(|editor| editor.read(cx).path(cx) == Some(path.as_path()))
+            });
+            let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+            for range in [0..0, 0..secret.len()] {
+                editor.update(cx, |editor, cx| editor.select_range(range, cx));
+                assert!(cx.read(|cx| ws.read(cx).file_context(cx).is_none()));
+                cx.update(|window, cx| window.focus(&input.focus_handle(cx)));
+                cx.simulate_input("Explain the settings");
+                cx.simulate_keystrokes("enter");
+                assert_eq!(chat_answer(&ws, cx), "Echo: Explain the settings");
+                cx.read(|cx| {
+                    let messages = &chat.read(cx).messages;
+                    assert!(messages.iter().all(|message| message.context.is_none()));
+                    assert!(
+                        messages
+                            .iter()
+                            .all(|message| !message.prompt.contains("private-context-test-marker"))
+                    );
+                });
+            }
+        }
+        let requests = seen.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("POST "))
+                .count(),
+            paths.len() * 2
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("private-context-test-marker"))
+        );
+        drop(requests);
+        let source = root.join("src/main.rs");
+        ws.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(source.clone(), None, window, cx);
+        });
+        wait_for(cx, "the source file", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|editor| editor.read(cx).path(cx) == Some(source.as_path()))
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let start = cx.read(|cx| editor.read(cx).text(cx).find("helper();").unwrap());
+        editor.update(cx, |editor, cx| {
+            editor.select_range(start..start + "helper();".len(), cx)
+        });
+        cx.read(|cx| {
+            let context = ws.read(cx).file_context(cx).unwrap();
+            assert_eq!(context.text, "helper();");
+            assert_eq!(context.part.as_deref(), Some("line 2"));
+        });
+        cx.update(|window, cx| window.focus(&input.focus_handle(cx)));
+        cx.simulate_input("Explain the selection");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(chat_answer(&ws, cx), "Echo: Explain the selection");
+        let requests = seen.lock().unwrap();
+        let request = requests.last().unwrap();
+        assert!(request.contains("helper();") && !request.contains("fn main()"));
+        assert!(!request.contains("private-context-test-marker"));
+    }
+
+    #[gpui::test]
+    fn chat_with_anthropic_after_adding_a_key(cx: &mut TestAppContext) {
+        let (api, seen) = fake_api();
+        let urls = crate::ai_providers::Urls {
+            anthropic: api,
+            ..down_urls()
+        };
+        let (_root, store, ws, cx) = ai_setup(cx, "chat-anthropic", urls);
+        cx.simulate_keystrokes("ctrl-shift-a");
+        let panel = cx.read(|cx| ws.read(cx).ai_panel.clone());
+        panel.update(cx, |p, cx| p.show(crate::ai_panel::View::Providers, cx));
+        wait_for(cx, "no key yet", &|cx| {
+            store.read(cx).provider("anthropic").unwrap().status
+                == crate::ai_providers::Status::NoKey
+        });
+        cx.run_until_parked();
+        let add = cx.debug_bounds("ai-key-anthropic").unwrap();
+        cx.simulate_click(add.center(), gpui::Modifiers::default());
+        cx.simulate_input("sk-ant-test");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the models", &|cx| {
+            store.read(cx).provider("anthropic").unwrap().models() == ["model-a"]
+        });
+        store.update(cx, |s, cx| {
+            s.choose(
+                ai::Role::Chat,
+                crate::ai_providers::ModelRef {
+                    provider: "anthropic".into(),
+                    model: "model-a".into(),
+                },
+                cx,
+            )
+        });
+        cx.simulate_keystrokes("secondary-shift-l");
+        cx.simulate_input("Hi there");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(chat_answer(&ws, cx), "Echo: Hi there");
+        let request = seen.lock().unwrap().last().unwrap().clone();
+        assert!(request.starts_with("POST /v1/messages "), "{request}");
+        assert!(request.contains("x-api-key: sk-ant-test"), "{request}");
+
+        // Forgetting the key leaves the provider without one.
+        let forget = cx.debug_bounds("ai-forget-key-anthropic").unwrap();
+        cx.simulate_click(forget.center(), gpui::Modifiers::default());
+        wait_for(cx, "the key to go", &|cx| {
+            store.read(cx).provider("anthropic").unwrap().status
+                == crate::ai_providers::Status::NoKey
+        });
+        let chat = cx.read(|cx| ws.read(cx).chat.clone());
+        let input = cx.read(|cx| chat.read(cx).input());
+        cx.update(|window, cx| window.focus(&input.focus_handle(cx)));
+        cx.simulate_input("Again?");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the refusal", &|cx| {
+            chat.read(cx)
+                .messages
+                .last()
+                .is_some_and(|m| m.error.is_some())
+        });
+    }
+
+    #[gpui::test]
+    fn chat_with_a_local_model_starts_its_server(cx: &mut TestAppContext) {
+        let (root, store, ws, cx) = ai_setup(cx, "chat-local", down_urls());
+        let data = root.join("data");
+        let bin = data.join("llama").join(ai::install::LLAMA_BUILD);
+        std::fs::create_dir_all(&bin).unwrap();
+        let mock =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../ai/tests/fixtures/mock_llama_server.py");
+        std::fs::copy(mock, bin.join("llama-server")).unwrap();
+        let model = ai::catalog::calibration();
+        let file = ai::Dirs::new(&data).model(model);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "GGUF").unwrap();
+        store.update(cx, |s, cx| s.load(cx));
+        wait_for(cx, "the install", &|cx| {
+            store.read(cx).installed.contains(&model.id)
+        });
+        store.update(cx, |s, cx| s.set_role(ai::Role::Chat, &model.id, cx));
+
+        cx.simulate_keystrokes("secondary-shift-l");
+        cx.simulate_input("Explain this");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(chat_answer(&ws, cx), "Local answer to: Explain this");
+        cx.read(|cx| {
+            let s = store.read(cx);
+            assert!(s.local.as_ref().is_some_and(|r| r.model == model.id));
+        });
+        // Removing the model stops its server.
+        let model = model.clone();
+        store.update(cx, |s, cx| s.remove(model, cx));
+        assert!(cx.read(|cx| store.read(cx).local.is_none()));
     }
 }

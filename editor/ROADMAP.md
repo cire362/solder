@@ -58,10 +58,12 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
       picks the best model it runs well; one-click install of llama.cpp and models
       (pinned build, SHA-256 checked, resumable); a catalog of fifteen models, any
       GGUF from Hugging Face or disk, and LM Studio's models
-- [ ] Providers: local llama.cpp, Ollama, LM Studio, OpenAI-compatible, Anthropic
+- [x] Providers: local llama.cpp, Ollama, LM Studio, OpenAI-compatible, Anthropic
       with your own key; model per task; offline mode
 - [ ] Project map for context; `.solderignore`; `.env` always excluded
-- [ ] Ask the codebase (chat), inline edits, streaming completions
+- [~] Ask the codebase (chat), inline edits, streaming completions
+      (streaming chat with the current file or selection; project context,
+      inline edits and completions are still to come)
 - [ ] Agent tasks in their own branch and worktree with an editable plan: edits,
       commands and tests in a loop, network and outside-project commands confirmed,
       review the diff and merge
