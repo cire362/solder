@@ -1,12 +1,15 @@
 //! Local models in the app: what this machine can run, the benchmark,
-//! downloads and which model serves each role. One store for all windows,
-//! since models are shared and only one server should hold memory.
+//! downloads, models added by hand and which model serves each role. One
+//! store for all windows, since models are shared and only one server should
+//! hold memory.
 //!
 //! Nothing runs until the AI tab is opened.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
-use ai::{Candidate, Dirs, Hardware, Model, Progress, Role, Speed, catalog, install};
+use ai::{
+    Candidate, Dirs, Hardware, Model, Progress, Role, Source, Speed, catalog, custom, install,
+};
 use gpui::{App, AppContext, Context, Entity, Global, SharedString, Task};
 
 /// What the benchmark is doing.
@@ -20,6 +23,8 @@ pub enum BenchStep {
 pub struct AiStore {
     pub dirs: Dirs,
     hub: String,
+    /// Folders searched for models other apps downloaded.
+    scan_dirs: Vec<PathBuf>,
     pub loaded: bool,
     pub hardware: Option<Hardware>,
     pub free_disk: Option<u64>,
@@ -28,11 +33,17 @@ pub struct AiStore {
     /// Speeds measured on each installed model after its download.
     pub verified: HashMap<String, Speed>,
     pub roles: HashMap<Role, String>,
-    pub installed: Vec<&'static str>,
+    /// Models added by hand, kept in `ai.json`.
+    pub custom: Vec<Model>,
+    /// Models found in LM Studio's folders, read again on each start.
+    pub found: Vec<Model>,
+    pub installed: Vec<String>,
     pub benchmark: Option<BenchStep>,
-    pub downloads: HashMap<&'static str, Arc<Progress>>,
+    pub downloads: HashMap<String, Arc<Progress>>,
     /// Models being measured after their download.
-    pub verifying: Vec<&'static str>,
+    pub verifying: Vec<String>,
+    /// A model being looked up to add.
+    pub adding: bool,
     pub error: Option<SharedString>,
     ticker: Option<Task<()>>,
 }
@@ -48,21 +59,36 @@ fn role_key(role: Role) -> &'static str {
     }
 }
 
+/// `~/models/x.gguf` and `/abs/x.gguf` are paths; anything else is looked
+/// up on Hugging Face.
+fn local_path(input: &str) -> Option<PathBuf> {
+    let input = input.trim();
+    let path = match input.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir()?.join(rest),
+        None => PathBuf::from(input),
+    };
+    (path.is_absolute() || input.ends_with(".gguf") && path.exists()).then_some(path)
+}
+
 impl AiStore {
     pub fn new(dirs: Dirs, hub: String) -> Self {
         Self {
             dirs,
             hub,
+            scan_dirs: custom::lm_studio_dirs(),
             loaded: false,
             hardware: None,
             free_disk: None,
             measured: None,
             verified: HashMap::new(),
             roles: HashMap::new(),
+            custom: Vec::new(),
+            found: Vec::new(),
             installed: Vec::new(),
             benchmark: None,
             downloads: HashMap::new(),
             verifying: Vec::new(),
+            adding: false,
             error: None,
             ticker: None,
         }
@@ -86,6 +112,23 @@ impl AiStore {
         cx.set_global(GlobalAiStore(store));
     }
 
+    #[cfg(test)]
+    pub fn with_scan_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.scan_dirs = dirs;
+        self
+    }
+
+    /// The catalog, then models added by hand, then models found on disk.
+    pub fn models(&self) -> Vec<Model> {
+        let mut out: Vec<Model> = catalog::models().to_vec();
+        for m in self.custom.iter().chain(&self.found) {
+            if !out.iter().any(|o| o.id == m.id) {
+                out.push(m.clone());
+            }
+        }
+        out
+    }
+
     /// Reads the machine and what is installed, the first time.
     pub fn load(&mut self, cx: &mut Context<Self>) {
         if self.loaded {
@@ -93,22 +136,26 @@ impl AiStore {
         }
         self.loaded = true;
         let dirs = self.dirs.clone();
+        let scan_dirs = self.scan_dirs.clone();
         let read = cx.background_executor().spawn(async move {
             let hw = ai::hardware::detect();
             let free = ai::free_space(&dirs.root);
             let state = std::fs::read(dirs.state())
                 .ok()
                 .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
-            let installed = install::installed_models(&dirs);
-            (hw, free, state, installed)
+            let found: Vec<Model> = custom::scan(&scan_dirs)
+                .iter()
+                .filter_map(|p| custom::from_file(p).ok())
+                .collect();
+            (hw, free, state, found)
         });
         cx.spawn(async move |this, cx| {
-            let (hw, free, state, installed) = read.await;
+            let (hw, free, state, found) = read.await;
             this.update(cx, |this, cx| {
                 this.hardware = Some(hw);
                 this.free_disk = free;
-                this.installed = installed.iter().map(|m| m.id).collect();
-                if let Some(state) = state {
+                this.found = found;
+                if let Some(state) = &state {
                     this.measured = Speed::from_json(&state["calibration"]);
                     if let Some(map) = state["verified"].as_object() {
                         for (id, speed) in map {
@@ -117,9 +164,18 @@ impl AiStore {
                             }
                         }
                     }
+                    this.custom = state["custom"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Model::from_json)
+                        .collect();
+                }
+                this.installed = install::installed_models(&this.dirs, &this.models());
+                if let Some(state) = &state {
                     for role in [Role::Chat, Role::Completion] {
                         if let Some(id) = state["roles"][role_key(role)].as_str()
-                            && this.installed.contains(&id)
+                            && this.installed.iter().any(|i| i == id)
                         {
                             this.roles.insert(role, id.to_string());
                         }
@@ -146,6 +202,7 @@ impl AiStore {
             "calibration": self.measured.map(Speed::to_json),
             "verified": verified,
             "roles": roles,
+            "custom": self.custom.iter().map(Model::to_json).collect::<Vec<_>>(),
         });
         let path = self.dirs.state();
         cx.background_executor()
@@ -160,7 +217,7 @@ impl AiStore {
 
     pub fn candidates(&self) -> Vec<Candidate> {
         match &self.hardware {
-            Some(hw) => catalog::recommend(hw, self.measured, &self.verified),
+            Some(hw) => catalog::recommend(hw, self.measured, &self.verified, &self.models()),
             None => Vec::new(),
         }
     }
@@ -222,9 +279,9 @@ impl AiStore {
         self.benchmark = Some(BenchStep::Runtime(progress.clone()));
         self.tick(cx);
         cx.spawn(async move |this, cx| {
+            let model = catalog::calibration();
             let result: Result<Speed, String> = async {
                 let binary = Self::runtime(dirs.clone(), hw, progress).await?;
-                let model = catalog::calibration();
                 let path = dirs.model(model);
                 if !path.is_file() {
                     let progress = Progress::new();
@@ -232,12 +289,18 @@ impl AiStore {
                         this.benchmark = Some(BenchStep::Model(progress.clone()))
                     })
                     .ok();
-                    ai::spawn(install::install_model(dirs.clone(), hub, model, progress)).await?;
+                    ai::spawn(install::install_model(
+                        dirs.clone(),
+                        hub,
+                        model.clone(),
+                        progress,
+                    ))
+                    .await?;
                 }
                 this.update(cx, |this, cx| {
                     this.benchmark = Some(BenchStep::Measuring);
                     if !this.installed.contains(&model.id) {
-                        this.installed.push(model.id);
+                        this.installed.push(model.id.clone());
                     }
                     cx.notify();
                 })
@@ -250,8 +313,7 @@ impl AiStore {
                 match result {
                     Ok(speed) => {
                         this.measured = Some(speed);
-                        this.verified
-                            .insert(catalog::calibration().id.to_string(), speed);
+                        this.verified.insert(model.id.clone(), speed);
                         this.save(cx);
                     }
                     Err(e) => this.error = Some(e.into()),
@@ -273,35 +335,102 @@ impl AiStore {
         }
     }
 
-    /// Downloads `model`, then measures it, and gives it the roles it is
-    /// recommended for that nothing else holds yet.
-    pub fn install(&mut self, model: &'static Model, cx: &mut Context<Self>) {
+    /// Measures an installed model again, on its own server.
+    pub fn measure(&mut self, model: Model, cx: &mut Context<Self>) {
         let Some(hw) = self.hardware.clone() else {
             return;
         };
-        if self.downloads.contains_key(model.id) {
+        if self.verifying.contains(&model.id) {
+            return;
+        }
+        self.error = None;
+        self.verifying.push(model.id.clone());
+        self.tick(cx);
+        let dirs = self.dirs.clone();
+        cx.spawn(async move |this, cx| {
+            let binary = Self::runtime(dirs.clone(), hw, Progress::new()).await;
+            let path = dirs.model(&model);
+            Self::verify(this, binary.map(|b| (b, path)), model, dirs, cx).await;
+        })
+        .detach();
+    }
+
+    /// Times `model` once nothing else is measuring, so two servers never
+    /// compete for memory.
+    async fn verify(
+        this: gpui::WeakEntity<Self>,
+        paths: Result<(PathBuf, PathBuf), String>,
+        model: Model,
+        dirs: Dirs,
+        cx: &mut gpui::AsyncApp,
+    ) {
+        let speed = match paths {
+            Ok((binary, path)) => {
+                loop {
+                    let free = this
+                        .update(cx, |this, _| {
+                            this.benchmark.is_none() && this.verifying.first() == Some(&model.id)
+                        })
+                        .unwrap_or(true);
+                    if free {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_millis(250))
+                        .await;
+                }
+                ai::spawn(ai::bench::run(binary, path, dirs.logs())).await
+            }
+            Err(e) => Err(e),
+        };
+        this.update(cx, |this, cx| {
+            this.verifying.retain(|id| *id != model.id);
+            match speed {
+                Ok(speed) => {
+                    this.verified.insert(model.id.clone(), speed);
+                    this.save(cx);
+                }
+                Err(e) => this.error = Some(format!("{}: {e}", model.name).into()),
+            }
+            cx.notify();
+        })
+        .ok();
+    }
+
+    /// Downloads `model`, then measures it, and gives it the roles it is
+    /// recommended for that nothing else holds yet.
+    pub fn install(&mut self, model: Model, cx: &mut Context<Self>) {
+        let Some(hw) = self.hardware.clone() else {
+            return;
+        };
+        if self.downloads.contains_key(&model.id) {
             return;
         }
         self.error = None;
         let progress = Progress::new();
-        self.downloads.insert(model.id, progress.clone());
+        self.downloads.insert(model.id.clone(), progress.clone());
         self.tick(cx);
         let (dirs, hub) = (self.dirs.clone(), self.hub.clone());
         cx.spawn(async move |this, cx| {
             let result = async {
                 let binary = Self::runtime(dirs.clone(), hw, Progress::new()).await?;
-                let path =
-                    ai::spawn(install::install_model(dirs.clone(), hub, model, progress)).await?;
+                let path = ai::spawn(install::install_model(
+                    dirs.clone(),
+                    hub,
+                    model.clone(),
+                    progress,
+                ))
+                .await?;
                 Ok::<_, String>((binary, path))
             }
             .await;
             let installed = this.update(cx, |this, cx| {
-                this.downloads.remove(model.id);
+                this.downloads.remove(&model.id);
                 this.refresh_disk(cx);
                 match result {
                     Ok(paths) => {
                         if !this.installed.contains(&model.id) {
-                            this.installed.push(model.id);
+                            this.installed.push(model.id.clone());
                         }
                         let picks = this
                             .candidates()
@@ -310,10 +439,10 @@ impl AiStore {
                             .map(|c| c.picks)
                             .unwrap_or_default();
                         for role in picks {
-                            this.roles.entry(role).or_insert_with(|| model.id.into());
+                            this.roles.entry(role).or_insert_with(|| model.id.clone());
                         }
                         this.save(cx);
-                        this.verifying.push(model.id);
+                        this.verifying.push(model.id.clone());
                         cx.notify();
                         Some(paths)
                     }
@@ -326,37 +455,9 @@ impl AiStore {
                     }
                 }
             });
-            let Ok(Some((binary, path))) = installed else {
-                return;
-            };
-            // Wait for the benchmark or another check to free the memory.
-            loop {
-                let free = this
-                    .update(cx, |this, _| {
-                        this.benchmark.is_none() && this.verifying.first() == Some(&model.id)
-                    })
-                    .unwrap_or(true);
-                if free {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(250))
-                    .await;
+            if let Ok(Some(paths)) = installed {
+                Self::verify(this, Ok(paths), model, dirs, cx).await;
             }
-            let logs = dirs.logs();
-            let speed = ai::spawn(ai::bench::run(binary, path, logs)).await;
-            this.update(cx, |this, cx| {
-                this.verifying.retain(|id| *id != model.id);
-                match speed {
-                    Ok(speed) => {
-                        this.verified.insert(model.id.into(), speed);
-                        this.save(cx);
-                    }
-                    Err(e) => this.error = Some(format!("{}: {e}", model.name).into()),
-                }
-                cx.notify();
-            })
-            .ok();
         })
         .detach();
     }
@@ -368,20 +469,25 @@ impl AiStore {
         cx.notify();
     }
 
-    pub fn remove(&mut self, model: &'static Model, cx: &mut Context<Self>) {
+    /// Deletes a downloaded model. A model added by hand is also taken off
+    /// the list; files Solder did not download stay on disk.
+    pub fn remove(&mut self, model: Model, cx: &mut Context<Self>) {
         self.installed.retain(|id| *id != model.id);
-        self.roles.retain(|_, id| id != model.id);
-        self.verified.remove(model.id);
+        self.roles.retain(|_, id| *id != model.id);
+        self.verified.remove(&model.id);
+        self.custom.retain(|m| m.id != model.id);
+        self.found.retain(|m| m.id != model.id);
         self.save(cx);
         let dirs = self.dirs.clone();
+        let name = model.name.clone();
         let removed = cx
             .background_executor()
-            .spawn(async move { install::remove_model(&dirs, model) });
+            .spawn(async move { install::remove_model(&dirs, &model) });
         cx.spawn(async move |this, cx| {
             let result = removed.await;
             this.update(cx, |this, cx| {
                 if let Err(e) = result {
-                    this.error = Some(format!("Could not delete {}: {e}", model.name).into());
+                    this.error = Some(format!("Could not delete {name}: {e}").into());
                 }
                 this.refresh_disk(cx);
                 cx.notify();
@@ -392,6 +498,52 @@ impl AiStore {
         cx.notify();
     }
 
+    /// Adds a model from a Hugging Face repository or link, or a `.gguf`
+    /// path, described by its file's header.
+    pub fn add(&mut self, input: String, cx: &mut Context<Self>) {
+        let input = input.trim().to_string();
+        if input.is_empty() || self.adding {
+            return;
+        }
+        self.adding = true;
+        self.error = None;
+        cx.notify();
+        let lookup: Task<Result<Model, String>> = match local_path(&input) {
+            Some(path) => cx
+                .background_executor()
+                .spawn(async move { custom::from_file(&path) }),
+            None => {
+                let hub = self.hub.clone();
+                let future = ai::spawn(custom::from_hub(hub, input));
+                cx.background_executor().spawn(future)
+            }
+        };
+        cx.spawn(async move |this, cx| {
+            let result = lookup.await;
+            this.update(cx, |this, cx| {
+                this.adding = false;
+                match result {
+                    Ok(model) => {
+                        if this.models().iter().any(|m| m.id == model.id) {
+                            this.error =
+                                Some(format!("{} is already in the list", model.name).into());
+                        } else {
+                            if matches!(&model.source, Source::File(p) if p.is_file()) {
+                                this.installed.push(model.id.clone());
+                            }
+                            this.custom.push(model);
+                            this.save(cx);
+                        }
+                    }
+                    Err(e) => this.error = Some(e.into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub fn set_role(&mut self, role: Role, model: &str, cx: &mut Context<Self>) {
         if self.roles.get(&role).map(String::as_str) == Some(model) {
             self.roles.remove(&role);
@@ -400,6 +552,10 @@ impl AiStore {
         }
         self.save(cx);
         cx.notify();
+    }
+
+    pub fn is_found(&self, id: &str) -> bool {
+        self.found.iter().any(|m| m.id == id)
     }
 
     fn refresh_disk(&mut self, cx: &mut Context<Self>) {
@@ -416,5 +572,18 @@ impl AiStore {
             .ok();
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tells_paths_from_hub_names() {
+        assert_eq!(local_path("/m/x.gguf"), Some(PathBuf::from("/m/x.gguf")));
+        assert!(local_path("~/x.gguf").is_some_and(|p| p.is_absolute()));
+        assert_eq!(local_path("org/repo"), None);
+        assert_eq!(local_path("org/repo/file.gguf"), None);
     }
 }

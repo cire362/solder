@@ -317,6 +317,21 @@ interrupted download resumes. After a download the model is measured for real,
 and that measurement replaces the prediction. Installed models can be given
 the chat and completion roles, or deleted.
 
+The catalog has fifteen models from 0.8B to 120B parameters (Qwen3.5, Qwen3.6,
+Qwen3.8, Qwen3 Coder, Gemma 4, gpt-oss, Nemotron 3.5), smallest first. Their
+parameter counts, active parameters and cache sizes come from each file's GGUF
+header, so mixture-of-experts models are predicted by the few experts a token
+uses, and hybrid and sliding-window models by the cache they really keep.
+
+Any other model can be added: type a Hugging Face repository (`org/model-GGUF`,
+or `org/model-GGUF:Q8_0` for a quantization), paste a link to a `.gguf` file, or
+type a path or pick a file with **File...**. Solder reads the file's header (for
+Hugging Face, the first megabytes with a range request) to know its size,
+parameters and cache, then lists it with the others: it can be installed,
+measured and given a role, but is never recommended, since its quality is
+unknown. Models LM Studio has downloaded are found and listed too, and run where
+they are. Models split across several files are not supported yet.
+
 Everything lives in `~/Library/Application Support/Solder` (on Linux,
 `~/.local/share/Solder`), shared by all projects. The server listens on
 `127.0.0.1` only, on a free port, with a key made for each run.
