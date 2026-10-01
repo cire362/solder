@@ -353,7 +353,35 @@ Open chat with `cmd-shift-l` (`ctrl-shift-l` on Linux and Windows). Pick a
 model, type a question and press Enter. The current file or selection is attached
 unless **File** is turned off; at most 24,000 characters are included. Files and
 directories whose names start with `.env` are never attached, including selected
-text. Project-wide context and `.solderignore` are not implemented yet.
+text. Files outside the project, symbolic links, Git-ignored files and build
+folders are also excluded.
+
+**Project map** is off by default. Turn it on to attach relative paths and
+declaration names with line numbers for Rust, TS/TSX, JS, Go and Python. It does
+not attach their bodies or let the model read other files. The map is built on
+request in the background, preferring paths mentioned in the question and files
+near the current file. Each request includes a fresh map, not copies of old maps.
+It is capped at 12,000 bytes and 1,000 files; **limited** means some entries were
+omitted. Scanning has a 20,000-entry limit and a two-second budget checked
+between entries; source reads are capped at 256 KiB per file and 2 MiB per
+request, with 16 declarations per file.
+
+Add `.solderignore` at the project root to exclude additional paths from both the
+map and file/selection attachments, using Git ignore syntax:
+
+```gitignore
+private/
+*.pem
+src/generated/*
+!src/generated/types.ts
+```
+
+Only the root `.solderignore` is used. Negations cannot re-include `.env*`,
+Git-ignored files or build folders. Rules are checked before every question. If
+a file used earlier in the conversation is now excluded or missing, Solder asks
+for **New chat** rather than re-sending that file or answers derived from it.
+Unreadable or invalid rules block attachments, not silently disable exclusions.
+Exclusions do not redact text you type yourself or retract previous requests.
 
 Answers stream into the right panel, with reasoning shown separately and copy
 buttons on code blocks. **Stop** or Escape cancels the request even when the

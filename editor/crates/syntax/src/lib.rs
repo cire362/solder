@@ -19,6 +19,9 @@ use tree_sitter::{
     TextProvider, Tree,
 };
 
+mod outline;
+pub use outline::{Symbol, outline};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum HighlightKind {

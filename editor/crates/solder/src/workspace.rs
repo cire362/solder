@@ -1654,8 +1654,39 @@ impl Workspace {
     /// The active file for the chat: its selection when there is one, else
     /// the whole file, with its path from the project root.
     pub fn file_context(&self, cx: &App) -> Option<crate::chat_panel::FileContext> {
+        let (source, path, part) = self.file_context_meta(cx)?;
         let editor = self.active_editor()?.read(cx);
-        let path = editor.path(cx)?;
+        let range = editor.newest_range();
+        let rope = editor.rope(cx);
+        let range = if part.is_some() {
+            range
+        } else {
+            0..rope.len_bytes()
+        };
+        Some(crate::chat_panel::FileContext {
+            source,
+            path,
+            text: rope
+                .byte_slice(range)
+                .chars()
+                .take(crate::chat_panel::FILE_LIMIT + 1)
+                .collect(),
+            part,
+        })
+    }
+
+    pub fn file_context_label(&self, cx: &App) -> Option<String> {
+        let (_, path, part) = self.file_context_meta(cx)?;
+        Some(match part {
+            Some(part) => format!("{path} ({part})"),
+            None => path,
+        })
+    }
+
+    fn file_context_meta(&self, cx: &App) -> Option<(PathBuf, String, Option<String>)> {
+        let editor = self.active_editor()?.read(cx);
+        let source = editor.path(cx)?.to_path_buf();
+        let path = &source;
         if !ai::context::allows_file(path) {
             return None;
         }
@@ -1666,26 +1697,21 @@ impl Workspace {
             .display()
             .to_string();
         let range = editor.newest_range();
-        let text = editor.text(cx);
-        if range.is_empty() || range.end > text.len() {
-            return Some(crate::chat_panel::FileContext {
-                path,
-                text,
-                part: None,
-            });
+        if range.is_empty() || range.end > editor.rope(cx).len_bytes() {
+            return Some((source, path, None));
         }
         let buffer = editor.buf(cx);
         let first = buffer.offset_to_point(range.start).row + 1;
         let last = buffer.offset_to_point(range.end).row + 1;
-        Some(crate::chat_panel::FileContext {
+        Some((
+            source,
             path,
-            text: text[range].to_string(),
-            part: Some(if first == last {
+            Some(if first == last {
                 format!("line {first}")
             } else {
                 format!("lines {first}-{last}")
             }),
-        })
+        ))
     }
 
     fn show_ai(&mut self, _: &ShowAi, window: &mut Window, cx: &mut Context<Self>) {
@@ -6036,6 +6062,273 @@ mod tests {
         let request = requests.last().unwrap();
         assert!(request.contains("helper();") && !request.contains("fn main()"));
         assert!(!request.contains("private-context-test-marker"));
+    }
+
+    #[gpui::test]
+    fn chat_project_map_is_opt_in_and_excludes_private_files(cx: &mut TestAppContext) {
+        let (api, seen) = fake_api();
+        let urls = crate::ai_providers::Urls {
+            lm_studio: api,
+            ..down_urls()
+        };
+        let (root, store, ws, cx) = ai_setup(cx, "chat-project-map", urls);
+        std::fs::write(root.join("src/private.rs"), "fn PRIVATE_DECLARATION() {}\n").unwrap();
+        std::fs::write(root.join(".env"), "ENV_SECRET=env-marker\n").unwrap();
+        std::fs::write(root.join(".solderignore"), "src/private.rs\n!.env\n").unwrap();
+        std::fs::write(
+            root.join("src/util.rs"),
+            "pub fn helper() { let value = \"BODY_SECRET\"; }\n",
+        )
+        .unwrap();
+        ws.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(root.join("src/main.rs"), None, window, cx)
+        });
+        wait_for(cx, "the source file", &|cx| {
+            ws.read(cx).active_editor().is_some_and(|editor| {
+                editor.read(cx).path(cx) == Some(root.join("src/main.rs").as_path())
+            })
+        });
+        cx.simulate_keystrokes("secondary-shift-l");
+        wait_for(cx, "the map test provider", &|cx| {
+            store
+                .read(cx)
+                .provider("lmstudio")
+                .is_some_and(|provider| provider.models() == ["model-a"])
+        });
+        store.update(cx, |store, cx| {
+            store.choose(
+                ai::Role::Chat,
+                crate::ai_providers::ModelRef {
+                    provider: "lmstudio".into(),
+                    model: "model-a".into(),
+                },
+                cx,
+            )
+        });
+        let chat = cx.read(|cx| ws.read(cx).chat.clone());
+        let input = cx.read(|cx| chat.read(cx).input());
+        assert!(!cx.read(|cx| chat.read(cx).include_project));
+        cx.run_until_parked();
+        let file_toggle = cx.debug_bounds("chat-file").unwrap();
+        cx.simulate_click(file_toggle.center(), gpui::Modifiers::default());
+        cx.update(|window, cx| window.focus(&input.focus_handle(cx)));
+        cx.simulate_input("Where is helper?");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(chat_answer(&ws, cx), "Echo: Where is helper?");
+        assert!(!seen.lock().unwrap().last().unwrap().contains("Project map"));
+        let map_toggle = cx.debug_bounds("chat-project").unwrap();
+        assert!(map_toggle.size.width > px(0.) && map_toggle.size.height > px(0.));
+        cx.simulate_click(map_toggle.center(), gpui::Modifiers::default());
+        cx.update(|window, cx| window.focus(&input.focus_handle(cx)));
+        cx.simulate_input("Find helper");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(chat_answer(&ws, cx), "Echo: Find helper");
+        let request = seen.lock().unwrap().last().unwrap().clone();
+        assert!(request.contains("Project map") && request.contains("src/util.rs"));
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert!(
+            !body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("src/util.rs")
+        );
+        assert_eq!(
+            body["messages"].as_array().unwrap().last().unwrap()["role"],
+            "user"
+        );
+        assert!(request.contains(r#"fn \"helper\":1"#), "{request}");
+        for private in [
+            "private.rs",
+            "PRIVATE_DECLARATION",
+            "BODY_SECRET",
+            "env-marker",
+            "\\\".env\\\"",
+        ] {
+            assert!(!request.contains(private), "{private}: {request}");
+        }
+        cx.update(|window, cx| window.focus(&input.focus_handle(cx)));
+        cx.simulate_input("Explain the names");
+        cx.simulate_keystrokes("enter");
+        chat_answer(&ws, cx);
+        let request = seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(request.matches("Project map").count(), 1);
+        assert_eq!(request.matches("src/util.rs").count(), 1);
+        cx.read(|cx| {
+            assert!(
+                chat.read(cx).messages[2]
+                    .context_paths
+                    .contains(&root.join("src/util.rs"))
+            );
+            assert!(!chat.read(cx).messages[2].prompt.contains("Project map"));
+        });
+    }
+
+    #[gpui::test]
+    fn chat_rechecks_history_and_requires_a_fresh_chat_after_exclusion(cx: &mut TestAppContext) {
+        let (api, seen) = fake_api();
+        let urls = crate::ai_providers::Urls {
+            lm_studio: api,
+            ..down_urls()
+        };
+        let (root, store, ws, cx) = ai_setup(cx, "chat-context-history", urls);
+        ws.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(root.join("src/main.rs"), None, window, cx)
+        });
+        wait_for(cx, "the history source", &|cx| {
+            ws.read(cx).active_editor().is_some_and(|editor| {
+                editor.read(cx).path(cx) == Some(root.join("src/main.rs").as_path())
+            })
+        });
+        cx.simulate_keystrokes("secondary-shift-l");
+        wait_for(cx, "the history provider", &|cx| {
+            store
+                .read(cx)
+                .provider("lmstudio")
+                .is_some_and(|provider| provider.models() == ["model-a"])
+        });
+        store.update(cx, |store, cx| {
+            store.choose(
+                ai::Role::Chat,
+                crate::ai_providers::ModelRef {
+                    provider: "lmstudio".into(),
+                    model: "model-a".into(),
+                },
+                cx,
+            )
+        });
+        let chat = cx.read(|cx| ws.read(cx).chat.clone());
+        let input = cx.read(|cx| chat.read(cx).input());
+        cx.update(|window, cx| window.focus(&input.focus_handle(cx)));
+        cx.simulate_input("Explain main");
+        cx.simulate_keystrokes("enter");
+        chat_answer(&ws, cx);
+        std::fs::write(root.join(".solderignore"), "src/main.rs\n").unwrap();
+        cx.simulate_input("And the rest?");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the changed rules", &|cx| !chat.read(cx).streaming());
+        cx.read(|cx| {
+            assert_eq!(
+                chat.read(cx)
+                    .messages
+                    .last()
+                    .unwrap()
+                    .error
+                    .as_ref()
+                    .map(|error| error.as_str()),
+                Some("Context rules changed. Start a new chat.")
+            )
+        });
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.starts_with("POST "))
+                .count(),
+            1
+        );
+        chat.update_in(cx, |chat, window, cx| {
+            chat.new_chat(&crate::chat_panel::NewChat, window, cx)
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        editor.update(cx, |editor, cx| editor.select_range(0..2, cx));
+        cx.update(|window, cx| window.focus(&input.focus_handle(cx)));
+        cx.simulate_input("A clean question");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(chat_answer(&ws, cx), "Echo: A clean question");
+        cx.read(|cx| assert!(chat.read(cx).messages[0].context.is_none()));
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .contains("From src/main.rs")
+        );
+        std::fs::write(root.join(".solderignore"), "[z-a]\n").unwrap();
+        cx.simulate_input("Check invalid rules");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "invalid context rules", &|cx| {
+            !chat.read(cx).streaming()
+        });
+        cx.read(|cx| {
+            assert_eq!(
+                chat.read(cx)
+                    .messages
+                    .last()
+                    .unwrap()
+                    .error
+                    .as_ref()
+                    .map(|error| error.as_str()),
+                Some("Invalid pattern in .solderignore.")
+            )
+        });
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.starts_with("POST "))
+                .count(),
+            2
+        );
+    }
+
+    #[gpui::test]
+    fn chat_stop_cancels_context_and_new_chat_has_no_stale_prompt(cx: &mut TestAppContext) {
+        let (api, seen) = fake_api();
+        let urls = crate::ai_providers::Urls {
+            lm_studio: api,
+            ..down_urls()
+        };
+        let (_root, store, ws, cx) = ai_setup(cx, "chat-context-stop", urls);
+        cx.simulate_keystrokes("secondary-shift-l");
+        wait_for(cx, "the stop test provider", &|cx| {
+            store
+                .read(cx)
+                .provider("lmstudio")
+                .is_some_and(|provider| provider.models() == ["model-a"])
+        });
+        store.update(cx, |store, cx| {
+            store.choose(
+                ai::Role::Chat,
+                crate::ai_providers::ModelRef {
+                    provider: "lmstudio".into(),
+                    model: "model-a".into(),
+                },
+                cx,
+            )
+        });
+        let chat = cx.read(|cx| ws.read(cx).chat.clone());
+        let input = cx.read(|cx| chat.read(cx).input());
+        cx.update(|window, cx| window.focus(&input.focus_handle(cx)));
+        cx.simulate_input("Cancelled question");
+        chat.update_in(cx, |chat, window, cx| {
+            chat.include_project = true;
+            chat.send(&crate::chat_panel::Send, window, cx);
+            assert!(chat.streaming());
+            chat.stop(&crate::chat_panel::Stop, window, cx);
+            chat.new_chat(&crate::chat_panel::NewChat, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|request| !request.starts_with("POST "))
+        );
+        cx.simulate_input("Fresh question");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(chat_answer(&ws, cx), "Echo: Fresh question");
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .contains("Cancelled question")
+        );
+        assert_eq!(cx.read(|cx| chat.read(cx).messages.len()), 2);
     }
 
     #[gpui::test]
