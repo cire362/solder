@@ -56,7 +56,8 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 ## 6. Solder AI
 - [x] Local models: a benchmark that reads the machine, times a small model and
       picks the best model it runs well; one-click install of llama.cpp and models
-      (pinned build, SHA-256 checked, resumable)
+      (pinned build, SHA-256 checked, resumable); a catalog of fifteen models, any
+      GGUF from Hugging Face or disk, and LM Studio's models
 - [ ] Providers: local llama.cpp, Ollama, LM Studio, OpenAI-compatible, Anthropic
       with your own key; model per task; offline mode
 - [ ] Project map for context; `.solderignore`; `.env` always excluded

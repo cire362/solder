@@ -239,6 +239,7 @@ pub fn bind_defaults(cx: &mut App) {
     crate::results::bind_keys(cx);
     crate::structure::bind_keys(cx);
     crate::erd_view::bind_keys(cx);
+    crate::ai_panel::bind_keys(cx);
 }
 
 fn read(path: &Path) -> String {

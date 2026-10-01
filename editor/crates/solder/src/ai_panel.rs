@@ -1,32 +1,77 @@
 //! The AI tab: this machine, the benchmark, and the models it can run, with
-//! install, delete and which model serves chat and completions.
+//! install, delete, models added by hand and which model serves chat and
+//! completions.
 
-use ai::{Candidate, Role, Speed, format_size};
+use ai::{Candidate, Role, Source, Speed, format_size};
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable, Hsla, SharedString, Window, div,
-    prelude::*, px, uniform_list,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable, Hsla, KeyBinding, PathPromptOptions,
+    SharedString, Window, actions, div, prelude::*, px, uniform_list,
 };
 
 use crate::{
     ai_store::{AiStore, BenchStep},
+    editor::Editor,
     theme::{ActiveTheme, Theme, UI_FONT_SIZE},
     ui,
 };
 
 const ROW_HEIGHT: gpui::Pixels = px(54.);
 
+actions!(ai_panel, [AddModel]);
+
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("enter", AddModel, Some("AiAddModel"))]);
+}
+
 pub struct AiPanel {
     store: Entity<AiStore>,
+    add_field: Entity<Editor>,
     focus: FocusHandle,
 }
 
 impl AiPanel {
     pub fn new(store: Entity<AiStore>, cx: &mut Context<Self>) -> Self {
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        let add_field = cx.new(|cx| Editor::single_line("org/model-GGUF or a .gguf path", cx));
         Self {
             store,
+            add_field,
             focus: cx.focus_handle(),
         }
+    }
+
+    fn add(&mut self, _: &AddModel, _: &mut Window, cx: &mut Context<Self>) {
+        let input = self.add_field.read(cx).text(cx);
+        if input.trim().is_empty() {
+            return;
+        }
+        self.store.update(cx, |s, cx| s.add(input, cx));
+        self.add_field.update(cx, |e, cx| e.set_text("", false, cx));
+    }
+
+    fn browse(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Add".into()),
+        });
+        let store = self.store.clone();
+        cx.spawn(async move |_, cx| {
+            if let Ok(Ok(Some(paths))) = paths.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                store
+                    .update(cx, |s, cx| s.add(path.display().to_string(), cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    #[cfg(test)]
+    pub fn add_field(&self) -> Entity<Editor> {
+        self.add_field.clone()
     }
 
     pub fn shown(&mut self, cx: &mut Context<Self>) {
@@ -99,7 +144,7 @@ impl AiPanel {
                     .candidates()
                     .into_iter()
                     .filter(|c| !c.picks.is_empty() && !store.installed.contains(&c.model.id))
-                    .filter(|c| !store.downloads.contains_key(c.model.id))
+                    .filter(|c| !store.downloads.contains_key(&c.model.id))
                     .collect();
                 let size: u64 = missing.iter().map(|c| c.model.size).sum();
                 block = block.child(
@@ -161,11 +206,13 @@ impl AiPanel {
 
     fn render_row(&self, ix: usize, c: &Candidate, theme: &Theme, cx: &App) -> AnyElement {
         let store = self.store.read(cx);
-        let model = c.model;
-        let installed = store.installed.contains(&model.id);
-        let download = store.downloads.get(model.id).cloned();
-        let verifying = store.verifying.contains(&model.id);
-        let verified = store.verified.get(model.id).copied();
+        let model = c.model.clone();
+        let id = model.id.clone();
+        let installed = store.installed.contains(&id);
+        let download = store.downloads.get(&id).cloned();
+        let verifying = store.verifying.contains(&id);
+        let verified = store.verified.get(&id).copied();
+        let found = store.is_found(&id);
         let budget = store.hardware.as_ref().map_or(0, |h| h.model_budget());
         let detail = if !c.fits && !installed {
             format!(
@@ -179,25 +226,32 @@ impl AiPanel {
                 (None, Some(p)) => format!(" · about {}", Self::speed_text(p)),
                 _ => String::new(),
             };
-            format!("{}{speed}", format_size(model.size))
+            let active = if model.active < model.params * 0.9 {
+                format!(" · {:.0}B, {:.1}B active", model.params, model.active)
+            } else {
+                format!(" · {:.1}B", model.params)
+            };
+            format!("{}{active}{speed}", format_size(model.size))
         };
         let entity = self.store.clone();
         let role_toggle = |role: Role, label: &'static str| {
             let entity = entity.clone();
-            let active = store.roles.get(&role).map(String::as_str) == Some(model.id);
-            let id = format!("ai-role-{label}-{}", model.id);
+            let active = store.roles.get(&role) == Some(&id);
+            let selector = format!("ai-role-{label}-{id}");
+            let model_id = id.clone();
             ui::toggle(
-                SharedString::from(id.clone()),
+                SharedString::from(selector.clone()),
                 label,
                 "",
                 active,
                 theme,
-                move |_, _, cx| entity.update(cx, |s, cx| s.set_role(role, model.id, cx)),
+                move |_, _, cx| entity.update(cx, |s, cx| s.set_role(role, &model_id, cx)),
             )
-            .debug_selector(move || id.clone())
+            .debug_selector(move || selector.clone())
         };
         let action: AnyElement = if let Some(progress) = &download {
             let fraction = progress.fraction();
+            let model_id = id.clone();
             div()
                 .flex()
                 .items_center()
@@ -210,14 +264,14 @@ impl AiPanel {
                         .child(fraction.map_or("...".to_string(), |f| format!("{:.0}%", f * 100.))),
                 )
                 .child(ui::toggle(
-                    SharedString::from(format!("ai-cancel-{}", model.id)),
+                    SharedString::from(format!("ai-cancel-{id}")),
                     "cancel",
                     "",
                     false,
                     theme,
                     {
                         let entity = entity.clone();
-                        move |_, _, cx| entity.update(cx, |s, cx| s.cancel(model.id, cx))
+                        move |_, _, cx| entity.update(cx, |s, cx| s.cancel(&model_id, cx))
                     },
                 ))
                 .into_any_element()
@@ -228,41 +282,72 @@ impl AiPanel {
                 .child("Measuring...")
                 .into_any_element()
         } else if installed {
+            // Files Solder did not download are only taken off the list.
+            let remove_label = match model.source {
+                Source::Hub { .. } => "delete",
+                Source::File(_) => "remove",
+            };
+            let selector = format!("ai-delete-{id}");
+            let removed = model.clone();
+            let measured = model.clone();
             div()
                 .flex()
                 .items_center()
                 .gap_0p5()
+                .when(verified.is_none() && store.measured.is_some(), |d| {
+                    let entity = entity.clone();
+                    d.child(ui::toggle(
+                        SharedString::from(format!("ai-measure-{id}")),
+                        "measure",
+                        "",
+                        false,
+                        theme,
+                        move |_, _, cx| entity.update(cx, |s, cx| s.measure(measured.clone(), cx)),
+                    ))
+                })
                 .child(role_toggle(Role::Chat, "chat"))
                 .child(role_toggle(Role::Completion, "complete"))
-                .child(
-                    div()
-                        .invisible()
-                        .group_hover("ai-model", |s| s.visible())
-                        .child(
-                            ui::toggle(
-                                SharedString::from(format!("ai-delete-{}", model.id)),
-                                "delete",
-                                "",
-                                false,
-                                theme,
-                                move |_, _, cx| entity.update(cx, |s, cx| s.remove(model, cx)),
-                            )
-                            .debug_selector(move || format!("ai-delete-{}", model.id)),
-                        ),
-                )
+                .when(!found, |d| {
+                    d.child(
+                        div()
+                            .invisible()
+                            .group_hover("ai-model", |s| s.visible())
+                            .child(
+                                ui::toggle(
+                                    SharedString::from(selector.clone()),
+                                    remove_label,
+                                    "",
+                                    false,
+                                    theme,
+                                    move |_, _, cx| {
+                                        entity.update(cx, |s, cx| s.remove(removed.clone(), cx))
+                                    },
+                                )
+                                .debug_selector(move || selector.clone()),
+                            ),
+                    )
+                })
                 .into_any_element()
-        } else if c.fits {
+        } else if c.fits || model.is_custom() {
+            let selector = format!("ai-install-{id}");
             ui::button(
-                SharedString::from(format!("ai-install-{}", model.id)),
+                SharedString::from(selector.clone()),
                 "Install",
                 !c.picks.is_empty(),
                 theme,
-                move |_, _, cx| entity.update(cx, |s, cx| s.install(model, cx)),
+                move |_, _, cx| entity.update(cx, |s, cx| s.install(model.clone(), cx)),
             )
-            .debug_selector(move || format!("ai-install-{}", model.id))
+            .debug_selector(move || selector.clone())
             .into_any_element()
         } else {
             div().into_any_element()
+        };
+        let origin = if found {
+            Some("LM Studio")
+        } else if c.model.is_custom() {
+            Some("added")
+        } else {
+            None
         };
         div()
             .w_full()
@@ -294,7 +379,7 @@ impl AiPanel {
                                     .gap_1p5()
                                     .text_size(UI_FONT_SIZE)
                                     .text_color(theme.fg)
-                                    .child(div().truncate().child(model.name))
+                                    .child(div().truncate().child(c.model.name.clone()))
                                     .children(
                                         c.picks.contains(&Role::Chat).then(|| {
                                             Self::tag("best for chat", theme.accent, theme)
@@ -306,7 +391,8 @@ impl AiPanel {
                                         .then(|| {
                                             Self::tag("best to complete", theme.accent, theme)
                                         }),
-                                    ),
+                                    )
+                                    .children(origin.map(|o| Self::tag(o, theme.fg_subtle, theme))),
                             )
                             .child(
                                 div()
@@ -325,6 +411,38 @@ impl AiPanel {
             )
             .into_any_element()
     }
+
+    fn render_add(&self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let focused = self.add_field.focus_handle(cx).is_focused(window);
+        let adding = self.store.read(cx).adding;
+        div()
+            .px_3()
+            .pb_2()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .key_context("AiAddModel")
+            .on_action(cx.listener(Self::add))
+            .child(ui::text_field(self.add_field.clone(), focused, theme))
+            .child(
+                ui::button(
+                    "ai-add",
+                    if adding { "Adding..." } else { "Add" },
+                    false,
+                    theme,
+                    cx.listener(|this, _, window, cx| this.add(&AddModel, window, cx)),
+                )
+                .debug_selector(|| "ai-add".into()),
+            )
+            .child(ui::button(
+                "ai-browse",
+                "File...",
+                false,
+                theme,
+                cx.listener(|this, _, _, cx| this.browse(cx)),
+            ))
+            .into_any_element()
+    }
 }
 
 impl Focusable for AiPanel {
@@ -334,8 +452,9 @@ impl Focusable for AiPanel {
 }
 
 impl Render for AiPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let add = self.render_add(window, &theme, cx);
         let store = self.store.read(cx);
         let small = UI_FONT_SIZE - px(1.);
         let header = match &store.hardware {
@@ -388,7 +507,9 @@ impl Render for AiPanel {
                     .child("LOCAL MODELS"),
             )
             .child(header.pb_3())
-            .when(loaded, |d| d.child(self.render_benchmark(&theme, cx)))
+            .when(loaded, |d| {
+                d.child(self.render_benchmark(&theme, cx)).child(add)
+            })
             .children(error.map(|e| {
                 div()
                     .px_3()

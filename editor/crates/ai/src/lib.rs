@@ -8,6 +8,8 @@
 
 pub mod bench;
 pub mod catalog;
+pub mod custom;
+pub mod gguf;
 pub mod hardware;
 pub mod install;
 pub mod server;
@@ -23,7 +25,7 @@ use std::{
 };
 
 pub use bench::Speed;
-pub use catalog::{Candidate, MODELS, Model, Role};
+pub use catalog::{Candidate, Model, Role, Source};
 pub use hardware::Hardware;
 pub use server::LocalServer;
 
@@ -111,7 +113,10 @@ impl Dirs {
     }
 
     pub fn model(&self, model: &Model) -> PathBuf {
-        self.models().join(model.file)
+        match &model.source {
+            Source::Hub { file, .. } => self.models().join(file),
+            Source::File(path) => path.clone(),
+        }
     }
 
     pub fn state(&self) -> PathBuf {

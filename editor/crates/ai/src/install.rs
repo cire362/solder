@@ -17,7 +17,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
-    Dirs, Model, Progress, client,
+    Dirs, Model, Progress,
+    catalog::Source,
+    client,
     hardware::{Backend, Hardware},
 };
 
@@ -172,9 +174,14 @@ fn unpack(archive: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// A file's URL on Hugging Face.
+pub fn hub_url(hub: &str, repo: &str, file: &str) -> String {
+    format!("{hub}/{repo}/resolve/main/{file}")
+}
+
 /// A model file's URL, size and SHA-256 on Hugging Face.
-pub async fn model_asset(hub: &str, model: &Model) -> Result<Asset, String> {
-    let url = format!("{hub}/{}/resolve/main/{}", model.repo, model.file);
+pub async fn model_asset(hub: &str, repo: &str, file: &str) -> Result<Asset, String> {
+    let url = hub_url(hub, repo, file);
     // The size and hash come with the redirect to the file's storage.
     let head = no_redirects()
         .head(&url)
@@ -189,8 +196,7 @@ pub async fn model_asset(hub: &str, model: &Model) -> Result<Asset, String> {
     };
     let (Some(size), Some(sha256)) = (header("x-linked-size"), header("x-linked-etag")) else {
         return Err(format!(
-            "Hugging Face did not describe {} (HTTP {})",
-            model.file,
+            "Hugging Face has no {file} in {repo} (HTTP {})",
             head.status().as_u16()
         ));
     };
@@ -216,27 +222,37 @@ fn no_redirects() -> &'static reqwest::Client {
     })
 }
 
-/// Downloads a model into the models directory; returns its path.
+/// Downloads a model into the models directory; returns its path. A model
+/// already on disk is used where it is.
 pub async fn install_model(
     dirs: Dirs,
     hub: String,
-    model: &'static Model,
+    model: Model,
     progress: Arc<Progress>,
 ) -> Result<PathBuf, String> {
-    let asset = model_asset(&hub, model).await?;
-    let path = dirs.model(model);
+    let path = dirs.model(&model);
+    let Source::Hub { repo, file } = &model.source else {
+        return Ok(path);
+    };
+    let asset = model_asset(&hub, repo, file).await?;
     download(&asset, &path, &progress).await?;
     Ok(path)
 }
 
-pub fn installed_models(dirs: &Dirs) -> Vec<&'static Model> {
-    crate::MODELS
+/// The ids of `models` whose files are on disk.
+pub fn installed_models(dirs: &Dirs, models: &[Model]) -> Vec<String> {
+    models
         .iter()
         .filter(|m| dirs.model(m).is_file())
+        .map(|m| m.id.clone())
         .collect()
 }
 
+/// Deletes a downloaded model. Files Solder did not download stay.
 pub fn remove_model(dirs: &Dirs, model: &Model) -> std::io::Result<()> {
+    if !matches!(model.source, Source::Hub { .. }) {
+        return Ok(());
+    }
     let path = dirs.model(model);
     let _ = std::fs::remove_file(part_path(&path));
     match std::fs::remove_file(path) {
@@ -530,20 +546,8 @@ mod tests {
     fn reads_model_size_and_hash_from_the_hub() {
         let body = b"GGUF fake model".to_vec();
         let (base, _) = server(body.clone(), None);
-        static FAKE: Model = Model {
-            id: "fake",
-            name: "Fake",
-            repo: "org/repo",
-            file: "meta",
-            size: 1,
-            params: 1.,
-            active: 1.,
-            cache: 0,
-            context: 512,
-            rank: 1,
-        };
         let hub = base.clone();
-        let asset = block(async move { model_asset(&hub, &FAKE).await }).unwrap();
+        let asset = block(async move { model_asset(&hub, "org/repo", "meta").await }).unwrap();
         assert_eq!(asset.size, body.len() as u64);
         assert_eq!(asset.sha256, sha(&body));
         assert_eq!(asset.url, format!("{base}/org/repo/resolve/main/meta"));

@@ -5443,6 +5443,28 @@ mod tests {
         base
     }
 
+    /// The smallest GGUF header Solder reads: an architecture and one tensor.
+    fn tiny_gguf() -> Vec<u8> {
+        let mut out = b"GGUF".to_vec();
+        out.extend(3u32.to_le_bytes());
+        out.extend(1u64.to_le_bytes());
+        out.extend(1u64.to_le_bytes());
+        let string = |out: &mut Vec<u8>, s: &str| {
+            out.extend((s.len() as u64).to_le_bytes());
+            out.extend(s.as_bytes());
+        };
+        string(&mut out, "general.architecture");
+        out.extend(8u32.to_le_bytes());
+        string(&mut out, "llama");
+        string(&mut out, "output.weight");
+        out.extend(2u32.to_le_bytes());
+        out.extend(1000u64.to_le_bytes());
+        out.extend(1000u64.to_le_bytes());
+        out.extend(0u32.to_le_bytes());
+        out.extend(0u64.to_le_bytes());
+        out
+    }
+
     #[gpui::test]
     fn ai_tab_benchmarks_installs_and_assigns_models(cx: &mut TestAppContext) {
         use crate::ai_store::AiStore;
@@ -5456,13 +5478,24 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../ai/tests/fixtures/mock_llama_server.py");
         std::fs::copy(mock, bin.join("llama-server")).unwrap();
         let hub = fake_hub(b"GGUF calibration model".to_vec());
+        // A model LM Studio downloaded.
+        let lm_studio = root.join("lmstudio");
+        std::fs::create_dir_all(lm_studio.join("org/Tiny-GGUF")).unwrap();
+        std::fs::write(
+            lm_studio.join("org/Tiny-GGUF/Tiny-Q4_K_M.gguf"),
+            tiny_gguf(),
+        )
+        .unwrap();
         cx.executor().allow_parking();
         let store = cx.update(|cx| {
-            let store = cx.new(|_| AiStore::new(ai::Dirs::new(&data), hub.clone()));
+            let store = cx.new(|_| {
+                AiStore::new(ai::Dirs::new(&data), hub.clone())
+                    .with_scan_dirs(vec![lm_studio.clone()])
+            });
             AiStore::set_global(store.clone(), cx);
             store
         });
-        let (_ws, cx) = setup(cx, root.clone());
+        let (ws, cx) = setup(cx, root.clone());
         cx.simulate_keystrokes("ctrl-shift-a");
         wait_for(cx, "hardware", &|cx| store.read(cx).hardware.is_some());
         cx.run_until_parked();
@@ -5471,6 +5504,7 @@ mod tests {
         cx.simulate_click(run.center(), gpui::Modifiers::default());
         wait_for(cx, "the benchmark", &|cx| store.read(cx).measured.is_some());
         let calibration = ai::catalog::calibration();
+        let calibration_file = ai::Dirs::new(&data).model(calibration);
         cx.read(|cx| {
             let s = store.read(cx);
             assert_eq!(
@@ -5480,11 +5514,15 @@ mod tests {
                     generate: 67.8
                 })
             );
-            assert_eq!(s.installed, [calibration.id]);
+            assert!(s.installed.contains(&calibration.id));
             assert!(s.error.is_none(), "{:?}", s.error);
+            // The LM Studio model is listed and runnable where it is.
+            assert_eq!(s.found.len(), 1);
+            assert!(s.installed.contains(&s.found[0].id));
+            assert_eq!(s.found[0].name, "Tiny-Q4_K_M");
         });
         assert_eq!(
-            std::fs::read(data.join("models").join(calibration.file)).unwrap(),
+            std::fs::read(&calibration_file).unwrap(),
             b"GGUF calibration model"
         );
 
@@ -5510,29 +5548,57 @@ mod tests {
         cx.read(|cx| {
             let s = again.read(cx);
             assert!(s.measured.is_some());
-            assert_eq!(
-                s.roles.get(&ai::Role::Chat).map(String::as_str),
-                Some(calibration.id)
-            );
+            assert_eq!(s.roles.get(&ai::Role::Chat), Some(&calibration.id));
         });
 
         // Delete shows on hover and removes the file and its role; the
-        // calibration model is the first row. (gpui never clears debug bounds between frames, so whether it was
-        // hidden before cannot be read back here; the Database tab's test
-        // covers that.)
+        // calibration model is the first row. (gpui never clears debug
+        // bounds between frames, so whether it was hidden before cannot be
+        // read back here; the Database tab's test covers that.)
         let row = cx.debug_bounds("ai-model-0").unwrap();
         cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
         let button = cx
             .debug_bounds("ai-delete-qwen3.5-0.8b")
             .expect("shown on hover");
         cx.simulate_click(button.center(), gpui::Modifiers::default());
-        wait_for(cx, "the file to go", &|_| {
-            !data.join("models").join(calibration.file).exists()
+        wait_for(cx, "the file to go", &|_| !calibration_file.exists());
+        cx.read(|cx| {
+            let s = store.read(cx);
+            assert!(!s.installed.contains(&calibration.id));
+            assert!(s.roles.is_empty());
+        });
+
+        // A .gguf path typed into the field is added, described by its
+        // header, and kept across restarts.
+        let own = root.join("mine/Own-Q8_0.gguf");
+        std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+        std::fs::write(&own, tiny_gguf()).unwrap();
+        let panel = cx.read(|cx| ws.read(cx).ai_panel.clone());
+        let field = cx.read(|cx| panel.read(cx).add_field());
+        cx.update(|window, cx| window.focus(&field.focus_handle(cx)));
+        cx.simulate_input(&own.display().to_string());
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the model to be added", &|cx| {
+            !store.read(cx).custom.is_empty()
         });
         cx.read(|cx| {
             let s = store.read(cx);
-            assert!(s.installed.is_empty());
-            assert!(s.roles.is_empty());
+            assert!(s.error.is_none(), "{:?}", s.error);
+            let added = &s.custom[0];
+            assert_eq!(added.name, "Own-Q8_0");
+            assert_eq!(added.params, 0.001);
+            assert!(s.installed.contains(&added.id));
+            assert!(s.candidates().iter().any(|c| c.model.id == added.id));
         });
+        assert!(cx.read(|cx| field.read(cx).text(cx)).is_empty());
+        settle(cx);
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(data.join("ai.json")).unwrap()).unwrap();
+        assert_eq!(state["custom"][0]["name"], "Own-Q8_0");
+
+        // A bad entry says why.
+        cx.simulate_input("not a model");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the error", &|cx| store.read(cx).error.is_some());
     }
 }
