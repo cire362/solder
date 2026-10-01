@@ -223,6 +223,23 @@ it drafted, to review and apply or save as a migration like any other change.
 **Mermaid** copies the diagram as a Mermaid `erDiagram` for docs and pull requests;
 **SVG** and **PNG** save it as a file.
 
+### Redis keys and MongoDB documents
+
+Documents from a collection (browsed from the Database tab, or any `find` that
+keeps `_id`) are edited like rows: a changed cell becomes `updateOne` with `$set`,
+a deleted row `deleteOne`, an added row `insertOne` (MongoDB fills in `_id`).
+Values are read as the shell reads them (`37` is a number, `{a: 1}` an object), but
+a text field stays text unless you type quotes, braces or `ObjectId(...)`. MongoDB
+without a replica set has no transactions, so changes run one by one and a failure
+leaves the earlier ones saved, which the review says.
+
+A Redis key opened from the Database tab shows its type and expiry above its value,
+with **Expire** (seconds, or never), **Rename** and **Delete key**. Its members are
+edited in the grid: hash fields and values, list items, set members, sorted set
+members and scores, or a string's value (its expiry is kept). Changes run as one
+MULTI/EXEC. **Key** on a connection creates a key: type its name, pick its type,
+fill in the first member and apply.
+
 ### Editing rows
 
 Rows from a plain `SELECT` on one table with a primary key can be edited in

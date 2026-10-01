@@ -188,6 +188,65 @@ impl Mongo {
         Ok(documents(docs))
     }
 
+    /// Runs staged `updateOne`, `deleteOne` and `insertOne` calls in order;
+    /// each must match one document. A standalone server has no
+    /// transactions, so the calls before a failing one stay applied.
+    pub async fn apply(&self, statements: &[String]) -> Result<()> {
+        if self.read_only {
+            return Err("This connection is read-only".into());
+        }
+        let db = self.client.database(&self.database.lock().await.clone());
+        let total = statements.len();
+        let failed = |i: usize, why: String| {
+            let kept = match i {
+                0 => "nothing was changed".to_string(),
+                1 => "the change before it was saved".to_string(),
+                n => format!("the {n} changes before it were saved"),
+            };
+            format!(
+                "Change {} of {total}: {why}. MongoDB saves each change as it runs: {kept}.",
+                i + 1
+            )
+        };
+        for (i, statement) in statements.iter().enumerate() {
+            let call = parse_call(statement).map_err(|e| failed(i, e))?;
+            let coll = db.collection::<Document>(&call.collection);
+            let arg = |n: usize| document(call.args.get(n).cloned().unwrap_or_default());
+            let matched = match call.method.as_str() {
+                "updateOne" => {
+                    let (filter, update) = (
+                        arg(0).map_err(|e| failed(i, e))?,
+                        arg(1).map_err(|e| failed(i, e))?,
+                    );
+                    coll.update_one(filter, update)
+                        .await
+                        .map_err(|e| failed(i, e.to_string()))?
+                        .matched_count
+                }
+                "deleteOne" => {
+                    coll.delete_one(arg(0).map_err(|e| failed(i, e))?)
+                        .await
+                        .map_err(|e| failed(i, e.to_string()))?
+                        .deleted_count
+                }
+                "insertOne" => {
+                    coll.insert_one(arg(0).map_err(|e| failed(i, e))?)
+                        .await
+                        .map_err(|e| failed(i, e.to_string()))?;
+                    1
+                }
+                other => return Err(failed(i, format!("{other} is not a change"))),
+            };
+            if matched != 1 {
+                return Err(failed(
+                    i,
+                    "it matched no document (it changed or was deleted since it was read)".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn schema(&self) -> Result<Schema> {
         let name = self.database.lock().await.clone();
         let db = self.client.database(&name);
@@ -364,6 +423,22 @@ fn type_name(v: &Bson) -> &'static str {
         Bson::Timestamp(_) => "timestamp",
         Bson::RegularExpression(_) => "regex",
         _ => "",
+    }
+}
+
+/// The collection a `find` call reads, for editing its documents.
+pub(crate) fn find_collection(query: &str) -> Option<String> {
+    let call = parse_call(query).ok()?;
+    (call.method == "find").then_some(call.collection)
+}
+
+/// Whether `text` is one shell value: a number, boolean, null, object,
+/// array, quoted string or a constructor such as `ObjectId(...)`.
+pub(crate) fn is_shell_value(text: &str) -> bool {
+    let mut p = Parser::new(text);
+    p.value().is_ok() && {
+        p.skip_ws();
+        p.done()
     }
 }
 

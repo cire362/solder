@@ -43,6 +43,8 @@ pub enum DatabasePanelEvent {
         connection: SharedString,
         engine: Engine,
     },
+    /// Create a Redis key.
+    NewKey { connection: SharedString },
     /// Open the connection's scratch query file.
     NewQuery { connection: SharedString },
 }
@@ -247,7 +249,10 @@ impl DatabasePanel {
                 };
                 let i = *i;
                 let query_name: SharedString = conn.spec.name.clone().into();
-                base.hover(|d| d.bg(theme.accent_soft))
+                base.relative()
+                    .group("connection-row")
+                    .debug_selector(move || format!("db-connection-{i}"))
+                    .hover(|d| d.bg(theme.accent_soft))
                     .child(
                         div()
                             .w(px(10.))
@@ -309,77 +314,116 @@ impl DatabasePanel {
                             .text_color(theme.fg_subtle)
                             .child(conn.spec.source.clone()),
                     )
+                    // Actions show on hover, over the source, so long names
+                    // and narrow panels keep every button reachable.
                     .child(
                         div()
-                            .id(("db-query", i))
-                            .flex_none()
-                            .h(px(20.))
-                            .px_1p5()
+                            .absolute()
+                            .right(px(4.))
+                            .top_0()
+                            .h_full()
+                            .pl_2()
                             .flex()
                             .items_center()
-                            .rounded(px(6.))
-                            .text_size(px(11.))
-                            .text_color(theme.fg_subtle)
-                            .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                            .child("Query")
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.stop_propagation();
-                                cx.emit(DatabasePanelEvent::NewQuery {
-                                    connection: query_name.clone(),
-                                });
-                            })),
-                    )
-                    .when(conn.spec.engine.is_sql(), |d| {
-                        let engine = conn.spec.engine;
-                        let connection: SharedString = conn.spec.name.clone().into();
-                        let conn_name = connection.clone();
-                        d.child(
-                            div()
-                                .id(("db-new-table", i))
-                                .flex_none()
-                                .h(px(20.))
-                                .px_1p5()
-                                .flex()
-                                .items_center()
-                                .rounded(px(6.))
-                                .text_size(px(11.))
-                                .text_color(theme.fg_subtle)
-                                .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                                .child("Table")
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.stop_propagation();
-                                    cx.emit(DatabasePanelEvent::Structure {
-                                        connection: connection.clone(),
-                                        engine,
-                                        object: None,
-                                    });
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id(("db-erd", i))
-                                .flex_none()
-                                .h(px(20.))
-                                .px_1p5()
-                                .flex()
-                                .items_center()
-                                .rounded(px(6.))
-                                .text_size(px(11.))
-                                .text_color(theme.fg_subtle)
-                                .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                                .child("ERD")
-                                .on_click({
-                                    let connection = conn_name.clone();
-                                    cx.listener(move |_, _, _, cx| {
+                            .bg(theme.bg_sunken)
+                            .invisible()
+                            .group_hover("connection-row", |s| s.visible())
+                            .child(
+                                div()
+                                    .id(("db-query", i))
+                                    .flex_none()
+                                    .h(px(20.))
+                                    .px_1p5()
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(6.))
+                                    .text_size(px(11.))
+                                    .text_color(theme.fg_subtle)
+                                    .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                                    .child("Query")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
                                         cx.stop_propagation();
-                                        cx.emit(DatabasePanelEvent::Diagram {
-                                            connection: connection.clone(),
-                                            engine,
+                                        cx.emit(DatabasePanelEvent::NewQuery {
+                                            connection: query_name.clone(),
                                         });
-                                    })
-                                }),
-                        )
-                    })
+                                    })),
+                            )
+                            .when(conn.spec.engine == Engine::Redis, |d| {
+                                let connection: SharedString = conn.spec.name.clone().into();
+                                d.child(
+                                    div()
+                                        .id(("db-new-key", i))
+                                        .flex_none()
+                                        .h(px(20.))
+                                        .px_1p5()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(6.))
+                                        .text_size(px(11.))
+                                        .text_color(theme.fg_subtle)
+                                        .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                                        .child("Key")
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.emit(DatabasePanelEvent::NewKey {
+                                                connection: connection.clone(),
+                                            });
+                                        })),
+                                )
+                            })
+                            .when(conn.spec.engine.is_sql(), |d| {
+                                let engine = conn.spec.engine;
+                                let connection: SharedString = conn.spec.name.clone().into();
+                                let conn_name = connection.clone();
+                                d.child(
+                                    div()
+                                        .id(("db-new-table", i))
+                                        .flex_none()
+                                        .h(px(20.))
+                                        .px_1p5()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(6.))
+                                        .text_size(px(11.))
+                                        .text_color(theme.fg_subtle)
+                                        .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                                        .child("Table")
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.emit(DatabasePanelEvent::Structure {
+                                                connection: connection.clone(),
+                                                engine,
+                                                object: None,
+                                            });
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id(("db-erd", i))
+                                        .debug_selector(move || format!("db-erd-{i}"))
+                                        .flex_none()
+                                        .h(px(20.))
+                                        .px_1p5()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(6.))
+                                        .text_size(px(11.))
+                                        .text_color(theme.fg_subtle)
+                                        .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                                        .child("ERD")
+                                        .on_click({
+                                            let connection = conn_name.clone();
+                                            cx.listener(move |_, _, _, cx| {
+                                                cx.stop_propagation();
+                                                cx.emit(DatabasePanelEvent::Diagram {
+                                                    connection: connection.clone(),
+                                                    engine,
+                                                });
+                                            })
+                                        }),
+                                )
+                            }),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_connection(i, cx)))
                     .into_any_element()
             }

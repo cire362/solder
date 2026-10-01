@@ -337,6 +337,26 @@ impl Workspace {
                     DatabasePanelEvent::Diagram { connection, engine } => {
                         this.open_erd(connection.clone(), *engine, window, cx)
                     }
+                    DatabasePanelEvent::NewKey { connection } => {
+                        let workspace = cx.weak_entity();
+                        let prompt = crate::key_prompts::NewKeyPrompt::new(
+                            this.results.downgrade(),
+                            connection.clone(),
+                            move |_, cx| {
+                                workspace
+                                    .update(cx, |ws, cx| {
+                                        ws.show_results = true;
+                                        ws.results_active = true;
+                                        ws.dock_open = true;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            },
+                        );
+                        this.toggle_modal(window, cx, move |window, cx| {
+                            Picker::new(prompt, window, cx)
+                        });
+                    }
                     DatabasePanelEvent::NewQuery { connection } => {
                         this.open_scratch_query(connection.to_string(), window, cx)
                     }
@@ -346,6 +366,16 @@ impl Workspace {
                 &results,
                 window,
                 |this, results, event, window, cx| match event {
+                    crate::results::ResultsEvent::KeyPrompt { action, key, .. } => {
+                        let prompt = crate::key_prompts::KeyPrompt::new(
+                            results.downgrade(),
+                            *action,
+                            key.clone(),
+                        );
+                        this.toggle_modal(window, cx, move |window, cx| {
+                            Picker::new(prompt, window, cx)
+                        });
+                    }
                     crate::results::ResultsEvent::PickReference {
                         row,
                         column,
@@ -4418,6 +4448,217 @@ mod tests {
         assert_eq!(&std::fs::read(&png).unwrap()[..4], b"\x89PNG");
         cx.simulate_keystrokes("escape");
         assert!(cx.read(|cx| ws.read(cx).erd.is_none()));
+    }
+
+    /// A project whose `.env` points at the test server in `var`, if set.
+    fn server_fixture(name: &str, var: &str, key: &str) -> Option<PathBuf> {
+        let url = std::env::var(var).ok().filter(|u| !u.is_empty())?;
+        let root = fixture(name);
+        std::fs::write(root.join(".env"), format!("{key}={url}\n")).unwrap();
+        Some(root)
+    }
+
+    fn server_session(root: &Path, key: &str) -> db::Session {
+        let spec = db::detect(root, None)
+            .into_iter()
+            .find(|s| s.name == key)
+            .unwrap();
+        futures::executor::block_on(db::Session::connect(spec)).unwrap()
+    }
+
+    #[gpui::test]
+    fn redis_keys_edit_expire_rename_delete_and_create(cx: &mut TestAppContext) {
+        use crate::results::{ApplyChanges, KeyAction, ResultsEvent, State};
+        let Some(root) = server_fixture("redis-keys", "SOLDER_TEST_REDIS", "REDIS_URL") else {
+            return;
+        };
+        let redis = server_session(&root, "REDIS_URL");
+        let run = |q: &str| futures::executor::block_on(redis.query(q.into())).unwrap();
+        run("DEL solder:ws:h solder:ws:h2 solder:ws:list");
+        run("HSET solder:ws:h name ada");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        let (store, results, panel) = cx.read(|cx| {
+            let ws = ws.read(cx);
+            (
+                ws.database.clone(),
+                ws.results.clone(),
+                ws.database_panel.clone(),
+            )
+        });
+        store.update(cx, |s, cx| s.ensure_detected(cx));
+        wait_for(cx, "detection", &|cx| store.read(cx).detected());
+        ws.update_in(cx, |ws, window, cx| {
+            ws.run_query(
+                "REDIS_URL".into(),
+                "HGETALL solder:ws:h".into(),
+                true,
+                window,
+                cx,
+            )
+        });
+        wait_for(cx, "hash", &|cx| results.read(cx).key_ttl == Some(-1));
+
+        // Change a value and add a field, as one transaction.
+        cx.simulate_keystrokes("right enter");
+        cx.simulate_input("Ada");
+        cx.simulate_keystrokes("enter secondary-n");
+        cx.simulate_input("lang");
+        cx.simulate_keystrokes("enter right enter");
+        cx.simulate_input("rust");
+        cx.simulate_keystrokes("enter secondary-s");
+        assert_eq!(
+            results.update(cx, |r, cx| r.statements(cx)).unwrap(),
+            ["HSET solder:ws:h name Ada", "HSET solder:ws:h lang rust"]
+        );
+        cx.dispatch_action(ApplyChanges);
+        wait_for(cx, "saved", &|cx| {
+            matches!(&results.read(cx).state, State::Done(r) if r.rows.len() == 2)
+                && results.read(cx).changes.is_empty()
+        });
+
+        // Expire and rename through the prompts.
+        results.update(cx, |_, cx| {
+            cx.emit(ResultsEvent::KeyPrompt {
+                action: KeyAction::Expire,
+                key: "solder:ws:h".into(),
+            })
+        });
+        cx.simulate_input("500");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "expiry", &|cx| {
+            results.read(cx).key_ttl.is_some_and(|t| t > 400)
+        });
+        results.update(cx, |_, cx| {
+            cx.emit(ResultsEvent::KeyPrompt {
+                action: KeyAction::Rename,
+                key: "solder:ws:h".into(),
+            })
+        });
+        cx.simulate_input("solder:ws:h2");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "renamed", &|cx| {
+            results.read(cx).query.as_ref() == "HGETALL solder:ws:h2"
+                && matches!(&results.read(cx).state, State::Done(r) if r.rows.len() == 2)
+        });
+        results.update(cx, |r, cx| {
+            r.key_command("DEL solder:ws:h2".into(), None, cx)
+        });
+        wait_for(cx, "deleted", &|cx| {
+            matches!(results.read(cx).state, State::Empty)
+        });
+        assert_eq!(run("EXISTS solder:ws:h2").rows[0][0], db::Value::Int(0));
+
+        // A new list: pick the type, fill the first item, apply.
+        panel.update(cx, |_, cx| {
+            cx.emit(crate::database_panel::DatabasePanelEvent::NewKey {
+                connection: "REDIS_URL".into(),
+            })
+        });
+        cx.simulate_input("solder:ws:list");
+        cx.simulate_keystrokes("down down enter");
+        wait_for(cx, "new key", &|cx| {
+            results.read(cx).changes.inserted.len() == 1
+        });
+        cx.update(|window, cx| window.focus(&results.focus_handle(cx)));
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("first");
+        cx.simulate_keystrokes("enter secondary-s");
+        cx.dispatch_action(ApplyChanges);
+        wait_for(cx, "list saved", &|cx| results.read(cx).changes.is_empty());
+        assert_eq!(
+            run("LRANGE solder:ws:list 0 -1").rows[0][1],
+            db::Value::Text("first".into())
+        );
+        run("DEL solder:ws:list");
+    }
+
+    #[gpui::test]
+    fn mongo_documents_edit_delete_and_insert(cx: &mut TestAppContext) {
+        use crate::results::{ApplyChanges, State};
+        let Some(root) = server_fixture("mongo-docs", "SOLDER_TEST_MONGO", "MONGO_URL") else {
+            return;
+        };
+        let mongo = server_session(&root, "MONGO_URL");
+        let run = |q: &str| futures::executor::block_on(mongo.query(q.into())).unwrap();
+        run("db.solder_ws_docs.deleteMany({})");
+        run(
+            "db.solder_ws_docs.insertMany([{_id: 1, name: 'ada', age: 36}, {_id: 2, name: 'bob', age: 25}])",
+        );
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        let (store, results) = cx.read(|cx| {
+            let ws = ws.read(cx);
+            (ws.database.clone(), ws.results.clone())
+        });
+        store.update(cx, |s, cx| s.ensure_detected(cx));
+        wait_for(cx, "detection", &|cx| store.read(cx).detected());
+        let spec = db::browse::Browse {
+            table: "solder_ws_docs".into(),
+            key: vec!["_id".into()],
+            ..Default::default()
+        };
+        results.update(cx, |r, cx| {
+            r.browse("MONGO_URL".into(), db::Engine::Mongo, spec, cx)
+        });
+        wait_for(
+            cx,
+            "documents",
+            &|cx| matches!(&results.read(cx).state, State::Done(r) if r.rows.len() == 2),
+        );
+        // As opening it from the Database tab does: show the Results tab.
+        ws.update(cx, |ws, cx| {
+            ws.show_results = true;
+            ws.results_active = true;
+            ws.dock_open = true;
+            cx.notify();
+        });
+        cx.update(|window, cx| window.focus(&results.focus_handle(cx)));
+        cx.simulate_keystrokes("right enter");
+        cx.simulate_input("Ada");
+        cx.simulate_keystrokes("enter down secondary-backspace secondary-n");
+        cx.simulate_input("cy");
+        cx.simulate_keystrokes("enter secondary-s");
+        assert_eq!(
+            results.update(cx, |r, cx| r.statements(cx)).unwrap(),
+            [
+                "db.getCollection(\"solder_ws_docs\").updateOne({\"_id\": 1}, {$set: {\"name\": \"Ada\"}})",
+                "db.getCollection(\"solder_ws_docs\").deleteOne({\"_id\": 2})",
+                "db.getCollection(\"solder_ws_docs\").insertOne({\"name\": \"cy\"})",
+            ]
+        );
+        cx.dispatch_action(ApplyChanges);
+        wait_for(cx, "saved", &|cx| {
+            results.read(cx).changes.is_empty()
+                && matches!(&results.read(cx).state, State::Done(r) if r.rows.len() == 2)
+        });
+        let names: Vec<String> =
+            run("db.solder_ws_docs.find({}, {_id: 0, name: 1}).sort({name: 1})")
+                .rows
+                .iter()
+                .map(|r| r[0].display())
+                .collect();
+        assert_eq!(names, ["Ada", "cy"]);
+        run("db.solder_ws_docs.deleteMany({})");
+    }
+
+    #[gpui::test]
+    fn connection_actions_appear_on_hover(cx: &mut TestAppContext) {
+        let root = sqlite_fixture("panel-hover");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        let store = cx.read(|cx| ws.read(cx).database.clone());
+        cx.simulate_keystrokes("ctrl-shift-d");
+        wait_for(cx, "detection", &|cx| store.read(cx).detected());
+        cx.run_until_parked();
+        // Hidden until the row is hovered: not drawn, so not clickable.
+        assert!(cx.debug_bounds("db-erd-0").is_none());
+        let row = cx.debug_bounds("db-connection-0").unwrap();
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+        let button = cx.debug_bounds("db-erd-0").expect("shown on hover");
+        assert!(row.contains(&button.center()));
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        assert!(cx.read(|cx| ws.read(cx).erd.is_some()));
     }
 
     #[gpui::test]

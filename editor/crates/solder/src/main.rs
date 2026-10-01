@@ -16,6 +16,7 @@ mod git;
 mod git_panel;
 mod git_store;
 mod go_to_line;
+mod key_prompts;
 mod locations;
 mod lsp_store;
 mod perf;
