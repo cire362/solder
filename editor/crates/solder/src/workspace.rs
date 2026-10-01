@@ -145,6 +145,14 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 const SIDEBAR_WIDTH: f32 = 330.;
+
+/// The bottom dock's tab in front.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockView {
+    Terminal,
+    Results,
+    Response,
+}
 const CHAT_WIDTH: f32 = 380.;
 const TITLEBAR_HEIGHT: f32 = 38.;
 const TAB_BAR_HEIGHT: f32 = 34.;
@@ -233,14 +241,13 @@ pub struct Workspace {
     results: Entity<ResultsView>,
     /// The Results tab is in the dock (a query has run and it was not closed).
     show_results: bool,
-    /// The dock shows Results rather than a terminal.
-    results_active: bool,
+    /// What the dock shows: the active terminal or one of its other tabs.
+    dock_view: DockView,
     /// The last HTTP response, the dock's Response tab.
     response: Entity<crate::response::ResponseView>,
     show_response: bool,
     /// Scratch queries and the requests file; tests point it elsewhere.
     scratch_dir: PathBuf,
-    response_active: bool,
     /// A query file waiting for detection before it can run (`true`) or
     /// pick its connection (`false`).
     pending_query: Option<(PathBuf, bool)>,
@@ -368,8 +375,7 @@ impl Workspace {
                         this.results
                             .update(cx, |r, cx| r.browse(connection, engine, spec, cx));
                         this.show_results = true;
-                        this.results_active = true;
-                        this.response_active = false;
+                        this.dock_view = DockView::Results;
                         this.dock_open = true;
                         cx.notify();
                     }
@@ -392,8 +398,7 @@ impl Workspace {
                                 workspace
                                     .update(cx, |ws, cx| {
                                         ws.show_results = true;
-                                        ws.results_active = true;
-                                        ws.response_active = false;
+                                        ws.dock_view = DockView::Results;
                                         ws.dock_open = true;
                                         cx.notify();
                                     })
@@ -564,11 +569,10 @@ impl Workspace {
             inline_edit: None,
             results,
             show_results: false,
-            results_active: false,
+            dock_view: DockView::Terminal,
             response,
             show_response: false,
             scratch_dir: settings::config_dir().join("scratch"),
-            response_active: false,
             pending_query: None,
             structure: None,
             erd: None,
@@ -1300,8 +1304,7 @@ impl Workspace {
         );
         self.terminals.push((terminal.clone(), subscription));
         self.active_terminal = self.terminals.len() - 1;
-        self.results_active = false;
-        self.response_active = false;
+        self.dock_view = DockView::Terminal;
         self.dock_open = true;
         if focus {
             window.focus(&terminal.focus_handle(cx));
@@ -1341,8 +1344,7 @@ impl Workspace {
     ) {
         if let Some(ix) = self.terminals.iter().position(|(t, _)| t == terminal) {
             self.active_terminal = ix;
-            self.results_active = false;
-            self.response_active = false;
+            self.dock_view = DockView::Terminal;
             self.dock_open = true;
             window.focus(&terminal.focus_handle(cx));
             cx.notify();
@@ -1397,8 +1399,7 @@ impl Workspace {
         self.results
             .update(cx, |r, cx| r.run(connection, query, cx));
         self.show_results = true;
-        self.results_active = true;
-        self.response_active = false;
+        self.dock_view = DockView::Results;
         self.dock_open = true;
         if focus {
             window.focus(&self.results.focus_handle(cx));
@@ -1642,8 +1643,7 @@ impl Workspace {
                         this.results
                             .update(cx, |r, cx| r.browse(connection, engine, spec, cx));
                         this.show_results = true;
-                        this.results_active = true;
-                        this.response_active = false;
+                        this.dock_view = DockView::Results;
                         this.dock_open = true;
                         cx.notify();
                     }
@@ -1932,8 +1932,7 @@ impl Workspace {
             cx.notify();
         });
         self.show_response = true;
-        self.response_active = true;
-        self.results_active = false;
+        self.dock_view = DockView::Response;
         self.dock_open = true;
         cx.notify();
     }
@@ -2083,8 +2082,11 @@ impl Workspace {
     fn close_response(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let was_focused = self.response.focus_handle(cx).contains_focused(window, cx);
         self.show_response = false;
-        self.response_active = false;
-        self.results_active = self.show_results;
+        self.dock_view = if self.show_results {
+            DockView::Results
+        } else {
+            DockView::Terminal
+        };
         if self.terminals.is_empty() && !self.show_results {
             self.dock_open = false;
         }
@@ -2102,8 +2104,7 @@ impl Workspace {
     pub fn send_request(&mut self, request: rest::Request, cx: &mut Context<Self>) {
         self.response.update(cx, |r, cx| r.send(request, cx));
         self.show_response = true;
-        self.response_active = true;
-        self.results_active = false;
+        self.dock_view = DockView::Response;
         self.dock_open = true;
         cx.notify();
     }
@@ -2129,8 +2130,11 @@ impl Workspace {
     fn close_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let was_focused = self.results.focus_handle(cx).contains_focused(window, cx);
         self.show_results = false;
-        self.results_active = false;
-        self.response_active = self.show_response;
+        self.dock_view = if self.show_response {
+            DockView::Response
+        } else {
+            DockView::Terminal
+        };
         if self.terminals.is_empty() && !self.show_response {
             self.dock_open = false;
         }
@@ -2160,8 +2164,13 @@ impl Workspace {
         drop(self.terminals.remove(ix));
         if self.terminals.is_empty() {
             self.dock_open = self.dock_open && (self.show_results || self.show_response);
-            self.results_active = self.show_results;
-            self.response_active = !self.show_results && self.show_response;
+            self.dock_view = if self.show_results {
+                DockView::Results
+            } else if self.show_response {
+                DockView::Response
+            } else {
+                DockView::Terminal
+            };
             self.active_terminal = 0;
         } else {
             self.active_terminal = self.active_terminal.min(self.terminals.len() - 1);
@@ -2171,8 +2180,12 @@ impl Workspace {
                 self.terminals.get(self.active_terminal),
                 self.active_editor(),
             ) {
-                _ if self.results_active => window.focus(&self.results.focus_handle(cx)),
-                _ if self.response_active => window.focus(&self.response.focus_handle(cx)),
+                _ if self.dock_view == DockView::Results => {
+                    window.focus(&self.results.focus_handle(cx))
+                }
+                _ if self.dock_view == DockView::Response => {
+                    window.focus(&self.response.focus_handle(cx))
+                }
                 (Some((t, _)), _) => window.focus(&t.focus_handle(cx)),
                 (None, Some(e)) => window.focus(&e.focus_handle(cx)),
                 (None, None) => window.focus(&self.focus_handle),
@@ -2200,8 +2213,7 @@ impl Workspace {
             }
             Some(t)
                 if self.dock_open
-                    && !self.results_active
-                    && !self.response_active
+                    && self.dock_view == DockView::Terminal
                     && t.focus_handle(cx).contains_focused(window, cx) =>
             {
                 self.dock_open = false;
@@ -2212,8 +2224,7 @@ impl Workspace {
             }
             Some(t) => {
                 self.dock_open = true;
-                self.results_active = false;
-                self.response_active = false;
+                self.dock_view = DockView::Terminal;
                 window.focus(&t.focus_handle(cx));
                 cx.notify();
             }
@@ -2232,8 +2243,7 @@ impl Workspace {
             .iter()
             .enumerate()
             .map(|(ix, (terminal, _))| {
-                let active =
-                    ix == self.active_terminal && !self.results_active && !self.response_active;
+                let active = ix == self.active_terminal && self.dock_view == DockView::Terminal;
                 let close = terminal.clone();
                 div()
                     .id(("terminal-tab", ix))
@@ -2250,8 +2260,7 @@ impl Workspace {
                     .hover(|d| d.text_color(theme.fg))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.active_terminal = ix;
-                        this.results_active = false;
-                        this.response_active = false;
+                        this.dock_view = DockView::Terminal;
                         if let Some((t, _)) = this.terminals.get(ix) {
                             window.focus(&t.focus_handle(cx));
                         }
@@ -2325,9 +2334,9 @@ impl Workspace {
                     ),
             )
             .child(div().flex_1().min_h_0().map(|d| {
-                if self.response_active {
+                if self.dock_view == DockView::Response {
                     d.child(self.response.clone())
-                } else if self.results_active {
+                } else if self.dock_view == DockView::Results {
                     d.child(self.results.clone())
                 } else {
                     d.children(
@@ -2344,7 +2353,7 @@ impl Workspace {
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active = self.results_active;
+        let active = self.dock_view == DockView::Results;
         div()
             .id("results-tab")
             .h(px(24.))
@@ -2359,8 +2368,7 @@ impl Workspace {
             .when(active, |d| d.bg(theme.bg_elev))
             .hover(|d| d.text_color(theme.fg))
             .on_click(cx.listener(|this, _, window, cx| {
-                this.results_active = true;
-                this.response_active = false;
+                this.dock_view = DockView::Results;
                 window.focus(&this.results.focus_handle(cx));
                 cx.notify();
             }))
@@ -2387,7 +2395,7 @@ impl Workspace {
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active = self.response_active;
+        let active = self.dock_view == DockView::Response;
         div()
             .id("response-tab")
             .h(px(24.))
@@ -2402,8 +2410,7 @@ impl Workspace {
             .when(active, |d| d.bg(theme.bg_elev))
             .hover(|d| d.text_color(theme.fg))
             .on_click(cx.listener(|this, _, window, cx| {
-                this.response_active = true;
-                this.results_active = false;
+                this.dock_view = DockView::Response;
                 window.focus(&this.response.focus_handle(cx));
                 cx.notify();
             }))
@@ -5289,8 +5296,7 @@ mod tests {
         // As opening it from the Database tab does: show the Results tab.
         ws.update(cx, |ws, cx| {
             ws.show_results = true;
-            ws.results_active = true;
-            ws.response_active = false;
+            ws.dock_view = DockView::Results;
             ws.dock_open = true;
             cx.notify();
         });
@@ -5426,7 +5432,7 @@ mod tests {
         );
         cx.read(|cx| {
             let ws = ws.read(cx);
-            assert!(ws.dock_open && ws.show_results && ws.results_active);
+            assert!(ws.dock_open && ws.show_results && ws.dock_view == DockView::Results);
         });
 
         cx.update(|window, cx| window.focus(&results.focus_handle(cx)));
@@ -5555,7 +5561,7 @@ mod tests {
         assert_eq!(json["method"], "POST");
         assert_eq!(json["path"], "/users");
         assert_eq!(json["body"], "{\"name\": \"Ada\"}");
-        assert!(cx.read(|cx| ws.read(cx).response_active && ws.read(cx).dock_open));
+        assert!(cx.read(|cx| ws.read(cx).dock_view == DockView::Response && ws.read(cx).dock_open));
 
         // A request that names a variable nobody defines says which one.
         let editor_text = active_text(&ws, cx);
