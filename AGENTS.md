@@ -21,8 +21,11 @@ stack and the measured performance numbers.
 
 - Never commit to `main` directly. Branch from an up-to-date `main`:
   `feat/<topic>`, `fix/<topic>`, `perf/<topic>`, `refactor/<topic>`,
-  `docs/<topic>`, `chore/<topic>`, `ci/<topic>`. One roadmap item or bug
-  per branch.
+  `docs/<topic>`, `chore/<topic>`, `ci/<topic>`. A large feature (a roadmap
+  item) gets its own branch, and its follow-up work stays on that branch. A
+  small change that is already checked (a visual fix, a lint, a bug found on
+  the way) does not get a branch of its own: commit it separately on the
+  branch in progress and mention it in that pull request.
 - Commits follow Conventional Commits with a scope: `site`, `editor`, `text`,
   `syntax`, `lsp`, `terminal`, `git`, `services`, `db`, `ci`. Example:
   `fix(lsp): send didChange before completion requests`. Explain *why* in
