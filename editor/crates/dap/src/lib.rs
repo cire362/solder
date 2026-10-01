@@ -330,8 +330,8 @@ impl Adapter {
             // TERM lets the programs clean up; what is left after two
             // seconds (one paused at a breakpoint ignores it) is killed by
             // a detached shell, so the caller does not wait.
-            let script = r#"kill -TERM -- "-$1"
-                ( sleep 2; kill -0 -- "-$1" && kill -KILL -- "-$1" ) >/dev/null 2>&1 &"#;
+            let script = r#"kill -TERM "-$1"
+                ( sleep 2; kill -0 "-$1" && kill -KILL "-$1" ) >/dev/null 2>&1 &"#;
             let _ = Command::new("sh")
                 .args(["-c", script, "sh", &self.child.id().to_string()])
                 .stdin(Stdio::null())
@@ -344,6 +344,9 @@ impl Adapter {
     }
 }
 
+// Process groups are signalled as `kill -SIG -PGID`, without `--`: dash
+// (Ubuntu's sh) reads `--` as a process id and fails.
+
 /// Stops the adapter's group if the editor dies without stopping it (a
 /// crash or a kill), so no debugged program outlives it. The adapter itself
 /// may die first (its stderr pipe closes), so a detached shell watches the
@@ -353,12 +356,12 @@ fn watch(editor: u32, adapter: u32) {
         return;
     }
     let script = r#"(
-        while kill -0 "$1" 2>/dev/null && kill -0 -- "-$2" 2>/dev/null; do sleep 2; done
+        while kill -0 "$1" 2>/dev/null && kill -0 "-$2" 2>/dev/null; do sleep 2; done
         if ! kill -0 "$1" 2>/dev/null; then
-            kill -TERM -- "-$2"
+            kill -TERM "-$2"
             # A program paused at a breakpoint cannot run its SIGTERM handler.
             sleep 2
-            kill -0 -- "-$2" && kill -KILL -- "-$2"
+            kill -0 "-$2" && kill -KILL "-$2"
         fi
     ) >/dev/null 2>&1 &"#;
     // The outer shell exits at once, leaving the loop to init.
@@ -567,13 +570,14 @@ mod tests {
         assert!(matches!(err, Error::Io(e) if e.contains("boom")));
     }
 
+    /// A zombie counts as gone: it waits only for whoever reaps it.
     fn alive(pid: u32) -> bool {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stderr(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        !stat.trim().is_empty() && !stat.trim().starts_with('Z')
     }
 
     fn wait_gone(pid: u32, within: Duration) {
