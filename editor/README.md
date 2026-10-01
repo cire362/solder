@@ -8,6 +8,7 @@ crates/
   syntax/   tree-sitter parsing and highlighting for Rust, TS/TSX, JS, JSON, CSS, Go, Python
   db/       database connections: detection, drivers, statement splitting (no UI)
   rest/     HTTP: .http files, route detection, OpenAPI import, sending (no UI)
+  ai/       local models: hardware, catalog, downloads, llama-server, benchmark (no UI)
   solder/   the app: GPUI window, editor element, file tree, tabs, status bar
 ```
 
@@ -292,6 +293,33 @@ Services tab, else `PORT` in `.env`, else the framework's usual port.
 **Import OpenAPI** turns an OpenAPI 3.0 or 3.1 file (JSON or YAML) into a `.http`
 file next to it, one request per operation, with example bodies built from the
 schemas and `$ref`s resolved. Swagger 2.0 is not supported.
+
+## Local models
+
+The AI tab (`ctrl-shift-a`) shows what this machine can give a model: the
+memory a model may use (on Apple Silicon, the share macOS lets the GPU wire;
+elsewhere the GPU's memory, or part of system memory) and the free disk space.
+
+**Run benchmark** downloads llama.cpp's server (a pinned build, about 12 MB)
+and a 0.8 GB test model, then times how fast it reads a prompt and writes
+tokens. Writing speed is bound by memory bandwidth and reading speed by
+compute, so that one measurement predicts every other model: each model in the
+list shows whether it fits and about how fast it would write. The best model
+that stays usable (15 tokens per second writing, 150 reading) is marked for
+chat; the best one fast enough for completions (40 and 600) that fits next to
+it is marked for completions.
+
+**Install recommended**, or **Install** on any model that fits, downloads it
+from Hugging Face. Every file is checked against its SHA-256 while it streams
+(the server against the hash GitHub publishes for the pinned build, a model
+against the one Hugging Face publishes) and only then gets its name; an
+interrupted download resumes. After a download the model is measured for real,
+and that measurement replaces the prediction. Installed models can be given
+the chat and completion roles, or deleted.
+
+Everything lives in `~/Library/Application Support/Solder` (on Linux,
+`~/.local/share/Solder`), shared by all projects. The server listens on
+`127.0.0.1` only, on a free port, with a key made for each run.
 
 ## Measured so far
 

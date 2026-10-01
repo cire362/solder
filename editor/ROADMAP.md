@@ -54,10 +54,16 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 - [x] HTTP client with requests generated from API routes, OpenAPI 3.1 import
 
 ## 6. Solder AI
-- [ ] Providers: hosted, Ollama, LM Studio, OpenAI-compatible; model per task; offline mode
+- [x] Local models: a benchmark that reads the machine, times a small model and
+      picks the best model it runs well; one-click install of llama.cpp and models
+      (pinned build, SHA-256 checked, resumable)
+- [ ] Providers: local llama.cpp, Ollama, LM Studio, OpenAI-compatible, Anthropic
+      with your own key; model per task; offline mode
 - [ ] Project map for context; `.solderignore`; `.env` always excluded
 - [ ] Ask the codebase (chat), inline edits, streaming completions
-- [ ] Agent tasks in sandboxed branches with an editable plan
+- [ ] Agent tasks in their own branch and worktree with an editable plan: edits,
+      commands and tests in a loop, network and outside-project commands confirmed,
+      review the diff and merge
 - [ ] AI review before push
 
 ## 7. Debugger, plugins, onboarding

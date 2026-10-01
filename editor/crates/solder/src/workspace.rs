@@ -77,6 +77,7 @@ actions!(
         ShowServices,
         ShowDatabase,
         ShowApi,
+        ShowAi,
         RunStatement,
         SelectConnection,
         ShowFileDiff,
@@ -116,6 +117,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-s", ShowServices, None),
         KeyBinding::new("ctrl-shift-d", ShowDatabase, None),
         KeyBinding::new("ctrl-shift-h", ShowApi, None),
+        KeyBinding::new("ctrl-shift-a", ShowAi, None),
         KeyBinding::new(
             "secondary-enter",
             RunStatement,
@@ -164,6 +166,7 @@ enum SidebarTab {
     Services,
     Database,
     Api,
+    Ai,
 }
 
 struct Modal {
@@ -205,6 +208,7 @@ pub struct Workspace {
     database: Entity<DatabaseStore>,
     database_panel: Entity<DatabasePanel>,
     api_panel: Entity<crate::api_panel::ApiPanel>,
+    ai_panel: Entity<crate::ai_panel::AiPanel>,
     results: Entity<ResultsView>,
     /// The Results tab is in the dock (a query has run and it was not closed).
     show_results: bool,
@@ -250,6 +254,8 @@ impl Workspace {
         let database = cx.new(|_| DatabaseStore::new(root.clone()));
         let database_panel = cx.new(|cx| DatabasePanel::new(database.clone(), cx));
         let api_panel = cx.new(|cx| crate::api_panel::ApiPanel::new(root.clone(), cx));
+        let ai_store = crate::ai_store::AiStore::global(cx);
+        let ai_panel = cx.new(|cx| crate::ai_panel::AiPanel::new(ai_store, cx));
         let results = cx.new(|cx| ResultsView::new(database.clone(), cx));
         let response = cx.new(crate::response::ResponseView::new);
         let project_search = cx.new(|cx| ProjectSearch::new(root, window, cx));
@@ -512,6 +518,7 @@ impl Workspace {
             database,
             database_panel,
             api_panel: api_panel.clone(),
+            ai_panel,
             results,
             show_results: false,
             results_active: false,
@@ -1296,6 +1303,9 @@ impl Workspace {
         if tab == Some(SidebarTab::Api) {
             self.api_panel.update(cx, |p, cx| p.shown(cx));
         }
+        if tab == Some(SidebarTab::Ai) {
+            self.ai_panel.update(cx, |p, cx| p.shown(cx));
+        }
         cx.notify();
     }
 
@@ -1614,6 +1624,11 @@ impl Workspace {
     }
 
     // ------------------------------------------------------------ HTTP
+
+    fn show_ai(&mut self, _: &ShowAi, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_sidebar(Some(SidebarTab::Ai), cx);
+        window.focus(&self.ai_panel.focus_handle(cx));
+    }
 
     fn show_api(&mut self, _: &ShowApi, window: &mut Window, cx: &mut Context<Self>) {
         self.set_sidebar(Some(SidebarTab::Api), cx);
@@ -2782,7 +2797,7 @@ impl Workspace {
             div()
                 .id(id)
                 .h(px(24.))
-                .px_1p5()
+                .px_1()
                 .flex()
                 .items_center()
                 .rounded(px(8.))
@@ -2798,6 +2813,7 @@ impl Workspace {
                     SidebarTab::Services => this.show_services(&ShowServices, window, cx),
                     SidebarTab::Database => this.show_database(&ShowDatabase, window, cx),
                     SidebarTab::Api => this.show_api(&ShowApi, window, cx),
+                    SidebarTab::Ai => this.show_ai(&ShowAi, window, cx),
                 }))
         };
         div()
@@ -2832,7 +2848,8 @@ impl Workspace {
                         "Database",
                         SidebarTab::Database,
                     ))
-                    .child(tab_button("sidebar-api", "API", SidebarTab::Api)),
+                    .child(tab_button("sidebar-api", "API", SidebarTab::Api))
+                    .child(tab_button("sidebar-ai", "AI", SidebarTab::Ai)),
             )
             .child(div().flex_1().min_h_0().pt_1().map(|d| match tab {
                 SidebarTab::Files => d.child(self.project_panel.clone()),
@@ -2841,6 +2858,7 @@ impl Workspace {
                 SidebarTab::Services => d.child(self.services.clone()),
                 SidebarTab::Database => d.child(self.database_panel.clone()),
                 SidebarTab::Api => d.child(self.api_panel.clone()),
+                SidebarTab::Ai => d.child(self.ai_panel.clone()),
             }))
     }
 
@@ -3110,6 +3128,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_services))
             .on_action(cx.listener(Self::show_database))
             .on_action(cx.listener(Self::show_api))
+            .on_action(cx.listener(Self::show_ai))
             .on_action(cx.listener(Self::open_requests))
             .on_action(cx.listener(Self::import_openapi))
             .on_action(cx.listener(Self::new_connection))
@@ -5371,5 +5390,149 @@ mod tests {
         let swagger = root.join("old.json");
         std::fs::write(&swagger, r#"{"swagger":"2.0","paths":{}}"#).unwrap();
         assert!(import_openapi_file(&swagger).is_err());
+    }
+
+    /// A stand-in for Hugging Face: `HEAD` answers like the hub's redirect,
+    /// with the file's size and SHA-256; `GET` serves the file.
+    fn fake_hub(body: Vec<u8>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let sha = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child.stdin.take().unwrap().write_all(&body)?;
+                child.wait_with_output()
+            })
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                }
+                if first.starts_with("HEAD") {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 302 Found\r\nLocation: /cdn\r\nX-Linked-Size: {}\r\nX-Linked-Etag: \"{sha}\"\r\nContent-Length: 0\r\n\r\n",
+                        body.len()
+                    );
+                } else {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(&body);
+                }
+            }
+        });
+        base
+    }
+
+    #[gpui::test]
+    fn ai_tab_benchmarks_installs_and_assigns_models(cx: &mut TestAppContext) {
+        use crate::ai_store::AiStore;
+        let root = db::testing::dir("ws-ai");
+        let data = root.join("data");
+        // The pinned server build, already installed: a mock that reports
+        // fixed timings.
+        let bin = data.join("llama").join(ai::install::LLAMA_BUILD);
+        std::fs::create_dir_all(&bin).unwrap();
+        let mock =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../ai/tests/fixtures/mock_llama_server.py");
+        std::fs::copy(mock, bin.join("llama-server")).unwrap();
+        let hub = fake_hub(b"GGUF calibration model".to_vec());
+        cx.executor().allow_parking();
+        let store = cx.update(|cx| {
+            let store = cx.new(|_| AiStore::new(ai::Dirs::new(&data), hub.clone()));
+            AiStore::set_global(store.clone(), cx);
+            store
+        });
+        let (_ws, cx) = setup(cx, root.clone());
+        cx.simulate_keystrokes("ctrl-shift-a");
+        wait_for(cx, "hardware", &|cx| store.read(cx).hardware.is_some());
+        cx.run_until_parked();
+
+        let run = cx.debug_bounds("ai-benchmark").expect("benchmark button");
+        cx.simulate_click(run.center(), gpui::Modifiers::default());
+        wait_for(cx, "the benchmark", &|cx| store.read(cx).measured.is_some());
+        let calibration = ai::catalog::calibration();
+        cx.read(|cx| {
+            let s = store.read(cx);
+            assert_eq!(
+                s.measured,
+                Some(ai::Speed {
+                    prompt: 1234.5,
+                    generate: 67.8
+                })
+            );
+            assert_eq!(s.installed, [calibration.id]);
+            assert!(s.error.is_none(), "{:?}", s.error);
+        });
+        assert_eq!(
+            std::fs::read(data.join("models").join(calibration.file)).unwrap(),
+            b"GGUF calibration model"
+        );
+
+        // Installed models can be given a role.
+        cx.run_until_parked();
+        assert_eq!(calibration.id, "qwen3.5-0.8b");
+        let toggle = cx
+            .debug_bounds("ai-role-chat-qwen3.5-0.8b")
+            .expect("role toggle");
+        cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+        assert_eq!(
+            cx.read(|cx| store.read(cx).roles.get(&ai::Role::Chat).cloned()),
+            Some(calibration.id.to_string())
+        );
+        settle(cx);
+
+        // The measurement and the role survive a restart.
+        let again = cx.update(|_, cx| cx.new(|_| AiStore::new(ai::Dirs::new(&data), hub.clone())));
+        again.update(cx, |s, cx| s.load(cx));
+        wait_for(cx, "the saved state", &|cx| {
+            again.read(cx).hardware.is_some()
+        });
+        cx.read(|cx| {
+            let s = again.read(cx);
+            assert!(s.measured.is_some());
+            assert_eq!(
+                s.roles.get(&ai::Role::Chat).map(String::as_str),
+                Some(calibration.id)
+            );
+        });
+
+        // Delete shows on hover and removes the file and its role; the
+        // calibration model is the first row. (gpui never clears debug bounds between frames, so whether it was
+        // hidden before cannot be read back here; the Database tab's test
+        // covers that.)
+        let row = cx.debug_bounds("ai-model-0").unwrap();
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+        let button = cx
+            .debug_bounds("ai-delete-qwen3.5-0.8b")
+            .expect("shown on hover");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        wait_for(cx, "the file to go", &|_| {
+            !data.join("models").join(calibration.file).exists()
+        });
+        cx.read(|cx| {
+            let s = store.read(cx);
+            assert!(s.installed.is_empty());
+            assert!(s.roles.is_empty());
+        });
     }
 }

@@ -53,6 +53,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "zed-reqwest",
+]
+
+[[package]]
 name = "alacritty_terminal"
 version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6435,6 +6445,7 @@ dependencies = [
 name = "solder"
 version = "0.1.0"
 dependencies = [
+ "ai",
  "alacritty_terminal",
  "db",
  "dirs 7.0.0",
