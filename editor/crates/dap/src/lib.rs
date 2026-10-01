@@ -257,26 +257,39 @@ pub fn initialize_arguments() -> Value {
 pub struct Adapter {
     child: Child,
     pub port: u16,
+    stopped: bool,
 }
 
 impl Adapter {
     /// Starts `program args... <port> 127.0.0.1` and waits until it listens.
     /// js-debug: `node .../dapDebugServer.js`.
     pub fn start(program: &Path, args: &[String], cwd: &Path) -> Result<Self> {
+        Self::start_watched(program, args, cwd, std::process::id())
+    }
+
+    /// `start`, with the adapter's group stopped when `editor` dies.
+    fn start_watched(program: &Path, args: &[String], cwd: &Path, editor: u32) -> Result<Self> {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|l| l.local_addr())
             .map(|a| a.port())
             .map_err(|e| Error::Io(e.to_string()))?;
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .arg(port.to_string())
             .arg("127.0.0.1")
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        // A group of its own: the programs and browsers it launches join
+        // it, so stopping the group stops them all.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let mut child = command
             .spawn()
             .map_err(|e| Error::Io(format!("{}: {e}", program.display())))?;
+        watch(editor, child.id());
         let start = Instant::now();
         loop {
             if TcpStream::connect_timeout(
@@ -285,7 +298,11 @@ impl Adapter {
             )
             .is_ok()
             {
-                return Ok(Self { child, port });
+                return Ok(Self {
+                    child,
+                    port,
+                    stopped: false,
+                });
             }
             if let Ok(Some(status)) = child.try_wait() {
                 let mut err = String::new();
@@ -306,9 +323,57 @@ impl Adapter {
     }
 
     pub fn stop(&mut self) {
+        if std::mem::replace(&mut self.stopped, true) {
+            return;
+        }
+        if cfg!(unix) {
+            // TERM lets the programs clean up; what is left after two
+            // seconds (one paused at a breakpoint ignores it) is killed by
+            // a detached shell, so the caller does not wait.
+            let script = r#"kill -TERM -- "-$1"
+                ( sleep 2; kill -0 -- "-$1" && kill -KILL -- "-$1" ) >/dev/null 2>&1 &"#;
+            let _ = Command::new("sh")
+                .args(["-c", script, "sh", &self.child.id().to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Stops the adapter's group if the editor dies without stopping it (a
+/// crash or a kill), so no debugged program outlives it. The adapter itself
+/// may die first (its stderr pipe closes), so a detached shell watches the
+/// group: while it has members, its id cannot belong to anything else.
+fn watch(editor: u32, adapter: u32) {
+    if !cfg!(unix) {
+        return;
+    }
+    let script = r#"(
+        while kill -0 "$1" 2>/dev/null && kill -0 -- "-$2" 2>/dev/null; do sleep 2; done
+        if ! kill -0 "$1" 2>/dev/null; then
+            kill -TERM -- "-$2"
+            # A program paused at a breakpoint cannot run its SIGTERM handler.
+            sleep 2
+            kill -0 -- "-$2" && kill -KILL -- "-$2"
+        fi
+    ) >/dev/null 2>&1 &"#;
+    // The outer shell exits at once, leaving the loop to init.
+    let _ = Command::new("sh")
+        .args([
+            "-c",
+            script,
+            "sh",
+            &editor.to_string(),
+            &adapter.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 impl Drop for Adapter {
@@ -327,7 +392,8 @@ pub struct StackFrame {
     /// 1-based.
     pub line: u32,
     pub column: u32,
-    /// Library or generated code the user rarely wants to step into.
+    /// Library or generated code the user rarely wants to step into, or a
+    /// label such as an async boundary.
     pub subtle: bool,
 }
 
@@ -342,7 +408,7 @@ pub fn stack_frames(body: &Value) -> Vec<StackFrame> {
             path: f["source"]["path"].as_str().map(PathBuf::from),
             line: f["line"].as_u64().unwrap_or(0) as u32,
             column: f["column"].as_u64().unwrap_or(0) as u32,
-            subtle: f["presentationHint"] == "subtle"
+            subtle: matches!(f["presentationHint"].as_str(), Some("subtle" | "label"))
                 || f["source"]["presentationHint"] == "deemphasize",
         })
         .collect()
@@ -469,10 +535,12 @@ mod tests {
         let frames = stack_frames(&json!({"stackFrames": [
             {"id": 7, "name": "handler", "line": 12, "column": 5, "source": {"path": "/p/app.js"}},
             {"id": 8, "name": "processTicks", "line": 1, "column": 1, "source": {"name": "<node_internals>", "presentationHint": "deemphasize"}},
+            {"id": 9, "name": "setTimeout", "line": 0, "column": 0, "presentationHint": "label"},
         ]}));
         assert_eq!(frames[0].path.as_deref(), Some(Path::new("/p/app.js")));
         assert_eq!((frames[0].line, frames[0].subtle), (12, false));
         assert!(frames[1].subtle && frames[1].path.is_none());
+        assert!(frames[2].subtle);
         let vars = variables(
             &json!({"variables": [
                 {"name": "user", "value": "{name: 'Ada'}", "type": "object", "variablesReference": 3},
@@ -497,5 +565,71 @@ mod tests {
         .err()
         .unwrap();
         assert!(matches!(err, Error::Io(e) if e.contains("boom")));
+    }
+
+    fn alive(pid: u32) -> bool {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    fn wait_gone(pid: u32, within: Duration) {
+        let start = Instant::now();
+        while alive(pid) {
+            assert!(start.elapsed() < within, "the launched program survived");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// An adapter that launches a program which ignores SIGTERM, as one
+    /// paused at a breakpoint does; returns the program's id.
+    fn adapter_with_program(name: &str, editor: u32) -> (Adapter, u32) {
+        let pid_file = std::env::temp_dir().join(format!("dap-{name}-{}", std::process::id()));
+        let script = "import socket, subprocess, sys, time\n\
+                      p = subprocess.Popen(['python3', '-c', 'import signal, time\\n\
+                      signal.signal(signal.SIGTERM, signal.SIG_IGN)\\ntime.sleep(30)'])\n\
+                      open(sys.argv[1], 'w').write(str(p.pid))\n\
+                      s = socket.socket(); s.bind(('127.0.0.1', int(sys.argv[2]))); s.listen()\n\
+                      time.sleep(30)";
+        let adapter = Adapter::start_watched(
+            Path::new("python3"),
+            &["-c".into(), script.into(), pid_file.display().to_string()],
+            Path::new("/"),
+            editor,
+        )
+        .unwrap();
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _ = std::fs::remove_file(pid_file);
+        assert!(alive(pid));
+        (adapter, pid)
+    }
+
+    /// What the adapter launched goes with it, as js-debug's debuggees must.
+    #[cfg(unix)]
+    #[test]
+    fn stopping_stops_what_the_adapter_launched() {
+        let (adapter, pid) = adapter_with_program("stop", std::process::id());
+        drop(adapter);
+        // SIGTERM is ignored; stop also kills.
+        wait_gone(pid, Duration::from_secs(5));
+    }
+
+    /// An editor that crashes leaves nothing running.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_editor_takes_the_adapter_group_along() {
+        let mut editor = Command::new("sleep").arg("30").spawn().unwrap();
+        let (adapter, pid) = adapter_with_program("crash", editor.id());
+        editor.kill().unwrap();
+        editor.wait().unwrap();
+        wait_gone(pid, Duration::from_secs(10));
+        drop(adapter);
     }
 }
