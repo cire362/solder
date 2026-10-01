@@ -836,13 +836,16 @@ impl AiPanel {
                                     .text_size(UI_FONT_SIZE)
                                     .text_color(theme.fg)
                                     .child(div().truncate().child(c.model.name.clone()))
+                                    // Advice for what to install; once installed,
+                                    // the role toggles say what it does.
                                     .children(
-                                        c.picks.contains(&Role::Chat).then(|| {
+                                        (!installed && c.picks.contains(&Role::Chat)).then(|| {
                                             Self::tag("best for chat", theme.accent, theme)
                                         }),
                                     )
                                     .children(
-                                        (c.picks.contains(&Role::Completion)
+                                        (!installed
+                                            && c.picks.contains(&Role::Completion)
                                             && !c.picks.contains(&Role::Chat))
                                         .then(|| {
                                             Self::tag("best to complete", theme.accent, theme)

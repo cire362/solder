@@ -66,9 +66,9 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
       map; inline edits with a streamed preview, reviewed diff, one-step undo and
       stale-file protection; completions as you type, filled in the middle by
       llama.cpp or asked through chat, accepted with Tab)
-- [ ] Agent tasks in their own branch and worktree with an editable plan: edits,
+- [x] Agent tasks in their own branch and worktree with an editable plan: edits,
       commands and tests in a loop, network and outside-project commands confirmed,
-      review the diff and merge
+      review the diff and merge (commands sandboxed with `sandbox-exec` or `bwrap`)
 - [ ] AI review before push
 
 ## 7. Debugger, plugins, onboarding

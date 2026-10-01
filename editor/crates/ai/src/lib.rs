@@ -18,6 +18,7 @@ pub mod install;
 pub mod keys;
 pub mod provider;
 pub mod server;
+pub mod tools;
 
 use std::{
     future::Future,
