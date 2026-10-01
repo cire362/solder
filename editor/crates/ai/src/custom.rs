@@ -344,7 +344,7 @@ mod tests {
                     let sha = "a".repeat(64);
                     let _ = write!(
                         stream,
-                        "HTTP/1.1 302 Found\r\nX-Linked-Size: 5000000\r\nX-Linked-Etag: \"{sha}\"\r\nContent-Length: 0\r\n\r\n"
+                        "HTTP/1.1 302 Found\r\nX-Linked-Size: 5000000\r\nX-Linked-Etag: \"{sha}\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     );
                     continue;
                 } else if first.contains("/org/repo/resolve/main/m-Q4_K_M.gguf") {
@@ -352,7 +352,7 @@ mod tests {
                 } else {
                     let _ = write!(
                         stream,
-                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     );
                     continue;
                 };

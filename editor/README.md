@@ -336,6 +336,30 @@ Everything lives in `~/Library/Application Support/Solder` (on Linux,
 `~/.local/share/Solder`), shared by all projects. The server listens on
 `127.0.0.1` only, on a free port, with a key made for each run.
 
+## AI providers and chat
+
+The AI tab's **Providers** view lists local llama.cpp, Ollama, LM Studio,
+Anthropic and OpenAI. Add another OpenAI-compatible service with its name,
+address up to `/v1` and an optional key. Choose separate models for chat and
+completions; selecting a completion model does not yet enable inline completions.
+
+Keys come from `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`, or from the provider's
+key field. Saved keys use macOS Keychain or Linux Secret Service when available;
+otherwise they live in a separate `keys.json` readable only by you on Unix.
+Provider settings contain no keys. **Offline** disables providers outside the
+local machine.
+
+Open chat with `cmd-shift-l` (`ctrl-shift-l` on Linux and Windows). Pick a
+model, type a question and press Enter. The current file or selection is attached
+unless **File** is turned off; at most 24,000 characters are included. Files and
+directories whose names start with `.env` are never attached, including selected
+text. Project-wide context and `.solderignore` are not implemented yet.
+
+Answers stream into the right panel, with reasoning shown separately and copy
+buttons on code blocks. **Stop** or Escape cancels the request even when the
+provider is waiting to send data. A local model's server starts on first use;
+**New chat** clears the conversation and cancels an answer in progress.
+
 ## Measured so far
 
 Apple M4, 16 GB, built-in 60 Hz display, release build.

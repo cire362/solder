@@ -1,7 +1,9 @@
 mod ai_panel;
+mod ai_providers;
 mod ai_store;
 mod api_panel;
 mod buffer_search;
+mod chat_panel;
 mod command_palette;
 mod completion;
 mod database;

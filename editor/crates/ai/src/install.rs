@@ -443,7 +443,7 @@ mod tests {
                 if first.contains("/meta") {
                     let _ = write!(
                         stream,
-                        "HTTP/1.1 302 Found\r\nLocation: /file\r\nX-Linked-Size: {}\r\nX-Linked-Etag: \"{}\"\r\nContent-Length: 0\r\n\r\n",
+                        "HTTP/1.1 302 Found\r\nLocation: /file\r\nX-Linked-Size: {}\r\nX-Linked-Etag: \"{}\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                         body.len(),
                         sha(&body)
                     );

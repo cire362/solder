@@ -409,7 +409,15 @@ fn layout(
         while !full.is_char_boundary(len) {
             len -= 1;
         }
-        let text = &full[..len];
+        // A masked field (an API key) draws one star per byte, so offsets
+        // and the cursor still line up.
+        let stars: String;
+        let text = if editor.masked {
+            stars = "*".repeat(len);
+            &stars
+        } else {
+            &full[..len]
+        };
         let (segments, next_ix) = color_segments(text, line_start, &spans, span_ix, theme);
         span_ix = next_ix;
         lines.push(shape_row(

@@ -262,6 +262,8 @@ pub(crate) struct HighlightCache {
 pub struct Editor {
     pub(crate) mode: EditorMode,
     pub(crate) placeholder: Option<SharedString>,
+    /// Draws the text as stars; for secrets typed into a field.
+    pub(crate) masked: bool,
     focus_handle: FocusHandle,
     pub(crate) document: Entity<Document>,
     /// Sorted by start and never overlapping.
@@ -328,6 +330,7 @@ impl Editor {
         Self {
             mode: EditorMode::Full,
             placeholder: None,
+            masked: false,
             focus_handle: cx.focus_handle(),
             document,
             selections: vec![Selection::cursor(0)],
@@ -355,6 +358,13 @@ impl Editor {
         let mut editor = Self::new(None, "", cx);
         editor.mode = EditorMode::SingleLine;
         editor.placeholder = Some(placeholder.into());
+        editor
+    }
+
+    /// A single-line field that hides what is typed.
+    pub fn masked(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+        let mut editor = Self::single_line(placeholder, cx);
+        editor.masked = true;
         editor
     }
 

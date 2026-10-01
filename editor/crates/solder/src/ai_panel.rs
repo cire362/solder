@@ -9,6 +9,7 @@ use gpui::{
 };
 
 use crate::{
+    ai_providers::{Kind, Status},
     ai_store::{AiStore, BenchStep},
     editor::Editor,
     theme::{ActiveTheme, Theme, UI_FONT_SIZE},
@@ -17,15 +18,33 @@ use crate::{
 
 const ROW_HEIGHT: gpui::Pixels = px(54.);
 
-actions!(ai_panel, [AddModel]);
+actions!(ai_panel, [AddModel, SaveKey, AddProvider]);
 
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("enter", AddModel, Some("AiAddModel"))]);
+    cx.bind_keys([
+        KeyBinding::new("enter", AddModel, Some("AiAddModel")),
+        KeyBinding::new("enter", SaveKey, Some("AiKey")),
+        KeyBinding::new("enter", AddProvider, Some("AiNewProvider")),
+    ]);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Models,
+    Providers,
 }
 
 pub struct AiPanel {
     store: Entity<AiStore>,
+    pub view: View,
     add_field: Entity<Editor>,
+    /// The provider whose key is being typed.
+    key_for: Option<String>,
+    key_field: Entity<Editor>,
+    new_provider: bool,
+    provider_name: Entity<Editor>,
+    provider_url: Entity<Editor>,
+    provider_key: Entity<Editor>,
     focus: FocusHandle,
 }
 
@@ -35,9 +54,320 @@ impl AiPanel {
         let add_field = cx.new(|cx| Editor::single_line("org/model-GGUF or a .gguf path", cx));
         Self {
             store,
+            view: View::Models,
             add_field,
+            key_for: None,
+            key_field: cx.new(|cx| Editor::masked("Paste the API key", cx)),
+            new_provider: false,
+            provider_name: cx.new(|cx| Editor::single_line("Name", cx)),
+            provider_url: cx.new(|cx| Editor::single_line("https://host/v1", cx)),
+            provider_key: cx.new(|cx| Editor::masked("API key, if it needs one", cx)),
             focus: cx.focus_handle(),
         }
+    }
+
+    pub fn show(&mut self, view: View, cx: &mut Context<Self>) {
+        self.view = view;
+        if view == View::Providers {
+            self.store.update(cx, |s, cx| s.refresh_providers(cx));
+        }
+        cx.notify();
+    }
+
+    fn save_key(&mut self, _: &SaveKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.key_for.take() else {
+            return;
+        };
+        // The field goes away; keep keys working.
+        window.focus(&self.focus);
+        let key = self.key_field.read(cx).text(cx);
+        self.key_field.update(cx, |e, cx| e.set_text("", false, cx));
+        if !key.trim().is_empty() {
+            self.store.update(cx, |s, cx| s.set_key(&id, key, cx));
+        }
+        cx.notify();
+    }
+
+    fn add_provider(&mut self, _: &AddProvider, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
+        let name = self.provider_name.read(cx).text(cx);
+        let url = self.provider_url.read(cx).text(cx);
+        let key = self.provider_key.read(cx).text(cx);
+        for field in [&self.provider_name, &self.provider_url, &self.provider_key] {
+            field.update(cx, |e, cx| e.set_text("", false, cx));
+        }
+        self.new_provider = false;
+        self.store
+            .update(cx, |s, cx| s.add_provider(name, url, Some(key), cx));
+        cx.notify();
+    }
+
+    fn render_providers(
+        &self,
+        window: &Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let store = self.store.read(cx);
+        let small = UI_FONT_SIZE - px(1.);
+        let entity = self.store.clone();
+        let panel = cx.entity();
+        let mut list = div().flex().flex_col().gap_0p5().px_1p5();
+        for p in store.providers.iter().filter(|p| p.kind != Kind::Local) {
+            let status: (String, Hsla) = match &p.status {
+                Status::Unknown | Status::Checking => ("Checking...".into(), theme.fg_subtle),
+                Status::Ready(models) => (
+                    match models.len() {
+                        1 => "1 model".into(),
+                        n => format!("{n} models"),
+                    },
+                    theme.git_added,
+                ),
+                Status::NoKey => ("No key".into(), theme.fg_subtle),
+                Status::Unavailable(e) => (e.to_string(), theme.fg_subtle),
+                Status::Offline => ("Off in offline mode".into(), theme.fg_subtle),
+            };
+            let key_note = p.key_source.map(|source| match source {
+                "saved" => "key saved".to_string(),
+                var => format!("key from {var}"),
+            });
+            let id = p.id.clone();
+            let editing = self.key_for.as_deref() == Some(id.as_str());
+            let mut actions = div().flex().items_center().gap_0p5();
+            if p.takes_key()
+                && p.key_source != Some("ANTHROPIC_API_KEY")
+                && p.key_source != Some("OPENAI_API_KEY")
+            {
+                let (label, sel) = if p.key_source.is_some() {
+                    ("forget key", format!("ai-forget-key-{id}"))
+                } else {
+                    ("add key", format!("ai-key-{id}"))
+                };
+                let forget = p.key_source.is_some();
+                let entity = entity.clone();
+                let panel = panel.clone();
+                let target = id.clone();
+                let selector = sel.clone();
+                actions = actions.child(
+                    ui::toggle(
+                        SharedString::from(sel),
+                        label,
+                        "",
+                        editing,
+                        theme,
+                        move |_, window, cx| {
+                            if forget {
+                                entity.update(cx, |s, cx| s.delete_key(&target, cx));
+                            } else {
+                                panel.update(cx, |this, cx| {
+                                    this.key_for = Some(target.clone());
+                                    cx.notify();
+                                });
+                                let field = panel.read(cx).key_field.clone();
+                                window.focus(&field.focus_handle(cx));
+                            }
+                        },
+                    )
+                    .debug_selector(move || selector.clone()),
+                );
+            }
+            if p.kind == Kind::Compatible {
+                let entity = entity.clone();
+                let target = id.clone();
+                actions = actions.child(ui::toggle(
+                    SharedString::from(format!("ai-remove-provider-{id}")),
+                    "remove",
+                    "",
+                    false,
+                    theme,
+                    move |_, _, cx| entity.update(cx, |s, cx| s.remove_provider(&target, cx)),
+                ));
+            }
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("ai-provider-{id}")))
+                    .debug_selector({
+                        let id = id.clone();
+                        move || format!("ai-provider-{id}")
+                    })
+                    .px_2()
+                    .py_1p5()
+                    .rounded(px(8.))
+                    .hover(|d| d.bg(theme.bg_elev))
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(UI_FONT_SIZE)
+                                    .text_color(theme.fg)
+                                    .child(p.name.clone()),
+                            )
+                            .child(actions),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(status.1)
+                            .child(match key_note {
+                                Some(note) => format!("{} · {note}", status.0),
+                                None => status.0,
+                            }),
+                    )
+                    .when(editing, |d| {
+                        let focused = self.key_field.focus_handle(cx).is_focused(window);
+                        d.child(
+                            div()
+                                .pt_1()
+                                .flex()
+                                .gap_1p5()
+                                .key_context("AiKey")
+                                .on_action(cx.listener(Self::save_key))
+                                .child(ui::text_field(self.key_field.clone(), focused, theme))
+                                .child(
+                                    ui::button(
+                                        "ai-save-key",
+                                        "Save",
+                                        true,
+                                        theme,
+                                        cx.listener(|this, _, window, cx| {
+                                            this.save_key(&SaveKey, window, cx)
+                                        }),
+                                    )
+                                    .debug_selector(|| "ai-save-key".into()),
+                                ),
+                        )
+                    }),
+            );
+        }
+        let form = if self.new_provider {
+            let field = |editor: &Entity<Editor>| {
+                let focused = editor.focus_handle(cx).is_focused(window);
+                ui::text_field(editor.clone(), focused, theme)
+            };
+            div()
+                .px_3()
+                .pt_2()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .key_context("AiNewProvider")
+                .on_action(cx.listener(Self::add_provider))
+                .child(
+                    div()
+                        .text_size(small)
+                        .text_color(theme.fg_subtle)
+                        .child("Any service with OpenAI's chat completions API."),
+                )
+                .child(div().flex().child(field(&self.provider_name)))
+                .child(div().flex().child(field(&self.provider_url)))
+                .child(div().flex().child(field(&self.provider_key)))
+                .child(
+                    div()
+                        .flex()
+                        .gap_1p5()
+                        .child(
+                            ui::button(
+                                "ai-add-provider",
+                                "Add provider",
+                                true,
+                                theme,
+                                cx.listener(|this, _, window, cx| {
+                                    this.add_provider(&AddProvider, window, cx)
+                                }),
+                            )
+                            .debug_selector(|| "ai-add-provider".into()),
+                        )
+                        .child(ui::button(
+                            "ai-cancel-provider",
+                            "Cancel",
+                            false,
+                            theme,
+                            cx.listener(|this, _, _, cx| {
+                                this.new_provider = false;
+                                cx.notify();
+                            }),
+                        )),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .px_3()
+                .pt_2()
+                .flex()
+                .gap_1p5()
+                .child(
+                    ui::button(
+                        "ai-new-provider",
+                        "Add provider",
+                        false,
+                        theme,
+                        cx.listener(|this, _, window, cx| {
+                            this.new_provider = true;
+                            window.focus(&this.provider_name.focus_handle(cx));
+                            cx.notify();
+                        }),
+                    )
+                    .debug_selector(|| "ai-new-provider".into()),
+                )
+                .child(ui::button(
+                    "ai-refresh-providers",
+                    "Check again",
+                    false,
+                    theme,
+                    {
+                        let entity = entity.clone();
+                        move |_, _, cx| entity.update(cx, |s, cx| s.refresh_providers(cx))
+                    },
+                ))
+                .into_any_element()
+        };
+        let offline = store.offline;
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px_3()
+                    .pb_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(small)
+                            .text_color(theme.fg_subtle)
+                            .child(if offline {
+                                "Offline: only this machine answers."
+                            } else {
+                                "Local servers, and services with your key."
+                            }),
+                    )
+                    .child(
+                        ui::toggle(
+                            "ai-offline",
+                            "offline",
+                            "",
+                            offline,
+                            theme,
+                            move |_, _, cx| entity.update(cx, |s, cx| s.set_offline(!offline, cx)),
+                        )
+                        .debug_selector(|| "ai-offline".into()),
+                    ),
+            )
+            .child(list)
+            .child(form)
+            .into_any_element()
     }
 
     fn add(&mut self, _: &AddModel, _: &mut Window, cx: &mut Context<Self>) {
@@ -67,6 +397,16 @@ impl AiPanel {
             }
         })
         .detach();
+    }
+
+    #[cfg(test)]
+    pub fn provider_url_field(&self) -> Entity<Editor> {
+        self.provider_url.clone()
+    }
+
+    #[cfg(test)]
+    pub fn provider_key_field(&self) -> Entity<Editor> {
+        self.provider_key.clone()
     }
 
     #[cfg(test)]
@@ -236,7 +576,7 @@ impl AiPanel {
         let entity = self.store.clone();
         let role_toggle = |role: Role, label: &'static str| {
             let entity = entity.clone();
-            let active = store.roles.get(&role) == Some(&id);
+            let active = store.roles.get(&role) == Some(&crate::ai_providers::ModelRef::local(&id));
             let selector = format!("ai-role-{label}-{id}");
             let model_id = id.clone();
             ui::toggle(
@@ -454,6 +794,55 @@ impl Focusable for AiPanel {
 impl Render for AiPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let view = self.view;
+        let tabs = div()
+            .px_3()
+            .pb_2()
+            .flex()
+            .gap_1()
+            .child(
+                ui::toggle(
+                    "ai-view-models",
+                    "models",
+                    "",
+                    view == View::Models,
+                    &theme,
+                    cx.listener(|this, _, _, cx| this.show(View::Models, cx)),
+                )
+                .debug_selector(|| "ai-view-models".into()),
+            )
+            .child(
+                ui::toggle(
+                    "ai-view-providers",
+                    "providers",
+                    "",
+                    view == View::Providers,
+                    &theme,
+                    cx.listener(|this, _, _, cx| this.show(View::Providers, cx)),
+                )
+                .debug_selector(|| "ai-view-providers".into()),
+            );
+        if view == View::Providers {
+            let providers = self.render_providers(window, &theme, cx);
+            let error = self.store.read(cx).error.clone();
+            return div()
+                .key_context("AiPanel")
+                .track_focus(&self.focus)
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(tabs)
+                .children(error.map(|e| {
+                    div()
+                        .px_3()
+                        .pb_2()
+                        .text_size(UI_FONT_SIZE - px(1.))
+                        .text_color(theme.error)
+                        .child(e)
+                }))
+                .child(providers)
+                .into_any_element();
+        }
         let add = self.render_add(window, &theme, cx);
         let store = self.store.read(cx);
         let small = UI_FONT_SIZE - px(1.);
@@ -498,14 +887,7 @@ impl Render for AiPanel {
             .size_full()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .px_3()
-                    .pb_2()
-                    .text_size(px(11.))
-                    .text_color(theme.fg_subtle)
-                    .child("LOCAL MODELS"),
-            )
+            .child(tabs)
             .child(header.pb_3())
             .when(loaded, |d| {
                 d.child(self.render_benchmark(&theme, cx)).child(add)
@@ -531,5 +913,6 @@ impl Render for AiPanel {
                 )
                 .flex_1(),
             )
+            .into_any_element()
     }
 }
