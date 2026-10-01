@@ -60,10 +60,10 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
       GGUF from Hugging Face or disk, and LM Studio's models
 - [x] Providers: local llama.cpp, Ollama, LM Studio, OpenAI-compatible, Anthropic
       with your own key; model per task; offline mode
-- [ ] Project map for context; `.solderignore`; `.env` always excluded
+- [x] Project map for context; `.solderignore`; `.env` always excluded
 - [~] Ask the codebase (chat), inline edits, streaming completions
-      (streaming chat with the current file or selection; project context,
-      inline edits and completions are still to come)
+      (streaming chat with the current file or selection and an optional project
+      map; inline edits and completions are still to come)
 - [ ] Agent tasks in their own branch and worktree with an editable plan: edits,
       commands and tests in a loop, network and outside-project commands confirmed,
       review the diff and merge

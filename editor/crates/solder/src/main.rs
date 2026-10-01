@@ -1,3 +1,4 @@
+mod ai_context;
 mod ai_panel;
 mod ai_providers;
 mod ai_store;
