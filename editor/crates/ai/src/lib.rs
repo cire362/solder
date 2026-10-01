@@ -10,6 +10,7 @@ pub mod bench;
 pub mod catalog;
 pub mod context;
 pub mod custom;
+pub mod edit;
 pub mod gguf;
 pub mod hardware;
 pub mod install;

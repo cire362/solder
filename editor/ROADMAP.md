@@ -63,7 +63,8 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 - [x] Project map for context; `.solderignore`; `.env` always excluded
 - [~] Ask the codebase (chat), inline edits, streaming completions
       (streaming chat with the current file or selection and an optional project
-      map; inline edits and completions are still to come)
+      map; inline edits with a streamed preview, reviewed diff, one-step undo and
+      stale-file protection; streaming completions are still to come)
 - [ ] Agent tasks in their own branch and worktree with an editable plan: edits,
       commands and tests in a loop, network and outside-project commands confirmed,
       review the diff and merge

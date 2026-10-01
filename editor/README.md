@@ -388,6 +388,30 @@ buttons on code blocks. **Stop** or Escape cancels the request even when the
 provider is waiting to send data. A local model's server starts on first use;
 **New chat** clears the conversation and cancels an answer in progress.
 
+### Inline edits
+
+Press `cmd-i` (`ctrl-i` on Linux and Windows) in a file, or use **Show Inline
+Edit** in the command palette. Describe a change and press Enter to generate a
+preview using the chat model. A selection is replaced exactly; without a
+selection, the whole file is the target. Save untitled files first. Use a single
+selection of at most 24,000 characters, or a file within that limit.
+
+The request contains the target and up to 2,000 characters on each side, with an
+optional **Project map**, off by default. The same context exclusions apply as
+in chat, including `.env*`, Git ignores and `.solderignore`. The file must be
+writable and inside the project. Exclusions are checked again before applying.
+
+Text streams without changing the document. A completed answer becomes a
+side-by-side **Before / Proposed** diff. **Apply**, or `cmd-enter` (`ctrl-enter`),
+applies it as one undo step without saving. **Stop** or Escape cancels an active
+request; **Discard** closes the preview. Switching tabs or panes cancels the
+edit. Changing the document invalidates the proposal instead of overwriting
+newer changes, including edits from another split view.
+
+Malformed, disconnected, token-limited and oversized answers cannot be applied.
+This is a single-target text edit, not an agent: it cannot run commands, change
+other files or save on its own. Inline completions remain unimplemented.
+
 ## Measured so far
 
 Apple M4, 16 GB, built-in 60 Hz display, release build.
