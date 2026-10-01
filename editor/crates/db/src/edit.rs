@@ -7,7 +7,26 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{Column, Engine, ForeignKey, Object, Schema, Value, complete, sql};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// What a result's rows are: table rows, MongoDB documents, or the members
+/// of one Redis key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TargetKind {
+    #[default]
+    Table,
+    Documents,
+    Key(KeyKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyKind {
+    String,
+    Hash,
+    List,
+    Set,
+    SortedSet,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EditTarget {
     pub namespace: Option<String>,
     pub table: String,
@@ -19,6 +38,7 @@ pub struct EditTarget {
     /// Result columns that reference one column of another table, with the
     /// key they belong to; new values can be picked from that table.
     pub references: Vec<(usize, ForeignKey)>,
+    pub kind: TargetKind,
 }
 
 /// The table a result came from, if its rows can be written back: a plain
@@ -30,8 +50,10 @@ pub fn edit_target(
     query: &str,
     columns: &[Column],
 ) -> Result<EditTarget, String> {
-    if !engine.is_sql() {
-        return Err("Editing works for Postgres, MySQL and SQLite results".into());
+    match engine {
+        Engine::Mongo => return crate::nosql::documents_target(query, columns),
+        Engine::Redis => return crate::nosql::key_target(query, columns),
+        _ => {}
     }
     let words: Vec<String> = complete::tokens(query)
         .into_iter()
@@ -126,6 +148,7 @@ pub fn edit_target(
         key,
         auto,
         references,
+        kind: TargetKind::Table,
     })
 }
 
@@ -178,6 +201,13 @@ pub fn statements(
     rows: &[Vec<Value>],
     changes: &Changes,
 ) -> Vec<String> {
+    match target.kind {
+        TargetKind::Documents => {
+            return crate::nosql::document_statements(target, columns, rows, changes);
+        }
+        TargetKind::Key(kind) => return crate::nosql::key_statements(kind, target, rows, changes),
+        TargetKind::Table => {}
+    }
     let table = sql::qualified_name(engine, target.namespace.as_deref(), &target.table);
     let mut by_row: BTreeMap<usize, Vec<(usize, &Option<String>)>> = BTreeMap::new();
     for ((row, column), value) in &changes.cells {
@@ -395,9 +425,9 @@ mod tests {
         assert!(refuse("select * from logs", &["line"]).contains("no primary key"));
         assert!(refuse("update users set name = 'x'", &[]).contains("SELECT"));
         assert!(
-            edit_target(Engine::Redis, &s, "GET a", &columns(&["value"]))
+            edit_target(Engine::Redis, &s, "KEYS *", &columns(&["#", "value"]))
                 .unwrap_err()
-                .contains("Postgres")
+                .contains("key")
         );
     }
 
@@ -409,6 +439,7 @@ mod tests {
             key: vec![0],
             auto: Vec::new(),
             references: Vec::new(),
+            kind: TargetKind::Table,
         };
         let cols = columns(&["id", "name", "bio"]);
         let rows = vec![
@@ -465,6 +496,7 @@ mod tests {
             key: vec![0],
             auto: vec![0],
             references: Vec::new(),
+            kind: TargetKind::Table,
         };
         let cols = columns(&["id", "name", "bio"]);
         let rows = vec![vec![Value::Int(7), Value::Text("ada".into()), Value::Null]];

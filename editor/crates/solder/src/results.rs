@@ -52,8 +52,13 @@ actions!(
     ]
 );
 
-/// Asks the workspace to open a picker of the rows a foreign key points at.
+/// Asks the workspace to open a picker of the rows a foreign key points at,
+/// or a prompt for a key's expiry or new name.
 pub enum ResultsEvent {
+    KeyPrompt {
+        action: KeyAction,
+        key: String,
+    },
     PickReference {
         row: usize,
         column: usize,
@@ -64,6 +69,12 @@ pub enum ResultsEvent {
 }
 
 impl gpui::EventEmitter<ResultsEvent> for ResultsView {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyAction {
+    Expire,
+    Rename,
+}
 
 /// What a cell shows: the value read, a staged value, or (new rows only)
 /// the column's default.
@@ -164,6 +175,11 @@ pub struct ResultsView {
     locked_notice: bool,
     applying: Option<Task<()>>,
     pub browsing: Option<Browsing>,
+    /// Seconds left before the shown Redis key expires; `Some(-1)` never.
+    pub key_ttl: Option<i64>,
+    /// A key being created: add its first member once the empty view loads.
+    new_key: bool,
+    key_task: Option<Task<()>>,
     /// Tables left by following a foreign key, to go back to.
     history: Vec<(SharedString, db::Engine, db::browse::Browse)>,
     filter: Entity<Editor>,
@@ -191,6 +207,9 @@ impl ResultsView {
             locked_notice: false,
             applying: None,
             browsing: None,
+            key_ttl: None,
+            new_key: false,
+            key_task: None,
             history: Vec::new(),
             filter: cx.new(|cx| Editor::single_line("Filter, e.g. status = 'paid'", cx)),
         }
@@ -249,6 +268,206 @@ impl ResultsView {
             _counting: Some(counting),
         });
         self.execute(connection, query, cx);
+    }
+
+    /// The Redis key this view shows, if it shows one.
+    pub fn shown_key(&mut self, cx: &mut Context<Self>) -> Option<(String, db::edit::KeyKind)> {
+        let result = self.result()?.clone();
+        let engine = self.store.read(cx).engine_of(&self.connection)?;
+        if engine != db::Engine::Redis {
+            return None;
+        }
+        let target =
+            db::edit::edit_target(engine, &db::Schema::default(), &self.query, &result.columns)
+                .ok()?;
+        match target.kind {
+            db::edit::TargetKind::Key(kind) => Some((target.table, kind)),
+            _ => None,
+        }
+    }
+
+    /// For a key: its expiry, and for a new key its first member to fill in.
+    fn after_key_loaded(&mut self, cx: &mut Context<Self>) {
+        self.key_ttl = None;
+        let Some((key, kind)) = self.shown_key(cx) else {
+            self.new_key = false;
+            return;
+        };
+        if std::mem::take(&mut self.new_key) {
+            if kind == db::edit::KeyKind::String {
+                self.selected = Some((0, 0));
+            } else {
+                self.changes.inserted.push(Default::default());
+                let numbered = self
+                    .result()
+                    .is_some_and(|r| r.columns.first().is_some_and(|c| c.name == "#"));
+                self.selected = Some((self.row_count() - 1, usize::from(numbered)));
+            }
+        }
+        let task = self.store.update(cx, |s, cx| {
+            s.run(&self.connection, format!("TTL {}", redis_arg(&key)), cx)
+        });
+        self.key_task = Some(cx.spawn(async move |this, cx| {
+            let ttl = task
+                .await
+                .ok()
+                .and_then(|r| match r.rows.first()?.first()? {
+                    Value::Int(t) => Some(*t),
+                    _ => None,
+                });
+            this.update(cx, |this, cx| {
+                this.key_ttl = ttl;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Opens an empty key of `kind` with its first member ready to fill in;
+    /// nothing exists until the change is applied.
+    pub fn new_key(
+        &mut self,
+        connection: SharedString,
+        kind: &str,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let object = db::Object {
+            name: name.to_string(),
+            kind: db::ObjectKind::Key(kind.to_string()),
+            ..Default::default()
+        };
+        self.new_key = true;
+        self.browsing = None;
+        self.history.clear();
+        self.execute(
+            connection,
+            db::preview_query(db::Engine::Redis, &object),
+            cx,
+        );
+    }
+
+    /// Runs a key-level command (EXPIRE, PERSIST, RENAME, DEL) right away,
+    /// then shows `then` (the key, or its new name) or nothing.
+    pub fn key_command(&mut self, command: String, then: Option<String>, cx: &mut Context<Self>) {
+        let name = self.connection.clone();
+        let task = self.store.update(cx, |s, cx| s.run(&name, command, cx));
+        self.key_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Err(e) => this.set_notice(Some(e.into()), cx),
+                    Ok(_) => {
+                        let connection = this.connection.clone();
+                        // Keys appear, move or go: the Database tab lists them.
+                        this.store
+                            .update(cx, |s, cx| s.load_schema(&connection, cx));
+                        match then {
+                            Some(query) => this.execute(connection, query, cx),
+                            None => {
+                                this.state = State::Empty;
+                                this.notice = Some("Key deleted".into());
+                                cx.notify();
+                            }
+                        }
+                    }
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn render_key_bar(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !matches!(self.state, State::Done(_)) {
+            return None;
+        }
+        let (key, kind) = self.shown_key(cx)?;
+        let ttl = match self.key_ttl {
+            Some(-1) => "no expiry".to_string(),
+            Some(-2) => "not saved yet".to_string(),
+            Some(t) => format!("expires in {t} s"),
+            None => String::new(),
+        };
+        let view = cx.entity();
+        let prompt = |action: KeyAction| {
+            let (view, key) = (view.clone(), key.clone());
+            move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                view.update(cx, |_, cx| {
+                    cx.emit(ResultsEvent::KeyPrompt {
+                        action,
+                        key: key.clone(),
+                    })
+                })
+            }
+        };
+        let delete = {
+            let (view, key) = (view.clone(), key.clone());
+            move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+                let answer = window.prompt(
+                    gpui::PromptLevel::Warning,
+                    &format!("Delete {key}?"),
+                    Some("The key and its value are removed from Redis."),
+                    &["Delete", "Cancel"],
+                    cx,
+                );
+                let (view, key) = (view.clone(), key.clone());
+                cx.spawn(async move |cx| {
+                    if answer.await.ok() == Some(0) {
+                        view.update(cx, |this, cx| {
+                            this.key_command(format!("DEL {}", redis_arg(&key)), None, cx)
+                        })
+                        .ok();
+                    }
+                })
+                .detach();
+            }
+        };
+        Some(
+            div()
+                .flex_none()
+                .h(px(34.))
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_2()
+                .border_b_1()
+                .border_color(theme.line)
+                .text_size(UI_FONT_SIZE)
+                .font_family(crate::theme::UI_FONT)
+                .child(
+                    div()
+                        .font_family(crate::theme::CODE_FONT)
+                        .text_color(theme.fg)
+                        .child(key.clone()),
+                )
+                .child(
+                    div()
+                        .text_color(theme.fg_subtle)
+                        .child(format!("{kind:?}").to_lowercase()),
+                )
+                .child(div().text_color(theme.fg_subtle).child(ttl))
+                .child(div().flex_1())
+                .child(ui::button(
+                    "key-expire",
+                    "Expire",
+                    false,
+                    theme,
+                    prompt(KeyAction::Expire),
+                ))
+                .child(ui::button(
+                    "key-rename",
+                    "Rename",
+                    false,
+                    theme,
+                    prompt(KeyAction::Rename),
+                ))
+                .child(ui::button("key-delete", "Delete key", false, theme, delete))
+                .into_any_element(),
+        )
     }
 
     /// Shows the rows again after they changed, keeping the view.
@@ -348,6 +567,7 @@ impl ResultsView {
                         this.widths[i] = this.widths[i].max(needed);
                     }
                 }
+                this.after_key_loaded(cx);
                 this.scroll.scroll_to_item(0, ScrollStrategy::Top);
                 cx.notify();
             })
@@ -571,6 +791,24 @@ impl ResultsView {
         };
         let engine = conn.spec.engine;
         let locked = conn.locked();
+        let locked_error = |this: &mut Self| -> SharedString {
+            this.locked_notice = true;
+            "This connection is read-only. Allow changes to edit its rows.".into()
+        };
+        // Documents and keys are edited without a schema.
+        if !engine.is_sql() {
+            let target = db::edit::edit_target(
+                engine,
+                &db::Schema::default(),
+                &self.query,
+                &result.columns,
+            )?;
+            return if locked {
+                Err(locked_error(self))
+            } else {
+                Ok(target)
+            };
+        }
         match &conn.schema {
             SchemaState::Loaded(schema) => {
                 let target = db::edit::edit_target(engine, schema, &self.query, &result.columns)?;
@@ -1026,7 +1264,22 @@ impl ResultsView {
 
     fn render_review(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let statements = self.statements(cx).unwrap_or_default();
-        let before = self.review_notes();
+        let kind = self.edit_target(cx).map(|t| t.kind).unwrap_or_default();
+        // Notes follow rows; for documents and keys one row can be several
+        // commands, so there are none.
+        let before = match kind {
+            db::edit::TargetKind::Table => self.review_notes(),
+            _ => vec![None; statements.len()],
+        };
+        let warning = match kind {
+            db::edit::TargetKind::Documents => Some(
+                "MongoDB saves each change as it runs: if one fails, the ones before it stay saved.",
+            ),
+            db::edit::TargetKind::Key(_) => Some(
+                "These run as one Redis transaction (MULTI/EXEC); Redis does not undo a command that fails while running.",
+            ),
+            db::edit::TargetKind::Table => None,
+        };
         div()
             .id("results-review")
             .flex_1()
@@ -1036,15 +1289,29 @@ impl ResultsView {
             .flex()
             .flex_col()
             .gap_1()
+            .children(warning.map(|w| div().pb_2().text_color(theme.warning).child(w)))
             .children(statements.into_iter().zip(before).map(|(s, note)| {
-                let color = if s.starts_with("DELETE") {
+                let color = if s.starts_with("DELETE")
+                    || s.contains(".deleteOne(")
+                    || s.starts_with("DEL")
+                    || s.starts_with("HDEL")
+                    || s.starts_with("SREM")
+                    || s.starts_with("ZREM")
+                    || s.starts_with("LREM")
+                {
                     theme.error
                 } else {
                     theme.fg
                 };
                 div()
                     .pb_1()
-                    .child(div().text_color(color).child(format!("{s};")))
+                    .child(div().text_color(color).child(
+                        if matches!(kind, db::edit::TargetKind::Key(_)) {
+                            s.clone()
+                        } else {
+                            format!("{s};")
+                        },
+                    ))
                     .children(
                         note.map(|n| div().text_color(theme.fg_subtle).child(format!("-- {n}"))),
                     )
@@ -1527,6 +1794,7 @@ impl Render for ResultsView {
             .text_size(settings.buffer_font_size() - px(1.))
             .child(self.render_status(&theme, cx))
             .children(self.render_filter_bar(&theme, window, cx))
+            .children(self.render_key_bar(&theme, cx))
             .children(changes_bar)
             .child(body)
             .child(
@@ -1540,6 +1808,14 @@ impl Render for ResultsView {
                 .size_full(),
             )
     }
+}
+
+/// Quotes a Redis argument for a command line.
+pub fn redis_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains(|c: char| c.is_whitespace() || c == '"' || c == '\'') {
+        return arg.to_string();
+    }
+    format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 #[cfg(test)]

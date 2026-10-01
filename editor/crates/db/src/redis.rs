@@ -59,6 +59,33 @@ impl Redis {
         Ok(to_result(pair_up(&args, value)))
     }
 
+    /// Runs staged commands as one MULTI/EXEC transaction: no other client
+    /// sees them half done. Redis does not roll back a command that fails
+    /// while running (a wrong type), so its error is reported as is.
+    pub async fn apply(&self, statements: &[String]) -> Result<()> {
+        if self.read_only {
+            return Err("This connection is read-only".into());
+        }
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        for statement in statements {
+            let args = split_args(statement)?;
+            let Some((name, rest)) = args.split_first() else {
+                continue;
+            };
+            let cmd = pipe.cmd(name);
+            for arg in rest {
+                cmd.arg(arg);
+            }
+        }
+        let mut conn = self.conn.clone();
+        let _: redis::Value = pipe
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub async fn schema(&self) -> Result<Schema> {
         let mut conn = self.conn.clone();
         let mut keys: Vec<String> = Vec::new();

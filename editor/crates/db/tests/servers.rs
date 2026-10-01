@@ -858,3 +858,125 @@ fn sqlite_ddl() {
         .unwrap(),
     );
 }
+
+#[test]
+fn redis_key_edits() {
+    use db::edit::{Changes, edit_target, statements};
+    let Some(spec) = spec("SOLDER_TEST_REDIS", Engine::Redis, false) else {
+        return;
+    };
+    let session = block(Session::connect(spec)).unwrap();
+    run(&session, "DEL solder:h solder:l solder:s");
+    run(&session, "HSET solder:h name ada lang rust");
+    run(&session, "RPUSH solder:l a b c");
+    run(&session, "SET solder:s hi EX 1000");
+    let save = |query: &str, changes: Changes| {
+        let result = run(&session, query);
+        let target =
+            edit_target(Engine::Redis, &Default::default(), query, &result.columns).unwrap();
+        let commands = statements(
+            Engine::Redis,
+            &target,
+            &result.columns,
+            &result.rows,
+            &changes,
+        );
+        block(session.apply(commands)).unwrap();
+        result
+    };
+    // Rename a hash field and change its value; drop another; add one.
+    let fields = run(&session, "HGETALL solder:h");
+    let name = fields
+        .rows
+        .iter()
+        .position(|r| r[0] == Value::Text("name".into()))
+        .unwrap();
+    let lang = 1 - name;
+    let mut changes = Changes::default();
+    changes.cells.insert((name, 0), Some("full_name".into()));
+    changes.cells.insert((name, 1), Some("Ada L".into()));
+    changes.deleted.insert(lang);
+    changes
+        .inserted
+        .push([(0, Some("age".into())), (1, Some("36".into()))].into());
+    save("HGETALL solder:h", changes);
+    let mut after: Vec<Vec<Value>> = run(&session, "HGETALL solder:h").rows;
+    after.sort_by_key(|r| r[0].display());
+    assert_eq!(
+        after,
+        vec![
+            vec![Value::Text("age".into()), Value::Text("36".into())],
+            vec![Value::Text("full_name".into()), Value::Text("Ada L".into())],
+        ]
+    );
+    // List: change b, drop a, append d.
+    let mut changes = Changes::default();
+    changes.cells.insert((1, 1), Some("B".into()));
+    changes.deleted.insert(0);
+    changes.inserted.push([(1, Some("d".into()))].into());
+    save("LRANGE solder:l 0 199", changes);
+    let items: Vec<String> = run(&session, "LRANGE solder:l 0 -1")
+        .rows
+        .iter()
+        .map(|r| r[1].display())
+        .collect();
+    assert_eq!(items, ["B", "c", "d"]);
+    // A string keeps its expiry.
+    let mut changes = Changes::default();
+    changes.cells.insert((0, 0), Some("hello".into()));
+    save("GET solder:s", changes);
+    assert_eq!(one(&session, "GET solder:s"), Value::Text("hello".into()));
+    assert!(matches!(one(&session, "TTL solder:s"), Value::Int(t) if t > 900));
+    run(&session, "DEL solder:h solder:l solder:s");
+}
+
+#[test]
+fn mongo_document_edits() {
+    use db::edit::{Changes, edit_target, statements};
+    let Some(spec) = spec("SOLDER_TEST_MONGO", Engine::Mongo, false) else {
+        return;
+    };
+    let session = block(Session::connect(spec)).unwrap();
+    run(&session, "db.solder_docs.deleteMany({})");
+    run(
+        &session,
+        "db.solder_docs.insertMany([{name: 'ada', age: 36}, {name: 'bob', age: 25}])",
+    );
+    let query = "db.getCollection(\"solder_docs\").find({}).sort({\"name\": 1}).limit(200)";
+    let result = run(&session, query);
+    let col = |name: &str| result.columns.iter().position(|c| c.name == name).unwrap();
+    let target = edit_target(Engine::Mongo, &Default::default(), query, &result.columns).unwrap();
+    let mut changes = Changes::default();
+    changes.cells.insert((0, col("age")), Some("37".into()));
+    changes.cells.insert((0, col("name")), Some("Ada".into()));
+    changes.deleted.insert(1);
+    changes.inserted.push(
+        [
+            (col("name"), Some("cy".into())),
+            (col("age"), Some("3".into())),
+        ]
+        .into(),
+    );
+    let calls = statements(
+        Engine::Mongo,
+        &target,
+        &result.columns,
+        &result.rows,
+        &changes,
+    );
+    block(session.apply(calls.clone())).unwrap();
+    let after = run(
+        &session,
+        "db.solder_docs.find({}, {_id: 0}).sort({name: 1})",
+    );
+    let rows: Vec<Vec<String>> = after
+        .rows
+        .iter()
+        .map(|r| r.iter().map(Value::display).collect())
+        .collect();
+    assert_eq!(rows, [["Ada", "37"], ["cy", "3"]]);
+    // The same delete again matches nothing: reported, not ignored.
+    let err = block(session.apply(vec![calls[1].clone()])).unwrap_err();
+    assert!(err.contains("matched no document"), "{err}");
+    run(&session, "db.solder_docs.deleteMany({})");
+}

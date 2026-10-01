@@ -50,7 +50,7 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 - [x] Browse without SQL: filter and sort by column, page through large tables, follow foreign keys
 - [x] Table structure: create, change and drop tables, columns, indexes and foreign keys; review the DDL, then apply it or save it as a migration
 - [x] ERD: tables and relations with layout, pan and zoom; open a table's data or structure; add tables, columns and relations; export SVG, PNG and Mermaid
-- [ ] Redis keys (every type, TTL) and MongoDB documents: add, edit, delete
+- [x] Redis keys (every type, TTL) and MongoDB documents: add, edit, delete
 - [ ] HTTP client with requests generated from API routes, OpenAPI 3.1 import
 
 ## 6. Solder AI

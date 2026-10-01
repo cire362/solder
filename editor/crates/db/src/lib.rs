@@ -14,6 +14,7 @@ pub mod erd;
 pub mod migrations;
 mod mongo;
 mod mysql;
+mod nosql;
 mod params;
 mod pg;
 mod redis;
@@ -335,8 +336,10 @@ impl Session {
         })
     }
 
-    /// Runs `statements` in one transaction. Each must change exactly one
-    /// row; otherwise, or on any error, everything is rolled back.
+    /// Applies staged edits. SQL runs them in one transaction where each
+    /// must change exactly one row, else everything is rolled back. Redis
+    /// runs its commands as one MULTI/EXEC; MongoDB runs its calls in order,
+    /// each matching one document.
     pub fn apply(
         &self,
         statements: Vec<String>,
@@ -347,9 +350,8 @@ impl Session {
                 Driver::Postgres(d) => d.apply(&statements).await,
                 Driver::MySql(d) => d.apply(&statements).await,
                 Driver::Sqlite(d) => d.apply(statements).await,
-                Driver::Redis(_) | Driver::Mongo(_) => {
-                    Err("Editing works for Postgres, MySQL and SQLite results".into())
-                }
+                Driver::Redis(d) => d.apply(&statements).await,
+                Driver::Mongo(d) => d.apply(&statements).await,
             }
         })
     }
