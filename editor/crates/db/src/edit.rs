@@ -497,6 +497,7 @@ mod tests {
             ref_namespace: Some("public".into()),
             ref_table: "logs".into(),
             ref_columns: vec!["line".into()],
+            on_delete: None,
         }];
         let target = edit_target(
             Engine::Postgres,

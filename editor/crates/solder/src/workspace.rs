@@ -210,6 +210,11 @@ pub struct Workspace {
     /// pick its connection (`false`).
     pending_query: Option<(PathBuf, bool)>,
     file_diff: Option<Entity<FileDiff>>,
+    /// A table's structure, shown in place of the editors.
+    structure: Option<(Entity<crate::structure::StructureView>, Subscription)>,
+    /// A connection's ERD, shown in place of the editors (under a structure
+    /// form opened from it).
+    erd: Option<(Entity<crate::erd_view::ErdView>, Subscription)>,
     diff_task: Option<Task<()>>,
     diff_subscription: Option<Subscription>,
     search_bar: Entity<BufferSearchBar>,
@@ -321,6 +326,16 @@ impl Workspace {
                         this.results_active = true;
                         this.dock_open = true;
                         cx.notify();
+                    }
+                    DatabasePanelEvent::Structure {
+                        connection,
+                        engine,
+                        object,
+                    } => {
+                        this.open_structure(connection.clone(), *engine, object.clone(), window, cx)
+                    }
+                    DatabasePanelEvent::Diagram { connection, engine } => {
+                        this.open_erd(connection.clone(), *engine, window, cx)
                     }
                     DatabasePanelEvent::NewQuery { connection } => {
                         this.open_scratch_query(connection.to_string(), window, cx)
@@ -444,6 +459,8 @@ impl Workspace {
             show_results: false,
             results_active: false,
             pending_query: None,
+            structure: None,
+            erd: None,
             file_diff: None,
             diff_task: None,
             diff_subscription: None,
@@ -1440,6 +1457,101 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    /// Shows a table's structure (or a new table) in place of the editors.
+    pub fn open_structure(
+        &mut self,
+        connection: SharedString,
+        engine: db::Engine,
+        object: Option<db::Object>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::structure::{StructureEvent, StructureView};
+        let (store, root) = (self.database.clone(), self.root(cx));
+        let table = object.as_ref().map(db::ddl::TableDraft::of);
+        let view = cx.new(|cx| StructureView::new(store, root, connection, engine, table, cx));
+        let subscription =
+            cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
+                StructureEvent::Close => this.close_structure(window, cx),
+                StructureEvent::OpenFile(path) => this.open_path(path.clone(), None, window, cx),
+            });
+        window.focus(&view.focus_handle(cx));
+        self.structure = Some((view, subscription));
+        cx.notify();
+    }
+
+    /// Shows a connection's ERD in place of the editors.
+    pub fn open_erd(
+        &mut self,
+        connection: SharedString,
+        engine: db::Engine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::erd_view::{ErdEvent, ErdView};
+        let (store, root) = (self.database.clone(), self.root(cx));
+        let view = cx.new(|cx| ErdView::new(store, root, connection.clone(), engine, cx));
+        let subscription =
+            cx.subscribe_in(
+                &view,
+                window,
+                move |this, _, event, window, cx| match event {
+                    ErdEvent::Close => {
+                        this.erd = None;
+                        this.close_structure(window, cx);
+                        cx.notify();
+                    }
+                    ErdEvent::Browse(object) => {
+                        let spec = db::browse::Browse::of(object);
+                        let connection = connection.clone();
+                        this.results
+                            .update(cx, |r, cx| r.browse(connection, engine, spec, cx));
+                        this.show_results = true;
+                        this.results_active = true;
+                        this.dock_open = true;
+                        cx.notify();
+                    }
+                    ErdEvent::Structure(object) => {
+                        this.open_structure(connection.clone(), engine, object.clone(), window, cx)
+                    }
+                    ErdEvent::Link(object, fk) => {
+                        this.open_structure(
+                            connection.clone(),
+                            engine,
+                            Some(object.clone()),
+                            window,
+                            cx,
+                        );
+                        if let Some((view, _)) = &this.structure {
+                            view.update(cx, |v, cx| v.add_foreign_key_draft(fk, cx));
+                        }
+                    }
+                    ErdEvent::RunQuery(query) => {
+                        this.run_query(connection.clone(), query.clone(), false, window, cx)
+                    }
+                },
+            );
+        window.focus(&view.focus_handle(cx));
+        self.erd = Some((view, subscription));
+        cx.notify();
+    }
+
+    fn close_structure(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.structure.take().is_some() {
+            // Back to the ERD it was opened from, if any.
+            if let Some((erd, _)) = &self.erd {
+                window.focus(&erd.focus_handle(cx));
+                cx.notify();
+                return;
+            }
+            match self.active_editor() {
+                Some(editor) => window.focus(&editor.focus_handle(cx)),
+                None => window.focus(&self.focus_handle),
+            }
+            cx.notify();
+        }
     }
 
     fn close_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2545,9 +2657,19 @@ impl Render for Workspace {
             |n| n.to_string_lossy().into_owned(),
         );
         let title = self
-            .file_diff
+            .structure
             .as_ref()
-            .map(|view| view.read(cx).path.display().to_string())
+            .map(|(view, _)| format!("Structure of {}", view.read(cx).title(cx)))
+            .or_else(|| {
+                self.erd
+                    .as_ref()
+                    .map(|(view, _)| format!("Diagram of {}", view.read(cx).connection))
+            })
+            .or_else(|| {
+                self.file_diff
+                    .as_ref()
+                    .map(|view| view.read(cx).path.display().to_string())
+            })
             .or_else(|| {
                 self.active_editor().and_then(|editor| {
                     editor
@@ -2558,7 +2680,13 @@ impl Render for Workspace {
             })
             .unwrap_or_else(|| root.display().to_string());
         window.set_window_title(&title);
-        let panes: Vec<_> = match &self.file_diff {
+        let special: Option<AnyView> = self
+            .structure
+            .as_ref()
+            .map(|(view, _)| view.clone().into())
+            .or_else(|| self.erd.as_ref().map(|(view, _)| view.clone().into()))
+            .or_else(|| self.file_diff.as_ref().map(|view| view.clone().into()));
+        let panes: Vec<_> = match special {
             Some(view) => vec![
                 div()
                     .flex_1()
@@ -3998,6 +4126,298 @@ mod tests {
             results.read(cx).query.contains("FROM \"posts\"") && loaded(cx) == 75
         });
         assert!(cx.read(|cx| results.read(cx).query.contains("DESC")));
+    }
+
+    #[gpui::test]
+    fn structure_changes_apply_or_become_migrations(cx: &mut TestAppContext) {
+        use crate::structure::StructureView;
+        let root = sqlite_fixture("structure");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let store = cx.read(|cx| ws.read(cx).database.clone());
+        store.update(cx, |s, cx| s.ensure_detected(cx));
+        wait_for(cx, "detection", &|cx| store.read(cx).detected());
+        store.update(cx, |s, cx| s.ensure_schema("DATABASE_URL", cx));
+        wait_for(cx, "schema", &|cx| {
+            store.read(cx).schema_of("DATABASE_URL").is_some()
+        });
+        let table = |cx: &App, name: &str| {
+            store
+                .read(cx)
+                .schema_of("DATABASE_URL")
+                .and_then(|(_, s)| s.objects.iter().find(|o| o.name == name).cloned())
+        };
+        let open =
+            |cx: &mut VisualTestContext, object: Option<db::Object>| -> Entity<StructureView> {
+                ws.update_in(cx, |ws, window, cx| {
+                    ws.open_structure(
+                        "DATABASE_URL".into(),
+                        db::Engine::Sqlite,
+                        object,
+                        window,
+                        cx,
+                    );
+                    ws.structure.as_ref().unwrap().0.clone()
+                })
+            };
+        let edit_users = |view: &Entity<StructureView>, cx: &mut VisualTestContext| {
+            view.update(cx, |v, cx| {
+                v.set_column(1, "full_name", "text", "", cx);
+                v.add_column(cx);
+                v.set_column(2, "email", "text", "", cx);
+                v.add_index(cx);
+                v.set_index(0, "users_email", "email", cx);
+            });
+        };
+        let closed = |cx: &App| ws.read(cx).structure.is_none();
+
+        // A draft that cannot work says why instead of reviewing.
+        let users = cx.read(|cx| table(cx, "users")).unwrap();
+        let view = open(cx, Some(users.clone()));
+        view.update(cx, |v, cx| v.add_index(cx));
+        cx.simulate_keystrokes("secondary-s");
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let v = view.read(cx);
+            assert!(v.review.is_none());
+            assert!(
+                v.notice
+                    .as_ref()
+                    .is_some_and(|n| n.contains("needs at least one column")),
+                "{:?}",
+                v.notice
+            );
+        });
+        cx.simulate_keystrokes("escape");
+        assert!(cx.read(|cx| closed(cx)));
+
+        // Reviewed, then saved as a migration: the database is untouched.
+        let view = open(cx, Some(users.clone()));
+        edit_users(&view, cx);
+        cx.simulate_keystrokes("secondary-s");
+        wait_for(cx, "review", &|cx| view.read(cx).review.is_some());
+        cx.read(|cx| {
+            let review = view.read(cx).review.as_ref().unwrap();
+            assert_eq!(
+                review.up,
+                [
+                    "ALTER TABLE \"users\" RENAME COLUMN \"name\" TO \"full_name\"",
+                    "ALTER TABLE \"users\" ADD COLUMN \"email\" text",
+                    "CREATE INDEX \"users_email\" ON \"users\" (\"email\")",
+                ]
+            );
+            assert_eq!(review.target.dir, root.join("migrations"));
+        });
+        view.update(cx, |v, cx| v.save_migration(cx));
+        wait_for(cx, "saved", &|cx| {
+            closed(cx) && ws.read(cx).active_editor().is_some()
+        });
+        let migration = active_path(&ws, cx).unwrap();
+        assert!(migration.starts_with(root.join("migrations")));
+        assert!(migration.to_string_lossy().ends_with("_alter_users.sql"));
+        let text = std::fs::read_to_string(&migration).unwrap();
+        assert!(text.contains("ADD COLUMN \"email\" text;"), "{text}");
+        assert!(text.contains("-- To undo:"), "{text}");
+        assert!(cx.read(|cx| table(cx, "users")).unwrap().columns[1].name == "name");
+
+        // The same change applied to the database.
+        let view = open(cx, Some(users));
+        edit_users(&view, cx);
+        cx.simulate_keystrokes("secondary-s");
+        wait_for(cx, "review", &|cx| view.read(cx).review.is_some());
+        view.update(cx, |v, cx| v.apply(cx));
+        wait_for(cx, "applied", &|cx| {
+            closed(cx)
+                && table(cx, "users").is_some_and(|t| {
+                    t.columns
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                        == ["id", "full_name", "email"]
+                })
+        });
+
+        // A new table, then dropping it.
+        let view = open(cx, None);
+        view.update(cx, |v, cx| {
+            v.set_table_name("tags", cx);
+            v.set_column(0, "id", "integer", "", cx);
+            v.add_column(cx);
+            v.set_column(1, "label", "text", "'none'", cx);
+        });
+        cx.simulate_keystrokes("secondary-s");
+        wait_for(cx, "review", &|cx| view.read(cx).review.is_some());
+        view.update(cx, |v, cx| v.apply(cx));
+        wait_for(cx, "created", &|cx| {
+            closed(cx) && table(cx, "tags").is_some()
+        });
+        let tags = cx.read(|cx| table(cx, "tags")).unwrap();
+        assert!(tags.columns[0].primary_key && tags.columns[0].auto);
+        let view = open(cx, Some(tags));
+        view.update(cx, |v, cx| {
+            v.drop = true;
+            cx.notify();
+        });
+        cx.simulate_keystrokes("secondary-s");
+        wait_for(cx, "review", &|cx| view.read(cx).review.is_some());
+        assert_eq!(
+            cx.read(|cx| view.read(cx).review.as_ref().unwrap().up.clone()),
+            ["DROP TABLE \"tags\""]
+        );
+        view.update(cx, |v, cx| v.apply(cx));
+        wait_for(cx, "dropped", &|cx| {
+            closed(cx) && table(cx, "tags").is_none()
+        });
+    }
+
+    #[gpui::test]
+    fn erd_moves_opens_links_and_exports(cx: &mut TestAppContext) {
+        use crate::erd_view::ErdView;
+        use gpui::{Modifiers, MouseButton, MouseDownEvent};
+        let root = sqlite_fixture("erd");
+        futures::executor::block_on(async {
+            let session = db::Session::connect(db::ConnectionSpec {
+                name: "seed".into(),
+                engine: db::Engine::Sqlite,
+                url: root.join("dev.db").display().to_string(),
+                source: "test".into(),
+                read_only: false,
+            })
+            .await
+            .unwrap();
+            session
+                .query(
+                    "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id), title TEXT)"
+                        .into(),
+                )
+                .await
+                .unwrap();
+        });
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let store = cx.read(|cx| ws.read(cx).database.clone());
+        store.update(cx, |s, cx| s.ensure_detected(cx));
+        wait_for(cx, "detection", &|cx| store.read(cx).detected());
+        let view: Entity<ErdView> = ws.update_in(cx, |ws, window, cx| {
+            ws.open_erd("DATABASE_URL".into(), db::Engine::Sqlite, window, cx);
+            ws.erd.as_ref().unwrap().0.clone()
+        });
+        wait_for(cx, "diagram", &|cx| view.read(cx).diagram.edges.len() == 1);
+        settle(cx);
+        let node = |cx: &VisualTestContext, name: &str| {
+            cx.read(|cx| {
+                let d = &view.read(cx).diagram;
+                d.nodes.iter().position(|n| n.name == name).unwrap()
+            })
+        };
+        let (users, posts) = (node(cx, "users"), node(cx, "posts"));
+        let at = |cx: &VisualTestContext, i: usize, dx: f32, dy: f32| {
+            cx.read(|cx| {
+                let v = view.read(cx);
+                let n = &v.diagram.nodes[i];
+                v.to_window((n.x + dx, n.y + dy))
+            })
+        };
+        let x_of =
+            |cx: &VisualTestContext, i: usize| cx.read(|cx| view.read(cx).diagram.nodes[i].x);
+        // Referenced tables sit to the left.
+        assert!(x_of(cx, users) < x_of(cx, posts));
+
+        // Dragging a table by its header moves it and saves the layout.
+        let before = x_of(cx, users);
+        let start = at(cx, users, 20., 10.);
+        let end = gpui::point(start.x + px(60.), start.y + px(30.));
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        let moved = x_of(cx, users);
+        assert!(moved > before + 10., "{before} -> {moved}");
+        let layout = db::erd::layout_path(&root, "DATABASE_URL");
+        wait_for(cx, "layout saved", &|_| layout.exists());
+        let saved = db::erd::Layout::load(&layout);
+        assert_eq!(saved.tables["users"].x, moved);
+
+        // Dragging from posts.title's handle onto users.name drafts a key.
+        let (w, title_y) = cx.read(|cx| {
+            let n = &view.read(cx).diagram.nodes[posts];
+            (n.width, n.row_y("title") - n.y)
+        });
+        let from = at(cx, posts, w - 4., title_y);
+        let name_y = cx.read(|cx| {
+            let n = &view.read(cx).diagram.nodes[users];
+            n.row_y("name") - n.y
+        });
+        let onto = at(cx, users, 30., name_y);
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(onto, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(onto, MouseButton::Left, Modifiers::default());
+        let structure = cx
+            .read(|cx| ws.read(cx).structure.as_ref().map(|(v, _)| v.clone()))
+            .unwrap();
+        let draft = cx.read(|cx| structure.read(cx).draft(cx));
+        assert_eq!(draft.name, "posts");
+        let fk = draft
+            .foreign_keys
+            .iter()
+            .find(|f| f.name == "posts_title_fkey")
+            .unwrap();
+        assert_eq!(
+            (
+                fk.columns.clone(),
+                fk.ref_table.as_str(),
+                fk.ref_columns.clone()
+            ),
+            (vec!["title".to_string()], "users", vec!["name".to_string()])
+        );
+        // Closing the form returns to the diagram.
+        cx.simulate_keystrokes("escape");
+        assert!(cx.read(|cx| ws.read(cx).structure.is_none() && ws.read(cx).erd.is_some()));
+
+        // Double-clicking a table browses its rows.
+        cx.simulate_event(MouseDownEvent {
+            position: at(cx, users, 20., 10.),
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        let results = cx.read(|cx| ws.read(cx).results.clone());
+        wait_for(cx, "browse", &|cx| {
+            results.read(cx).query.contains("FROM \"users\"") && ws.read(cx).dock_open
+        });
+
+        // Search: Enter selects and centers the first match.
+        let search = cx.read(|cx| view.read(cx).search_field());
+        cx.update(|window, cx| window.focus(&search.focus_handle(cx)));
+        cx.simulate_input("pos");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(cx.read(|cx| view.read(cx).selected), Some(posts));
+
+        // The exports.
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx)));
+        view.update(cx, |v, cx| v.copy_mermaid(cx));
+        let mermaid = cx.read_from_clipboard().and_then(|i| i.text()).unwrap();
+        assert!(
+            mermaid.contains("users ||--o{ posts : \"user_id\""),
+            "{mermaid}"
+        );
+        let (svg, png) = (root.join("diagram.svg"), root.join("diagram.png"));
+        // The test executor runs these as it is driven, not on their own.
+        view.update(cx, |v, cx| v.export_svg(svg.clone(), cx))
+            .detach();
+        view.update(cx, |v, cx| v.export_png(png.clone(), cx))
+            .detach();
+        wait_for(cx, "exports", &|_| {
+            std::fs::read(&png).is_ok_and(|b| b.len() > 8) && svg.exists()
+        });
+        assert!(
+            std::fs::read_to_string(&svg)
+                .unwrap()
+                .contains(">posts</text>")
+        );
+        assert_eq!(&std::fs::read(&png).unwrap()[..4], b"\x89PNG");
+        cx.simulate_keystrokes("escape");
+        assert!(cx.read(|cx| ws.read(cx).erd.is_none()));
     }
 
     #[gpui::test]

@@ -48,8 +48,8 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 - [x] Results grid with staged edits applied as one transaction; read-only production
 - [x] Rows: add, duplicate and delete; defaults and server-filled columns; pick foreign key values from the referenced table
 - [x] Browse without SQL: filter and sort by column, page through large tables, follow foreign keys
-- [ ] Table structure: create, change and drop tables, columns, indexes and foreign keys; review the DDL, then apply it or save it as a migration
-- [ ] ERD: tables and relations with layout, pan and zoom; open a table's data or structure; add tables, columns and relations; export SVG, PNG and Mermaid
+- [x] Table structure: create, change and drop tables, columns, indexes and foreign keys; review the DDL, then apply it or save it as a migration
+- [x] ERD: tables and relations with layout, pan and zoom; open a table's data or structure; add tables, columns and relations; export SVG, PNG and Mermaid
 - [ ] Redis keys (every type, TTL) and MongoDB documents: add, edit, delete
 - [ ] HTTP client with requests generated from API routes, OpenAPI 3.1 import
 

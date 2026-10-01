@@ -174,7 +174,7 @@ fn sql_candidates(
     if previous == "INDEX" {
         for object in &schema.objects {
             out.extend(object.indexes.iter().map(|i| Candidate {
-                label: i.clone(),
+                label: i.name.clone(),
                 kind: CandidateKind::Index,
                 detail: format!("index on {}", object.name),
             }));
@@ -433,7 +433,10 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
-            indexes: vec![format!("{name}_pkey")],
+            indexes: vec![crate::Index {
+                name: format!("{name}_pkey"),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         Schema {

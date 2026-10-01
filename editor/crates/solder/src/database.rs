@@ -280,6 +280,19 @@ impl DatabaseStore {
         cx.background_spawn(async move { session.await?.apply(statements).await })
     }
 
+    /// Applies structure changes (see `Session::apply_ddl`).
+    pub fn apply_ddl(
+        &mut self,
+        name: &str,
+        statements: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), String>> {
+        let Some(session) = self.session(name, cx) else {
+            return Task::ready(Err(format!("No connection named {name}")));
+        };
+        cx.background_spawn(async move { session.await?.apply_ddl(statements).await })
+    }
+
     pub fn connection(&self, name: &str) -> Option<&Connection> {
         self.connections.iter().find(|c| c.spec.name == name)
     }

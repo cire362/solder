@@ -94,6 +94,25 @@ impl MySql {
         conn.query_drop("COMMIT").await.map_err(|e| e.to_string())
     }
 
+    pub async fn apply_ddl(&self, statements: &[String]) -> Result<()> {
+        let mut conn = self.conn.lock().await;
+        for (i, statement) in statements.iter().enumerate() {
+            if let Err(e) = conn.query_drop(statement.as_str()).await {
+                return Err(format!(
+                    "Statement {} of {}: {e}. MySQL saves each structure change as it runs: {}.",
+                    i + 1,
+                    statements.len(),
+                    match i {
+                        0 => "nothing was changed".to_string(),
+                        1 => "the one before it was applied".to_string(),
+                        n => format!("the {n} before it were applied"),
+                    }
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn schema(&self) -> Result<Schema> {
         let mut conn = self.conn.lock().await;
         // Without a database in the URL, every non-system schema.
@@ -112,15 +131,18 @@ impl MySql {
             .map_err(|e| e.to_string())?;
         let keys: Vec<Row> = conn
             .query(format!(
-                "SELECT c.TABLE_SCHEMA, c.TABLE_NAME, c.COLUMN_NAME FROM information_schema.COLUMNS c \
+                "SELECT c.TABLE_SCHEMA, c.TABLE_NAME, c.COLUMN_NAME, 'PRIMARY' FROM information_schema.COLUMNS c \
                  WHERE {filter} AND c.COLUMN_KEY = 'PRI'"
             ))
             .await
             .map_err(|e| e.to_string())?;
         let indexes: Vec<Row> = conn
             .query(format!(
-                "SELECT DISTINCT c.TABLE_SCHEMA, c.TABLE_NAME, c.INDEX_NAME FROM information_schema.STATISTICS c \
-                 WHERE {filter} ORDER BY c.INDEX_NAME"
+                "SELECT c.TABLE_SCHEMA, c.TABLE_NAME, c.INDEX_NAME, IF(MAX(c.NON_UNIQUE) = 0, '1', ''), \
+                   IF(c.INDEX_NAME = 'PRIMARY', '1', ''), \
+                   GROUP_CONCAT(c.COLUMN_NAME ORDER BY c.SEQ_IN_INDEX SEPARATOR 0x1f) \
+                 FROM information_schema.STATISTICS c \
+                 WHERE {filter} GROUP BY c.TABLE_SCHEMA, c.TABLE_NAME, c.INDEX_NAME ORDER BY c.INDEX_NAME"
             ))
             .await
             .map_err(|e| e.to_string())?;
@@ -129,8 +151,11 @@ impl MySql {
                 "SELECT c.CONSTRAINT_NAME, c.TABLE_SCHEMA, c.TABLE_NAME, \
                    GROUP_CONCAT(c.COLUMN_NAME ORDER BY c.ORDINAL_POSITION SEPARATOR 0x1f), \
                    c.REFERENCED_TABLE_SCHEMA, c.REFERENCED_TABLE_NAME, \
-                   GROUP_CONCAT(c.REFERENCED_COLUMN_NAME ORDER BY c.ORDINAL_POSITION SEPARATOR 0x1f) \
+                   GROUP_CONCAT(c.REFERENCED_COLUMN_NAME ORDER BY c.ORDINAL_POSITION SEPARATOR 0x1f), \
+                   MAX(r.DELETE_RULE) \
                  FROM information_schema.KEY_COLUMN_USAGE c \
+                 JOIN information_schema.REFERENTIAL_CONSTRAINTS r \
+                   ON r.CONSTRAINT_SCHEMA = c.TABLE_SCHEMA AND r.CONSTRAINT_NAME = c.CONSTRAINT_NAME \
                  WHERE {filter} AND c.REFERENCED_TABLE_NAME IS NOT NULL \
                  GROUP BY c.CONSTRAINT_NAME, c.TABLE_SCHEMA, c.TABLE_NAME, \
                    c.REFERENCED_TABLE_SCHEMA, c.REFERENCED_TABLE_NAME \

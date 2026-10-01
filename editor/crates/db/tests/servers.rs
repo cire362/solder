@@ -100,7 +100,19 @@ fn postgres() {
         .unwrap();
     assert_eq!(users.namespace.as_deref(), Some("public"));
     assert!(users.columns[0].primary_key && !users.columns[1].nullable);
-    assert!(users.indexes.contains(&"solder_users_name".to_string()));
+    assert!(
+        users
+            .indexes
+            .iter()
+            .any(|i| i.name == "solder_users_name" && i.columns == ["name"])
+    );
+    assert!(
+        users
+            .indexes
+            .iter()
+            .any(|i| i.primary && i.unique && i.columns == ["id"])
+    );
+    assert_eq!(users.primary_key_name.as_deref(), Some("solder_users_pkey"));
     assert_eq!(run(&session, &session.preview_query(users)).rows.len(), 2);
 
     let ro = block(Session::connect(ConnectionSpec {
@@ -161,7 +173,12 @@ fn mysql() {
         .find(|o| o.name == "solder_orders")
         .unwrap();
     assert!(orders.columns[0].primary_key && !orders.columns[1].nullable);
-    assert!(orders.indexes.contains(&"by_customer".to_string()));
+    assert!(
+        orders
+            .indexes
+            .iter()
+            .any(|i| i.name == "by_customer" && !i.unique && i.columns == ["customer"])
+    );
     assert_eq!(run(&session, &session.preview_query(orders)).rows.len(), 2);
 
     let err = block(session.query("SELEC 1".into())).unwrap_err();
@@ -690,4 +707,154 @@ fn mongo_browse() {
     let count = run(&session, &count_query(Engine::Mongo, &browse));
     assert_eq!(count.rows[0][0], Value::Int(2));
     run(&session, "db.solder_browse.deleteMany({})");
+}
+
+/// Structure changes run on the server: create, a broad alter, its inverse,
+/// drop. Rows survive every step.
+fn check_ddl(session: &Session) {
+    use db::ddl::{Change, ColumnDraft, ForeignKeyDraft, IndexDraft, TableDraft, statements};
+    let engine = session.engine();
+    for t in ["solder_members", "solder_teams"] {
+        run(session, &format!("DROP TABLE IF EXISTS {t}"));
+    }
+    let apply = |change: &Change| {
+        let ddl = statements(engine, change).unwrap();
+        block(session.apply_ddl(ddl.clone())).unwrap_or_else(|e| panic!("{ddl:#?}: {e}"));
+    };
+    let col = |name: &str, ty: &str, key: bool| ColumnDraft {
+        name: name.into(),
+        type_name: ty.into(),
+        nullable: !key,
+        primary_key: key,
+        ..Default::default()
+    };
+    apply(&Change::Create(TableDraft {
+        name: "solder_teams".into(),
+        columns: vec![
+            col("id", "integer", true),
+            col("title", "varchar(50)", false),
+        ],
+        ..Default::default()
+    }));
+    apply(&Change::Create(TableDraft {
+        name: "solder_members".into(),
+        columns: vec![
+            col("id", "integer", true),
+            col("name", "varchar(40)", false),
+            col("note", "varchar(20)", false),
+        ],
+        indexes: vec![IndexDraft {
+            name: "solder_members_name".into(),
+            columns: vec!["name".into()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }));
+    run(
+        session,
+        "INSERT INTO solder_teams (id, title) VALUES (1, 'core')",
+    );
+    run(
+        session,
+        "INSERT INTO solder_members (id, name, note) VALUES (1, 'ada', 'x')",
+    );
+
+    let members = |session: &Session| {
+        block(session.schema())
+            .unwrap()
+            .objects
+            .into_iter()
+            .find(|o| o.name == "solder_members")
+            .unwrap()
+    };
+    let before = TableDraft::of(&members(session));
+    let mut after = before.clone();
+    after.columns[1].name = "full_name".into();
+    after.columns[1].nullable = false;
+    after.columns[2].type_name = "varchar(200)".into();
+    after.indexes[0].columns = vec!["full_name".into()];
+    after.columns.push(col("team_id", "integer", false));
+    after.indexes.push(IndexDraft {
+        name: "solder_members_team".into(),
+        columns: vec!["team_id".into()],
+        ..Default::default()
+    });
+    after.foreign_keys.push(ForeignKeyDraft {
+        name: "solder_members_team_fk".into(),
+        columns: vec!["team_id".into()],
+        ref_table: "solder_teams".into(),
+        ref_columns: vec!["id".into()],
+        on_delete: Some("SET NULL".into()),
+        ..Default::default()
+    });
+    let change = Change::Alter { before, after };
+    apply(&change);
+    let changed = members(session);
+    let names: Vec<_> = changed.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "full_name", "note", "team_id"]);
+    assert!(!changed.columns[1].nullable);
+    assert!(
+        changed.columns[2].type_name.contains("200"),
+        "{:?}",
+        changed.columns[2]
+    );
+    let [fk] = changed.foreign_keys.as_slice() else {
+        panic!("{:?}", changed.foreign_keys)
+    };
+    assert_eq!(
+        (fk.ref_table.as_str(), fk.on_delete.as_deref()),
+        ("solder_teams", Some("SET NULL"))
+    );
+    assert!(changed.indexes.iter().any(|i| i.columns == ["team_id"]));
+    assert_eq!(
+        one(session, "SELECT full_name FROM solder_members"),
+        Value::Text("ada".into())
+    );
+
+    apply(&change.inverse());
+    let restored = members(session);
+    let names: Vec<_> = restored.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "name", "note"]);
+    assert!(restored.foreign_keys.is_empty());
+    assert!(restored.columns[1].nullable);
+    assert_eq!(
+        one(session, "SELECT name FROM solder_members"),
+        Value::Text("ada".into())
+    );
+
+    let schema = block(session.schema()).unwrap();
+    for t in ["solder_members", "solder_teams"] {
+        let object = schema.objects.iter().find(|o| o.name == t).unwrap();
+        apply(&Change::Drop(TableDraft::of(object)));
+    }
+}
+
+#[test]
+fn postgres_ddl() {
+    if let Some(spec) = spec("SOLDER_TEST_POSTGRES", Engine::Postgres, false) {
+        check_ddl(&block(Session::connect(spec)).unwrap());
+    }
+}
+
+#[test]
+fn mysql_ddl() {
+    if let Some(spec) = spec("SOLDER_TEST_MYSQL", Engine::MySql, false) {
+        check_ddl(&block(Session::connect(spec)).unwrap());
+    }
+}
+
+#[test]
+fn sqlite_ddl() {
+    let path = db::testing::dir("sqlite-ddl").join("test.db");
+    std::fs::write(&path, b"").unwrap();
+    check_ddl(
+        &block(Session::connect(ConnectionSpec {
+            name: "ddl".into(),
+            engine: Engine::Sqlite,
+            url: path.display().to_string(),
+            source: "test".into(),
+            read_only: false,
+        }))
+        .unwrap(),
+    );
 }

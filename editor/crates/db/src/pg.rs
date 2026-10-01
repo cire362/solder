@@ -4,7 +4,7 @@ use tokio_postgres::{Client, SimpleQueryMessage, types::Type};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::{
-    Column, ColumnInfo, ConnectionSpec, ForeignKey, Object, ObjectKind, QueryResult, Result,
+    Column, ColumnInfo, ConnectionSpec, ForeignKey, Index, Object, ObjectKind, QueryResult, Result,
     Schema, Value,
     params::{self, Tls},
     tls,
@@ -117,11 +117,33 @@ impl Pg {
         self.client.batch_execute("COMMIT").await.map_err(error)
     }
 
+    pub async fn apply_ddl(&self, statements: &[String]) -> Result<()> {
+        let _busy = self.busy.lock().await;
+        self.client.batch_execute("BEGIN").await.map_err(error)?;
+        for (i, statement) in statements.iter().enumerate() {
+            if let Err(e) = self.client.batch_execute(statement).await {
+                let _ = self.client.batch_execute("ROLLBACK").await;
+                return Err(format!(
+                    "Statement {} of {}: {}. Nothing was changed.",
+                    i + 1,
+                    statements.len(),
+                    error(e)
+                ));
+            }
+        }
+        self.client.batch_execute("COMMIT").await.map_err(error)
+    }
+
     pub async fn schema(&self) -> Result<Schema> {
         let _busy = self.busy.lock().await;
         let columns = self
             .rows(
-                "SELECT c.table_schema, c.table_name, t.table_type, c.column_name, c.data_type, c.is_nullable, \
+                "SELECT c.table_schema, c.table_name, t.table_type, c.column_name, \
+                   (SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+                     JOIN pg_class cl ON cl.oid = a.attrelid JOIN pg_namespace n ON n.oid = cl.relnamespace \
+                     WHERE n.nspname = c.table_schema AND cl.relname = c.table_name \
+                       AND a.attname = c.column_name), \
+                   c.is_nullable, \
                    coalesce(c.column_default, ''), \
                    CASE WHEN c.is_identity = 'YES' OR c.column_default LIKE 'nextval(%' \
                      OR c.is_generated = 'ALWAYS' THEN '1' ELSE '' END \
@@ -134,7 +156,7 @@ impl Pg {
             .await?;
         let keys = self
             .rows(
-                "SELECT kcu.table_schema, kcu.table_name, kcu.column_name \
+                "SELECT kcu.table_schema, kcu.table_name, kcu.column_name, tc.constraint_name \
                  FROM information_schema.table_constraints tc \
                  JOIN information_schema.key_column_usage kcu \
                    ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema \
@@ -143,8 +165,18 @@ impl Pg {
             .await?;
         let indexes = self
             .rows(
-                "SELECT schemaname, tablename, indexname FROM pg_indexes \
-                 WHERE schemaname NOT IN ('pg_catalog', 'information_schema') ORDER BY indexname",
+                "SELECT ns.nspname, t.relname, i.relname, \
+                   CASE WHEN ix.indisunique THEN '1' ELSE '' END, \
+                   CASE WHEN ix.indisprimary THEN '1' ELSE '' END, \
+                   CASE WHEN 0 = ANY(ix.indkey) THEN '' ELSE \
+                     array_to_string(ARRAY(SELECT a.attname FROM unnest(ix.indkey) WITH ORDINALITY k(n, o) \
+                       JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.n ORDER BY k.o), chr(31)) END \
+                 FROM pg_index ix \
+                 JOIN pg_class i ON i.oid = ix.indexrelid JOIN pg_class t ON t.oid = ix.indrelid \
+                 JOIN pg_namespace ns ON ns.oid = t.relnamespace \
+                 WHERE ns.nspname NOT IN ('pg_catalog', 'information_schema') \
+                   AND ns.nspname NOT LIKE 'pg_toast%' \
+                 ORDER BY i.relname",
             )
             .await?;
         // Column lists in key order, joined with the unit separator so names
@@ -156,7 +188,9 @@ impl Pg {
                      JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.n ORDER BY k.i), chr(31)), \
                    fns.nspname, fcl.relname, \
                    array_to_string(ARRAY(SELECT a.attname FROM unnest(con.confkey) WITH ORDINALITY k(n, i) \
-                     JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.n ORDER BY k.i), chr(31)) \
+                     JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.n ORDER BY k.i), chr(31)), \
+                   CASE con.confdeltype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' \
+                     WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT' ELSE '' END \
                  FROM pg_constraint con \
                  JOIN pg_class cl ON cl.oid = con.conrelid JOIN pg_namespace ns ON ns.oid = cl.relnamespace \
                  JOIN pg_class fcl ON fcl.oid = con.confrelid JOIN pg_namespace fns ON fns.oid = fcl.relnamespace \
@@ -184,7 +218,9 @@ impl Pg {
 }
 
 /// Builds objects from `(namespace, table, kind, column, type, nullable,
-/// default, auto)` rows, primary keys, index names and foreign keys
+/// default, auto)` rows, primary keys `(namespace, table, column,
+/// constraint)`, indexes `(namespace, table, name, unique, primary,
+/// columns)` and foreign keys
 /// `(name, namespace, table, columns, ref namespace, ref table, ref columns)`
 /// with column lists separated by U+001F. Shared with MySQL, whose
 /// information schema has the same shape.
@@ -196,15 +232,12 @@ pub(crate) fn build_schema(
 ) -> Schema {
     let key = |r: &[String]| (r[0].clone(), r[1].clone());
     let mut primary: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut primary_names: HashMap<(String, String), String> = HashMap::new();
     for row in keys {
         primary.entry(key(&row)).or_default().push(row[2].clone());
-    }
-    let mut index_names: HashMap<(String, String), Vec<String>> = HashMap::new();
-    for row in indexes {
-        index_names
-            .entry(key(&row))
-            .or_default()
-            .push(row[2].clone());
+        if let Some(name) = row.get(3) {
+            primary_names.insert(key(&row), name.clone());
+        }
     }
     let split = |s: &str| -> Vec<String> {
         s.split('\u{1f}')
@@ -212,6 +245,15 @@ pub(crate) fn build_schema(
             .map(str::to_string)
             .collect()
     };
+    let mut table_indexes: HashMap<(String, String), Vec<Index>> = HashMap::new();
+    for row in indexes {
+        table_indexes.entry(key(&row)).or_default().push(Index {
+            name: row[2].clone(),
+            unique: row[3] == "1",
+            primary: row[4] == "1",
+            columns: split(&row[5]),
+        });
+    }
     let mut references: HashMap<(String, String), Vec<ForeignKey>> = HashMap::new();
     for row in foreign_keys {
         references
@@ -223,6 +265,10 @@ pub(crate) fn build_schema(
                 ref_namespace: Some(row[4].clone()),
                 ref_table: row[5].clone(),
                 ref_columns: split(&row[6]),
+                on_delete: row
+                    .get(7)
+                    .filter(|r| !r.is_empty() && *r != "NO ACTION")
+                    .cloned(),
             });
     }
     let mut objects: Vec<Object> = Vec::new();
@@ -241,8 +287,9 @@ pub(crate) fn build_schema(
                     ObjectKind::Table
                 },
                 columns: Vec::new(),
-                indexes: index_names.remove(&id).unwrap_or_default(),
+                indexes: table_indexes.remove(&id).unwrap_or_default(),
                 foreign_keys: references.remove(&id).unwrap_or_default(),
+                primary_key_name: primary_names.remove(&id),
             });
         }
         let pk = primary.get(&id).is_some_and(|cols| cols.contains(&row[3]));
