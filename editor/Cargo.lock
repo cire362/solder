@@ -6456,6 +6456,7 @@ version = "0.1.0"
 dependencies = [
  "ai",
  "alacritty_terminal",
+ "dap",
  "db",
  "dirs 7.0.0",
  "futures",

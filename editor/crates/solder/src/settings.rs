@@ -242,6 +242,7 @@ pub fn bind_defaults(cx: &mut App) {
     crate::ai_panel::bind_keys(cx);
     crate::chat_panel::bind_keys(cx);
     crate::agent_panel::bind_keys(cx);
+    crate::debug_panel::bind_keys(cx);
     crate::inline_edit::bind_keys(cx);
 }
 

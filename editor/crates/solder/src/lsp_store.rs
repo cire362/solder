@@ -91,7 +91,7 @@ fn find_root(file: &Path, markers: &[&str]) -> PathBuf {
 
 /// Project-local `node_modules/.bin` first, then `PATH`, then the usual
 /// install locations (apps started from the Dock get a minimal `PATH`).
-fn find_program(program: &str, root: &Path) -> Option<PathBuf> {
+pub(crate) fn find_program(program: &str, root: &Path) -> Option<PathBuf> {
     for dir in root.ancestors() {
         let local = dir.join("node_modules/.bin").join(program);
         if local.is_file() {

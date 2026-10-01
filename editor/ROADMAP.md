@@ -73,7 +73,10 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
       only when something is found)
 
 ## 7. Debugger, plugins, onboarding
-- [ ] Debugger over DAP; one session across browser and server; query timeline
+- [x] Debugger over DAP; one session across browser and server; query timeline
+      (JavaScript and TypeScript through js-debug: breakpoints, steps, stack,
+      variables, console; a Next.js server and its page in one session; HTTP and
+      SQL of the run, each linked to its line)
 - [ ] Plugin host: WebAssembly sandbox, declared permissions, per-frame time budget
 - [ ] Import settings from VS Code, Cursor, JetBrains
 - [ ] Preview environments per branch (needs the hosted service)

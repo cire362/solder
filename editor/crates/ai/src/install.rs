@@ -154,7 +154,7 @@ pub async fn install_runtime(
 }
 
 /// `tar` reads both the `.tar.gz` builds and, on Windows, the `.zip` ones.
-fn unpack(archive: &Path, target: &Path) -> Result<(), String> {
+pub fn unpack(archive: &Path, target: &Path) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(target);
     std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
     let out = Command::new("tar")
