@@ -254,11 +254,8 @@ pub fn parse(data: &[u8]) -> Result<Info, Error> {
 
     let used = int("expert_used_count").unwrap_or(0);
     let count = int("expert_count").unwrap_or(0);
-    let active_experts = if count > 0 {
-        experts * used / count
-    } else {
-        experts
-    };
+    // Without an expert count, every expert tensor counts as active.
+    let active_experts = (experts * used).checked_div(count).unwrap_or(experts);
     let active = (params - experts - lookups.min(params - experts)) + active_experts;
     Ok(Info {
         name: match meta.get("general.name") {
