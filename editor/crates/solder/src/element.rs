@@ -252,9 +252,14 @@ impl Element for EditorElement {
             cx,
         );
 
-        for quad in state.background.drain(..) {
-            window.paint_quad(quad);
-        }
+        // Rows scrolled partly out of view must not spill over what is above
+        // or below the editor (the tab bar): clip to its bounds.
+        let mask = Some(ContentMask { bounds });
+        window.with_content_mask(mask.clone(), |window| {
+            for quad in state.background.drain(..) {
+                window.paint_quad(quad);
+            }
+        });
         let layout = state
             .layout
             .take()
@@ -298,9 +303,11 @@ impl Element for EditorElement {
                 }
             },
         );
-        for (number, origin) in state.gutter.drain(..) {
-            number.paint(origin, layout.line_height, window, cx).ok();
-        }
+        window.with_content_mask(mask, |window| {
+            for (number, origin) in state.gutter.drain(..) {
+                number.paint(origin, layout.line_height, window, cx).ok();
+            }
+        });
 
         self.editor
             .update(cx, |editor, _| editor.layout = Some(layout));
