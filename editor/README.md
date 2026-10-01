@@ -173,6 +173,17 @@ aliases and `table.`), tables after `FROM`, `JOIN`, `INTO` and `UPDATE`, index
 names after `INDEX`, and keywords. Redis files complete commands and keys, MongoDB
 files collections, methods and fields.
 
+### Browsing tables
+
+A table or collection opened from the Database tab is browsed rather than queried:
+rows load 200 at a time as you scroll, and the status line counts all that match.
+Type a condition in the **WHERE** field (`cmd-f`, `enter` applies; a filter
+document such as `{status: "paid"}` for MongoDB), or press `alt-f` on a cell to keep
+rows with that value. Click a column header to sort by it, again for descending,
+a third time for the default order (the primary key). Foreign key columns show
+the table they point at; `alt-enter` on such a cell opens the row it references and
+`alt-left` goes back. Browsed SQL tables stay editable.
+
 ### Editing rows
 
 Rows from a plain `SELECT` on one table with a primary key can be edited in
