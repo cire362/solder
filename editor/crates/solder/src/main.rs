@@ -22,6 +22,7 @@ mod git;
 mod git_panel;
 mod git_store;
 mod go_to_line;
+mod inline_edit;
 mod key_prompts;
 mod locations;
 mod lsp_store;

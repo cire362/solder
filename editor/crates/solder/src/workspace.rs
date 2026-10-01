@@ -29,6 +29,7 @@ use crate::{
     git_panel::{self, BranchPicker, GitPanel, GitPanelEvent},
     git_store::{GitStore, GitStoreEvent},
     go_to_line::GoToLine as GoToLineDelegate,
+    inline_edit::{InlineEdit, InlineEditEvent},
     locations::{CodeActionPicker, LocationPicker, RenamePrompt},
     lsp_store::{LspStore, from_range},
     perf::{self, Perf},
@@ -79,6 +80,7 @@ actions!(
         ShowApi,
         ShowAi,
         ToggleChat,
+        ShowInlineEdit,
         RunStatement,
         SelectConnection,
         ShowFileDiff,
@@ -120,6 +122,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-h", ShowApi, None),
         KeyBinding::new("ctrl-shift-a", ShowAi, None),
         KeyBinding::new("secondary-shift-l", ToggleChat, None),
+        KeyBinding::new(
+            "secondary-i",
+            ShowInlineEdit,
+            Some("Editor && mode == full"),
+        ),
         KeyBinding::new(
             "secondary-enter",
             RunStatement,
@@ -214,6 +221,7 @@ pub struct Workspace {
     ai_panel: Entity<crate::ai_panel::AiPanel>,
     chat: Entity<crate::chat_panel::ChatPanel>,
     chat_open: bool,
+    inline_edit: Option<(Entity<InlineEdit>, Subscription)>,
     results: Entity<ResultsView>,
     /// The Results tab is in the dock (a query has run and it was not closed).
     show_results: bool,
@@ -528,6 +536,7 @@ impl Workspace {
             ai_panel,
             chat,
             chat_open: false,
+            inline_edit: None,
             results,
             show_results: false,
             results_active: false,
@@ -640,6 +649,7 @@ impl Workspace {
                 if let Some((p, t)) = this.locate(&editor)
                     && (this.active_pane != p || this.panes[p].active != Some(t))
                 {
+                    this.discard_inline_edit(cx);
                     this.active_pane = p;
                     this.panes[p].active = Some(t);
                     this.search_bar
@@ -744,6 +754,13 @@ impl Workspace {
             return;
         };
         let editor = tab.editor.clone();
+        if self
+            .inline_edit
+            .as_ref()
+            .is_some_and(|(edit, _)| !edit.read(cx).is_target(&editor))
+        {
+            self.discard_inline_edit(cx);
+        }
         self.close_file_diff(window, cx);
         self.active_pane = pane;
         self.panes[pane].active = Some(ix);
@@ -816,6 +833,13 @@ impl Workspace {
         let Some((p, ix)) = self.locate(editor) else {
             return;
         };
+        if self
+            .inline_edit
+            .as_ref()
+            .is_some_and(|(edit, _)| edit.read(cx).is_target(editor))
+        {
+            self.discard_inline_edit(cx);
+        }
         self.panes[p].tabs.remove(ix);
         if self.panes[p].tabs.is_empty() && self.panes.len() > 1 {
             // An empty split closes; focus moves to its neighbour.
@@ -974,6 +998,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.discard_inline_edit(cx);
         let view = cx.new(|cx| FileDiff::new(path, scope, cx));
         self.diff_subscription =
             Some(
@@ -1545,6 +1570,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.discard_inline_edit(cx);
         use crate::structure::{StructureEvent, StructureView};
         let (store, root) = (self.database.clone(), self.root(cx));
         let table = object.as_ref().map(db::ddl::TableDraft::of);
@@ -1567,6 +1593,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.discard_inline_edit(cx);
         use crate::erd_view::{ErdEvent, ErdView};
         let (store, root) = (self.database.clone(), self.root(cx));
         let view = cx.new(|cx| ErdView::new(store, root, connection.clone(), engine, cx));
@@ -1633,6 +1660,50 @@ impl Workspace {
     }
 
     // ------------------------------------------------------------ HTTP
+
+    fn discard_inline_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some((panel, _)) = self.inline_edit.take() {
+            panel.update(cx, |panel, cx| panel.abort(cx));
+        }
+    }
+
+    fn show_inline_edit(
+        &mut self,
+        _: &ShowInlineEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.active_editor().cloned() else {
+            return;
+        };
+        self.close_file_diff(window, cx);
+        if self.inline_edit.is_none() {
+            let root = self.root(cx);
+            let store = crate::ai_store::AiStore::global(cx);
+            let panel = cx.new(|cx| InlineEdit::new(editor, root, store, cx));
+            let subscription = cx.subscribe_in(&panel, window, |this, _, event, window, cx| {
+                match event {
+                    InlineEditEvent::Close => {
+                        this.discard_inline_edit(cx);
+                        if let Some(editor) = this.active_editor() {
+                            window.focus(&editor.focus_handle(cx));
+                        }
+                    }
+                    InlineEditEvent::ChooseModel => {
+                        this.show_ai(&ShowAi, window, cx);
+                        this.ai_panel.update(cx, |panel, cx| {
+                            panel.show(crate::ai_panel::View::Providers, cx)
+                        });
+                    }
+                }
+                cx.notify();
+            });
+            self.inline_edit = Some((panel, subscription));
+        }
+        let input = self.inline_edit.as_ref().unwrap().0.read(cx).input();
+        window.focus(&input.focus_handle(cx));
+        cx.notify();
+    }
 
     fn toggle_chat(&mut self, _: &ToggleChat, window: &mut Window, cx: &mut Context<Self>) {
         let input = self.chat.read(cx).input();
@@ -2404,6 +2475,7 @@ impl Workspace {
         match self.panes[next].active {
             Some(tab) => self.activate(next, tab, window, cx),
             None => {
+                self.discard_inline_edit(cx);
                 self.active_pane = next;
                 cx.notify();
             }
@@ -2868,6 +2940,9 @@ impl Workspace {
                     .children(tabs),
             )
             .when(search_visible, |d| d.child(self.search_bar.clone()))
+            .when(is_active_pane, |pane| {
+                pane.children(self.inline_edit.as_ref().map(|(panel, _)| panel.clone()))
+            })
             .child(
                 div()
                     .flex_1()
@@ -3219,6 +3294,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_api))
             .on_action(cx.listener(Self::show_ai))
             .on_action(cx.listener(Self::toggle_chat))
+            .on_action(cx.listener(Self::show_inline_edit))
             .on_action(cx.listener(Self::open_requests))
             .on_action(cx.listener(Self::import_openapi))
             .on_action(cx.listener(Self::new_connection))
@@ -5710,6 +5786,14 @@ mod tests {
     /// streams back "Echo: <the question's last line>" for chats. Records
     /// each request body. Returns the base URL (with `/v1`).
     fn fake_api() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        fake_api_reply(None, Duration::ZERO, true)
+    }
+
+    fn fake_api_reply(
+        reply: Option<&'static str>,
+        pause: Duration,
+        complete: bool,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -5764,17 +5848,32 @@ mod tests {
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
                 );
                 let anthropic = first.contains("/messages");
-                for word in format!("Echo: {question}").split(' ') {
+                let answer = reply
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("Echo: {question}"));
+                let split = answer
+                    .char_indices()
+                    .nth(8)
+                    .map_or(answer.len(), |(index, _)| index);
+                for (index, chunk) in [&answer[..split], &answer[split..]].into_iter().enumerate() {
                     let data = if anthropic {
-                        serde_json::json!({"type":"content_block_delta","delta":{"type":"text_delta","text": format!("{word} ")}})
+                        serde_json::json!({"type":"content_block_delta","delta":{"type":"text_delta","text": chunk}})
                     } else {
-                        serde_json::json!({"choices":[{"delta":{"content": format!("{word} ")}}]})
+                        serde_json::json!({"choices":[{"delta":{"content": chunk}}]})
                     };
                     let _ = write!(stream, "data: {data}\n\n");
                     let _ = stream.flush();
+                    if index == 0 {
+                        std::thread::sleep(pause);
+                    }
                 }
-                if !anthropic {
-                    let _ = write!(stream, "data: [DONE]\n\n");
+                if complete {
+                    let end = if anthropic {
+                        "data: {\"type\":\"message_stop\"}\n\n"
+                    } else {
+                        "data: [DONE]\n\n"
+                    };
+                    let _ = write!(stream, "{end}");
                 }
             }
         });
@@ -5831,6 +5930,472 @@ mod tests {
             assert!(m.error.is_none(), "{:?}", m.error);
             m.text.trim().to_string()
         })
+    }
+
+    fn inline_panel(ws: &Entity<Workspace>, cx: &mut VisualTestContext) -> Entity<InlineEdit> {
+        cx.simulate_keystrokes("secondary-i");
+        cx.read(|cx| {
+            ws.read(cx)
+                .inline_edit
+                .as_ref()
+                .expect("inline panel")
+                .0
+                .clone()
+        })
+    }
+
+    fn choose_edit_model(store: &Entity<crate::ai_store::AiStore>, cx: &mut VisualTestContext) {
+        wait_for(cx, "the edit provider", &|cx| {
+            store
+                .read(cx)
+                .provider("lmstudio")
+                .is_some_and(|provider| provider.models() == ["model-a"])
+        });
+        store.update(cx, |store, cx| {
+            store.choose(
+                ai::Role::Chat,
+                crate::ai_providers::ModelRef {
+                    provider: "lmstudio".into(),
+                    model: "model-a".into(),
+                },
+                cx,
+            )
+        });
+    }
+
+    #[gpui::test]
+    fn inline_edit_reviews_selection_and_applies_with_one_undo_in_split_views(
+        cx: &mut TestAppContext,
+    ) {
+        let (api, seen) = fake_api_reply(Some("```rs\nrenamed();\n```"), Duration::ZERO, true);
+        let (root, store, ws, cx) = ai_setup(
+            cx,
+            "inline-selection",
+            crate::ai_providers::Urls {
+                lm_studio: api,
+                ..down_urls()
+            },
+        );
+        let path = root.join("src/main.rs");
+        ws.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(path.clone(), None, window, cx)
+        });
+        cx.run_until_parked();
+        let first = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let original = cx.read(|cx| first.read(cx).text(cx));
+        cx.simulate_keystrokes("secondary-\\");
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let start = original.find("helper();").unwrap();
+        let range = start..start + "helper();".len();
+        editor.update(cx, |editor, cx| editor.select_range(range.clone(), cx));
+        let panel = inline_panel(&ws, cx);
+        choose_edit_model(&store, cx);
+        cx.simulate_input("Rename the call");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the edit preview", &|cx| panel.read(cx).ready());
+        assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), original);
+        let request = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|request| request.starts_with("POST"))
+            .unwrap()
+            .clone();
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once('\n').unwrap().1).unwrap();
+        let context: serde_json::Value =
+            serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(context["target"], "helper();");
+        assert!(context["before"].as_str().unwrap().contains("fn main"));
+        assert!(context["project_map"].is_null());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(cx.debug_bounds("edit-apply").is_some());
+        first.update(cx, |editor, cx| {
+            editor.select_range(original.len()..original.len(), cx)
+        });
+        editor.update(cx, |editor, cx| {
+            editor.select_range(start + 1..start + 1, cx)
+        });
+        cx.simulate_keystrokes("secondary-enter");
+        wait_for(cx, "the edit applied", &|cx| {
+            ws.read(cx).inline_edit.is_none()
+        });
+        let expected = original.replace("helper();", "renamed();");
+        assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), expected);
+        assert_eq!(cx.read(|cx| first.read(cx).text(cx)), expected);
+        assert_eq!(
+            cx.read(|cx| first.read(cx).newest_range()),
+            expected.len()..expected.len()
+        );
+        assert_eq!(
+            cx.read(|cx| editor.read(cx).newest_range()),
+            start + "renamed();".len()..start + "renamed();".len()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        cx.simulate_keystrokes("secondary-z");
+        assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), original);
+        assert_eq!(
+            cx.read(|cx| editor.read(cx).newest_range()),
+            start + 1..start + 1
+        );
+        cx.simulate_keystrokes("secondary-shift-z");
+        assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), expected);
+    }
+
+    #[gpui::test]
+    fn inline_edit_whole_file_can_delete_and_rechecks_privacy_before_apply(
+        cx: &mut TestAppContext,
+    ) {
+        let (api, _) = fake_api_reply(Some("```\n```"), Duration::ZERO, true);
+        let (root, store, ws, cx) = ai_setup(
+            cx,
+            "inline-delete",
+            crate::ai_providers::Urls {
+                lm_studio: api,
+                ..down_urls()
+            },
+        );
+        ws.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(root.join("src/main.rs"), None, window, cx)
+        });
+        cx.run_until_parked();
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let original = cx.read(|cx| editor.read(cx).text(cx));
+        let panel = inline_panel(&ws, cx);
+        choose_edit_model(&store, cx);
+        cx.simulate_input("Delete file contents");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "deletion preview", &|cx| panel.read(cx).ready());
+        std::fs::write(root.join(".solderignore"), "src/main.rs\n").unwrap();
+        cx.simulate_keystrokes("secondary-enter");
+        wait_for(cx, "privacy recheck", &|cx| {
+            panel.read(cx).error().is_some()
+        });
+        assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), original);
+        std::fs::write(root.join(".solderignore"), "").unwrap();
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "fresh deletion preview", &|cx| panel.read(cx).ready());
+        cx.simulate_keystrokes("secondary-enter");
+        wait_for(cx, "deletion applied", &|cx| {
+            ws.read(cx).inline_edit.is_none()
+        });
+        assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), "");
+        cx.simulate_keystrokes("secondary-z");
+        assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), original);
+    }
+
+    #[gpui::test]
+    fn inline_edit_cancels_partial_stream_and_invalidates_changed_files(cx: &mut TestAppContext) {
+        let (api, _) = fake_api_reply(Some("```rs\nnew();\n```"), Duration::from_millis(250), true);
+        let (root, store, ws, cx) = ai_setup(
+            cx,
+            "inline-stop",
+            crate::ai_providers::Urls {
+                lm_studio: api,
+                ..down_urls()
+            },
+        );
+        ws.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(root.join("src/main.rs"), None, window, cx)
+        });
+        cx.run_until_parked();
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let original = cx.read(|cx| editor.read(cx).text(cx));
+        let panel = inline_panel(&ws, cx);
+        choose_edit_model(&store, cx);
+        cx.simulate_input("Rewrite");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "partial preview", &|cx| {
+            panel.read(cx).has_streamed_text()
+        });
+        assert!(!cx.read(|cx| panel.read(cx).ready()));
+        cx.simulate_keystrokes("escape secondary-enter");
+        assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), original);
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "regenerated preview", &|cx| panel.read(cx).ready());
+        editor.update(cx, |editor, cx| {
+            editor.replace_ranges(vec![(0..0, "// changed\n".into())], cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read(|cx| panel.read(cx).error().map(str::to_string)),
+            Some("File changed. Generate again.".to_string())
+        );
+        cx.simulate_keystrokes("secondary-enter");
+        assert_eq!(
+            cx.read(|cx| editor.read(cx).text(cx)),
+            format!("// changed\n{original}")
+        );
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "stream after modification", &|cx| {
+            panel.read(cx).has_streamed_text()
+        });
+        ws.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(root.join("src/util/strings.rs"), None, window, cx)
+        });
+        wait_for(cx, "tab switch closes the edit", &|cx| {
+            ws.read(cx).inline_edit.is_none()
+        });
+        assert!(!cx.read(|cx| panel.read(cx).streaming()));
+        assert_eq!(
+            cx.read(|cx| editor.read(cx).text(cx)),
+            format!("// changed\n{original}")
+        );
+    }
+
+    #[gpui::test]
+    fn inline_edit_blocks_private_files_without_sending_the_selection(cx: &mut TestAppContext) {
+        let (api, seen) = fake_api_reply(Some("```\nnew\n```"), Duration::ZERO, true);
+        let (root, store, ws, cx) = ai_setup(
+            cx,
+            "inline-private",
+            crate::ai_providers::Urls {
+                lm_studio: api,
+                ..down_urls()
+            },
+        );
+        std::fs::write(root.join(".solderignore"), "private.rs\n").unwrap();
+        for name in [".env", ".ENV.local", "private.rs"] {
+            let path = root.join(name);
+            std::fs::write(&path, "secret-inline-marker").unwrap();
+            ws.update_in(cx, |workspace, window, cx| {
+                workspace.open_path(path.clone(), None, window, cx)
+            });
+            wait_for(cx, "private tab", &|cx| {
+                ws.read(cx)
+                    .active_editor()
+                    .is_some_and(|editor| editor.read(cx).path(cx) == Some(path.as_path()))
+            });
+            let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+            editor.update(cx, |editor, cx| editor.select_range(0..6, cx));
+            let panel = inline_panel(&ws, cx);
+            choose_edit_model(&store, cx);
+            cx.simulate_input("Replace");
+            cx.simulate_keystrokes("enter");
+            wait_for(cx, "excluded edit", &|cx| panel.read(cx).error().is_some());
+            assert!(!cx.read(|cx| panel.read(cx).ready()));
+            cx.simulate_keystrokes("escape");
+        }
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|request| !request.starts_with("POST"))
+        );
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|request| !request.contains("secret-inline-marker"))
+        );
+    }
+
+    #[gpui::test]
+    fn inline_edit_rejects_a_disconnected_response_even_with_a_complete_block(
+        cx: &mut TestAppContext,
+    ) {
+        let (api, _) = fake_api_reply(Some("```rs\nnew();\n```"), Duration::ZERO, false);
+        let (root, store, ws, cx) = ai_setup(
+            cx,
+            "inline-disconnected",
+            crate::ai_providers::Urls {
+                lm_studio: api,
+                ..down_urls()
+            },
+        );
+        ws.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(root.join("src/main.rs"), None, window, cx)
+        });
+        cx.run_until_parked();
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let original = cx.read(|cx| editor.read(cx).text(cx));
+        let panel = inline_panel(&ws, cx);
+        choose_edit_model(&store, cx);
+        cx.simulate_input("Rewrite");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "disconnected error", &|cx| {
+            panel.read(cx).error().is_some()
+        });
+        assert!(cx.read(|cx| panel.read(cx).error().unwrap().contains("disconnected")));
+        cx.simulate_keystrokes("secondary-enter");
+        assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), original);
+    }
+
+    #[gpui::test]
+    fn inline_edit_requires_a_model_and_a_small_writable_single_target(cx: &mut TestAppContext) {
+        let (api, seen) = fake_api_reply(Some("```\nnew\n```"), Duration::ZERO, true);
+        let (root, store, ws, cx) = ai_setup(
+            cx,
+            "inline-guards",
+            crate::ai_providers::Urls {
+                lm_studio: api,
+                ..down_urls()
+            },
+        );
+        ws.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(root.join("src/main.rs"), None, window, cx)
+        });
+        cx.run_until_parked();
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let panel = inline_panel(&ws, cx);
+        cx.simulate_input("Rewrite");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            cx.read(|cx| panel.read(cx).error().map(str::to_string)),
+            Some("Choose a chat model first.".into())
+        );
+        choose_edit_model(&store, cx);
+        editor.update(cx, |editor, cx| editor.select_ranges(&[0..0, 3..3], cx));
+        cx.simulate_keystrokes("enter");
+        assert!(cx.read(|cx| panel.read(cx).error().unwrap().contains("one selection")));
+        cx.simulate_keystrokes("escape");
+        for (path, content, message) in [
+            (None, "untitled".to_string(), "Save this file"),
+            (
+                Some(root.join("src/main.rs")),
+                "x".repeat(crate::chat_panel::FILE_LIMIT + 1),
+                "smaller part",
+            ),
+            (
+                Some(root.parent().unwrap().join("outside.rs")),
+                "outside".to_string(),
+                "inside this project",
+            ),
+        ] {
+            ws.update_in(cx, |workspace, window, cx| {
+                workspace.add_editor(path, &content, None, window, cx)
+            });
+            let panel = inline_panel(&ws, cx);
+            cx.simulate_input("Rewrite");
+            cx.simulate_keystrokes("enter");
+            assert!(cx.read(|cx| panel.read(cx).error().unwrap().contains(message)));
+            cx.simulate_keystrokes("escape");
+        }
+        let document = cx.new(|cx| {
+            Document::virtual_file("Read only".into(), root.join("src/main.rs"), "code", cx)
+        });
+        let editor = cx.new(|cx| Editor::for_document(document, cx));
+        ws.update_in(cx, |workspace, window, cx| {
+            workspace.add_tab(editor, window, cx)
+        });
+        let panel = inline_panel(&ws, cx);
+        cx.simulate_input("Rewrite");
+        cx.simulate_keystrokes("enter");
+        assert!(cx.read(|cx| panel.read(cx).error().unwrap().contains("read-only")));
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|request| !request.starts_with("POST"))
+        );
+    }
+
+    #[gpui::test]
+    fn inline_edit_cancels_apply_when_the_target_tab_closes(cx: &mut TestAppContext) {
+        let (api, _) = fake_api_reply(Some("```rs\nnew();\n```"), Duration::ZERO, true);
+        let (root, store, ws, cx) = ai_setup(
+            cx,
+            "inline-close-apply",
+            crate::ai_providers::Urls {
+                lm_studio: api,
+                ..down_urls()
+            },
+        );
+        ws.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(root.join("src/main.rs"), None, window, cx)
+        });
+        cx.run_until_parked();
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let original = cx.read(|cx| editor.read(cx).text(cx));
+        let panel = inline_panel(&ws, cx);
+        choose_edit_model(&store, cx);
+        cx.simulate_input("Rewrite");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the preview before closing", &|cx| {
+            panel.read(cx).ready()
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.apply(&crate::inline_edit::Apply, window, cx)
+        });
+        ws.update_in(cx, |workspace, window, cx| {
+            workspace.remove_tab(&editor, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).inline_edit.is_none()));
+        assert!(!cx.read(|cx| panel.read(cx).streaming()));
+        assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), original);
+    }
+
+    #[gpui::test]
+    fn inline_edit_map_is_opt_in_and_unchanged_proposals_are_not_applied(cx: &mut TestAppContext) {
+        let (api, seen) = fake_api_reply(
+            Some("```rs\nfn main() {\n    helper();\n}\n```"),
+            Duration::ZERO,
+            true,
+        );
+        let (root, store, ws, cx) = ai_setup(
+            cx,
+            "inline-map-noop",
+            crate::ai_providers::Urls {
+                lm_studio: api,
+                ..down_urls()
+            },
+        );
+        ws.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(root.join("src/main.rs"), None, window, cx)
+        });
+        cx.run_until_parked();
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let version = cx.read(|cx| editor.read(cx).version(cx));
+        let panel = inline_panel(&ws, cx);
+        choose_edit_model(&store, cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let toggle = cx.debug_bounds("edit-project").unwrap();
+        cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+        cx.simulate_keystrokes("secondary-i");
+        assert_eq!(
+            cx.read(|cx| ws.read(cx).inline_edit.as_ref().unwrap().0.clone()),
+            panel
+        );
+        cx.simulate_input("Keep the file as it is");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "unchanged preview", &|cx| {
+            panel.read(cx).previewed() || panel.read(cx).error().is_some()
+        });
+        assert!(
+            cx.read(|cx| panel.read(cx).previewed()),
+            "{:?}",
+            cx.read(|cx| panel.read(cx).error().map(str::to_string))
+        );
+        assert!(!cx.read(|cx| panel.read(cx).ready()));
+        cx.simulate_keystrokes("secondary-enter");
+        assert_eq!(cx.read(|cx| editor.read(cx).version(cx)), version);
+        assert!(!cx.read(|cx| editor.read(cx).doc(cx).is_dirty()));
+        let request = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|request| request.starts_with("POST"))
+            .unwrap()
+            .clone();
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once('\n').unwrap().1).unwrap();
+        let context: serde_json::Value =
+            serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert!(context["project_map"].as_str().unwrap().contains("helper"));
+        cx.simulate_keystrokes("secondary-b");
+        cx.simulate_resize(gpui::size(px(480.), px(320.)));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let bounds = cx.debug_bounds("inline-edit").unwrap();
+        assert!(bounds.bottom() <= px(320. - STATUS_HEIGHT), "{bounds:?}");
+        assert!(bounds.right() <= px(480.), "{bounds:?}");
+        assert!(cx.debug_bounds("edit-apply").is_none());
     }
 
     #[gpui::test]

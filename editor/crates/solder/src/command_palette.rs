@@ -24,7 +24,7 @@ pub struct CommandPalette {
 }
 
 /// Actions that only make sense inside a specific widget.
-const HIDDEN_NAMESPACES: &[&str] = &["picker", "search_bar"];
+const HIDDEN_NAMESPACES: &[&str] = &["picker", "search_bar", "inline_edit"];
 
 /// `editor::MoveLineUp` becomes `Editor: Move line up`.
 pub fn humanize_action_name(name: &str) -> String {

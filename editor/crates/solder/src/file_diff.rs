@@ -220,6 +220,7 @@ pub struct FileDiff {
     pub path: std::path::PathBuf,
     pub scope: DiffScope,
     pub model: Option<DiffModel>,
+    preview: bool,
     error: Option<String>,
     focus: FocusHandle,
     scroll: UniformListScrollHandle,
@@ -253,6 +254,7 @@ impl FileDiff {
             path,
             scope,
             model: None,
+            preview: false,
             error: None,
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
@@ -261,6 +263,12 @@ impl FileDiff {
             column_width: px(0.),
             char_width: px(0.),
         }
+    }
+
+    pub fn preview(path: std::path::PathBuf, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::new(path, DiffScope::Working, cx);
+        view.preview = true;
+        view
     }
 
     pub fn set_result(&mut self, result: Result<DiffModel, GitError>, cx: &mut Context<Self>) {
@@ -305,7 +313,9 @@ impl FileDiff {
         self.step(true, cx);
     }
     fn refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(FileDiffEvent::Refresh);
+        if !self.preview {
+            cx.emit(FileDiffEvent::Refresh);
+        }
     }
     fn close(&mut self, _: &Close, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(FileDiffEvent::Close);
@@ -548,9 +558,10 @@ impl Render for FileDiff {
                 )
                 .into_any_element()
         };
-        let labels = match self.scope {
-            DiffScope::Working => ("Index", "Working copy"),
-            DiffScope::Staged => ("HEAD", "Index (staged)"),
+        let labels = match (self.preview, self.scope) {
+            (true, _) => ("Before", "Proposed"),
+            (false, DiffScope::Working) => ("Index", "Working copy"),
+            (false, DiffScope::Staged) => ("HEAD", "Index (staged)"),
         };
         let heading = |label: &'static str, no_newline: bool| {
             div()
@@ -579,46 +590,48 @@ impl Render for FileDiff {
             .bg(theme.bg)
             .text_color(theme.fg)
             .text_size(UI_FONT_SIZE)
-            .child(
-                div()
-                    .flex_none()
-                    .px_3()
-                    .py_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .flex_wrap()
-                    .border_b_1()
-                    .border_color(theme.line)
-                    .bg(theme.bg_sunken)
-                    .child(div().flex_1().min_w_0().truncate().child(name))
-                    .when(
-                        self.model.as_ref().is_some_and(|model| model.can_open),
-                        |bar| {
-                            bar.child(ui::button(
-                                "diff-open",
-                                "Open file",
-                                false,
-                                &theme,
-                                cx.listener(|_, _, _, cx| cx.emit(FileDiffEvent::OpenFile)),
-                            ))
-                        },
-                    )
-                    .child(ui::button(
-                        "diff-refresh",
-                        "Refresh",
-                        false,
-                        &theme,
-                        cx.listener(|_, _, _, cx| cx.emit(FileDiffEvent::Refresh)),
-                    ))
-                    .child(ui::button(
-                        "diff-close",
-                        "Close",
-                        false,
-                        &theme,
-                        cx.listener(|_, _, _, cx| cx.emit(FileDiffEvent::Close)),
-                    )),
-            )
+            .when(!self.preview, |body| {
+                body.child(
+                    div()
+                        .flex_none()
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .flex_wrap()
+                        .border_b_1()
+                        .border_color(theme.line)
+                        .bg(theme.bg_sunken)
+                        .child(div().flex_1().min_w_0().truncate().child(name))
+                        .when(
+                            self.model.as_ref().is_some_and(|model| model.can_open),
+                            |bar| {
+                                bar.child(ui::button(
+                                    "diff-open",
+                                    "Open file",
+                                    false,
+                                    &theme,
+                                    cx.listener(|_, _, _, cx| cx.emit(FileDiffEvent::OpenFile)),
+                                ))
+                            },
+                        )
+                        .child(ui::button(
+                            "diff-refresh",
+                            "Refresh",
+                            false,
+                            &theme,
+                            cx.listener(|_, _, _, cx| cx.emit(FileDiffEvent::Refresh)),
+                        ))
+                        .child(ui::button(
+                            "diff-close",
+                            "Close",
+                            false,
+                            &theme,
+                            cx.listener(|_, _, _, cx| cx.emit(FileDiffEvent::Close)),
+                        )),
+                )
+            })
             .child(
                 div()
                     .flex_none()

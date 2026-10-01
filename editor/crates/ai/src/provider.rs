@@ -246,6 +246,36 @@ pub fn stream(
     endpoint: Endpoint,
     req: ChatRequest,
 ) -> mpsc::UnboundedReceiver<Result<Event, String>> {
+    stream_inner(endpoint, req, false)
+}
+
+pub fn stream_edit(
+    endpoint: Endpoint,
+    req: ChatRequest,
+) -> mpsc::UnboundedReceiver<Result<Event, String>> {
+    stream_inner(endpoint, req, true)
+}
+
+fn edit_complete(api: Api, data: &str) -> Result<bool, String> {
+    if data == "[DONE]" {
+        return Ok(api == Api::OpenAi);
+    }
+    let value: serde_json::Value = serde_json::from_str(data).map_err(|error| error.to_string())?;
+    let reason = match api {
+        Api::OpenAi => value["choices"][0]["finish_reason"].as_str(),
+        Api::Anthropic => value["delta"]["stop_reason"].as_str(),
+    };
+    if reason.is_some_and(|reason| !matches!(reason, "stop" | "end_turn" | "stop_sequence")) {
+        return Err("The model did not finish the edit. Try a smaller selection.".into());
+    }
+    Ok(api == Api::Anthropic && value["type"] == "message_stop")
+}
+
+fn stream_inner(
+    endpoint: Endpoint,
+    req: ChatRequest,
+    complete_required: bool,
+) -> mpsc::UnboundedReceiver<Result<Event, String>> {
     let (tx, rx) = mpsc::unbounded_channel();
     crate::runtime().spawn(async move {
         let result = async {
@@ -269,15 +299,25 @@ pub fn stream(
             let mut response = response;
             let mut parser = SseParser::default();
             let mut done = false;
-            while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+            let mut complete = false;
+            'chunks: while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
                 for data in parser.push(&chunk) {
+                    if complete_required {
+                        complete |= edit_complete(endpoint.api, &data)?;
+                    }
                     for event in decode(endpoint.api, &data)? {
                         done |= matches!(event, Event::Done { .. });
                         if tx.send(Ok(event)).is_err() {
                             return Ok(());
                         }
                     }
+                    if complete_required && complete {
+                        break 'chunks;
+                    }
                 }
+            }
+            if complete_required && !complete {
+                return Err("The model disconnected before completing the edit.".into());
             }
             if !done {
                 let _ = tx.send(Ok(Event::Done {
@@ -373,6 +413,32 @@ pub mod tests {
             ["{\"a\":1}", "[DONE]"]
         );
         assert_eq!(p.push(b"data: one\ndata: two\n\n"), ["one\ntwo"]);
+    }
+
+    #[test]
+    fn edits_require_the_protocol_end_and_reject_token_limits_and_tool_calls() {
+        assert!(edit_complete(Api::OpenAi, "[DONE]").unwrap());
+        assert!(edit_complete(Api::Anthropic, r#"{"type":"message_stop"}"#).unwrap());
+        assert!(!edit_complete(Api::Anthropic, r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}"#).unwrap());
+        assert!(!edit_complete(Api::OpenAi, r#"{"choices":[{"finish_reason":"stop"}]}"#).unwrap());
+        for reason in ["length", "tool_calls", "content_filter"] {
+            assert!(
+                edit_complete(
+                    Api::OpenAi,
+                    &serde_json::json!({"choices":[{"finish_reason":reason}]}).to_string()
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            edit_complete(
+                Api::Anthropic,
+                r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#
+            )
+            .is_err()
+        );
+        assert!(!edit_complete(Api::Anthropic, "[DONE]").unwrap());
+        assert!(!edit_complete(Api::OpenAi, r#"{"type":"message_stop"}"#).unwrap());
     }
 
     #[test]
@@ -569,7 +635,7 @@ pub mod tests {
                 }
                 let end = match api {
                     Api::OpenAi => "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n".to_string(),
-                    Api::Anthropic => "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}\n\n".to_string(),
+                    Api::Anthropic => "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}\n\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
                 };
                 let _ = write!(stream, "{end}");
             }
@@ -597,6 +663,43 @@ pub mod tests {
             }
             out
         })
+    }
+
+    #[test]
+    fn complete_edits_stream_from_both_provider_protocols() {
+        for api in [Api::OpenAi, Api::Anthropic] {
+            let (base_url, _) = chat_server(api, &["```rs\n", "new();\n", "```"]);
+            let mut receiver = stream_edit(
+                Endpoint {
+                    api,
+                    base_url,
+                    key: None,
+                },
+                ChatRequest {
+                    model: "model-a".into(),
+                    system: None,
+                    messages: vec![],
+                    max_tokens: 64,
+                },
+            );
+            let answer = crate::runtime().block_on(async move {
+                let mut answer = String::new();
+                while let Some(event) =
+                    tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                        .await
+                        .unwrap()
+                {
+                    if let Event::Text(text) = event.unwrap() {
+                        answer.push_str(&text);
+                    }
+                }
+                answer
+            });
+            assert_eq!(
+                crate::edit::replacement(&answer, "old\n").unwrap(),
+                "new();\n"
+            );
+        }
     }
 
     #[test]
