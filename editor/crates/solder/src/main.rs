@@ -1,3 +1,5 @@
+mod ai_panel;
+mod ai_store;
 mod api_panel;
 mod buffer_search;
 mod command_palette;
