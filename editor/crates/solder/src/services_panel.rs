@@ -210,6 +210,17 @@ impl ServicesPanel {
         }
     }
 
+    /// Ports of services that are running now, first started first.
+    pub fn running_ports(&self, cx: &App) -> Vec<u16> {
+        let mut names: Vec<&String> = self.runs.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .filter(|n| self.status(n, cx) == Status::Running)
+            .flat_map(|n| self.ports(n).iter().copied())
+            .collect()
+    }
+
     pub fn ports(&self, name: &str) -> &[u16] {
         self.runs.get(name).map_or(&[], |r| &r.ports)
     }

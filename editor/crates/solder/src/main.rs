@@ -1,3 +1,4 @@
+mod api_panel;
 mod buffer_search;
 mod command_palette;
 mod completion;
@@ -25,6 +26,7 @@ mod project;
 mod project_panel;
 mod project_search;
 mod reference_picker;
+mod response;
 mod results;
 mod search;
 mod services;

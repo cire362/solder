@@ -76,6 +76,7 @@ actions!(
         ShowGit,
         ShowServices,
         ShowDatabase,
+        ShowApi,
         RunStatement,
         SelectConnection,
         ShowFileDiff,
@@ -114,6 +115,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-g", ShowGit, None),
         KeyBinding::new("secondary-shift-s", ShowServices, None),
         KeyBinding::new("ctrl-shift-d", ShowDatabase, None),
+        KeyBinding::new("ctrl-shift-h", ShowApi, None),
         KeyBinding::new(
             "secondary-enter",
             RunStatement,
@@ -129,7 +131,7 @@ pub fn bind_keys(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
 
-const SIDEBAR_WIDTH: f32 = 300.;
+const SIDEBAR_WIDTH: f32 = 330.;
 const TITLEBAR_HEIGHT: f32 = 38.;
 const TAB_BAR_HEIGHT: f32 = 34.;
 const STATUS_HEIGHT: f32 = 26.;
@@ -161,6 +163,7 @@ enum SidebarTab {
     Git,
     Services,
     Database,
+    Api,
 }
 
 struct Modal {
@@ -201,11 +204,18 @@ pub struct Workspace {
     services: Entity<ServicesPanel>,
     database: Entity<DatabaseStore>,
     database_panel: Entity<DatabasePanel>,
+    api_panel: Entity<crate::api_panel::ApiPanel>,
     results: Entity<ResultsView>,
     /// The Results tab is in the dock (a query has run and it was not closed).
     show_results: bool,
     /// The dock shows Results rather than a terminal.
     results_active: bool,
+    /// The last HTTP response, the dock's Response tab.
+    response: Entity<crate::response::ResponseView>,
+    show_response: bool,
+    /// Scratch queries and the requests file; tests point it elsewhere.
+    scratch_dir: PathBuf,
+    response_active: bool,
     /// A query file waiting for detection before it can run (`true`) or
     /// pick its connection (`false`).
     pending_query: Option<(PathBuf, bool)>,
@@ -239,7 +249,9 @@ impl Workspace {
         let services = cx.new(|cx| ServicesPanel::new(root.clone(), cx));
         let database = cx.new(|_| DatabaseStore::new(root.clone()));
         let database_panel = cx.new(|cx| DatabasePanel::new(database.clone(), cx));
+        let api_panel = cx.new(|cx| crate::api_panel::ApiPanel::new(root.clone(), cx));
         let results = cx.new(|cx| ResultsView::new(database.clone(), cx));
+        let response = cx.new(crate::response::ResponseView::new);
         let project_search = cx.new(|cx| ProjectSearch::new(root, window, cx));
         let search_bar = cx.new(|cx| BufferSearchBar::new(window, cx));
         let subscriptions = vec![
@@ -324,6 +336,7 @@ impl Workspace {
                             .update(cx, |r, cx| r.browse(connection, engine, spec, cx));
                         this.show_results = true;
                         this.results_active = true;
+                        this.response_active = false;
                         this.dock_open = true;
                         cx.notify();
                     }
@@ -347,6 +360,7 @@ impl Workspace {
                                     .update(cx, |ws, cx| {
                                         ws.show_results = true;
                                         ws.results_active = true;
+                                        ws.response_active = false;
                                         ws.dock_open = true;
                                         cx.notify();
                                     })
@@ -395,6 +409,18 @@ impl Workspace {
                         this.toggle_modal(window, cx, move |window, cx| {
                             Picker::new(picker, window, cx)
                         });
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &api_panel,
+                window,
+                |this, _, event, window, cx| match event {
+                    crate::api_panel::ApiEvent::Open(request) => {
+                        this.add_request(request.clone(), window, cx)
+                    }
+                    crate::api_panel::ApiEvent::Send(request) => {
+                        this.send_route_request(request.clone(), cx)
                     }
                 },
             ),
@@ -485,9 +511,14 @@ impl Workspace {
             services,
             database,
             database_panel,
+            api_panel: api_panel.clone(),
             results,
             show_results: false,
             results_active: false,
+            response,
+            show_response: false,
+            scratch_dir: settings::config_dir().join("scratch"),
+            response_active: false,
             pending_query: None,
             structure: None,
             erd: None,
@@ -1200,6 +1231,7 @@ impl Workspace {
         self.terminals.push((terminal.clone(), subscription));
         self.active_terminal = self.terminals.len() - 1;
         self.results_active = false;
+        self.response_active = false;
         self.dock_open = true;
         if focus {
             window.focus(&terminal.focus_handle(cx));
@@ -1240,6 +1272,7 @@ impl Workspace {
         if let Some(ix) = self.terminals.iter().position(|(t, _)| t == terminal) {
             self.active_terminal = ix;
             self.results_active = false;
+            self.response_active = false;
             self.dock_open = true;
             window.focus(&terminal.focus_handle(cx));
             cx.notify();
@@ -1259,6 +1292,9 @@ impl Workspace {
         self.services.update(cx, |s, cx| s.set_visible(visible, cx));
         if tab == Some(SidebarTab::Database) {
             self.database_panel.update(cx, |p, cx| p.shown(cx));
+        }
+        if tab == Some(SidebarTab::Api) {
+            self.api_panel.update(cx, |p, cx| p.shown(cx));
         }
         cx.notify();
     }
@@ -1289,6 +1325,7 @@ impl Workspace {
             .update(cx, |r, cx| r.run(connection, query, cx));
         self.show_results = true;
         self.results_active = true;
+        self.response_active = false;
         self.dock_open = true;
         if focus {
             window.focus(&self.results.focus_handle(cx));
@@ -1340,6 +1377,16 @@ impl Workspace {
     }
 
     fn run_statement(&mut self, _: &RunStatement, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self.active_editor().cloned()
+            && editor
+                .read(cx)
+                .path(cx)
+                .and_then(|p| p.extension())
+                .is_some_and(|e| e == "http" || e == "rest")
+        {
+            self.send_request_at_cursor(&editor, cx);
+            return;
+        }
         let path = self
             .active_editor()
             .and_then(|e| e.read(cx).path(cx).map(Path::to_path_buf));
@@ -1443,26 +1490,7 @@ impl Workspace {
             db::Engine::Mongo => "mongodb",
             _ => "sql",
         };
-        let root = self.root(cx);
-        let project = root
-            .file_name()
-            .map_or("project".into(), |n| n.to_string_lossy().into_owned());
-        let safe = |s: &str| -> String {
-            s.chars()
-                .map(|c| {
-                    if c.is_alphanumeric() || c == '-' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect()
-        };
-        let path = settings::config_dir().join("scratch").join(format!(
-            "{}-{}.{extension}",
-            safe(&project),
-            safe(&name)
-        ));
+        let path = self.scratch_file(&name, extension, cx);
         let create = path.clone();
         cx.spawn_in(window, async move |this, cx| {
             let created = cx
@@ -1540,6 +1568,7 @@ impl Workspace {
                             .update(cx, |r, cx| r.browse(connection, engine, spec, cx));
                         this.show_results = true;
                         this.results_active = true;
+                        this.response_active = false;
                         this.dock_open = true;
                         cx.notify();
                     }
@@ -1584,11 +1613,262 @@ impl Workspace {
         }
     }
 
+    // ------------------------------------------------------------ HTTP
+
+    fn show_api(&mut self, _: &ShowApi, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_sidebar(Some(SidebarTab::Api), cx);
+        window.focus(&self.api_panel.focus_handle(cx));
+    }
+
+    /// Where the project's server listens: a running service's port, else
+    /// `PORT` in `.env`, else the usual port of its framework.
+    fn base_url(&self, cx: &App) -> String {
+        let running = self.services.read(cx).running_ports(cx);
+        let env_port = std::fs::read_to_string(self.root(cx).join(".env"))
+            .ok()
+            .and_then(|t| db::parse_env(&t).get("PORT")?.parse().ok());
+        let framework = self.api_panel.read(cx).framework();
+        let port = running
+            .first()
+            .copied()
+            .unwrap_or_else(|| rest::routes::default_port(framework, env_port));
+        format!("http://localhost:{port}")
+    }
+
+    /// The project's requests file, kept with the scratch queries.
+    pub fn requests_path(&self, cx: &App) -> PathBuf {
+        self.scratch_file("requests", "http", cx)
+    }
+
+    /// `<project>-<name>.<extension>` in the scratch directory, outside the project so
+    /// it survives restarts without cluttering it.
+    fn scratch_file(&self, name: &str, extension: &str, cx: &App) -> PathBuf {
+        let project = self
+            .root(cx)
+            .file_name()
+            .map_or("project".into(), |n| n.to_string_lossy().into_owned());
+        let safe = |s: &str| -> String {
+            s.chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        };
+        self.scratch_dir
+            .join(format!("{}-{}.{extension}", safe(&project), safe(name)))
+    }
+
+    fn show_request_error(&mut self, error: String, cx: &mut Context<Self>) {
+        self.response.update(cx, |r, cx| {
+            r.request = None;
+            r.state = crate::response::ResponseState::Failed(error.into());
+            cx.notify();
+        });
+        self.show_response = true;
+        self.response_active = true;
+        self.results_active = false;
+        self.dock_open = true;
+        cx.notify();
+    }
+
+    fn requests_header(&self, cx: &App) -> String {
+        format!(
+            "# Requests for this project. cmd-enter sends the one under the cursor.\n@baseUrl = {}\n",
+            self.base_url(cx)
+        )
+    }
+
+    fn open_requests(
+        &mut self,
+        _: &crate::api_panel::OpenRequests,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self.requests_path(cx);
+        let header = self.requests_header(cx);
+        let create = path.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let made = cx
+                .background_executor()
+                .spawn(async move {
+                    std::fs::create_dir_all(create.parent().unwrap_or(Path::new(".")))?;
+                    if !create.exists() {
+                        std::fs::write(&create, header)?;
+                    }
+                    std::io::Result::Ok(())
+                })
+                .await;
+            if made.is_ok() {
+                this.update_in(cx, |this, window, cx| {
+                    this.open_path(path, None, window, cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Adds `request` to the end of the requests file and opens it there,
+    /// the cursor on its request line.
+    pub fn add_request(&mut self, request: String, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.requests_path(cx);
+        // An open, possibly unsaved, requests file gets the text in place.
+        if let Some(document) = self.document_for_path(&path, cx) {
+            let end = document.read(cx).text().len();
+            let row = document.read(cx).text().offset_to_point(end).row;
+            let text = format!("\n{request}");
+            document.update(cx, |d, cx| {
+                d.apply_edits(vec![(end..end, text)], None, cx);
+            });
+            self.open_path(
+                path,
+                Some(Jump::Point {
+                    row: row + 2,
+                    column: 0,
+                }),
+                window,
+                cx,
+            );
+            return;
+        }
+        let header = self.requests_header(cx);
+        let write = path.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let row = cx
+                .background_executor()
+                .spawn(async move {
+                    std::fs::create_dir_all(write.parent().unwrap_or(Path::new(".")))?;
+                    let mut text = std::fs::read_to_string(&write).unwrap_or(header);
+                    if !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    let row = text.lines().count() + 2;
+                    text.push('\n');
+                    text.push_str(&request);
+                    std::fs::write(&write, text)?;
+                    std::io::Result::Ok(row)
+                })
+                .await;
+            if let Ok(row) = row {
+                this.update_in(cx, |this, window, cx| {
+                    this.open_path(path, Some(Jump::Point { row, column: 0 }), window, cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Sends a route's request right away; `{{baseUrl}}` is where the
+    /// project's server listens.
+    fn send_route_request(&mut self, request: String, cx: &mut Context<Self>) {
+        let mut env = std::fs::read_to_string(self.root(cx).join(".env"))
+            .map(|t| db::parse_env(&t))
+            .unwrap_or_default();
+        env.entry("baseUrl".into())
+            .or_insert_with(|| self.base_url(cx));
+        let Some(block) = rest::request_at(&request, 0) else {
+            return;
+        };
+        match rest::http_file::parse(&request, &block, &env) {
+            Ok(request) => self.send_request(request, cx),
+            Err(e) => self.show_request_error(e, cx),
+        }
+    }
+
+    /// Writes an OpenAPI file's operations to a `.http` file next to it and
+    /// opens that.
+    fn import_openapi(
+        &mut self,
+        _: &crate::api_panel::ImportOpenApi,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let answer = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = answer.await else {
+                return;
+            };
+            let Some(spec) = paths.into_iter().next() else {
+                return;
+            };
+            let import = cx
+                .background_executor()
+                .spawn(async move { import_openapi_file(&spec) })
+                .await;
+            this.update_in(cx, |this, window, cx| match import {
+                Ok(path) => {
+                    this.api_panel.update(cx, |p, cx| p.reload(cx));
+                    this.open_path(path, None, window, cx);
+                }
+                Err(e) => this.show_request_error(e, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn close_response(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_focused = self.response.focus_handle(cx).contains_focused(window, cx);
+        self.show_response = false;
+        self.response_active = false;
+        self.results_active = self.show_results;
+        if self.terminals.is_empty() && !self.show_results {
+            self.dock_open = false;
+        }
+        if was_focused {
+            match self.active_editor() {
+                Some(e) => window.focus(&e.focus_handle(cx)),
+                None => window.focus(&self.focus_handle),
+            }
+        }
+        cx.notify();
+    }
+
+    /// Sends `request` and shows the Response tab; the keyboard stays where
+    /// it was.
+    pub fn send_request(&mut self, request: rest::Request, cx: &mut Context<Self>) {
+        self.response.update(cx, |r, cx| r.send(request, cx));
+        self.show_response = true;
+        self.response_active = true;
+        self.results_active = false;
+        self.dock_open = true;
+        cx.notify();
+    }
+
+    /// `cmd-enter` in a `.http` file: the request under the cursor, with
+    /// `{{variables}}` from the file and then the project's `.env`.
+    fn send_request_at_cursor(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        let e = editor.read(cx);
+        let offset = e.newest_range().end;
+        let text = e.text(cx);
+        let Some(block) = rest::request_at(&text, offset) else {
+            return;
+        };
+        let env = std::fs::read_to_string(self.root(cx).join(".env"))
+            .map(|t| db::parse_env(&t))
+            .unwrap_or_default();
+        match rest::http_file::parse(&text, &block, &env) {
+            Ok(request) => self.send_request(request, cx),
+            Err(e) => self.show_request_error(e, cx),
+        }
+    }
+
     fn close_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let was_focused = self.results.focus_handle(cx).contains_focused(window, cx);
         self.show_results = false;
         self.results_active = false;
-        if self.terminals.is_empty() {
+        self.response_active = self.show_response;
+        if self.terminals.is_empty() && !self.show_response {
             self.dock_open = false;
         }
         if was_focused {
@@ -1616,8 +1896,9 @@ impl Workspace {
         let was_focused = terminal.focus_handle(cx).contains_focused(window, cx);
         drop(self.terminals.remove(ix));
         if self.terminals.is_empty() {
-            self.dock_open = self.dock_open && self.show_results;
+            self.dock_open = self.dock_open && (self.show_results || self.show_response);
             self.results_active = self.show_results;
+            self.response_active = !self.show_results && self.show_response;
             self.active_terminal = 0;
         } else {
             self.active_terminal = self.active_terminal.min(self.terminals.len() - 1);
@@ -1628,6 +1909,7 @@ impl Workspace {
                 self.active_editor(),
             ) {
                 _ if self.results_active => window.focus(&self.results.focus_handle(cx)),
+                _ if self.response_active => window.focus(&self.response.focus_handle(cx)),
                 (Some((t, _)), _) => window.focus(&t.focus_handle(cx)),
                 (None, Some(e)) => window.focus(&e.focus_handle(cx)),
                 (None, None) => window.focus(&self.focus_handle),
@@ -1656,6 +1938,7 @@ impl Workspace {
             Some(t)
                 if self.dock_open
                     && !self.results_active
+                    && !self.response_active
                     && t.focus_handle(cx).contains_focused(window, cx) =>
             {
                 self.dock_open = false;
@@ -1667,6 +1950,7 @@ impl Workspace {
             Some(t) => {
                 self.dock_open = true;
                 self.results_active = false;
+                self.response_active = false;
                 window.focus(&t.focus_handle(cx));
                 cx.notify();
             }
@@ -1685,7 +1969,8 @@ impl Workspace {
             .iter()
             .enumerate()
             .map(|(ix, (terminal, _))| {
-                let active = ix == self.active_terminal && !self.results_active;
+                let active =
+                    ix == self.active_terminal && !self.results_active && !self.response_active;
                 let close = terminal.clone();
                 div()
                     .id(("terminal-tab", ix))
@@ -1703,6 +1988,7 @@ impl Workspace {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.active_terminal = ix;
                         this.results_active = false;
+                        this.response_active = false;
                         if let Some((t, _)) = this.terminals.get(ix) {
                             window.focus(&t.focus_handle(cx));
                         }
@@ -1752,6 +2038,9 @@ impl Workspace {
                     .bg(theme.bg_sunken)
                     .border_b_1()
                     .border_color(theme.line)
+                    .when(self.show_response, |d| {
+                        d.child(self.render_response_tab(&theme, cx))
+                    })
                     .when(self.show_results, |d| {
                         d.child(self.render_results_tab(&theme, cx))
                     })
@@ -1773,7 +2062,9 @@ impl Workspace {
                     ),
             )
             .child(div().flex_1().min_h_0().map(|d| {
-                if self.results_active {
+                if self.response_active {
+                    d.child(self.response.clone())
+                } else if self.results_active {
                     d.child(self.results.clone())
                 } else {
                     d.children(
@@ -1806,6 +2097,7 @@ impl Workspace {
             .hover(|d| d.text_color(theme.fg))
             .on_click(cx.listener(|this, _, window, cx| {
                 this.results_active = true;
+                this.response_active = false;
                 window.focus(&this.results.focus_handle(cx));
                 cx.notify();
             }))
@@ -1823,6 +2115,49 @@ impl Workspace {
                     .on_click(cx.listener(|this, _, window, cx| {
                         cx.stop_propagation();
                         this.close_results(window, cx);
+                    })),
+            )
+    }
+
+    fn render_response_tab(
+        &self,
+        theme: &crate::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.response_active;
+        div()
+            .id("response-tab")
+            .h(px(24.))
+            .pl_2p5()
+            .pr_1()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .rounded(px(8.))
+            .text_size(UI_FONT_SIZE)
+            .text_color(if active { theme.fg } else { theme.fg_subtle })
+            .when(active, |d| d.bg(theme.bg_elev))
+            .hover(|d| d.text_color(theme.fg))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.response_active = true;
+                this.results_active = false;
+                window.focus(&this.response.focus_handle(cx));
+                cx.notify();
+            }))
+            .child("Response")
+            .child(
+                div()
+                    .id("response-close")
+                    .size(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .hover(|d| d.bg(theme.line))
+                    .child("×")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_response(window, cx);
                     })),
             )
     }
@@ -2462,6 +2797,7 @@ impl Workspace {
                     SidebarTab::Git => this.show_git(&ShowGit, window, cx),
                     SidebarTab::Services => this.show_services(&ShowServices, window, cx),
                     SidebarTab::Database => this.show_database(&ShowDatabase, window, cx),
+                    SidebarTab::Api => this.show_api(&ShowApi, window, cx),
                 }))
         };
         div()
@@ -2495,7 +2831,8 @@ impl Workspace {
                         "sidebar-database",
                         "Database",
                         SidebarTab::Database,
-                    )),
+                    ))
+                    .child(tab_button("sidebar-api", "API", SidebarTab::Api)),
             )
             .child(div().flex_1().min_h_0().pt_1().map(|d| match tab {
                 SidebarTab::Files => d.child(self.project_panel.clone()),
@@ -2503,6 +2840,7 @@ impl Workspace {
                 SidebarTab::Git => d.child(self.git_panel.clone()),
                 SidebarTab::Services => d.child(self.services.clone()),
                 SidebarTab::Database => d.child(self.database_panel.clone()),
+                SidebarTab::Api => d.child(self.api_panel.clone()),
             }))
     }
 
@@ -2642,6 +2980,15 @@ impl Workspace {
 }
 
 /// Files whose change can add, remove or alter a detected service.
+/// `api.yaml` becomes `api.http` beside it.
+pub fn import_openapi_file(spec: &Path) -> Result<PathBuf, String> {
+    let text = std::fs::read_to_string(spec).map_err(|e| format!("{}: {e}", spec.display()))?;
+    let parsed = rest::openapi::parse(&text)?;
+    let out = spec.with_extension("http");
+    std::fs::write(&out, rest::openapi::to_http(&parsed)).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
 fn is_service_manifest(path: &Path) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     matches!(
@@ -2762,6 +3109,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_git))
             .on_action(cx.listener(Self::show_services))
             .on_action(cx.listener(Self::show_database))
+            .on_action(cx.listener(Self::show_api))
+            .on_action(cx.listener(Self::open_requests))
+            .on_action(cx.listener(Self::import_openapi))
             .on_action(cx.listener(Self::new_connection))
             .on_action(cx.listener(Self::run_statement))
             .on_action(cx.listener(Self::select_connection))
@@ -2819,7 +3169,8 @@ impl Render for Workspace {
                     .children(panes),
             )
             .when(
-                self.dock_open && (!self.terminals.is_empty() || self.show_results),
+                self.dock_open
+                    && (!self.terminals.is_empty() || self.show_results || self.show_response),
                 |d| d.child(self.render_dock(cx)),
             )
             .child(self.render_status(cx))
@@ -4610,6 +4961,7 @@ mod tests {
         ws.update(cx, |ws, cx| {
             ws.show_results = true;
             ws.results_active = true;
+            ws.response_active = false;
             ws.dock_open = true;
             cx.notify();
         });
@@ -4772,5 +5124,252 @@ mod tests {
         );
         ws.update_in(cx, |ws, window, cx| ws.close_results(window, cx));
         assert!(!cx.read(|cx| ws.read(cx).dock_open));
+    }
+
+    /// A server that answers every request with its method, path and body
+    /// as JSON. Returns its port.
+    fn echo_server() -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut data = Vec::new();
+                let mut buf = [0; 4096];
+                let (head, body) = loop {
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        break (String::new(), String::new());
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&data).to_string();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse().ok())?
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            break (head.to_string(), body.to_string());
+                        }
+                    }
+                };
+                let mut line = head.lines().next().unwrap_or("").split(' ');
+                let (method, path) = (line.next().unwrap_or(""), line.next().unwrap_or(""));
+                let json = format!(
+                    "{{\"method\":\"{method}\",\"path\":\"{path}\",\"body\":{}}}",
+                    serde_json::to_string(&body).unwrap()
+                );
+                let status = if method == "POST" {
+                    "201 Created"
+                } else {
+                    "200 OK"
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                    json.len()
+                );
+            }
+        });
+        port
+    }
+
+    fn response_json(
+        ws: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> (u16, serde_json::Value) {
+        use crate::response::ResponseState;
+        wait_for(cx, "the response", &|cx| {
+            !matches!(
+                ws.read(cx).response.read(cx).state,
+                ResponseState::Sending | ResponseState::Empty
+            )
+        });
+        cx.read(|cx| match &ws.read(cx).response.read(cx).state {
+            ResponseState::Done(response, _) => (
+                response.status,
+                serde_json::from_slice(&response.body).unwrap(),
+            ),
+            ResponseState::Failed(e) => panic!("request failed: {e}"),
+            _ => unreachable!(),
+        })
+    }
+
+    #[gpui::test]
+    fn http_file_sends_the_request_under_the_cursor(cx: &mut TestAppContext) {
+        let port = echo_server();
+        let root = db::testing::dir("ws-http-file");
+        std::fs::write(root.join(".env"), format!("PORT={port}\n")).unwrap();
+        let file = root.join("api.http");
+        std::fs::write(
+            &file,
+            "@base = http://127.0.0.1:{{PORT}}\n\n### list\nGET {{base}}/users\n\n### create\nPOST {{base}}/users\nContent-Type: application/json\n\n{\"name\": \"Ada\"}\n",
+        )
+        .unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| w.open_path(file, None, window, cx));
+        cx.run_until_parked();
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let at = active_text(&ws, cx).find("POST").unwrap();
+        editor.update(cx, |e, cx| {
+            e.select_ranges(std::slice::from_ref(&(at..at)), cx)
+        });
+        cx.simulate_keystrokes("secondary-enter");
+        let (status, json) = response_json(&ws, cx);
+        assert_eq!(status, 201);
+        assert_eq!(json["method"], "POST");
+        assert_eq!(json["path"], "/users");
+        assert_eq!(json["body"], "{\"name\": \"Ada\"}");
+        assert!(cx.read(|cx| ws.read(cx).response_active && ws.read(cx).dock_open));
+
+        // A request that names a variable nobody defines says which one.
+        let editor_text = active_text(&ws, cx);
+        editor.update(cx, |e, cx| {
+            let end = editor_text.len();
+            e.select_ranges(std::slice::from_ref(&(end..end)), cx)
+        });
+        cx.simulate_input("\n### broken\nGET {{missing}}/x\n");
+        cx.simulate_keystrokes("secondary-enter");
+        cx.run_until_parked();
+        cx.read(|cx| match &ws.read(cx).response.read(cx).state {
+            crate::response::ResponseState::Failed(e) => assert!(e.contains("missing"), "{e}"),
+            _ => panic!("expected an error"),
+        });
+    }
+
+    #[gpui::test]
+    fn api_tab_turns_routes_into_requests(cx: &mut TestAppContext) {
+        let port = echo_server();
+        let root = db::testing::dir("ws-api-tab");
+        std::fs::create_dir_all(root.join("app/api/users")).unwrap();
+        std::fs::write(
+            root.join("app/api/users/route.ts"),
+            "export async function GET() {}\nexport async function POST() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("server.js"),
+            "app.get('/health', (req, res) => res.send('ok'))\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("openapi.yaml"),
+            "openapi: 3.1.0\ninfo: {title: Pets, version: '1'}\nservers: [{url: 'http://127.0.0.1:1'}]\npaths:\n  /pets:\n    get: {summary: List pets}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".env"), format!("PORT={port}\n")).unwrap();
+        let root = root.canonicalize().unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let scratch = root.join("scratch");
+        ws.update(cx, |w, _| w.scratch_dir = scratch.clone());
+        let panel = cx.read(|cx| ws.read(cx).api_panel.clone());
+        cx.simulate_keystrokes("ctrl-shift-h");
+        wait_for(cx, "routes", &|cx| panel.read(cx).loaded);
+        let rows: Vec<(String, String)> = cx.read(|cx| {
+            panel
+                .read(cx)
+                .visible_rows()
+                .into_iter()
+                .map(|r| (r.method, r.path))
+                .collect()
+        });
+        for (method, path) in [
+            ("GET", "/api/users"),
+            ("POST", "/api/users"),
+            ("GET", "/health"),
+            ("GET", "/pets"),
+        ] {
+            assert!(
+                rows.contains(&(method.into(), path.into())),
+                "{method} {path} in {rows:?}"
+            );
+        }
+
+        let filter = cx.read(|cx| panel.read(cx).filter_field());
+        cx.update(|window, cx| window.focus(&filter.focus_handle(cx)));
+        cx.simulate_input("health");
+        cx.run_until_parked();
+        let rows = cx.read(|cx| panel.read(cx).visible_rows());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/health");
+
+        // Clicking a route adds its request to the requests file.
+        let row = cx.debug_bounds("route-0").unwrap();
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        let requests = cx.read(|cx| ws.read(cx).requests_path(cx));
+        wait_for(cx, "the requests file", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .and_then(|e| e.read(cx).path(cx).map(Path::to_path_buf))
+                .as_deref()
+                == Some(requests.as_path())
+        });
+        let text = active_text(&ws, cx);
+        assert!(
+            text.contains(&format!("@baseUrl = http://localhost:{port}")),
+            "{text}"
+        );
+        assert!(text.contains("GET {{baseUrl}}/health"), "{text}");
+
+        // The cursor is on the new request, so cmd-enter sends it.
+        cx.simulate_keystrokes("secondary-enter");
+        let (status, json) = response_json(&ws, cx);
+        assert_eq!(status, 200);
+        assert_eq!(json["path"], "/health");
+
+        // A second route goes to the end of the open file.
+        cx.update(|window, cx| window.focus(&filter.focus_handle(cx)));
+        cx.simulate_keystrokes("secondary-a backspace");
+        cx.simulate_input("post users");
+        cx.run_until_parked();
+        let row = cx.debug_bounds("route-0").unwrap();
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let text = active_text(&ws, cx);
+        assert!(text.contains("GET {{baseUrl}}/health"), "{text}");
+        assert!(text.trim_end().ends_with("{}"), "{text}");
+        assert!(text.contains("POST {{baseUrl}}/api/users"), "{text}");
+
+        // Send, shown on hover, sends without touching the file.
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+        let send = cx.debug_bounds("route-send-0").expect("shown on hover");
+        cx.simulate_click(send.center(), gpui::Modifiers::default());
+        let (status, json) = response_json(&ws, cx);
+        assert_eq!(status, 201);
+        assert_eq!(json["path"], "/api/users");
+        assert_eq!(json["body"], "{}");
+        assert_eq!(active_text(&ws, cx), text);
+    }
+
+    #[test]
+    fn openapi_import_writes_a_http_file() {
+        let root = db::testing::dir("ws-openapi");
+        let spec = root.join("petstore.json");
+        std::fs::write(
+            &spec,
+            r#"{"openapi":"3.1.0","info":{"title":"Pets","version":"1"},
+               "servers":[{"url":"https://api.example.com/v1"}],
+               "paths":{"/pets/{petId}":{"get":{"summary":"One pet",
+                 "parameters":[{"name":"petId","in":"path","schema":{"type":"integer"}}]}}}}"#,
+        )
+        .unwrap();
+        let out = import_openapi_file(&spec).unwrap();
+        assert_eq!(out, root.join("petstore.http"));
+        let text = std::fs::read_to_string(out).unwrap();
+        assert!(
+            text.contains("@baseUrl = https://api.example.com/v1"),
+            "{text}"
+        );
+        assert!(text.contains("GET {{baseUrl}}/pets/"), "{text}");
+        let swagger = root.join("old.json");
+        std::fs::write(&swagger, r#"{"swagger":"2.0","paths":{}}"#).unwrap();
+        assert!(import_openapi_file(&swagger).is_err());
     }
 }

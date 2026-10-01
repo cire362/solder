@@ -51,7 +51,7 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 - [x] Table structure: create, change and drop tables, columns, indexes and foreign keys; review the DDL, then apply it or save it as a migration
 - [x] ERD: tables and relations with layout, pan and zoom; open a table's data or structure; add tables, columns and relations; export SVG, PNG and Mermaid
 - [x] Redis keys (every type, TTL) and MongoDB documents: add, edit, delete
-- [ ] HTTP client with requests generated from API routes, OpenAPI 3.1 import
+- [x] HTTP client with requests generated from API routes, OpenAPI 3.1 import
 
 ## 6. Solder AI
 - [ ] Providers: hosted, Ollama, LM Studio, OpenAI-compatible; model per task; offline mode

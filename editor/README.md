@@ -7,6 +7,7 @@ crates/
   text/     rope buffer, edits, undo history, cursor movement (no UI, fully unit-tested)
   syntax/   tree-sitter parsing and highlighting for Rust, TS/TSX, JS, JSON, CSS, Go, Python
   db/       database connections: detection, drivers, statement splitting (no UI)
+  rest/     HTTP: .http files, route detection, OpenAPI import, sending (no UI)
   solder/   the app: GPUI window, editor element, file tree, tabs, status bar
 ```
 
@@ -258,6 +259,39 @@ at, searchable by key and name; `f2` types the value instead.
 replaces. **Apply in one transaction** runs it all or nothing. Every statement
 targets one row by its primary key and the values the grid showed, so a row that
 someone changed or deleted since it was read stops the save and nothing is written.
+
+## HTTP requests
+
+Requests live in `.http` files, the format VS Code's REST Client and JetBrains
+use: requests separated by `###`, a method and URL, headers, a blank line, then
+the body. `@name = value` defines a variable and `{{name}}` uses it; names the
+file does not define come from the project's `.env`. `cmd-enter` sends the
+request under the cursor and shows the status, time, size, headers and body
+(JSON pretty-printed) in the Response tab of the bottom dock.
+
+```http
+@baseUrl = http://localhost:3000
+
+### create a user
+POST {{baseUrl}}/api/users
+Content-Type: application/json
+
+{"name": "Ada"}
+```
+
+The API tab (`ctrl-shift-h`) lists the routes the project serves, read from its
+code: Next.js route handlers and pages API, Express, Fastify, Hono and similar
+routers, FastAPI, Flask, Django, Go's `net/http`, chi and gin, axum and actix.
+Operations from OpenAPI files in the project (`openapi.yaml`, `swagger.json`,
+`*.openapi.json`) are listed too. Click a route to add its request to the
+project's requests file (kept in `~/.config/solder/scratch`, outside the project)
+with the cursor on it; **Send**, shown on hover, sends it without writing
+anything. `{{baseUrl}}` points at the port of a running service from the
+Services tab, else `PORT` in `.env`, else the framework's usual port.
+
+**Import OpenAPI** turns an OpenAPI 3.0 or 3.1 file (JSON or YAML) into a `.http`
+file next to it, one request per operation, with example bodies built from the
+schemas and `$ref`s resolved. Swagger 2.0 is not supported.
 
 ## Measured so far
 
