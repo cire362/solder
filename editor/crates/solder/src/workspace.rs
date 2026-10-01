@@ -80,6 +80,7 @@ actions!(
         ShowApi,
         ShowAi,
         ToggleChat,
+        ShowAgent,
         ShowInlineEdit,
         RunStatement,
         SelectConnection,
@@ -122,6 +123,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-h", ShowApi, None),
         KeyBinding::new("ctrl-shift-a", ShowAi, None),
         KeyBinding::new("secondary-shift-l", ToggleChat, None),
+        KeyBinding::new("secondary-shift-i", ShowAgent, None),
         KeyBinding::new(
             "secondary-i",
             ShowInlineEdit,
@@ -220,6 +222,9 @@ pub struct Workspace {
     api_panel: Entity<crate::api_panel::ApiPanel>,
     ai_panel: Entity<crate::ai_panel::AiPanel>,
     chat: Entity<crate::chat_panel::ChatPanel>,
+    agent: Entity<crate::agent_panel::AgentPanel>,
+    /// The right dock shows the agent rather than the chat.
+    agent_shown: bool,
     chat_open: bool,
     inline_edit: Option<(Entity<InlineEdit>, Subscription)>,
     results: Entity<ResultsView>,
@@ -271,7 +276,10 @@ impl Workspace {
         ai_store.update(cx, |s, _| s.add_root(root.clone()));
         let ai_panel = cx.new(|cx| crate::ai_panel::AiPanel::new(ai_store.clone(), cx));
         let weak = cx.entity().downgrade();
-        let chat = cx.new(|cx| crate::chat_panel::ChatPanel::new(ai_store, weak, cx));
+        let chat =
+            cx.new(|cx| crate::chat_panel::ChatPanel::new(ai_store.clone(), weak.clone(), cx));
+        let agent =
+            cx.new(|cx| crate::agent_panel::AgentPanel::new(ai_store, weak, root.clone(), cx));
         let results = cx.new(|cx| ResultsView::new(database.clone(), cx));
         let response = cx.new(crate::response::ResponseView::new);
         let project_search = cx.new(|cx| ProjectSearch::new(root, window, cx));
@@ -536,6 +544,8 @@ impl Workspace {
             api_panel: api_panel.clone(),
             ai_panel,
             chat,
+            agent,
+            agent_shown: false,
             chat_open: false,
             inline_edit: None,
             results,
@@ -1706,7 +1716,66 @@ impl Workspace {
         cx.notify();
     }
 
+    fn show_agent(&mut self, _: &ShowAgent, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_right(true, window, cx);
+    }
+
+    /// Opens the right dock on the chat or the agent and focuses its field.
+    fn show_right(&mut self, agent: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.chat_open = true;
+        self.agent_shown = agent;
+        let input = if agent {
+            self.agent.update(cx, |a, cx| a.shown(cx));
+            self.agent.read(cx).input()
+        } else {
+            self.chat.update(cx, |c, cx| c.shown(cx));
+            self.chat.read(cx).input()
+        };
+        window.focus(&input.focus_handle(cx));
+        cx.notify();
+    }
+
+    /// Shows a file an agent changed: as it was when the task started, and
+    /// as it is in the agent's worktree.
+    pub fn show_agent_diff(
+        &mut self,
+        path: PathBuf,
+        rel: String,
+        old: String,
+        new: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.discard_inline_edit(cx);
+        let view = cx.new(|cx| FileDiff::preview(path, cx));
+        view.update(cx, |view, cx| {
+            view.set_result(
+                Ok(DiffModel::new(crate::git::FileDiffSnapshot {
+                    path: rel,
+                    old,
+                    new,
+                    can_open: false,
+                })),
+                cx,
+            )
+        });
+        self.diff_subscription =
+            Some(
+                cx.subscribe_in(&view, window, |this, _, event, window, cx| {
+                    if let FileDiffEvent::Close = event {
+                        this.close_file_diff(window, cx);
+                    }
+                }),
+            );
+        self.diff_task = None;
+        self.file_diff = Some(view);
+        cx.notify();
+    }
+
     fn toggle_chat(&mut self, _: &ToggleChat, window: &mut Window, cx: &mut Context<Self>) {
+        if self.agent_shown && self.chat_open {
+            return self.show_right(false, window, cx);
+        }
         let input = self.chat.read(cx).input();
         if self.chat_open && !input.focus_handle(cx).is_focused(window) {
             // Open but elsewhere: go to it rather than close it.
@@ -3295,6 +3364,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_api))
             .on_action(cx.listener(Self::show_ai))
             .on_action(cx.listener(Self::toggle_chat))
+            .on_action(cx.listener(Self::show_agent))
             .on_action(cx.listener(Self::show_inline_edit))
             .on_action(cx.listener(Self::open_requests))
             .on_action(cx.listener(Self::import_openapi))
@@ -3354,14 +3424,58 @@ impl Render for Workspace {
                     .children(self.sidebar.map(|tab| self.render_sidebar(tab, cx)))
                     .children(panes)
                     .when(self.chat_open, |d| {
+                        let agent = self.agent_shown;
+                        let tab = |id: &'static str, label: &'static str, active: bool| {
+                            div()
+                                .id(id)
+                                .debug_selector(move || id.into())
+                                .h(px(24.))
+                                .px_1p5()
+                                .flex()
+                                .items_center()
+                                .rounded(px(8.))
+                                .text_size(UI_FONT_SIZE)
+                                .text_color(if active { theme.fg } else { theme.fg_subtle })
+                                .when(active, |d| d.bg(theme.bg_elev))
+                                .hover(|d| d.text_color(theme.fg))
+                                .child(label)
+                        };
                         d.child(
                             div()
                                 .w(px(CHAT_WIDTH))
                                 .flex_none()
                                 .h_full()
+                                .flex()
+                                .flex_col()
                                 .border_l_1()
                                 .border_color(theme.line)
-                                .child(self.chat.clone()),
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .px_2()
+                                        .py_1()
+                                        .flex()
+                                        .gap_1()
+                                        .border_b_1()
+                                        .border_color(theme.line)
+                                        .child(tab("right-chat", "Chat", !agent).on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.show_right(false, window, cx)
+                                            }),
+                                        ))
+                                        .child(tab("right-agent", "Agent", agent).on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.show_right(true, window, cx)
+                                            }),
+                                        )),
+                                )
+                                .child(div().flex_1().min_h_0().map(|d| {
+                                    if agent {
+                                        d.child(self.agent.clone())
+                                    } else {
+                                        d.child(self.chat.clone())
+                                    }
+                                })),
                         )
                     }),
             )
@@ -7145,5 +7259,368 @@ mod tests {
         assert_eq!(ghost_text(&ws, cx).as_deref(), Some("a * b;"));
         assert!(cx.read(|cx| store.read(cx).no_infill.contains(&id)));
         store.update(cx, |s, _| s.stop_local());
+    }
+
+    /// A model that answers each step from a script: one OpenAI-style
+    /// response per request, in order. Records the requests.
+    fn scripted_model(
+        steps: Vec<serde_json::Value>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            let mut steps = steps.into_iter();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap_or(0);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).ok();
+                let json = if first.starts_with("GET") {
+                    r#"{"data":[{"id":"agent-model"}]}"#.to_string()
+                } else {
+                    log.lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&body).unwrap_or_default());
+                    steps.next().unwrap_or_else(|| serde_json::json!({"choices":[{"finish_reason":"stop","message":{"content":"(script ended)"}}]})).to_string()
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                    json.len()
+                );
+            }
+        });
+        (base, seen)
+    }
+
+    fn tool_step(id: &str, name: &str, input: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"choices":[{"finish_reason":"tool_calls","message":{
+            "content":"",
+            "tool_calls":[{"id": id, "type":"function","function":{"name": name, "arguments": input.to_string()}}],
+        }}]})
+    }
+
+    #[gpui::test]
+    fn agent_plans_works_asks_and_merges_on_its_own_branch(cx: &mut TestAppContext) {
+        use crate::agent_task::Status;
+        let (api, seen) = scripted_model(vec![
+            tool_step(
+                "p1",
+                "update_plan",
+                serde_json::json!({"steps": [{"text": "Fix add"}, {"text": "Check it"}]}),
+            ),
+            tool_step(
+                "e1",
+                "edit_file",
+                serde_json::json!({"path": "src/lib.rs", "old": "a - b", "new": "a + b"}),
+            ),
+            tool_step(
+                "r1",
+                "run",
+                serde_json::json!({"command": "grep -q 'a + b' src/lib.rs && echo checked", "access": "full", "reason": "to check"}),
+            ),
+            tool_step(
+                "f1",
+                "finish",
+                serde_json::json!({"summary": "Fixed add and checked it."}),
+            ),
+        ]);
+        // A repository with one commit, and AI data kept outside it.
+        let repo = db::testing::dir("agent-flow");
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a - b\n}\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let repo = repo.canonicalize().unwrap();
+        let data = db::testing::dir("agent-flow-data");
+        cx.executor().allow_parking();
+        let store = cx.update(|cx| {
+            let store = cx.new(|_| {
+                crate::ai_store::AiStore::new(ai::Dirs::new(&data), "http://127.0.0.1:9".into())
+                    .with_scan_dirs(Vec::new())
+                    .for_tests(down_urls())
+            });
+            crate::ai_store::AiStore::set_global(store.clone(), cx);
+            store
+        });
+        let (ws, cx) = setup(cx, repo.clone());
+        store.update(cx, |s, cx| {
+            s.load(cx);
+            s.add_provider("Mock".into(), api.clone(), None, cx);
+        });
+        wait_for(cx, "the provider", &|cx| {
+            store
+                .read(cx)
+                .provider("custom-mock")
+                .is_some_and(|p| !p.models().is_empty())
+        });
+        store.update(cx, |s, cx| {
+            s.choose(
+                ai::Role::Chat,
+                crate::ai_providers::ModelRef {
+                    provider: "custom-mock".into(),
+                    model: "agent-model".into(),
+                },
+                cx,
+            )
+        });
+
+        cx.simulate_keystrokes("secondary-shift-i");
+        cx.simulate_input("Fix the add function");
+        cx.simulate_keystrokes("enter");
+        let panel = cx.read(|cx| ws.read(cx).agent.clone());
+        let status = |cx: &mut VisualTestContext| {
+            cx.read(|cx| {
+                panel
+                    .read(cx)
+                    .task
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .status
+                    .clone()
+            })
+        };
+        wait_for(cx, "the plan", &|cx| {
+            panel.read(cx).task.as_ref().unwrap().read(cx).status == Status::AwaitingPlan
+        });
+        let task = cx.read(|cx| panel.read(cx).task.clone().unwrap());
+        let worktree = cx.read(|cx| task.read(cx).worktree.clone().unwrap());
+        assert_eq!(worktree.branch, "solder/agent/fix-the-add-function");
+        // Planning offered no tools that change anything.
+        let first = seen.lock().unwrap()[0].clone();
+        let tools: Vec<String> = first["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !tools.contains(&"edit_file".to_string()) && tools.contains(&"update_plan".to_string()),
+            "{tools:?}"
+        );
+
+        // Approving starts the work; the command that wants more than the
+        // sandbox waits.
+        cx.run_until_parked();
+        let approve = cx.debug_bounds("agent-approve").expect("approve");
+        cx.simulate_click(approve.center(), gpui::Modifiers::default());
+        wait_for(cx, "the request to run", &|cx| {
+            matches!(
+                panel.read(cx).task.as_ref().unwrap().read(cx).status,
+                Status::AwaitingApproval { .. }
+            )
+        });
+        assert!(
+            std::fs::read_to_string(worktree.path.join("src/lib.rs"))
+                .unwrap()
+                .contains("a + b")
+        );
+        // The user's checkout is untouched.
+        assert!(
+            std::fs::read_to_string(repo.join("src/lib.rs"))
+                .unwrap()
+                .contains("a - b")
+        );
+        cx.run_until_parked();
+        let allow = cx.debug_bounds("agent-allow").expect("allow");
+        cx.simulate_click(allow.center(), gpui::Modifiers::default());
+        wait_for(cx, "the end", &|cx| {
+            let t = panel.read(cx).task.as_ref().unwrap().read(cx);
+            t.status == Status::Finished && !t.changes.is_empty()
+        });
+        cx.read(|cx| {
+            let t = task.read(cx);
+            assert_eq!(t.summary.as_deref(), Some("Fixed add and checked it."));
+            assert!(t.plan.iter().all(|s| s.done));
+            assert_eq!(t.changes[0].path, "src/lib.rs");
+        });
+        let requests = seen.lock().unwrap().clone();
+        let approved = requests[1]["messages"].to_string();
+        assert!(approved.contains("The plan is approved"), "{approved}");
+        let after_run = requests[3]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(after_run["role"], "tool");
+        assert!(
+            after_run["content"].as_str().unwrap().contains("checked"),
+            "{after_run}"
+        );
+
+        // Review a change, then merge it into the user's branch.
+        cx.run_until_parked();
+        let change = cx.debug_bounds("agent-change-0").expect("a change");
+        cx.simulate_click(change.center(), gpui::Modifiers::default());
+        wait_for(cx, "the diff", &|cx| ws.read(cx).file_diff.is_some());
+        let merge = cx.debug_bounds("agent-merge").expect("merge");
+        cx.simulate_click(merge.center(), gpui::Modifiers::default());
+        wait_for(cx, "the merge", &|cx| {
+            panel.read(cx).task.as_ref().unwrap().read(cx).status == Status::Merged
+        });
+        assert!(
+            std::fs::read_to_string(repo.join("src/lib.rs"))
+                .unwrap()
+                .contains("a + b")
+        );
+        assert!(!worktree.path.exists());
+        assert_eq!(status(cx), Status::Merged);
+    }
+
+    #[gpui::test]
+    fn agent_stops_and_takes_new_instructions(cx: &mut TestAppContext) {
+        use crate::agent_task::Status;
+        let (api, seen) = scripted_model(vec![
+            tool_step(
+                "p1",
+                "update_plan",
+                serde_json::json!({"steps": ["Try it"]}),
+            ),
+            tool_step(
+                "r1",
+                "run",
+                serde_json::json!({"command": "curl https://example.com", "access": "network", "reason": "download"}),
+            ),
+            tool_step(
+                "f1",
+                "finish",
+                serde_json::json!({"summary": "Did it without the network."}),
+            ),
+        ]);
+        let repo = db::testing::dir("agent-deny");
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let repo = repo.canonicalize().unwrap();
+        let data = db::testing::dir("agent-deny-data");
+        cx.executor().allow_parking();
+        let store = cx.update(|cx| {
+            let store = cx.new(|_| {
+                crate::ai_store::AiStore::new(ai::Dirs::new(&data), "http://127.0.0.1:9".into())
+                    .with_scan_dirs(Vec::new())
+                    .for_tests(down_urls())
+            });
+            crate::ai_store::AiStore::set_global(store.clone(), cx);
+            store
+        });
+        let (ws, cx) = setup(cx, repo.clone());
+        store.update(cx, |s, cx| {
+            s.load(cx);
+            s.add_provider("Mock".into(), api, None, cx);
+        });
+        wait_for(cx, "the provider", &|cx| {
+            store
+                .read(cx)
+                .provider("custom-mock")
+                .is_some_and(|p| !p.models().is_empty())
+        });
+        store.update(cx, |s, cx| {
+            s.choose(
+                ai::Role::Chat,
+                crate::ai_providers::ModelRef {
+                    provider: "custom-mock".into(),
+                    model: "agent-model".into(),
+                },
+                cx,
+            )
+        });
+        cx.simulate_keystrokes("secondary-shift-i");
+        cx.simulate_input("Do the thing");
+        cx.simulate_keystrokes("enter");
+        let panel = cx.read(|cx| ws.read(cx).agent.clone());
+        wait_for(cx, "the plan", &|cx| {
+            panel.read(cx).task.as_ref().unwrap().read(cx).status == Status::AwaitingPlan
+        });
+        let task = cx.read(|cx| panel.read(cx).task.clone().unwrap());
+        task.update(cx, |t, cx| {
+            t.approve_plan(vec!["Try it".into(), "  ".into()], cx)
+        });
+        wait_for(cx, "the network request", &|cx| {
+            matches!(task.read(cx).status, Status::AwaitingApproval { .. })
+        });
+        // A new instruction declines the waiting command and goes on.
+        let input = cx.read(|cx| panel.read(cx).input());
+        cx.update(|window, cx| window.focus(&input.focus_handle(cx)));
+        cx.simulate_input("Skip the download");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the end", &|cx| {
+            task.read(cx).status == Status::Finished
+        });
+        let last = seen.lock().unwrap().last().unwrap()["messages"].clone();
+        let messages = last.as_array().unwrap();
+        let declined = messages
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == "r1")
+            .unwrap();
+        assert!(
+            declined["content"].as_str().unwrap().contains("Not run"),
+            "{declined}"
+        );
+        assert_eq!(messages.last().unwrap()["content"], "Skip the download");
+        cx.read(|cx| assert!(task.read(cx).changes.is_empty()));
+
+        // Discard removes the worktree and its branch.
+        let wt = cx.read(|cx| task.read(cx).worktree.clone().unwrap());
+        task.update(cx, |t, cx| t.discard(cx));
+        wait_for(cx, "the worktree to go", &|_| !wt.path.exists());
+        let branches = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--list", "solder/*"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&branches.stdout).trim().is_empty());
     }
 }

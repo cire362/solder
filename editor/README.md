@@ -429,6 +429,33 @@ removed. Files `.env` or `.solderignore` keeps from AI are never sent; the check
 reads only the file's own rules, not the whole project, so it costs nothing
 noticeable while typing.
 
+### Agent tasks
+
+The **Agent** tab of the right dock (`cmd-shift-i`, `ctrl-shift-i` elsewhere)
+takes a task in a sentence and works on it with the chat model, on a branch and
+Git worktree of its own (`solder/agent/<task>`, from your last commit, kept in
+Solder's data folder). Your checkout and uncommitted changes are not touched.
+
+1. **Plan.** The agent explores with read-only tools (list, read, search) and
+   proposes steps. Edit them, add or remove steps, or tell it what to change,
+   then **Approve plan**. Nothing changes before that.
+2. **Work.** It edits files, runs commands (tests, builds, linters), fixes what
+   fails and ticks the plan off. Commands run in a sandbox: no network beyond this
+   machine and no writes outside the worktree and temporary folders
+   (`sandbox-exec` on macOS, `bwrap` on Linux). A command that needs the network
+   (package caches become writable too) or the whole disk says why and waits for
+   **Allow once** or **Don't run**. Without a sandbox every command waits.
+3. **Review.** When it finishes it lists the changed files; click one for its
+   diff against where the task started. **Merge into my branch** commits the work
+   on the agent's branch and merges it into yours (Git refuses rather than
+   overwrite uncommitted changes in the way); **Discard** deletes the worktree and
+   the branch.
+
+Type in the field at any time to steer it: after the plan, while it waits for a
+command (which declines that command) or after it finished. **Stop** halts it
+between steps. Files `.env` and `.solderignore` keep from AI stay unreadable to
+it, as in the chat; a task stops after 60 steps and asks how to go on.
+
 ## Measured so far
 
 Apple M4, 16 GB, built-in 60 Hz display, release build.
