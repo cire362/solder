@@ -91,7 +91,7 @@ pub struct LayoutSnapshot {
 }
 
 impl LayoutSnapshot {
-    fn row_at(&self, buffer: &Buffer, scroll: Point<Pixels>, y: Pixels) -> usize {
+    pub(crate) fn row_at(&self, buffer: &Buffer, scroll: Point<Pixels>, y: Pixels) -> usize {
         let row = ((y - self.bounds.top() + scroll.y) / self.line_height).floor();
         (row.max(0.) as usize).min(buffer.line_count() - 1)
     }
@@ -658,6 +658,68 @@ fn layout(
                 marked_rows.push((row, d.severity));
             }
         }
+        // Breakpoints, and where a debugged program is paused.
+        let (breakpoints, paused_row, checked) =
+            match (doc.path(), crate::debug::DebugStore::try_global(cx)) {
+                (Some(path), Some(debug)) => {
+                    let debug = debug.read(cx);
+                    let lines: Vec<(usize, bool)> = debug
+                        .lines(path)
+                        .map(|l| {
+                            l.iter()
+                                .map(|(line, ok)| (*line as usize - 1, *ok))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let paused = debug
+                        .paused
+                        .as_ref()
+                        .and_then(|p| p.frame())
+                        .filter(|f| f.path.as_deref() == Some(path))
+                        .map(|f| (f.line as usize).saturating_sub(1));
+                    (lines, paused, debug.state.active())
+                }
+                _ => (Vec::new(), None, false),
+            };
+        if let Some(row) = paused_row.filter(|r| (first_row..end_row).contains(r)) {
+            let mut tint = theme.warning;
+            tint.a = 0.16;
+            background.push(fill(
+                Bounds::new(
+                    point(bounds.left(), row_y(row)),
+                    size(bounds.size.width, lh),
+                ),
+                tint,
+            ));
+            background.push(fill(
+                Bounds::new(point(bounds.left(), row_y(row)), size(px(3.), lh)),
+                theme.warning,
+            ));
+        }
+        for (row, verified) in &breakpoints {
+            if !(first_row..end_row).contains(row) {
+                continue;
+            }
+            let size_px = (lh * 0.55).min(px(11.));
+            let mut color = theme.error;
+            // While a program runs, a breakpoint no session confirmed is faint.
+            if checked && !verified {
+                color.a = 0.45;
+            }
+            let mut quad = fill(
+                Bounds::new(
+                    point(bounds.left() + px(3.), row_y(*row) + (lh - size_px) / 2.),
+                    size(size_px, size_px),
+                ),
+                color,
+            );
+            quad.corner_radii = gpui::Corners::all(size_px / 2.);
+            background.push(quad);
+        }
+        let marked_rows: Vec<(usize, Severity)> = marked_rows
+            .into_iter()
+            .filter(|(row, _)| !breakpoints.iter().any(|(b, _)| b == row))
+            .collect();
         for (row, severity) in marked_rows {
             let size_px = px(6.);
             let mut quad = fill(

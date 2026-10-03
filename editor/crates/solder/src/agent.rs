@@ -475,8 +475,11 @@ pub fn run_command(
             timed_out = true;
             #[cfg(unix)]
             {
+                // `--` matters: without it procps reads `-4724` as the
+                // group `-4`, and a number starting with 1 as `-1`, which
+                // is every process the user has.
                 let _ = Command::new("kill")
-                    .args(["-9", &format!("-{}", child.id())])
+                    .args(["-9", "--", &format!("-{}", child.id())])
                     .status();
             }
             let _ = child.kill();
@@ -1270,6 +1273,40 @@ mod tests {
         assert!(error && out.contains("Stopped after 1 s"), "{out}");
         assert_eq!(clip(&"x".repeat(100)), "x".repeat(100));
         assert!(clip(&"y".repeat(20_000)).contains("bytes cut"));
+    }
+
+    /// A timeout stops what the command started as well, and nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_stops_the_commands_whole_group() {
+        let root = repo("agent-timeout");
+        let out = run_command(
+            Sandbox::None,
+            &root,
+            "sleep 30 & echo $! > child.pid; wait",
+            Access::Full,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(out.timed_out);
+        let pid = std::fs::read_to_string(root.join("child.pid")).unwrap();
+        // A zombie counts as gone: it waits only for whoever reaps it.
+        let alive = || {
+            let out = Command::new("ps")
+                .args(["-o", "stat=", "-p", pid.trim()])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&out.stdout);
+            !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+        };
+        let start = Instant::now();
+        while alive() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the command's child survived the timeout"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[cfg(target_os = "macos")]

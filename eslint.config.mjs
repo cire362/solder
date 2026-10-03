@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // The editor is Rust; its JavaScript runs inside debugged Node programs.
+    "editor/**",
   ]),
 ]);
 

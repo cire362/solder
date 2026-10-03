@@ -81,6 +81,12 @@ actions!(
         ShowAi,
         ToggleChat,
         ShowAgent,
+        DebugStart,
+        DebugPick,
+        DebugStop,
+        DebugStepOver,
+        DebugStepIn,
+        DebugStepOut,
         ShowInlineEdit,
         RunStatement,
         SelectConnection,
@@ -124,6 +130,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-a", ShowAi, None),
         KeyBinding::new("secondary-shift-l", ToggleChat, None),
         KeyBinding::new("secondary-shift-i", ShowAgent, None),
+        KeyBinding::new("f5", DebugStart, None),
+        KeyBinding::new("shift-f5", DebugStop, None),
+        KeyBinding::new("f10", DebugStepOver, None),
+        KeyBinding::new("f11", DebugStepIn, None),
+        KeyBinding::new("shift-f11", DebugStepOut, None),
         KeyBinding::new(
             "secondary-i",
             ShowInlineEdit,
@@ -145,6 +156,15 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 const SIDEBAR_WIDTH: f32 = 330.;
+
+/// The bottom dock's tab in front.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockView {
+    Terminal,
+    Results,
+    Response,
+    Debug,
+}
 const CHAT_WIDTH: f32 = 380.;
 const TITLEBAR_HEIGHT: f32 = 38.;
 const TAB_BAR_HEIGHT: f32 = 34.;
@@ -233,14 +253,16 @@ pub struct Workspace {
     results: Entity<ResultsView>,
     /// The Results tab is in the dock (a query has run and it was not closed).
     show_results: bool,
-    /// The dock shows Results rather than a terminal.
-    results_active: bool,
+    /// What the dock shows: the active terminal or one of its other tabs.
+    dock_view: DockView,
     /// The last HTTP response, the dock's Response tab.
     response: Entity<crate::response::ResponseView>,
     show_response: bool,
+    debug: Entity<crate::debug::DebugStore>,
+    debug_panel: Entity<crate::debug_panel::DebugPanel>,
+    show_debug: bool,
     /// Scratch queries and the requests file; tests point it elsewhere.
     scratch_dir: PathBuf,
-    response_active: bool,
     /// A query file waiting for detection before it can run (`true`) or
     /// pick its connection (`false`).
     pending_query: Option<(PathBuf, bool)>,
@@ -275,6 +297,9 @@ impl Workspace {
         let database = cx.new(|_| DatabaseStore::new(root.clone()));
         let database_panel = cx.new(|cx| DatabasePanel::new(database.clone(), cx));
         let api_panel = cx.new(|cx| crate::api_panel::ApiPanel::new(root.clone(), cx));
+        let debug = crate::debug::DebugStore::global(cx);
+        let debug_panel =
+            cx.new(|cx| crate::debug_panel::DebugPanel::new(debug.clone(), root.clone(), cx));
         let ai_store = crate::ai_store::AiStore::global(cx);
         ai_store.update(cx, |s, _| s.add_root(root.clone()));
         let ai_panel = cx.new(|cx| crate::ai_panel::AiPanel::new(ai_store.clone(), cx));
@@ -288,6 +313,42 @@ impl Workspace {
         let project_search = cx.new(|cx| ProjectSearch::new(root, window, cx));
         let search_bar = cx.new(|cx| BufferSearchBar::new(window, cx));
         let subscriptions = vec![
+            cx.subscribe_in(&debug, window, |this, _, event, window, cx| match event {
+                crate::debug::DebugEvent::Paused(path, line) => {
+                    // The window whose project holds the file shows it.
+                    if path.starts_with(this.root(cx)) {
+                        this.show_debug = true;
+                        this.dock_view = DockView::Debug;
+                        this.dock_open = true;
+                        this.open_path(
+                            path.clone(),
+                            Some(Jump::Point {
+                                row: line.saturating_sub(1) as usize,
+                                column: 0,
+                            }),
+                            window,
+                            cx,
+                        );
+                        // A browser being debugged covers the editor; a
+                        // pause brings it back in front.
+                        cx.activate(true);
+                        window.activate_window();
+                    }
+                }
+                crate::debug::DebugEvent::Reveal(path, line) => {
+                    if path.starts_with(this.root(cx)) {
+                        this.open_path(
+                            path.clone(),
+                            Some(Jump::Point {
+                                row: line.saturating_sub(1) as usize,
+                                column: 0,
+                            }),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            }),
             cx.subscribe_in(
                 &project_panel,
                 window,
@@ -368,8 +429,7 @@ impl Workspace {
                         this.results
                             .update(cx, |r, cx| r.browse(connection, engine, spec, cx));
                         this.show_results = true;
-                        this.results_active = true;
-                        this.response_active = false;
+                        this.dock_view = DockView::Results;
                         this.dock_open = true;
                         cx.notify();
                     }
@@ -392,8 +452,7 @@ impl Workspace {
                                 workspace
                                     .update(cx, |ws, cx| {
                                         ws.show_results = true;
-                                        ws.results_active = true;
-                                        ws.response_active = false;
+                                        ws.dock_view = DockView::Results;
                                         ws.dock_open = true;
                                         cx.notify();
                                     })
@@ -564,11 +623,13 @@ impl Workspace {
             inline_edit: None,
             results,
             show_results: false,
-            results_active: false,
+            dock_view: DockView::Terminal,
             response,
             show_response: false,
+            debug,
+            debug_panel,
+            show_debug: false,
             scratch_dir: settings::config_dir().join("scratch"),
-            response_active: false,
             pending_query: None,
             structure: None,
             erd: None,
@@ -1300,8 +1361,7 @@ impl Workspace {
         );
         self.terminals.push((terminal.clone(), subscription));
         self.active_terminal = self.terminals.len() - 1;
-        self.results_active = false;
-        self.response_active = false;
+        self.dock_view = DockView::Terminal;
         self.dock_open = true;
         if focus {
             window.focus(&terminal.focus_handle(cx));
@@ -1341,8 +1401,7 @@ impl Workspace {
     ) {
         if let Some(ix) = self.terminals.iter().position(|(t, _)| t == terminal) {
             self.active_terminal = ix;
-            self.results_active = false;
-            self.response_active = false;
+            self.dock_view = DockView::Terminal;
             self.dock_open = true;
             window.focus(&terminal.focus_handle(cx));
             cx.notify();
@@ -1397,8 +1456,7 @@ impl Workspace {
         self.results
             .update(cx, |r, cx| r.run(connection, query, cx));
         self.show_results = true;
-        self.results_active = true;
-        self.response_active = false;
+        self.dock_view = DockView::Results;
         self.dock_open = true;
         if focus {
             window.focus(&self.results.focus_handle(cx));
@@ -1642,8 +1700,7 @@ impl Workspace {
                         this.results
                             .update(cx, |r, cx| r.browse(connection, engine, spec, cx));
                         this.show_results = true;
-                        this.results_active = true;
-                        this.response_active = false;
+                        this.dock_view = DockView::Results;
                         this.dock_open = true;
                         cx.notify();
                     }
@@ -1932,8 +1989,7 @@ impl Workspace {
             cx.notify();
         });
         self.show_response = true;
-        self.response_active = true;
-        self.results_active = false;
+        self.dock_view = DockView::Response;
         self.dock_open = true;
         cx.notify();
     }
@@ -2080,12 +2136,130 @@ impl Workspace {
         .detach();
     }
 
+    /// The tab in front once another closes.
+    fn fallback_dock_view(&self) -> DockView {
+        if self.show_debug {
+            DockView::Debug
+        } else if self.show_results {
+            DockView::Results
+        } else if self.show_response {
+            DockView::Response
+        } else {
+            DockView::Terminal
+        }
+    }
+
+    fn dock_has_tabs(&self) -> bool {
+        !self.terminals.is_empty() || self.show_results || self.show_response || self.show_debug
+    }
+
+    // ---------------------------------------------------------------- debug
+
+    /// The Debug tab in front, with what can be debugged read again for the
+    /// file in front; `start` then runs the chosen configuration.
+    fn show_debug_tab(&mut self, start: bool, cx: &mut Context<Self>) {
+        let file = self
+            .active_editor()
+            .and_then(|e| e.read(cx).path(cx).map(Path::to_path_buf));
+        self.debug_panel
+            .update(cx, |p, cx| p.refresh_configs(file, start, cx));
+        self.show_debug = true;
+        self.dock_view = DockView::Debug;
+        self.dock_open = true;
+        cx.notify();
+    }
+
+    /// F5: start what is chosen (the file in front first), or continue.
+    fn debug_start(&mut self, _: &DebugStart, _: &mut Window, cx: &mut Context<Self>) {
+        if self.debug.read(cx).state.active() {
+            self.debug_panel.update(cx, |p, cx| p.start_or_continue(cx));
+            return;
+        }
+        self.show_debug_tab(true, cx);
+    }
+
+    fn debug_pick(&mut self, _: &DebugPick, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_debug_tab(false, cx);
+        self.debug_panel.update(cx, |p, cx| p.toggle_picker(cx));
+    }
+
+    fn debug_stop(&mut self, _: &DebugStop, _: &mut Window, cx: &mut Context<Self>) {
+        self.debug.update(cx, |s, cx| s.stop(cx));
+    }
+
+    fn debug_over(&mut self, _: &DebugStepOver, _: &mut Window, cx: &mut Context<Self>) {
+        self.debug.update(cx, |s, cx| s.step_over(cx));
+    }
+
+    fn debug_in(&mut self, _: &DebugStepIn, _: &mut Window, cx: &mut Context<Self>) {
+        self.debug.update(cx, |s, cx| s.step_in(cx));
+    }
+
+    fn debug_out(&mut self, _: &DebugStepOut, _: &mut Window, cx: &mut Context<Self>) {
+        self.debug.update(cx, |s, cx| s.step_out(cx));
+    }
+
+    fn close_debug(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_debug = false;
+        self.dock_view = self.fallback_dock_view();
+        if !self.dock_has_tabs() {
+            self.dock_open = false;
+        }
+        let _ = window;
+        cx.notify();
+    }
+
+    fn render_debug_tab(
+        &self,
+        theme: &crate::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.dock_view == DockView::Debug;
+        let paused = self.debug.read(cx).state == crate::debug::State::Paused;
+        div()
+            .id("debug-tab")
+            .debug_selector(|| "debug-tab".into())
+            .h(px(24.))
+            .pl_2p5()
+            .pr_1()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .rounded(px(8.))
+            .text_size(UI_FONT_SIZE)
+            .text_color(if active { theme.fg } else { theme.fg_subtle })
+            .when(active, |d| d.bg(theme.bg_elev))
+            .hover(|d| d.text_color(theme.fg))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.dock_view = DockView::Debug;
+                cx.notify();
+            }))
+            .when(paused, |d| {
+                d.child(div().size(px(6.)).rounded(px(3.)).bg(theme.warning))
+            })
+            .child("Debug")
+            .child(
+                div()
+                    .id("debug-close")
+                    .size(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .hover(|d| d.bg(theme.line))
+                    .child("×")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_debug(window, cx);
+                    })),
+            )
+    }
+
     fn close_response(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let was_focused = self.response.focus_handle(cx).contains_focused(window, cx);
         self.show_response = false;
-        self.response_active = false;
-        self.results_active = self.show_results;
-        if self.terminals.is_empty() && !self.show_results {
+        self.dock_view = self.fallback_dock_view();
+        if !self.dock_has_tabs() {
             self.dock_open = false;
         }
         if was_focused {
@@ -2102,8 +2276,7 @@ impl Workspace {
     pub fn send_request(&mut self, request: rest::Request, cx: &mut Context<Self>) {
         self.response.update(cx, |r, cx| r.send(request, cx));
         self.show_response = true;
-        self.response_active = true;
-        self.results_active = false;
+        self.dock_view = DockView::Response;
         self.dock_open = true;
         cx.notify();
     }
@@ -2129,9 +2302,8 @@ impl Workspace {
     fn close_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let was_focused = self.results.focus_handle(cx).contains_focused(window, cx);
         self.show_results = false;
-        self.results_active = false;
-        self.response_active = self.show_response;
-        if self.terminals.is_empty() && !self.show_response {
+        self.dock_view = self.fallback_dock_view();
+        if !self.dock_has_tabs() {
             self.dock_open = false;
         }
         if was_focused {
@@ -2159,9 +2331,8 @@ impl Workspace {
         let was_focused = terminal.focus_handle(cx).contains_focused(window, cx);
         drop(self.terminals.remove(ix));
         if self.terminals.is_empty() {
-            self.dock_open = self.dock_open && (self.show_results || self.show_response);
-            self.results_active = self.show_results;
-            self.response_active = !self.show_results && self.show_response;
+            self.dock_open = self.dock_open && self.dock_has_tabs();
+            self.dock_view = self.fallback_dock_view();
             self.active_terminal = 0;
         } else {
             self.active_terminal = self.active_terminal.min(self.terminals.len() - 1);
@@ -2171,8 +2342,12 @@ impl Workspace {
                 self.terminals.get(self.active_terminal),
                 self.active_editor(),
             ) {
-                _ if self.results_active => window.focus(&self.results.focus_handle(cx)),
-                _ if self.response_active => window.focus(&self.response.focus_handle(cx)),
+                _ if self.dock_view == DockView::Results => {
+                    window.focus(&self.results.focus_handle(cx))
+                }
+                _ if self.dock_view == DockView::Response => {
+                    window.focus(&self.response.focus_handle(cx))
+                }
                 (Some((t, _)), _) => window.focus(&t.focus_handle(cx)),
                 (None, Some(e)) => window.focus(&e.focus_handle(cx)),
                 (None, None) => window.focus(&self.focus_handle),
@@ -2200,8 +2375,7 @@ impl Workspace {
             }
             Some(t)
                 if self.dock_open
-                    && !self.results_active
-                    && !self.response_active
+                    && self.dock_view == DockView::Terminal
                     && t.focus_handle(cx).contains_focused(window, cx) =>
             {
                 self.dock_open = false;
@@ -2212,8 +2386,7 @@ impl Workspace {
             }
             Some(t) => {
                 self.dock_open = true;
-                self.results_active = false;
-                self.response_active = false;
+                self.dock_view = DockView::Terminal;
                 window.focus(&t.focus_handle(cx));
                 cx.notify();
             }
@@ -2232,8 +2405,7 @@ impl Workspace {
             .iter()
             .enumerate()
             .map(|(ix, (terminal, _))| {
-                let active =
-                    ix == self.active_terminal && !self.results_active && !self.response_active;
+                let active = ix == self.active_terminal && self.dock_view == DockView::Terminal;
                 let close = terminal.clone();
                 div()
                     .id(("terminal-tab", ix))
@@ -2250,8 +2422,7 @@ impl Workspace {
                     .hover(|d| d.text_color(theme.fg))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.active_terminal = ix;
-                        this.results_active = false;
-                        this.response_active = false;
+                        this.dock_view = DockView::Terminal;
                         if let Some((t, _)) = this.terminals.get(ix) {
                             window.focus(&t.focus_handle(cx));
                         }
@@ -2301,6 +2472,9 @@ impl Workspace {
                     .bg(theme.bg_sunken)
                     .border_b_1()
                     .border_color(theme.line)
+                    .when(self.show_debug, |d| {
+                        d.child(self.render_debug_tab(&theme, cx))
+                    })
                     .when(self.show_response, |d| {
                         d.child(self.render_response_tab(&theme, cx))
                     })
@@ -2325,9 +2499,11 @@ impl Workspace {
                     ),
             )
             .child(div().flex_1().min_h_0().map(|d| {
-                if self.response_active {
+                if self.dock_view == DockView::Debug {
+                    d.child(self.debug_panel.clone())
+                } else if self.dock_view == DockView::Response {
                     d.child(self.response.clone())
-                } else if self.results_active {
+                } else if self.dock_view == DockView::Results {
                     d.child(self.results.clone())
                 } else {
                     d.children(
@@ -2344,7 +2520,7 @@ impl Workspace {
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active = self.results_active;
+        let active = self.dock_view == DockView::Results;
         div()
             .id("results-tab")
             .h(px(24.))
@@ -2359,8 +2535,7 @@ impl Workspace {
             .when(active, |d| d.bg(theme.bg_elev))
             .hover(|d| d.text_color(theme.fg))
             .on_click(cx.listener(|this, _, window, cx| {
-                this.results_active = true;
-                this.response_active = false;
+                this.dock_view = DockView::Results;
                 window.focus(&this.results.focus_handle(cx));
                 cx.notify();
             }))
@@ -2387,7 +2562,7 @@ impl Workspace {
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active = self.response_active;
+        let active = self.dock_view == DockView::Response;
         div()
             .id("response-tab")
             .h(px(24.))
@@ -2402,8 +2577,7 @@ impl Workspace {
             .when(active, |d| d.bg(theme.bg_elev))
             .hover(|d| d.text_color(theme.fg))
             .on_click(cx.listener(|this, _, window, cx| {
-                this.response_active = true;
-                this.results_active = false;
+                this.dock_view = DockView::Response;
                 window.focus(&this.response.focus_handle(cx));
                 cx.notify();
             }))
@@ -3383,6 +3557,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_ai))
             .on_action(cx.listener(Self::toggle_chat))
             .on_action(cx.listener(Self::show_agent))
+            .on_action(cx.listener(Self::debug_start))
+            .on_action(cx.listener(Self::debug_pick))
+            .on_action(cx.listener(Self::debug_stop))
+            .on_action(cx.listener(Self::debug_over))
+            .on_action(cx.listener(Self::debug_in))
+            .on_action(cx.listener(Self::debug_out))
             .on_action(cx.listener(Self::show_inline_edit))
             .on_action(cx.listener(Self::open_requests))
             .on_action(cx.listener(Self::import_openapi))
@@ -3497,11 +3677,9 @@ impl Render for Workspace {
                         )
                     }),
             )
-            .when(
-                self.dock_open
-                    && (!self.terminals.is_empty() || self.show_results || self.show_response),
-                |d| d.child(self.render_dock(cx)),
-            )
+            .when(self.dock_open && self.dock_has_tabs(), |d| {
+                d.child(self.render_dock(cx))
+            })
             .child(self.render_status(cx))
             .children(self.modal.as_ref().map(|modal| {
                 deferred(
@@ -5289,8 +5467,7 @@ mod tests {
         // As opening it from the Database tab does: show the Results tab.
         ws.update(cx, |ws, cx| {
             ws.show_results = true;
-            ws.results_active = true;
-            ws.response_active = false;
+            ws.dock_view = DockView::Results;
             ws.dock_open = true;
             cx.notify();
         });
@@ -5426,7 +5603,7 @@ mod tests {
         );
         cx.read(|cx| {
             let ws = ws.read(cx);
-            assert!(ws.dock_open && ws.show_results && ws.results_active);
+            assert!(ws.dock_open && ws.show_results && ws.dock_view == DockView::Results);
         });
 
         cx.update(|window, cx| window.focus(&results.focus_handle(cx)));
@@ -5555,7 +5732,7 @@ mod tests {
         assert_eq!(json["method"], "POST");
         assert_eq!(json["path"], "/users");
         assert_eq!(json["body"], "{\"name\": \"Ada\"}");
-        assert!(cx.read(|cx| ws.read(cx).response_active && ws.read(cx).dock_open));
+        assert!(cx.read(|cx| ws.read(cx).dock_view == DockView::Response && ws.read(cx).dock_open));
 
         // A request that names a variable nobody defines says which one.
         let editor_text = active_text(&ws, cx);
@@ -7799,5 +7976,183 @@ mod tests {
         cx.dispatch_action(crate::git_panel::ReviewAndPush);
         wait_for(cx, "the second push", &|cx| ws.read(cx).pushes == 2);
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    // ------------------------------------------------------------ debugger
+
+    /// A project with `app.js` and the debugger on `mock_dap.py`.
+    fn debug_setup<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+    ) -> (
+        PathBuf,
+        Entity<crate::debug::DebugStore>,
+        Entity<Workspace>,
+        &'a mut VisualTestContext,
+    ) {
+        let root = db::testing::dir(&format!("ws-{name}"))
+            .canonicalize()
+            .unwrap();
+        std::fs::write(
+            root.join("app.js"),
+            "function add(a, b) {\n  const sum = a + b;\n  return sum;\n}\nconsole.log(add(2, 3));\n",
+        )
+        .unwrap();
+        cx.executor().allow_parking();
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_dap.py");
+        let data = root.join("data");
+        let store = cx.update(|cx| {
+            let store = cx.new(|_| {
+                crate::debug::DebugStore::new(
+                    data,
+                    crate::debug::AdapterSpec::Command {
+                        program: "python3".into(),
+                        args: vec![fixture.display().to_string()],
+                    },
+                )
+            });
+            crate::debug::DebugStore::set_global(store.clone(), cx);
+            store
+        });
+        let (ws, cx) = setup(cx, root.clone());
+        let app = root.join("app.js");
+        ws.update_in(cx, |w, window, cx| w.open_path(app, None, window, cx));
+        wait_for(cx, "app.js", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|e| e.read(cx).layout.is_some())
+        });
+        (root, store, ws, cx)
+    }
+
+    fn paused_line(store: &Entity<crate::debug::DebugStore>, cx: &App) -> Option<u32> {
+        store.read(cx).paused.as_ref()?.frame().map(|f| f.line)
+    }
+
+    #[gpui::test]
+    fn debugger_stops_steps_evaluates_and_records_queries(cx: &mut TestAppContext) {
+        let (root, store, ws, cx) = debug_setup(cx, "debug-flow");
+        let app = root.join("app.js");
+        // A click on line 3's number sets a breakpoint and a second clears
+        // it; F9 sets one on the cursor's line.
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let (left, top, line_height) = cx.read(|cx| {
+            let layout = editor.read(cx).layout.as_ref().unwrap();
+            (
+                layout.bounds.left(),
+                layout.bounds.top(),
+                layout.line_height,
+            )
+        });
+        let line_3 = gpui::point(left + px(4.), top + line_height * 2.5);
+        cx.simulate_click(line_3, gpui::Modifiers::default());
+        let lines = |cx: &mut VisualTestContext| {
+            cx.read(|cx| {
+                store
+                    .read(cx)
+                    .lines(&app)
+                    .map(|l| l.keys().copied().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+        };
+        assert_eq!(lines(cx), [3]);
+        cx.simulate_click(line_3, gpui::Modifiers::default());
+        assert!(lines(cx).is_empty());
+        cx.simulate_keystrokes("down f9");
+        assert_eq!(lines(cx), [2]);
+
+        // F5 runs the open file and stops on the breakpoint, verified.
+        cx.simulate_keystrokes("f5");
+        wait_for(cx, "the pause", &|cx| paused_line(&store, cx) == Some(2));
+        assert_eq!(
+            cx.read(|cx| store.read(cx).lines(&app).cloned()),
+            Some([(2, true)].into())
+        );
+        assert_eq!(cx.read(|cx| ws.read(cx).dock_view), DockView::Debug);
+        assert_eq!(active_path(&ws, cx), Some(app.clone()));
+
+        // Variables, and an object opened one level.
+        wait_for(cx, "the variables", &|cx| {
+            store
+                .read(cx)
+                .children
+                .get(&10)
+                .is_some_and(|v| v.len() == 2)
+        });
+        let user = cx.debug_bounds("debug-var-2").expect("the user row");
+        cx.simulate_click(user.center(), gpui::Modifiers::default());
+        wait_for(cx, "the user's fields", &|cx| {
+            store
+                .read(cx)
+                .children
+                .get(&11)
+                .is_some_and(|v| v[0].name == "name")
+        });
+
+        // The console runs an expression in the paused frame.
+        let input = cx.read(|cx| ws.read(cx).debug_panel.read(cx).input());
+        cx.update(|window, cx| window.focus(&input.focus_handle(cx)));
+        cx.simulate_input("a + 1");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the answer", &|cx| {
+            store
+                .read(cx)
+                .console
+                .iter()
+                .any(|l| l.text == "seen a + 1")
+        });
+
+        // F10 steps a line, F5 runs to the end.
+        cx.simulate_keystrokes("f10");
+        wait_for(cx, "the step", &|cx| paused_line(&store, cx) == Some(3));
+        cx.simulate_keystrokes("f5");
+        wait_for(cx, "the end", &|cx| !store.read(cx).state.active());
+        assert!(cx.read(|cx| store.read(cx).console.iter().any(|l| l.text == "done")));
+
+        // The query the program ran, and a click on it opens where.
+        wait_for(cx, "the timeline", &|cx| store.read(cx).timeline.len() == 1);
+        let tab = cx
+            .debug_bounds("debug-timeline-tab")
+            .expect("the timeline tab");
+        cx.simulate_click(tab.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let row = cx.debug_bounds("debug-timeline-0").expect("the query row");
+        editor.update_in(cx, |e, _, cx| e.select_range(0..0, cx));
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| editor.read(cx).cursor_position(cx).0), 2);
+    }
+
+    #[gpui::test]
+    fn a_server_run_opens_its_browser_and_stop_ends_both(cx: &mut TestAppContext) {
+        let (root, store, _ws, cx) = debug_setup(cx, "debug-browser");
+        let app = root.join("app.js");
+        store.update(cx, |s, cx| s.toggle(&app, 2, cx));
+        let config = crate::debug_launch::LaunchConfig {
+            name: "npm run dev + browser".into(),
+            request: serde_json::json!({
+                "type": "pwa-node",
+                "request": "launch",
+                "program": app,
+                "env": {},
+            }),
+            browser: Some("http://localhost:4123".into()),
+        };
+        store.update(cx, |s, cx| s.start(config, root.clone(), cx));
+        // The server says where it listens; the page opens in a browser
+        // session of the same run, named for what it is.
+        wait_for(cx, "the browser session", &|cx| {
+            let sessions = &store.read(cx).sessions;
+            sessions.iter().filter(|s| s.name == "Browser").count() == 2
+        });
+        wait_for(cx, "the server's pause", &|cx| {
+            paused_line(&store, cx) == Some(2)
+        });
+        cx.simulate_keystrokes("shift-f5");
+        cx.run_until_parked();
+        let s = cx.read(|cx| store.read(cx).sessions.len());
+        assert_eq!(s, 0);
+        assert!(cx.read(|cx| !store.read(cx).state.active()));
+        assert!(cx.read(|cx| store.read(cx).paused.is_none()));
     }
 }

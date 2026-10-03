@@ -83,6 +83,33 @@ Containers are listed below the services when a Docker runtime is running: Docke
 Desktop, OrbStack or Colima. Solder uses the `docker` CLI and its current context,
 and finds OrbStack's CLI in `~/.orbstack/bin` even without the `/usr/local/bin` links.
 
+## Debugging
+
+Click a line number (or press `F9`) to set a breakpoint, then `F5`. The Debug
+tab in the bottom dock lists what can run: the open JavaScript or TypeScript file
+with Node, and every `package.json` script with the package manager its lockfile
+implies (scripts in subfolders are named after them, like `api: pnpm run start`).
+A Next.js `dev` script also comes as **+ browser**: the server runs under the
+debugger and, once it prints its address, the page opens in Chrome in the same
+session, so breakpoints stop in server and page code alike. Chrome gets a
+profile of its own in the app's data folder, kept between runs; your usual
+profile is never touched.
+
+The first run downloads Microsoft's js-debug (pinned version, SHA-256 checked,
+1.2 MB) into the app's data folder; Node itself is the one on your machine. When
+it stops, the editor opens the file at the line and comes to the front, the call
+stack and variables show next to the console, and an expression typed in the
+console runs in the paused frame. `F5` continues, `F10` steps over, `F11` into,
+`shift-F11` out, `shift-F5` stops everything the run started, including the
+browser.
+
+**Timeline** next to the console lists what the Node program did: requests it
+served and sent (`http`, `https`, `fetch`) and the SQL it ran through `pg` and
+`mysql2`, in the order they began, with status, rows and time. Queries and calls
+made while serving a request sit under it, and each row opens the line of your
+code that made it. A small script loaded with `--require` records them; a dev
+server's own assets (`/_next/`) are left out.
+
 ## Databases
 
 Open the Database tab with `ctrl-shift-d`. Solder lists the databases it finds:

@@ -92,6 +92,7 @@ actions!(
         NextConflict,
         AcceptGhost,
         DismissGhost,
+        ToggleBreakpoint,
     ]
 );
 
@@ -169,6 +170,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-k 2", AcceptTheirs, full),
         KeyBinding::new("secondary-k 3", AcceptBoth, full),
         KeyBinding::new("secondary-k n", NextConflict, full),
+        KeyBinding::new("f9", ToggleBreakpoint, full),
     ]);
     // After the editor's own Tab and Escape, so these win while a suggestion
     // shows.
@@ -707,6 +709,21 @@ impl Editor {
         let origin = cx.entity_id();
         self.document
             .update(cx, |d, cx| d.edit(edits, before, Some(origin), cx));
+    }
+
+    fn toggle_breakpoint_at(&mut self, row: usize, cx: &mut Context<Self>) {
+        let Some(path) = self.path(cx).map(Path::to_path_buf) else {
+            return;
+        };
+        let store = crate::debug::DebugStore::global(cx);
+        store.update(cx, |s, cx| s.toggle(&path, row as u32 + 1, cx));
+        cx.notify();
+    }
+
+    fn toggle_breakpoint(&mut self, _: &ToggleBreakpoint, _: &mut Window, cx: &mut Context<Self>) {
+        let head = self.newest_range().end;
+        let row = self.buf(cx).offset_to_point(head).row;
+        self.toggle_breakpoint_at(row, cx);
     }
 
     pub fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -1511,6 +1528,16 @@ impl Editor {
     ) {
         window.focus(&self.focus_handle);
         self.hide_popovers(cx);
+        // A click on a line number sets or clears a breakpoint there.
+        if !self.is_single_line()
+            && let Some(layout) = &self.layout
+            && event.position.x < layout.text_left
+            && event.position.x >= layout.bounds.left()
+        {
+            let row = layout.row_at(self.buf(cx), self.scroll, event.position.y);
+            self.toggle_breakpoint_at(row, cx);
+            return;
+        }
         let Some(offset) = self.offset_at(event.position, cx) else {
             return;
         };
@@ -1751,6 +1778,7 @@ impl Render for Editor {
             .when(!single_line, |d| d.size_full().bg(cx.theme().bg))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::accept_ghost))
+            .on_action(cx.listener(Self::toggle_breakpoint))
             .on_action(cx.listener(Self::dismiss_ghost))
             .on_action(cx.listener(Self::move_left))
             .on_action(cx.listener(Self::move_right))

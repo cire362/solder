@@ -1479,6 +1479,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
+name = "dap"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "parking_lot",
+ "serde_json",
+]
+
+[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6447,6 +6456,7 @@ version = "0.1.0"
 dependencies = [
  "ai",
  "alacritty_terminal",
+ "dap",
  "db",
  "dirs 7.0.0",
  "futures",

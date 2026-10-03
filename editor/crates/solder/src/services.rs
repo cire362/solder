@@ -65,7 +65,7 @@ fn skip_dir(name: &str) -> bool {
 }
 
 /// Manifests up to `depth` folders below the root, in a stable order.
-fn find_files(root: &Path, names: &[&str], depth: usize) -> Vec<PathBuf> {
+pub(crate) fn find_files(root: &Path, names: &[&str], depth: usize) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut dirs = vec![(root.to_path_buf(), 0)];
     while let Some((dir, level)) = dirs.pop() {
@@ -104,7 +104,7 @@ fn dir_name(root: &Path, dir: &Path) -> String {
 }
 
 /// The package manager a folder uses, judged by the nearest lockfile.
-fn node_manager(dir: &Path, root: &Path) -> &'static str {
+pub(crate) fn node_manager(dir: &Path, root: &Path) -> &'static str {
     for d in dir.ancestors() {
         if d.join("pnpm-lock.yaml").exists() {
             return "pnpm";
