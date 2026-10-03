@@ -23,6 +23,7 @@ regex = "1.13.1"
 ai = { path = "../ai" }
 dap = { path = "../dap" }
 import = { path = "../import" }
+extension = { path = "../extension" }
 plugin = { path = "../plugin" }
 rest = { path = "../rest" }
 serde = { version = "1.0.229", features = ["derive"] }

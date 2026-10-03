@@ -317,6 +317,7 @@ impl Editor {
             crate::lsp_store::LspStore::register(&document, cx);
         }
         crate::plugin_store::PluginStore::register(&document, cx);
+        crate::extension_store::ExtensionStore::register(&document, cx);
         Self::for_document(document, cx)
     }
 

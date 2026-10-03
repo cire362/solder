@@ -305,6 +305,45 @@ impl Document {
         }
     }
 
+    /// The names snippet files may use for the language at `offset`.
+    pub fn language_ids_at(&self, offset: usize) -> Vec<String> {
+        match &self.syntax {
+            Some(syntax) => syntax.language_at(offset).ids(),
+            None => self
+                .path
+                .as_deref()
+                .or(self.language_path.as_deref())
+                .and_then(syntax::language_for_path)
+                .map(|l| l.ids())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The set of languages changed: an extension was installed or removed.
+    /// A file that had no language may have one now, and the other way round.
+    pub fn languages_changed(&mut self, cx: &mut Context<Self>) {
+        let now = self
+            .path
+            .as_deref()
+            .or(self.language_path.as_deref())
+            .and_then(syntax::language_for_path);
+        let same = match (&self.syntax, &now) {
+            (Some(syntax), Some(language)) => Arc::ptr_eq(syntax.language(), language),
+            // Nothing parsed yet, or still parsing: start over only if there
+            // is something to parse with.
+            (None, language) => language.is_none() && self.parse_task.is_none(),
+            (Some(_), None) => false,
+        };
+        if same {
+            return;
+        }
+        self.parse_task = None;
+        self.set_syntax(None, cx);
+        self.initial_parse(cx);
+        // A language server may be waiting for this language.
+        cx.emit(DocumentEvent::PathChanged);
+    }
+
     pub fn diagnostics(&self) -> &Arc<Vec<Diagnostic>> {
         &self.diagnostics
     }

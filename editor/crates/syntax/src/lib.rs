@@ -219,6 +219,33 @@ impl Language {
             .as_ref()
     }
 
+    /// The lowercase names this language goes by elsewhere: what snippet
+    /// files and VS Code call it, and for an extension's language its
+    /// aliases and file endings.
+    pub fn ids(&self) -> Vec<String> {
+        let mut ids = vec![self.name.to_lowercase()];
+        match &self.source {
+            Source::Native { .. } => ids.extend(
+                match self.name {
+                    "TSX" => &["typescriptreact"][..],
+                    "JavaScript" => &["javascriptreact", "jsx"][..],
+                    "JSON" => &["jsonc"][..],
+                    _ => &[][..],
+                }
+                .iter()
+                .map(|id| id.to_string()),
+            ),
+            Source::Wasm(spec) => ids.extend(
+                spec.aliases
+                    .iter()
+                    .chain(&spec.suffixes)
+                    .map(|id| id.to_lowercase()),
+            ),
+        }
+        ids.dedup();
+        ids
+    }
+
     /// Whether an injection that asks for `name` (lowercase) means this
     /// language.
     fn answers_to(&self, name: &str) -> bool {
@@ -1049,6 +1076,7 @@ mod tests {
         // Vue's own query.
         assert!(spans.contains(&("template".into(), HighlightKind::Tag)));
         assert!(spans.contains(&("class".into(), HighlightKind::Attribute)));
+        assert_eq!(tree.language().ids(), ["vue.js", "vue"]);
         let at = |text: &str| tree.language_at(COMPONENT.find(text).unwrap()).name;
         assert_eq!(at("class="), "Vue.js");
         assert_eq!(at("const msg"), "TypeScript");

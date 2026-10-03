@@ -108,7 +108,6 @@ impl Extension {
             .count();
         let parts: Vec<String> = [
             count(highlighted, "language", "languages"),
-            count(self.servers.len(), "language server", "language servers"),
             count(self.themes.len(), "theme", "themes"),
             count(self.snippets.len(), "snippet file", "snippet files"),
         ]

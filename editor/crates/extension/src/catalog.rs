@@ -81,22 +81,28 @@ fn encode(query: &str) -> String {
     out
 }
 
-/// Extensions matching `query` in the catalog at `base`, most downloaded
-/// first. An empty query gives the catalog's most downloaded ones. The future
-/// can be awaited from any executor.
+/// Extensions matching `query` in the catalog at `base`, in the catalog's
+/// own order of relevance. An empty query gives the most downloaded ones.
+/// The future can be awaited from any executor.
 pub fn search(
     origin: Origin,
     base: &str,
     query: &str,
 ) -> impl Future<Output = Result<Vec<Entry>, String>> + Send + 'static {
     let base = base.trim_end_matches('/').to_string();
+    let browsing = query.trim().is_empty();
     let url = match origin {
         Origin::Zed => format!(
             "{base}/extensions?max_schema_version=1&filter={}",
             encode(query.trim())
         ),
         Origin::VsCode => format!(
-            "{base}/api/-/search?size=50&sortBy=downloadCount&sortOrder=desc&query={}",
+            "{base}/api/-/search?size=50&sortBy={}&sortOrder=desc&query={}",
+            if browsing {
+                "downloadCount"
+            } else {
+                "relevance"
+            },
             encode(query.trim())
         ),
     };
@@ -120,7 +126,13 @@ pub fn search(
         let answer: Value =
             serde_json::from_slice(&body).map_err(|_| "The catalog's answer is not JSON")?;
         Ok(match origin {
-            Origin::Zed => parse_zed(&base, &answer),
+            Origin::Zed => {
+                let mut entries = parse_zed(&base, &answer);
+                if browsing {
+                    entries.sort_by(|a, b| b.downloads.cmp(&a.downloads));
+                }
+                entries
+            }
             Origin::VsCode => parse_open_vsx(&answer),
         })
     });
@@ -142,7 +154,7 @@ fn text(value: &Value) -> String {
 }
 
 fn parse_zed(base: &str, answer: &Value) -> Vec<Entry> {
-    let mut entries: Vec<Entry> = answer["data"]
+    answer["data"]
         .as_array()
         .into_iter()
         .flatten()
@@ -169,9 +181,7 @@ fn parse_zed(base: &str, answer: &Value) -> Vec<Entry> {
                 id,
             })
         })
-        .collect();
-    entries.sort_by(|a, b| b.downloads.cmp(&a.downloads));
-    entries
+        .collect()
 }
 
 fn parse_open_vsx(answer: &Value) -> Vec<Entry> {
@@ -202,7 +212,7 @@ fn parse_open_vsx(answer: &Value) -> Vec<Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::install::testing::{Served, block, serve};
+    use crate::testing::{Served, block, serve};
 
     #[test]
     fn reads_zeds_catalog() {
@@ -220,8 +230,12 @@ mod tests {
             requests.lock().unwrap()[0],
             "/extensions?max_schema_version=1&filter=vue%20js"
         );
-        // Most downloaded first; an id that is not a plain name is dropped.
+        // The catalog's order is kept for a query; an id that is not a plain
+        // name is dropped.
         assert_eq!(found.len(), 2);
+        assert_eq!(found[0].id, "tokyo-night");
+        let found = block(search(Origin::Zed, &base, " ")).unwrap();
+        // Without one, the most downloaded come first.
         assert_eq!(found[0].id, "vue");
         assert_eq!(
             found[0].provides,
@@ -234,6 +248,10 @@ mod tests {
             )
         );
         assert_eq!(found[1].description, "A theme");
+        assert_eq!(
+            requests.lock().unwrap()[1],
+            "/extensions?max_schema_version=1&filter="
+        );
     }
 
     #[test]

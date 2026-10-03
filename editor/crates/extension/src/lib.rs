@@ -14,6 +14,7 @@ pub mod catalog;
 pub mod install;
 pub mod manifest;
 pub mod snippet;
+pub mod testing;
 
 pub use catalog::Entry;
 pub use manifest::{Code, Extension, Grammar, Language, Origin, Server, SnippetFile};

@@ -80,6 +80,7 @@ actions!(
         ShowApi,
         ShowAi,
         ShowPlugins,
+        ShowExtensions,
         ImportSettings,
         ToggleChat,
         ShowAgent,
@@ -2251,6 +2252,13 @@ impl Workspace {
         });
     }
 
+    fn show_extensions(&mut self, _: &ShowExtensions, window: &mut Window, cx: &mut Context<Self>) {
+        let store = crate::extension_store::ExtensionStore::global(cx);
+        self.toggle_modal(window, cx, move |_, cx| {
+            crate::extensions_view::ExtensionsView::new(store, cx)
+        });
+    }
+
     /// F5: start what is chosen (the file in front first), or continue.
     fn debug_start(&mut self, _: &DebugStart, _: &mut Window, cx: &mut Context<Self>) {
         if self.debug.read(cx).state.active() {
@@ -3669,6 +3677,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_chat))
             .on_action(cx.listener(Self::show_agent))
             .on_action(cx.listener(Self::show_plugins))
+            .on_action(cx.listener(Self::show_extensions))
             .on_action(cx.listener(Self::import_settings))
             .on_action(cx.listener(Self::debug_start))
             .on_action(cx.listener(Self::debug_pick))
@@ -8777,6 +8786,255 @@ mod tests {
         assert_eq!(
             cx.read(|cx| plugin_status(&store, "word-count-go", cx)),
             None
+        );
+    }
+
+    // ----------------------------------------------------------- extensions
+
+    use crate::extension_store::ExtensionStore;
+    use extension::{
+        Origin,
+        testing::{Served, serve, tar, write as write_file, zip},
+    };
+
+    /// A store that keeps extensions in a fresh folder and asks the catalogs
+    /// at `base`, a project with `App.vue` open, and the window.
+    fn extension_setup<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+        base: &str,
+    ) -> (
+        PathBuf,
+        Entity<ExtensionStore>,
+        Entity<Workspace>,
+        &'a mut VisualTestContext,
+    ) {
+        let root = db::testing::dir(&format!("ws-{name}"))
+            .canonicalize()
+            .unwrap();
+        let component = "<template>\n  <p>{{ msg }}</p>\n</template>\n<script setup lang=\"ts\">\nconst msg = 'hi'\n</script>\n";
+        std::fs::write(root.join("App.vue"), component).unwrap();
+        let data = db::testing::dir(&format!("ws-{name}-data"));
+        let config = db::testing::dir(&format!("ws-{name}-config"));
+        cx.executor().allow_parking();
+        let store = cx.update(|cx| {
+            let store = cx.new(|_| {
+                let mut store = ExtensionStore::new(data.join("extensions"), config.clone());
+                store.zed_url = base.to_string();
+                store.open_vsx_url = base.to_string();
+                store
+            });
+            ExtensionStore::set_global(store.clone(), cx);
+            store.update(cx, |s, cx| s.scan(cx));
+            store
+        });
+        let (ws, cx) = setup(cx, root.clone());
+        let file = root.join("App.vue");
+        ws.update_in(cx, |w, window, cx| w.open_path(file, None, window, cx));
+        wait_for(cx, "the extensions folder", &|cx| {
+            store.read(cx).loaded && ws.read(cx).active_editor().is_some()
+        });
+        (config, store, ws, cx)
+    }
+
+    /// Zed's Vue extension as its catalog serves it: the real grammar and
+    /// queries, plus a theme and a snippet file.
+    fn vue_archive(name: &str) -> Vec<u8> {
+        let dir = db::testing::dir(&format!("ws-{name}-archive")).join("vue");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../syntax/tests/fixtures/vue");
+        write_file(
+            &dir.join("extension.toml"),
+            "id = \"vue\"\nname = \"Vue\"\nversion = \"0.4.0\"\nschema_version = 1\ndescription = \"Vue support.\"\n",
+        );
+        write_file(
+            &dir.join("languages/vue/config.toml"),
+            "name = \"Vue.js\"\ngrammar = \"vue\"\npath_suffixes = [\"vue\"]\ncode_fence_block_name = \"vue\"\n",
+        );
+        for query in ["highlights.scm", "injections.scm"] {
+            std::fs::copy(fixtures.join(query), dir.join("languages/vue").join(query)).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("grammars")).unwrap();
+        std::fs::copy(fixtures.join("vue.wasm"), dir.join("grammars/vue.wasm")).unwrap();
+        write_file(&dir.join("themes/demo.json"), extension::testing::ZED_THEME);
+        write_file(
+            &dir.join("snippets/vue.json"),
+            r#"{"Base": {"prefix": "vbase", "body": ["<section>", "\t${1:$TM_FILENAME_BASE}", "</section>"], "description": "A section"}}"#,
+        );
+        tar(&dir)
+    }
+
+    fn click(cx: &mut VisualTestContext, selector: &'static str) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("no {selector} on screen"));
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_zed_extension_installs_from_the_catalog_and_works(cx: &mut TestAppContext) {
+        let catalog = r#"{"data":[{"id":"vue","name":"Vue","version":"0.4.0","description":"Vue support.","download_count":675263,"provides":["languages","grammars","language-servers"]}]}"#;
+        let (base, requests) = serve(vec![
+            ("/extensions", Served::ok(catalog.as_bytes().to_vec())),
+            (
+                "/extensions/vue/download",
+                Served::ok(vue_archive("ext-zed")),
+            ),
+        ]);
+        let (config, store, ws, cx) = extension_setup(cx, "ext-zed", &base);
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let language = |cx: &App| editor.read(cx).doc(cx).language_name();
+        // Nothing installed: the file is plain text.
+        assert_eq!(cx.read(|cx| language(cx)), None);
+
+        cx.dispatch_action(ShowExtensions);
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        assert!(cx.debug_bounds("extension-0").is_none());
+        // The catalog is asked only when its tab is opened.
+        assert!(requests.lock().unwrap().is_empty());
+        click(cx, "extensions-zed");
+        wait_for(cx, "the catalog", &|cx| {
+            !store.read(cx).catalog(Origin::Zed).entries.is_empty()
+        });
+        cx.run_until_parked();
+        click(cx, "extension-act-0");
+        wait_for(cx, "the install", &|cx| {
+            store.read(cx).find(Origin::Zed, "vue").is_some()
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+
+        // The file that was already open is now Vue, with its script
+        // highlighted as TypeScript.
+        wait_for(cx, "the grammar", &|cx| {
+            editor.read(cx).doc(cx).syntax().is_some()
+        });
+        assert_eq!(cx.read(|cx| language(cx)), Some("Vue.js"));
+        let spans = cx.read(|cx| {
+            let doc = editor.read(cx).doc(cx);
+            let rope = doc.text().rope();
+            let text = rope.to_string();
+            doc.syntax()
+                .unwrap()
+                .highlights(rope, 0..rope.len_bytes())
+                .into_iter()
+                .map(|(r, k)| (text[r].to_string(), k))
+                .collect::<Vec<_>>()
+        });
+        assert!(spans.contains(&("template".into(), syntax::HighlightKind::Tag)));
+        assert!(spans.contains(&("const".into(), syntax::HighlightKind::Keyword)));
+
+        // Its snippet completes, with the file's name filled in.
+        editor.update_in(cx, |e, _, cx| {
+            let end = e.text(cx).len();
+            e.select_range(end..end, cx)
+        });
+        cx.simulate_input("vba");
+        wait_for(cx, "the snippet", &|cx| {
+            editor.read(cx).completion.is_some()
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let (text, selected) = cx.read(|cx| {
+            let editor = editor.read(cx);
+            let text = editor.text(cx);
+            let range = editor.newest_range();
+            (text.clone(), text[range].to_string())
+        });
+        assert!(text.ends_with("<section>\n  App\n</section>"), "{text:?}");
+        assert_eq!(selected, "App");
+
+        // One of its themes becomes the editor's.
+        cx.dispatch_action(ShowExtensions);
+        cx.run_until_parked();
+        click(cx, "extension-theme-0");
+        wait_for(cx, "the theme", &|cx| {
+            store.read(cx).theme_status == Some(Ok("Demo Dark".into()))
+        });
+        assert_eq!(
+            cx.read(|cx| cx.global::<Settings>().theme.clone()),
+            settings::ThemeMode::Named("Demo Dark".into())
+        );
+        assert!(config.join("themes/demo-dark.json").is_file());
+
+        // Removed, the file is plain text again.
+        click(cx, "extension-act-0");
+        wait_for(cx, "the removal", &|cx| {
+            store.read(cx).loaded && store.read(cx).installed.is_empty()
+        });
+        assert_eq!(cx.read(|cx| language(cx)), None);
+        assert!(cx.read(|cx| editor.read(cx).doc(cx).syntax().is_none()));
+    }
+
+    #[gpui::test]
+    fn a_vscode_extension_says_what_does_not_run_and_points_to_zed(cx: &mut TestAppContext) {
+        let dir = db::testing::dir("ws-ext-vsx-archive");
+        extension::testing::vscode_extension(&dir.join("extension"));
+        let manifest = std::fs::read_to_string(dir.join("extension/package.json"))
+            .unwrap()
+            .replace("\"publisher\": \"Acme\"", "\"publisher\": \"Vue\"")
+            .replace("\"name\": \"demo\"", "\"name\": \"volar\"");
+        std::fs::write(dir.join("extension/package.json"), manifest).unwrap();
+        let Some(vsix) = zip(&dir, "extension") else {
+            eprintln!("skipped: no python3 to build a .vsix");
+            return;
+        };
+        // The catalog's answer names the download by its full address, so
+        // the file is served first, from a server of its own.
+        let (files, _) = serve(vec![("/volar.vsix", Served::ok(vsix))]);
+        let search = format!(
+            r#"{{"extensions":[{{"namespace":"Vue","name":"volar","displayName":"Vue (Official)","version":"3.0.1","description":"Language support for Vue","downloadCount":5200000,"files":{{"download":"{files}/volar.vsix"}}}}]}}"#
+        );
+        let (base, requests) = serve(vec![
+            ("/api/-/search", Served::ok(search.into_bytes())),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-vsx", &base);
+
+        cx.dispatch_action(ShowExtensions);
+        cx.run_until_parked();
+        click(cx, "extensions-open-vsx");
+        wait_for(cx, "the catalog", &|cx| {
+            !store.read(cx).catalog(Origin::VsCode).entries.is_empty()
+        });
+        cx.run_until_parked();
+        // Enter installs what is selected.
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the install", &|cx| {
+            store.read(cx).find(Origin::VsCode, "vue.volar").is_some()
+        });
+        let installed = cx.read(|cx| store.read(cx).find(Origin::VsCode, "Vue.volar").cloned());
+        let installed = installed.unwrap();
+        assert_eq!(installed.themes.len(), 1);
+        assert!(
+            installed
+                .missing
+                .iter()
+                .any(|m| m.contains("needs VS Code"))
+        );
+        // Its language (files ending in .dm) has no grammar here, so it is
+        // not a language of the editor. Asked of the registry and not of the
+        // open file: the registry is one per process, and the test next to
+        // this one installs Vue into it.
+        assert_eq!(installed.languages[0].suffixes, ["dm", "Demofile"]);
+        assert!(syntax::language_for_path(Path::new("notes.dm")).is_none());
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+
+        // The window points to the Zed extension for the language and
+        // searches for it.
+        cx.run_until_parked();
+        click(cx, "extension-equivalent");
+        wait_for(cx, "Zed's catalog", &|cx| {
+            store.read(cx).catalog(Origin::Zed).searched
+        });
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r == "/extensions?max_schema_version=1&filter=vue")
         );
     }
 }

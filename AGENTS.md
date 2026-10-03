@@ -104,6 +104,16 @@ Never guess a signature.
   compiled from Go) gets only what `wasi.rs` gives it: its streams, a clock
   and random numbers. Do not add files or sockets there.
 
+- Extensions of other editors are read by `crates/extension` (no GPUI) and
+  kept by `ExtensionStore` (`extension_store.rs`). A language from one is a
+  tree-sitter grammar in WebAssembly: `crates/syntax` compiles it on the
+  first file that needs it, never on the UI thread (`Language::is_ready`),
+  and parsers that run such grammars come from a pool. The network is used
+  only when the Extensions window searches or installs, and only against
+  Zed's catalog and Open VSX. An archive is unpacked in a staging folder
+  and checked before it replaces anything. Highlight queries follow the
+  rule that the last matching pattern wins.
+
 ### Performance rules
 
 The site promises cold start, memory and input latency numbers

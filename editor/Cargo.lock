@@ -6744,6 +6744,7 @@ dependencies = [
  "dap",
  "db",
  "dirs 7.0.0",
+ "extension",
  "futures",
  "gpui",
  "grep-matcher",

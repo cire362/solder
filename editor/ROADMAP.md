@@ -89,5 +89,11 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
       the same sandbox, with typings; the budget is measured in time)
 - [x] Plugins in Go (a program built for WASI, in the same sandbox, with a
       package that speaks to the editor)
+- [x] Extensions of Zed and VS Code, installed from Zed's catalog and Open VSX
+      with no service of our own: languages (grammars in WebAssembly, with the
+      languages inside them), snippets and themes; a VS Code extension gives
+      its themes and snippets and points to the Zed one for its language
+- [ ] Language servers of Zed extensions (the extension's own code, run in
+      wasmtime, gets and starts the server)
 - [ ] The plugin registry (needs the hosted service)
 - [ ] Preview environments per branch (needs the hosted service)
