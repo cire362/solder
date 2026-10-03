@@ -80,6 +80,7 @@ actions!(
         ShowApi,
         ShowAi,
         ShowPlugins,
+        ImportSettings,
         ToggleChat,
         ShowAgent,
         DebugStart,
@@ -299,6 +300,8 @@ impl Workspace {
         let database = cx.new(|_| DatabaseStore::new(root.clone()));
         let database_panel = cx.new(|cx| DatabasePanel::new(database.clone(), cx));
         let api_panel = cx.new(|cx| crate::api_panel::ApiPanel::new(root.clone(), cx));
+        #[cfg(not(test))]
+        Self::offer_import(window, cx);
         let plugins = crate::plugin_store::PluginStore::global(cx);
         let this = cx.entity().downgrade();
         plugins.update(cx, |p, cx| p.set_workspace(this, root.clone(), cx));
@@ -2185,6 +2188,62 @@ impl Workspace {
         cx.notify();
     }
 
+    fn import_settings(&mut self, _: &ImportSettings, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_import(
+            crate::import_settings::system_roots(),
+            settings::config_dir(),
+            window,
+            cx,
+        );
+    }
+
+    /// The Import window for the editors under `roots`, writing to `target`.
+    fn show_import(
+        &mut self,
+        roots: import::Roots,
+        target: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_modal(window, cx, move |_, cx| {
+            crate::import_view::ImportView::new(roots, target, cx)
+        });
+    }
+
+    /// On a first launch with another editor's settings here, shows the
+    /// Import window once. The look is off the UI thread, after the window
+    /// is up.
+    #[cfg(not(test))]
+    fn offer_import(window: &mut Window, cx: &mut Context<Self>) {
+        static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        // Once per run, and never under a benchmark, which types into the
+        // editor.
+        if ASKED.swap(true, std::sync::atomic::Ordering::Relaxed)
+            || std::env::vars_os()
+                .any(|(name, _)| name.to_string_lossy().starts_with("SOLDER_BENCH"))
+        {
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let offer = cx
+                .background_executor()
+                .spawn(async {
+                    crate::import_settings::first_launch_offer(
+                        &settings::config_dir(),
+                        &crate::import_settings::system_roots(),
+                    )
+                })
+                .await;
+            if offer {
+                this.update_in(cx, |this, window, cx| {
+                    this.import_settings(&ImportSettings, window, cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     fn show_plugins(&mut self, _: &ShowPlugins, window: &mut Window, cx: &mut Context<Self>) {
         let store = self.plugins.clone();
         self.toggle_modal(window, cx, move |_, cx| {
@@ -3610,6 +3669,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_chat))
             .on_action(cx.listener(Self::show_agent))
             .on_action(cx.listener(Self::show_plugins))
+            .on_action(cx.listener(Self::import_settings))
             .on_action(cx.listener(Self::debug_start))
             .on_action(cx.listener(Self::debug_pick))
             .on_action(cx.listener(Self::debug_stop))
@@ -8476,5 +8536,160 @@ mod tests {
             cx.read(|cx| plugin_status(&store, "probe", cx)).as_deref(),
             Some("change notes.txt")
         );
+    }
+
+    // --------------------------------------------------------------- import
+
+    /// A home folder where VS Code keeps settings, a key binding, a theme
+    /// from an extension and two other extensions.
+    fn vscode_home(name: &str) -> import::Roots {
+        let home = db::testing::dir(&format!("ws-{name}-home"));
+        for (path, text) in [
+            (
+                "Library/Application Support/Code/User/settings.json",
+                r#"{
+                  // What comes over.
+                  "editor.fontSize": 15,
+                  "editor.tabSize": 2,
+                  "editor.formatOnSave": true,
+                  "workbench.colorTheme": "Night Owl",
+                }"#,
+            ),
+            (
+                "Library/Application Support/Code/User/keybindings.json",
+                r#"[{"key": "ctrl+alt+d", "command": "editor.action.copyLinesDownAction"},
+                    {"key": "cmd+k z", "command": "workbench.action.toggleZenMode"}]"#,
+            ),
+            (
+                ".vscode/extensions/sdras.night-owl-2.0.1/package.json",
+                r#"{"contributes": {"themes": [{"label": "Night Owl", "uiTheme": "vs-dark", "path": "./owl.json"}]}}"#,
+            ),
+            (
+                ".vscode/extensions/sdras.night-owl-2.0.1/owl.json",
+                r##"{"colors": {"editor.background": "#011627", "editor.foreground": "#d6deeb"},
+                    "tokenColors": [{"scope": "keyword", "settings": {"foreground": "#c792ea"}}]}"##,
+            ),
+            (
+                ".vscode/extensions/eamodio.gitlens-15.0.0/package.json",
+                "{}",
+            ),
+        ] {
+            let path = home.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        import::Roots {
+            home,
+            bundled: Vec::new(),
+        }
+    }
+
+    #[gpui::test]
+    fn import_brings_settings_a_theme_and_keys_from_another_editor(cx: &mut TestAppContext) {
+        let root = fixture("import");
+        let roots = vscode_home("import");
+        // Solder's own config, where the user already chose a font size.
+        let config = db::testing::dir("ws-import-config");
+        std::fs::write(
+            config.join("settings.json"),
+            "// Mine.\n{\n  \"buffer_font_size\": 16\n}\n",
+        )
+        .unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(root.join("x.txt")), "one\ntwo", None, window, cx);
+            w.show_import(roots, config.clone(), window, cx)
+        });
+        let view = cx.read(|cx| {
+            let modal = ws.read(cx).modal.as_ref().expect("the Import window");
+            modal
+                .view
+                .clone()
+                .downcast::<crate::import_view::ImportView>()
+                .unwrap()
+        });
+        wait_for(cx, "the other editor", &|cx| view.read(cx).loaded());
+        cx.run_until_parked();
+
+        // Rows: SETTINGS, font size (kept: the user's own), indent, format
+        // on save, THEME, Night Owl, KEYS, VS Code keys, own bindings,
+        // ALREADY BUILT IN, gitlens. The indent is left out by a click.
+        let indent = cx.debug_bounds("import-item-2").expect("the indent row");
+        cx.simulate_click(indent.center(), gpui::Modifiers::default());
+        let apply = cx.debug_bounds("import-apply").expect("the Import button");
+        cx.simulate_click(apply.center(), gpui::Modifiers::default());
+        wait_for(cx, "the import", &|cx| view.read(cx).status().is_some());
+        let status = cx.read(|cx| view.read(cx).status().unwrap());
+        assert!(
+            status.starts_with("Imported from VS Code: 1 setting, the theme Night Owl, "),
+            "{status}"
+        );
+
+        // The user's file keeps its comment and its own value.
+        let text = std::fs::read_to_string(config.join("settings.json")).unwrap();
+        assert!(text.starts_with("// Mine.\n{"), "{text}");
+        assert!(config.join("themes/night-owl.json").is_file());
+        // The same folder, read as the app reads its config.
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        let settings = cx.read(|cx| Settings::get(cx).clone());
+        assert_eq!(settings.buffer_font_size, 16.);
+        assert_eq!(settings.indent_size, 4);
+        assert!(settings.format_on_save);
+        assert_eq!(
+            settings.theme,
+            settings::ThemeMode::Named("Night Owl".into())
+        );
+        let theme = settings.theme(gpui::WindowAppearance::Light);
+        assert_eq!(theme.bg, gpui::Hsla::from(gpui::rgb(0x011627)));
+        assert_eq!(theme.syntax.keyword, gpui::Hsla::from(gpui::rgb(0xc792ea)));
+        assert!(cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+
+        // The imported binding works; the one without an equivalent did
+        // not come.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+        cx.simulate_keystrokes("ctrl-alt-d");
+        assert_eq!(active_text(&ws, cx), "one\none\ntwo");
+        // The user's own keymap wins over what was imported.
+        std::fs::write(
+            config.join("keymap.json"),
+            r#"[{"context": "Editor && mode == full", "bindings": {"ctrl-alt-d": "editor::SelectLine"}}]"#,
+        )
+        .unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        cx.simulate_keystrokes("ctrl-alt-d backspace");
+        assert_eq!(active_text(&ws, cx), "one\ntwo");
+        // Back to the defaults for the tests that follow.
+        cx.update(|_, cx| settings::reload_from(&db::testing::dir("ws-import-none"), cx));
+    }
+
+    #[gpui::test]
+    fn every_action_an_import_binds_exists(cx: &mut TestAppContext) {
+        let (_ws, cx) = setup(cx, fixture("import-actions"));
+        for (action, context) in import::keymap::actions() {
+            cx.update(|_, cx| {
+                assert!(cx.build_action(action, None).is_ok(), "{action}");
+                if let Some(context) = context {
+                    assert!(
+                        gpui::KeyBindingContextPredicate::parse(context).is_ok(),
+                        "{context}"
+                    );
+                }
+            });
+        }
+        // The presets, as a keymap file, load without a complaint.
+        for preset in [
+            import::keymap::vscode_preset(true),
+            import::keymap::vscode_preset(false),
+            import::keymap::jetbrains_preset(true),
+            import::keymap::jetbrains_preset(false),
+        ] {
+            let text = import::keymap::to_json(&preset);
+            let (bindings, errors) = cx.update(|_, cx| settings::parse_keymap("preset", &text, cx));
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(bindings.len() > 30);
+        }
     }
 }

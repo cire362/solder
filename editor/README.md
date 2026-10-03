@@ -9,6 +9,7 @@ crates/
   db/       database connections: detection, drivers, statement splitting (no UI)
   rest/     HTTP: .http files, route detection, OpenAPI import, sending (no UI)
   ai/       local models: hardware, catalog, downloads, llama-server, benchmark (no UI)
+  import/   settings, themes and key bindings of VS Code, Cursor, Zed and JetBrains IDEs (no UI)
   plugin/   plugin host: manifest, permissions, the WebAssembly sandbox and its budget (no UI)
   plugin_sdk/  what a plugin is written against, and the messages it exchanges with the editor
   solder/   the app: GPUI window, editor element, file tree, tabs, status bar
@@ -569,6 +570,49 @@ Copy `plugin.json` and `target/wasm32-unknown-unknown/release/word_count.wasm`
 Go plugins, the registry and extensions of other editors are not there yet: VS
 Code extensions are Node programs with full access to the machine, and Zed's use
 the WebAssembly Component Model, which this interpreter does not run.
+
+## Settings from another editor
+
+On a first launch (no `~/.config/solder/settings.json` yet) Solder looks for VS
+Code, Cursor, Zed and JetBrains IDEs on the machine, off the UI thread, and
+shows **Import settings** once if it finds one. **Workspace: Import settings** in
+the command palette opens it at any time. Pick the editor, untick what should
+stay behind, and press **Import**:
+
+| | VS Code, Cursor | Zed | JetBrains |
+|---|---|---|---|
+| Font, font size, line height | yes | yes | font and size |
+| Indent (2, 4 or 8), format on save | yes | yes | |
+| Theme | from the extension that has it | from `themes` or an installed extension | |
+| The editor's own keys | **VS Code keys** | | **JetBrains keys** |
+| Bindings you changed | `keybindings.json` | `keymap.json` | `keymaps/*.xml` |
+| Extensions Solder already covers | listed, nothing is installed | | |
+
+An import only adds. A setting you already changed in Solder is shown as kept
+and left alone; the others are written into `settings.json` key by key, so your
+comments stay. Key bindings go to `keymap-imported.json`, which loads under your
+own `keymap.json`; importing again replaces that file, deleting it drops them.
+A binding whose command or condition has no equivalent here is counted, not
+guessed at.
+
+A theme becomes a file in `~/.config/solder/themes`, and `"theme"` in
+`settings.json` names it (`system`, `dark` and `light` remain). The file gives
+Solder's tokens as hex colors, so it can be edited or written by hand:
+
+```json
+{
+  "name": "Night Owl",
+  "appearance": "dark",
+  "colors": { "bg": "#011627", "fg": "#d6deeb", "accent": "#7e57c2" },
+  "syntax": { "keyword": "#c792ea", "string": "#ecc48d" }
+}
+```
+
+Tokens left out fall back to the built-in dark or light theme. From a VS Code
+theme, the workbench colors and the TextMate rules are laid over those tokens;
+what the theme does not say (or says in a way that would not read here, like a
+border in its brightest color) is worked out from its background and text.
+Snippets, Vim configs and JetBrains color schemes are not imported.
 
 ## Measured so far
 

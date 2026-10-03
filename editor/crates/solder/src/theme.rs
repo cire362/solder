@@ -5,7 +5,7 @@
 use gpui::{App, Global, Hsla, WindowAppearance, px, rgb, rgba};
 use syntax::HighlightKind;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
     pub bg: Hsla,
     pub bg_elev: Hsla,
@@ -31,7 +31,7 @@ pub struct Theme {
     pub syntax: SyntaxColors,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SyntaxColors {
     pub keyword: Hsla,
     pub string: Hsla,
@@ -134,6 +134,66 @@ impl Theme {
                 tag: rgb(0xb24a1c).into(),
             },
         }
+    }
+
+    /// A theme from `themes/<name>.json`: the built-in dark or light one
+    /// with every token the file gives laid over it.
+    pub fn from_file(file: &import::ThemeFile) -> Self {
+        let mut theme = if file.appearance == "light" {
+            Self::light()
+        } else {
+            Self::dark()
+        };
+        let color = |map: &std::collections::BTreeMap<String, String>, key: &str| {
+            let c = import::theme::Rgba::parse(map.get(key)?)?;
+            let packed = u32::from_be_bytes([c.r, c.g, c.b, c.a]);
+            Some(Hsla::from(rgba(packed)))
+        };
+        let colors: [(&str, &mut Hsla); 21] = [
+            ("bg", &mut theme.bg),
+            ("bg_elev", &mut theme.bg_elev),
+            ("bg_sunken", &mut theme.bg_sunken),
+            ("fg", &mut theme.fg),
+            ("fg_muted", &mut theme.fg_muted),
+            ("fg_subtle", &mut theme.fg_subtle),
+            ("line", &mut theme.line),
+            ("accent", &mut theme.accent),
+            ("accent_soft", &mut theme.accent_soft),
+            ("accent_fg", &mut theme.accent_fg),
+            ("selection", &mut theme.selection),
+            ("active_line", &mut theme.active_line),
+            ("search_match", &mut theme.search_match),
+            ("search_active", &mut theme.search_active),
+            ("bracket", &mut theme.bracket),
+            ("error", &mut theme.error),
+            ("warning", &mut theme.warning),
+            ("git_added", &mut theme.git_added),
+            ("git_modified", &mut theme.git_modified),
+            ("conflict_ours", &mut theme.conflict_ours),
+            ("conflict_theirs", &mut theme.conflict_theirs),
+        ];
+        for (key, slot) in colors {
+            if let Some(found) = color(&file.colors, key) {
+                *slot = found;
+            }
+        }
+        let syntax: [(&str, &mut Hsla); 9] = [
+            ("keyword", &mut theme.syntax.keyword),
+            ("string", &mut theme.syntax.string),
+            ("function", &mut theme.syntax.function),
+            ("type", &mut theme.syntax.r#type),
+            ("comment", &mut theme.syntax.comment),
+            ("number", &mut theme.syntax.number),
+            ("punctuation", &mut theme.syntax.punctuation),
+            ("variable", &mut theme.syntax.variable),
+            ("tag", &mut theme.syntax.tag),
+        ];
+        for (key, slot) in syntax {
+            if let Some(found) = color(&file.syntax, key) {
+                *slot = found;
+            }
+        }
+        theme
     }
 
     pub fn for_appearance(appearance: WindowAppearance) -> Self {

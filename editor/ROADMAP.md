@@ -81,6 +81,9 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
       (plugins in Rust against an SDK: commands, status bar, the open file, project
       files, HTTP to declared hosts; approved per module; typing work over budget is
       deferred and the plugin marked slow)
-- [ ] Plugins in TypeScript and Go; the registry
-- [ ] Import settings from VS Code, Cursor, JetBrains
+- [x] Import settings from VS Code, Cursor, JetBrains
+      (and Zed: font, indent, format on save; themes from VS Code and Zed theme
+      files, kept in `themes`; the editors' own keys and the bindings a user
+      changed; offered once on a first launch; an import only adds)
+- [ ] Plugins in TypeScript and Go; the registry (needs the hosted service)
 - [ ] Preview environments per branch (needs the hosted service)
