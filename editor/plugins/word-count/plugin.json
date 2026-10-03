@@ -1,0 +1,8 @@
+{
+  "name": "word-count",
+  "version": "0.1.0",
+  "description": "Shows how many words the file in front has.",
+  "permissions": ["statusBar", "editor:read", "editor:write"],
+  "events": ["open", "change", "save"],
+  "commands": [{ "id": "insert", "title": "Word Count: Insert the count" }]
+}

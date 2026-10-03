@@ -1,0 +1,8 @@
+{
+  "name": "probe",
+  "version": "0.1.0",
+  "description": "Exercises every request, for the host's tests.",
+  "permissions": ["statusBar", "editor:read", "editor:write", "fs:read", "http:127.0.0.1"],
+  "events": ["activate", "open", "change", "save"],
+  "commands": [{ "id": "editor", "title": "Probe: Editor" }]
+}
