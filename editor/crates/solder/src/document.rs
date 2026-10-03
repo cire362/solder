@@ -290,6 +290,21 @@ impl Document {
         })
     }
 
+    /// What starts a line comment at `offset`. Inside a file that mixes
+    /// languages this is the one under the cursor: `//` in the script of a
+    /// component, nothing in its markup.
+    pub fn line_comment_at(&self, offset: usize) -> Option<&'static str> {
+        match &self.syntax {
+            Some(syntax) => syntax.language_at(offset).line_comment,
+            None => self
+                .path
+                .as_deref()
+                .or(self.language_path.as_deref())
+                .and_then(syntax::language_for_path)
+                .and_then(|l| l.line_comment),
+        }
+    }
+
     pub fn diagnostics(&self) -> &Arc<Vec<Diagnostic>> {
         &self.diagnostics
     }
@@ -512,7 +527,9 @@ impl Document {
         else {
             return;
         };
-        if self.text.len() <= SYNC_PARSE_LIMIT {
+        // An extension's grammar is compiled on first use, which is too slow
+        // for this thread whatever the size of the file.
+        if self.text.len() <= SYNC_PARSE_LIMIT && language.is_ready() {
             self.syntax = SyntaxTree::parse(language, self.text.rope());
             self.syntax_generation += 1;
             return;

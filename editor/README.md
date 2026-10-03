@@ -5,7 +5,8 @@ The native editor behind the website in `../src`. Rust, GPU-rendered UI, no Elec
 ```
 crates/
   text/     rope buffer, edits, undo history, cursor movement (no UI, fully unit-tested)
-  syntax/   tree-sitter parsing and highlighting for Rust, TS/TSX, JS, JSON, CSS, Go, Python
+  syntax/   tree-sitter parsing and highlighting for Rust, TS/TSX, JS, JSON, CSS, Go, Python,
+            and for the languages of extensions (grammars in WebAssembly)
   db/       database connections: detection, drivers, statement splitting (no UI)
   rest/     HTTP: .http files, route detection, OpenAPI import, sending (no UI)
   ai/       local models: hardware, catalog, downloads, llama-server, benchmark (no UI)

@@ -57,6 +57,10 @@ WebAssembly; install the target once with
 `rustup target add wasm32-unknown-unknown`. The tests of Go plugins build with
 `go` (1.21 or later) and are skipped without it.
 
+Building the editor needs `cmake` on the PATH: the WebAssembly runtime that
+loads the grammars of extensions copies its C headers with it
+(`brew install cmake`, `apt-get install cmake`).
+
 Database drivers are tested against real servers in
 `editor/crates/db/tests/servers.rs`. CI starts Postgres, MySQL, Redis and
 MongoDB as service containers; locally each test is skipped unless its URL is

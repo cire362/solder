@@ -1,4 +1,5 @@
 use std::{
+    ops::ControlFlow,
     path::Path,
     time::{Duration, Instant},
 };
@@ -29,7 +30,13 @@ pub fn outline(
     };
     let deadline = Instant::now() + Duration::from_millis(25);
     let mut read = |offset: usize, _| source.as_bytes().get(offset..).unwrap_or_default();
-    let mut stop = |_: &ParseState| cancelled() || Instant::now() >= deadline;
+    let mut stop = |_: &ParseState| {
+        if cancelled() || Instant::now() >= deadline {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
     let options = ParseOptions::new().progress_callback(&mut stop);
     let Some(tree) = parser.parse_with_options(&mut read, None, Some(options)) else {
         return Vec::new();
