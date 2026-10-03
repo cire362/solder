@@ -8511,9 +8511,9 @@ mod tests {
             .unwrap();
         });
         store.update(cx, |s, cx| {
-            // The probe's change handler needs a few million.
+            // The probe's change handler works for milliseconds.
             s.set_budget(plugin::Budget {
-                typing: 100_000,
+                typing: Duration::from_micros(200),
                 idle: Duration::from_millis(20),
                 ..Default::default()
             });
