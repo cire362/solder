@@ -87,5 +87,7 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
       changed; offered once on a first launch; an import only adds)
 - [x] Plugins in TypeScript and JavaScript (one `plugin.js` run by QuickJS inside
       the same sandbox, with typings; the budget is measured in time)
-- [ ] Plugins in Go; the registry (needs the hosted service)
+- [x] Plugins in Go (a program built for WASI, in the same sandbox, with a
+      package that speaks to the editor)
+- [ ] The plugin registry (needs the hosted service)
 - [ ] Preview environments per branch (needs the hosted service)

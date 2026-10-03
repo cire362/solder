@@ -7,7 +7,7 @@ echo "== website: lint"
 npm run lint --silent
 echo "== website: types"
 npm run typecheck --silent
-echo "== editor: TypeScript plugins"
+echo "== editor: example plugins"
 npm run plugins --silent
 
 echo "== editor: format"

@@ -34,7 +34,7 @@ when the diff does not make it obvious.
 `scripts/check.sh` runs everything CI runs:
 
 - website: ESLint and TypeScript, and the editor's example plugins written in
-  TypeScript (`npm run plugins`)
+  TypeScript and, where Go is installed, in Go (`npm run plugins`)
 - editor: `cargo fmt --check`, `cargo clippy` with warnings as errors, `cargo test`
 
 The checks use the `ci` Cargo profile and the committed lockfile. This profile
@@ -54,7 +54,8 @@ real processes or the mock server in `editor/crates/solder/tests/fixtures`.
 
 The plugin host is tested against real plugins, which the tests build for
 WebAssembly; install the target once with
-`rustup target add wasm32-unknown-unknown`.
+`rustup target add wasm32-unknown-unknown`. The tests of Go plugins build with
+`go` (1.21 or later) and are skipped without it.
 
 Database drivers are tested against real servers in
 `editor/crates/db/tests/servers.rs`. CI starts Postgres, MySQL, Redis and

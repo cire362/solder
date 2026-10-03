@@ -20,6 +20,11 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # For the Go half of `npm run plugins`.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
       - run: npm run lint
       - run: npm run typecheck
       # The editor's example plugins in TypeScript, checked where Node is.
@@ -74,6 +79,11 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev \
             libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
             libasound2-dev libzstd-dev pkg-config
+      # The plugin tests build a Go plugin for WASI; without Go they skip.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
