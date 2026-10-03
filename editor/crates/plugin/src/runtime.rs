@@ -32,7 +32,7 @@ use wasmi::{
     TypedResumableCallOutOfFuel, Val,
 };
 
-use crate::{Manifest, script};
+use crate::{Manifest, wasi};
 
 /// What the editor does for plugins. Called on the plugin's thread.
 pub trait Host: Send + Sync + 'static {
@@ -45,7 +45,8 @@ pub trait Host: Send + Sync + 'static {
 /// What a plugin is made of.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Code {
-    /// `plugin.wasm`: a module that exports `solder_event`.
+    /// `plugin.wasm`: a module that exports `solder_event`, or a WASI
+    /// program (it exports `_start`) that speaks in lines.
     Module(Vec<u8>),
     /// `plugin.js`: a script, run by the JavaScript engine built in.
     Script(String),
@@ -231,8 +232,10 @@ pub(crate) struct State {
     pub(crate) stats: Arc<Mutex<Stats>>,
     /// Time spent in the editor answering requests during this slice.
     pub(crate) answering: Duration,
-    /// A script's side of the conversation.
-    pub(crate) script: script::Io,
+    /// A program's side of the conversation.
+    pub(crate) script: wasi::Io,
+    /// Set when the plugin is being stopped, for a program asleep.
+    pub(crate) stop: Arc<AtomicBool>,
 }
 
 impl State {
@@ -275,9 +278,9 @@ struct Guest {
 enum Kind {
     /// Called once for each event.
     Module { entry: TypedFunc<u32, ()> },
-    /// One long call that reads events as lines; between events it is
-    /// parked in the read.
-    Script {
+    /// A WASI program: one long call that reads events as lines; between
+    /// events it is parked in the read.
+    Process {
         memory: Memory,
         parked: Option<TypedResumableCallHostTrap<()>>,
     },
@@ -307,7 +310,7 @@ impl Worker {
         let engine = Engine::new(&config);
         let wasm: &[u8] = match &code {
             Code::Module(wasm) => wasm,
-            Code::Script(_) => script::ENGINE,
+            Code::Script(_) => wasi::ENGINE,
         };
         let loaded = Module::new(&engine, wasm)
             .map_err(|e| e.to_string())
@@ -386,7 +389,8 @@ impl Worker {
                 host: self.host.clone(),
                 stats: self.stats.clone(),
                 answering: Duration::ZERO,
-                script: script::Io::new(source),
+                script: wasi::Io::new(source),
+                stop: self.stop.clone(),
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -395,7 +399,7 @@ impl Worker {
             .func_wrap("solder", "read", host_read)
             .and_then(|l| l.func_wrap("solder", "call", host_call))
             .map_err(|e| e.to_string())?;
-        script::link(&mut linker).map_err(|e| e.to_string())?;
+        wasi::link(&mut linker).map_err(|e| e.to_string())?;
         // Enough for a module's start function, which is not an event.
         store
             .set_fuel(FIRST_SLICE * 50)
@@ -403,7 +407,12 @@ impl Worker {
         let instance = linker
             .instantiate_and_start(&mut store, module)
             .map_err(|e| e.to_string())?;
-        if source.is_none() {
+        // A module of the plugin's own is a program if it has a `_start` and
+        // no `solder_event`.
+        let program = source.is_some()
+            || (module.get_export("_start").is_some()
+                && module.get_export("solder_event").is_none());
+        if !program {
             let entry = instance
                 .get_typed_func::<u32, ()>(&store, "solder_event")
                 .map_err(|_| "The module has no solder_event function".to_string())?;
@@ -415,17 +424,17 @@ impl Worker {
         }
         let memory = instance
             .get_memory(&store, "memory")
-            .ok_or("The engine exports no memory")?;
+            .ok_or("The program exports no memory")?;
         let mut guest = Guest {
             store,
-            kind: Kind::Script {
+            kind: Kind::Process {
                 memory,
                 parked: None,
             },
             slice: FIRST_SLICE,
         };
-        // The engine starts and runs the script up to where it waits for
-        // its first event.
+        // The program starts and runs up to where it waits for its first
+        // event.
         let start = instance
             .get_typed_func::<(), ()>(&guest.store, "_start")
             .map_err(|e| e.to_string())?;
@@ -446,12 +455,12 @@ impl Worker {
                     entry.call_resumable(store, len)
                 })?
             }
-            Kind::Script { memory, parked } => {
+            Kind::Process { memory, parked } => {
                 let (memory, parked) = (*memory, parked.take());
-                let parked = parked.ok_or("The script is not waiting for an event")?;
+                let parked = parked.ok_or("The plugin is not waiting for an event")?;
                 guest.store.data_mut().script.push_line(&bytes);
                 // The read it was parked in now has something to return.
-                script::finish_read(&mut guest.store, memory).map_err(|e| e.to_string())?;
+                wasi::finish_read(&mut guest.store, memory).map_err(|e| e.to_string())?;
                 self.drive_call(guest, typing, self.budget.limit, |store| {
                     parked.resume(store, &[Val::I32(0)])
                 })?
@@ -482,7 +491,7 @@ impl Worker {
         let failed = |e: wasmi::Error| format!("The plugin failed: {e}");
         // A script that stopped says why itself.
         let ended = |guest: &Guest, e: String| match guest.kind {
-            Kind::Script { .. } => guest.store.data().script.ended(),
+            Kind::Process { .. } => guest.store.data().script.ended(),
             Kind::Module { .. } => e,
         };
         let mut begin = Some(begin);
@@ -520,12 +529,12 @@ impl Worker {
             match call {
                 TypedResumableCall::Finished(()) => match guest.kind {
                     Kind::Module { .. } => break,
-                    Kind::Script { .. } => return Err(ended(guest, String::new())),
+                    Kind::Process { .. } => return Err(ended(guest, String::new())),
                 },
                 TypedResumableCall::HostTrap(trap) => {
                     // A script waiting for its next event is done with
                     // this one.
-                    if let Kind::Script { parked, .. } = &mut guest.kind
+                    if let Kind::Process { parked, .. } = &mut guest.kind
                         && guest.store.data().script.waiting()
                     {
                         *parked = Some(trap);

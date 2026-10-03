@@ -17,6 +17,16 @@ pub fn word_count_ts() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/word-count-ts")
 }
 
+/// The example plugin written in Go.
+pub fn word_count_go() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/word-count-go")
+}
+
+/// The Go program that exercises every request.
+pub fn probe_go() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe-go")
+}
+
 /// The plugin that exercises every request.
 pub fn probe() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe")
@@ -107,4 +117,56 @@ pub fn install_script(dir: &Path, plugins: &Path) -> PathBuf {
         std::fs::copy(dir.join(file), dest.join(file)).expect(file);
     }
     dest
+}
+
+/// Compiles the Go plugin in `dir` for WASI (once per test run) and returns
+/// its module's bytes, or `None` where Go is not installed.
+pub fn build_go(dir: &Path) -> Option<Vec<u8>> {
+    static BUILT: Mutex<Option<HashMap<PathBuf, Option<Vec<u8>>>>> = Mutex::new(None);
+    let mut built = BUILT.lock().unwrap_or_else(|e| e.into_inner());
+    let built = built.get_or_insert_with(HashMap::new);
+    if let Some(wasm) = built.get(dir) {
+        return wasm.clone();
+    }
+    let name = dir.file_name().expect("a folder").to_string_lossy();
+    let out = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target"))
+        .join("wasm-plugins/go")
+        .join(format!("{name}.wasm"));
+    let ran = Command::new("go")
+        .args(["build", "-ldflags=-s -w", "-o"])
+        .arg(&out)
+        .arg(".")
+        .current_dir(dir)
+        .env("GOOS", "wasip1")
+        .env("GOARCH", "wasm")
+        .output();
+    let wasm = match ran {
+        // No Go here: the callers skip.
+        Err(_) => None,
+        Ok(output) => {
+            assert!(
+                output.status.success(),
+                "building {} failed:\n{}",
+                dir.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Some(std::fs::read(&out).expect("the built module"))
+        }
+    };
+    built.insert(dir.to_path_buf(), wasm.clone());
+    wasm
+}
+
+/// Builds the Go plugin in `dir` and puts it under `plugins`; `None` where
+/// Go is not installed.
+pub fn install_go(dir: &Path, plugins: &Path) -> Option<PathBuf> {
+    let wasm = build_go(dir)?;
+    let manifest = crate::Manifest::load(dir).expect("the plugin's manifest");
+    let dest = plugins.join(&manifest.name);
+    std::fs::create_dir_all(&dest).expect("the plugin folder");
+    std::fs::copy(dir.join(crate::MANIFEST), dest.join(crate::MANIFEST)).expect("plugin.json");
+    std::fs::write(dest.join(crate::MODULE), wasm).expect("plugin.wasm");
+    Some(dest)
 }
