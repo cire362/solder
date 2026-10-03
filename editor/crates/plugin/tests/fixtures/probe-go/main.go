@@ -5,6 +5,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -60,6 +61,10 @@ func run(id string) {
 		}
 	case "panic":
 		panic("probe asked to panic")
+	case "file":
+		// There are no files here: the program loads, and this fails.
+		_, err := os.ReadFile(arg)
+		show("read it", err)
 	case "print":
 		fmt.Println(arg)
 		solder.Status("printed")
@@ -88,6 +93,7 @@ func main() {
 		"count", "editor", "shout", "read:notes.txt", "read:missing.txt",
 		"get:http://127.0.0.1:8080/x", "get:http://example.com/x",
 		"forever", "panic", "print:hello from go", "nap", "alloc:1000", "alloc:200000000",
+		"file:/etc/passwd",
 	} {
 		id := id
 		solder.Command(id, func() { run(id) })

@@ -584,6 +584,7 @@ fn a_go_program_gets_events_and_its_requests_are_answered() {
         "count",
         "print:hello from go",
         "nap",
+        "file:/etc/passwd",
         "panic",
     ];
     let allowed = [
@@ -639,6 +640,13 @@ fn a_go_program_gets_events_and_its_requests_are_answered() {
     // It can sleep; that is not counted as work.
     assert_eq!(run(&plugin, &editor, "nap"), "slept true");
     assert!(plugin.stats().last_ms < 40., "{}", plugin.stats().last_ms);
+    // It has no files of its own: the standard library's read fails, though
+    // the program that could call it loads.
+    let refused = run(&plugin, &editor, "file:/etc/passwd");
+    assert!(
+        refused.starts_with("refused: open /etc/passwd"),
+        "{refused}"
+    );
     // A panic in a handler fails that event; the program goes on.
     command(&plugin, "panic");
     wait("the panic", || plugin.stats().failures == 1);
@@ -646,7 +654,7 @@ fn a_go_program_gets_events_and_its_requests_are_answered() {
         plugin.stats().last_failure.as_deref(),
         Some("panic: probe asked to panic")
     );
-    assert_eq!(run(&plugin, &editor, "count"), "13 events");
+    assert_eq!(run(&plugin, &editor, "count"), "14 events");
     assert_eq!((plugin.stats().stopped, plugin.stats().error), (0, None));
 }
 

@@ -36,6 +36,7 @@ const MODULE: &str = "wasi_snapshot_preview1";
 // WASI error numbers.
 const OK: i32 = 0;
 const BADF: i32 = 8;
+const NOSYS: i32 = 52;
 const SPIPE: i32 = 70;
 
 /// The longest a program sleeps in one call, so that stopping it is not
@@ -518,6 +519,83 @@ pub(crate) fn link(linker: &mut Linker<State>) -> Result<(), wasmi::errors::Link
         "path_unlink_file",
         |_: u32, _: u32, _: u32| -> i32 { BADF },
     )?;
+    // The rest of WASI preview 1, so that a program which could touch a
+    // file or a socket still loads; doing so tells it there is none.
+    linker.func_wrap(
+        MODULE,
+        "clock_res_get",
+        |mut caller: Caller<'_, State>, _id: u32, at: u32| -> Result<i32, wasmi::Error> {
+            let memory = memory(&caller)?;
+            write(&mut caller, memory, at, &1_000u64.to_le_bytes())?;
+            Ok(OK)
+        },
+    )?;
+    linker.func_wrap(
+        MODULE,
+        "fd_advise",
+        |_: u32, _: u64, _: u64, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(MODULE, "fd_allocate", |_: u32, _: u64, _: u64| -> i32 {
+        BADF
+    })?;
+    linker.func_wrap(MODULE, "fd_datasync", |_: u32| -> i32 { BADF })?;
+    linker.func_wrap(
+        MODULE,
+        "fd_fdstat_set_rights",
+        |_: u32, _: u64, _: u64| -> i32 { BADF },
+    )?;
+    linker.func_wrap(MODULE, "fd_filestat_get", |_: u32, _: u32| -> i32 { BADF })?;
+    linker.func_wrap(MODULE, "fd_filestat_set_size", |_: u32, _: u64| -> i32 {
+        BADF
+    })?;
+    linker.func_wrap(
+        MODULE,
+        "fd_filestat_set_times",
+        |_: u32, _: u64, _: u64, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(
+        MODULE,
+        "fd_pread",
+        |_: u32, _: u32, _: u32, _: u64, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(
+        MODULE,
+        "fd_pwrite",
+        |_: u32, _: u32, _: u32, _: u64, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(MODULE, "fd_renumber", |_: u32, _: u32| -> i32 { BADF })?;
+    linker.func_wrap(MODULE, "fd_sync", |_: u32| -> i32 { BADF })?;
+    linker.func_wrap(MODULE, "fd_tell", |_: u32, _: u32| -> i32 { SPIPE })?;
+    linker.func_wrap(
+        MODULE,
+        "path_link",
+        |_: u32, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(
+        MODULE,
+        "path_readlink",
+        |_: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(
+        MODULE,
+        "path_symlink",
+        |_: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(MODULE, "proc_raise", |_: u32| -> i32 { NOSYS })?;
+    linker.func_wrap(MODULE, "sock_accept", |_: u32, _: u32, _: u32| -> i32 {
+        BADF
+    })?;
+    linker.func_wrap(
+        MODULE,
+        "sock_recv",
+        |_: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(
+        MODULE,
+        "sock_send",
+        |_: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(MODULE, "sock_shutdown", |_: u32, _: u32| -> i32 { BADF })?;
     linker.func_wrap(MODULE, "sched_yield", || -> i32 { OK })?;
     linker.func_wrap(
         MODULE,
