@@ -106,6 +106,24 @@ fn wait(what: &str, f: impl Fn() -> bool) {
     }
 }
 
+/// Types until `over` holds, and for a while after: time enough for work
+/// that should be waiting to show that it is not.
+fn hold_typing(activity: &Activity, over: impl Fn() -> bool) {
+    let start = Instant::now();
+    let mut since = None;
+    while since.is_none_or(|at: Instant| at.elapsed() < Duration::from_millis(300)) {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "timed out waiting for the plugin to go over its budget"
+        );
+        if since.is_none() && over() {
+            since = Some(Instant::now());
+        }
+        activity.touch();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn command(plugin: &Plugin, id: &str) {
     plugin.send(plugin::Event::Command { id: id.into() });
 }
@@ -223,17 +241,21 @@ fn work_started_by_typing_waits_for_a_pause_and_is_counted() {
     };
     let (plugin, editor, activity) = start(manifest(ALL, &[]), budget);
     let change = || plugin.send(plugin::Event::Change { path: "a".into() });
+    // Loaded first: on a slow machine that alone outlasts the typing below.
+    plugin.send(plugin::Event::Activate);
+    wait("the plugin", || {
+        editor.last_status().as_deref() == Some("active")
+    });
 
-    // While the user types, the plugin is over budget and held back.
-    let typing = Instant::now();
+    // While the user types, the plugin goes over budget and is held back.
     activity.touch();
     change();
-    while typing.elapsed() < Duration::from_millis(400) {
-        activity.touch();
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert_eq!(editor.last_status(), None, "ran while the user was typing");
-    assert_eq!(plugin.stats().over_budget, 1);
+    hold_typing(&activity, || plugin.stats().over_budget == 1);
+    assert_eq!(
+        editor.last_status().as_deref(),
+        Some("active"),
+        "ran while the user was typing"
+    );
     // Typing stopped: it finishes.
     wait("the deferred change", || {
         editor.last_status().as_deref() == Some("change a")
@@ -488,15 +510,10 @@ fn a_script_is_held_to_the_same_permissions_and_budget() {
     );
 
     // Typing: over the budget, held while the user types, done after.
-    let typing = Instant::now();
     activity.touch();
     plugin.send(plugin::Event::Change { path: "a".into() });
-    while typing.elapsed() < Duration::from_millis(400) {
-        activity.touch();
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    hold_typing(&activity, || plugin.stats().over_budget == 1);
     assert_ne!(editor.last_status().as_deref(), Some("change a"));
-    assert_eq!(plugin.stats().over_budget, 1);
     wait("the deferred change", || {
         editor.last_status().as_deref() == Some("change a")
     });

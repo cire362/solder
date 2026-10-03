@@ -39,6 +39,7 @@ when the diff does not make it obvious.
 
 The checks use the `ci` Cargo profile and the committed lockfile. This profile
 keeps debug assertions and overflow checks, but disables dependency optimization
+(except for the plugin interpreter, which the tests of script plugins wait on)
 and uses line-table debug information for faster builds. Normal development and
 release profiles are unchanged.
 
