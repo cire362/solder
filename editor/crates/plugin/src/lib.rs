@@ -11,8 +11,8 @@
 
 mod manifest;
 mod runtime;
-mod script;
 pub mod testing;
+mod wasi;
 
 pub use manifest::{Command, MANIFEST, MODULE, Manifest, Permission, SCRIPT, url_host};
 pub use runtime::{Activity, Budget, Code, Host, Plugin, SLOW_AFTER, Stats};

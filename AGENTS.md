@@ -99,7 +99,10 @@ Never guess a signature.
   not a measure (a unit is worth a hundred times less time in QuickJS, which
   runs `plugin.js` plugins, than in a plugin compiled from Rust).
   `editor/plugins/*/plugin.js` is compiled from `plugin.ts`; `npm run
-  plugins` checks it is current.
+  plugins` checks it is current, and checks the Go package and examples
+  where Go is installed. A plugin that is a WASI program (QuickJS, or one
+  compiled from Go) gets only what `wasi.rs` gives it: its streams, a clock
+  and random numbers. Do not add files or sockets there.
 
 ### Performance rules
 

@@ -551,3 +551,145 @@ fn a_script_that_cannot_run_says_why() {
         "Could not load: The script failed: Error: at the top at <anonymous> (plugin.js:3:11)"
     );
 }
+
+// --------------------------------------------------------------------- Go
+
+/// The Go probe, or `None` (and a note) where Go is not installed.
+fn start_go(manifest: Manifest, budget: Budget) -> Option<(Plugin, Arc<Editor>, Arc<Activity>)> {
+    let Some(wasm) = testing::build_go(&testing::probe_go()) else {
+        eprintln!("go is not installed; skipped");
+        return None;
+    };
+    let editor = Arc::new(Editor::default());
+    let activity = Arc::new(Activity::default());
+    let plugin = Plugin::start(
+        manifest,
+        Code::Module(wasm),
+        editor.clone(),
+        activity.clone(),
+        budget,
+    );
+    Some((plugin, editor, activity))
+}
+
+#[test]
+fn a_go_program_gets_events_and_its_requests_are_answered() {
+    let commands = [
+        "editor",
+        "shout",
+        "read:notes.txt",
+        "read:missing.txt",
+        "get:http://127.0.0.1:8080/x",
+        "get:http://example.com/x",
+        "count",
+        "print:hello from go",
+        "nap",
+        "file:/etc/passwd",
+        "panic",
+    ];
+    let allowed = [
+        "statusBar",
+        "editor:read",
+        "editor:write",
+        "fs:read",
+        "http:127.0.0.1",
+    ];
+    let Some((plugin, editor, _)) = start_go(manifest(&allowed, &commands), Budget::default())
+    else {
+        return;
+    };
+    plugin.send(plugin::Event::Activate);
+    wait("activate", || {
+        editor.last_status().as_deref() == Some("active")
+    });
+    plugin.send(plugin::Event::Open {
+        path: "src/a.rs".into(),
+        language: None,
+    });
+    wait("open", || {
+        editor.last_status().as_deref() == Some("open src/a.rs")
+    });
+    // Positions are bytes, as the editor counts.
+    assert_eq!(run(&plugin, &editor, "editor"), "src/a.rs 1..3 5");
+    assert_eq!(run(&plugin, &editor, "shout"), "edited");
+    assert!(editor.requests.lock().unwrap().contains(&Request::Edit {
+        path: "src/a.rs".into(),
+        start: 0,
+        end: 5,
+        text: "HELLO".into(),
+    }));
+    assert_eq!(run(&plugin, &editor, "read:notes.txt"), "from notes");
+    assert_eq!(
+        run(&plugin, &editor, "read:missing.txt"),
+        "refused: No such file"
+    );
+    assert_eq!(
+        run(&plugin, &editor, "get:http://127.0.0.1:8080/x"),
+        "200 got http://127.0.0.1:8080/x"
+    );
+    // The same permissions as any plugin.
+    assert_eq!(
+        run(&plugin, &editor, "get:http://example.com/x"),
+        "refused: The plugin did not declare the permission http:example.com"
+    );
+    // One program for all of them: its state lasts.
+    assert_eq!(run(&plugin, &editor, "count"), "9 events");
+    // What it prints is its log.
+    assert_eq!(run(&plugin, &editor, "print:hello from go"), "printed");
+    assert_eq!(plugin.stats().log, ["hello from go"]);
+    // It can sleep; that is not counted as work.
+    assert_eq!(run(&plugin, &editor, "nap"), "slept true");
+    assert!(plugin.stats().last_ms < 40., "{}", plugin.stats().last_ms);
+    // It has no files of its own: the standard library's read fails, though
+    // the program that could call it loads.
+    let refused = run(&plugin, &editor, "file:/etc/passwd");
+    assert!(
+        refused.starts_with("refused: open /etc/passwd"),
+        "{refused}"
+    );
+    // A panic in a handler fails that event; the program goes on.
+    command(&plugin, "panic");
+    wait("the panic", || plugin.stats().failures == 1);
+    assert_eq!(
+        plugin.stats().last_failure.as_deref(),
+        Some("panic: probe asked to panic")
+    );
+    assert_eq!(run(&plugin, &editor, "count"), "14 events");
+    assert_eq!((plugin.stats().stopped, plugin.stats().error), (0, None));
+}
+
+#[test]
+fn a_go_program_is_held_to_the_budget_and_the_memory_limit() {
+    let commands = ["forever", "count", "alloc:1000", "alloc:200000000"];
+    let budget = Budget {
+        typing: Duration::from_micros(200),
+        limit: Duration::from_secs(1),
+        idle: Duration::from_millis(120),
+    };
+    let Some((plugin, editor, activity)) = start_go(manifest(ALL, &commands), budget) else {
+        return;
+    };
+    assert_eq!(run(&plugin, &editor, "count"), "1 events");
+
+    // Typing: over the budget, held while the user types, done after.
+    activity.touch();
+    plugin.send(plugin::Event::Change { path: "a".into() });
+    hold_typing(&activity, || plugin.stats().over_budget == 1);
+    assert_ne!(editor.last_status().as_deref(), Some("change a"));
+    wait("the deferred change", || {
+        editor.last_status().as_deref() == Some("change a")
+    });
+
+    // An endless handler is stopped, and the program starts afresh.
+    command(&plugin, "forever");
+    wait("the stop", || plugin.stats().stopped == 1);
+    assert!(plugin.stats().slow());
+    assert_eq!(run(&plugin, &editor, "count"), "1 events");
+
+    // Memory is capped at 64 MiB: the runtime dies asking for more, and
+    // the program starts afresh.
+    assert_eq!(run(&plugin, &editor, "alloc:1000"), "allocated 1000");
+    command(&plugin, "alloc:200000000");
+    wait("the failed allocation", || plugin.stats().failures == 2);
+    assert_eq!(run(&plugin, &editor, "count"), "1 events");
+}

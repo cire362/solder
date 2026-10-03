@@ -1,18 +1,23 @@
-//! JavaScript plugins: `plugin.js` runs in QuickJS, itself a WebAssembly
-//! module inside the same sandbox as any other plugin.
+//! Plugins that are WASI programs: a `plugin.wasm` with a `_start` (one
+//! compiled from Go, say), and `plugin.js`, which runs in QuickJS, itself
+//! such a program built into the editor.
 //!
-//! The engine is a WASI program. It gets no files, no environment and no
-//! clock it could wait on: only its three standard streams. On those the
-//! plugin and the editor speak in lines. The editor writes an event to the
-//! engine's input; the script handles it and reads again. A request is a
+//! A program gets no files, no environment and no network: only its three
+//! standard streams, a clock and random numbers. On the streams the plugin
+//! and the editor speak in lines. The editor writes an event to the
+//! program's input; the program handles it and reads again. A request is a
 //! line on its output that starts with `\x01`; the reply is the next line
 //! on its input. Anything else it prints goes to the plugin's log.
 //!
-//! When the script reads and nothing is waiting, the read stops the engine
-//! where it is, and the next event resumes it there: that pause is the end
-//! of one event.
+//! When the program reads and nothing is waiting, the read stops it where
+//! it is, and the next event resumes it there: that pause is the end of one
+//! event.
 
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
 
 use serde_json::Value;
 use solder_plugin::{Reply, Request};
@@ -34,7 +39,11 @@ const BADF: i32 = 8;
 const NOSYS: i32 = 52;
 const SPIPE: i32 = 70;
 
-/// A read the engine made with nothing to give it yet.
+/// The longest a program sleeps in one call, so that stopping it is not
+/// kept waiting.
+const NAP: Duration = Duration::from_millis(20);
+
+/// A read the program made with nothing to give it yet.
 #[derive(Clone, Copy)]
 struct Read {
     iovs: u32,
@@ -42,17 +51,21 @@ struct Read {
     nread: u32,
 }
 
-/// The engine's standard streams.
+/// A program's standard streams.
 pub(crate) struct Io {
+    /// A script in the JavaScript engine, not a program of the plugin's own.
+    script: bool,
     args: Vec<Vec<u8>>,
     input: VecDeque<u8>,
     /// Output not yet ended by a newline, for stdout and stderr.
     lines: [Vec<u8>; 2],
     waiting: Option<Read>,
     exit: Option<i32>,
-    /// The last lines the engine printed that were not requests: why it
-    /// ended, if it did.
+    /// The last lines the program printed that were not requests: why a
+    /// script ended, if it did.
     printed: VecDeque<String>,
+    /// The line a program compiled from Go dies with.
+    panic: Option<String>,
     /// The text of the last `editor_text` reply, to turn the script's
     /// UTF-16 positions into the editor's bytes.
     text: Option<String>,
@@ -61,8 +74,9 @@ pub(crate) struct Io {
 }
 
 impl Io {
-    pub(crate) fn new(source: Option<&str>) -> Self {
-        let args = match source {
+    /// The streams of a script's engine, or of the plugin's own program.
+    pub(crate) fn new(script: Option<&str>) -> Self {
+        let args = match script {
             // `--std` gives the script `std` and `os`, which the prelude
             // uses and then takes away.
             Some(source) => vec![
@@ -71,15 +85,17 @@ impl Io {
                 b"-e".to_vec(),
                 format!("{}\n{source}\n;__solder_run();", PRELUDE.trim_end()).into_bytes(),
             ],
-            None => Vec::new(),
+            None => vec![b"plugin".to_vec()],
         };
         Self {
+            script: script.is_some(),
             args,
             input: VecDeque::new(),
             lines: [Vec::new(), Vec::new()],
             waiting: None,
             exit: None,
             printed: VecDeque::new(),
+            panic: None,
             text: None,
             failure: None,
         }
@@ -100,8 +116,15 @@ impl Io {
         self.failure.take()
     }
 
-    /// Why a script that is no longer running stopped.
+    /// Why a program that is no longer running stopped.
     pub(crate) fn ended(&self) -> String {
+        if !self.script {
+            return match (&self.panic, self.exit) {
+                (Some(panic), _) => format!("The plugin failed: {panic}"),
+                (None, Some(code)) => format!("The plugin ended with code {code}"),
+                (None, None) => "The plugin ended".into(),
+            };
+        }
         // The engine prints what was thrown, then where: `Error: x`, and
         // `    at f (plugin.js:3:1)` under it.
         let mut lines = self.printed.iter().skip_while(|l| l.starts_with(' '));
@@ -160,10 +183,15 @@ fn byte_to_utf16(text: &str, byte: u64) -> u64 {
         .sum()
 }
 
-/// Answers a request line from a script. JavaScript counts positions in
-/// UTF-16 units and the editor in bytes, so both directions are converted
-/// against the text the script last read.
+/// Answers a request line. JavaScript counts positions in UTF-16 units and
+/// the editor in bytes, so for a script both directions are converted
+/// against the text it last read; a program counts in bytes as the editor
+/// does.
 fn answer(state: &mut State, line: &[u8]) -> Reply {
+    if !state.script.script {
+        let request = serde_json::from_slice(line).map_err(|e| format!("Not a request: {e}"))?;
+        return state.answer(request);
+    }
     let mut value: Value =
         serde_json::from_slice(line).map_err(|e| format!("Not a request: {e}"))?;
     if value["call"] == "edit" {
@@ -218,6 +246,11 @@ fn written(state: &mut State, stream: usize, bytes: &[u8]) -> Result<(), wasmi::
             }
             _ => {
                 let text = relabel(&String::from_utf8_lossy(line));
+                if state.script.panic.is_none()
+                    && (text.starts_with("panic: ") || text.starts_with("fatal error: "))
+                {
+                    state.script.panic = Some(text.clone());
+                }
                 if !text.trim().is_empty() {
                     state.script.printed.push_back(text.clone());
                     if state.script.printed.len() > 4 {
@@ -231,11 +264,18 @@ fn written(state: &mut State, stream: usize, bytes: &[u8]) -> Result<(), wasmi::
     Ok(())
 }
 
+/// The one clock a program has, in nanoseconds.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
 fn read_u32(caller: &Caller<'_, State>, memory: Memory, at: u32) -> Result<u32, wasmi::Error> {
     let mut bytes = [0; 4];
     memory
         .read(caller, at as usize, &mut bytes)
-        .map_err(|_| wasmi::Error::new("outside the engine's memory"))?;
+        .map_err(|_| wasmi::Error::new("outside the program's memory"))?;
     Ok(u32::from_le_bytes(bytes))
 }
 
@@ -247,7 +287,7 @@ fn write(
 ) -> Result<(), wasmi::Error> {
     memory
         .write(caller, at as usize, bytes)
-        .map_err(|_| wasmi::Error::new("outside the engine's memory"))
+        .map_err(|_| wasmi::Error::new("outside the program's memory"))
 }
 
 /// Copies waiting input into the buffers of the read the script is parked
@@ -256,7 +296,7 @@ pub(crate) fn finish_read(store: &mut Store<State>, memory: Memory) -> Result<()
     let Some(read) = store.data_mut().script.waiting.take() else {
         return Ok(());
     };
-    let outside = |_| wasmi::Error::new("outside the engine's memory");
+    let outside = |_| wasmi::Error::new("outside the program's memory");
     let mut total = 0u32;
     for i in 0..read.count {
         let mut iov = [0u8; 8];
@@ -335,10 +375,7 @@ pub(crate) fn link(linker: &mut Linker<State>) -> Result<(), wasmi::errors::Link
          at: u32|
          -> Result<i32, wasmi::Error> {
             let memory = memory(&caller)?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos() as u64);
-            write(&mut caller, memory, at, &now.to_le_bytes())?;
+            write(&mut caller, memory, at, &now().to_le_bytes())?;
             Ok(OK)
         },
     )?;
@@ -439,7 +476,7 @@ pub(crate) fn link(linker: &mut Linker<State>) -> Result<(), wasmi::errors::Link
                 let mut bytes = vec![0; len as usize];
                 memory
                     .read(&caller, buf as usize, &mut bytes)
-                    .map_err(|_| wasmi::Error::new("outside the engine's memory"))?;
+                    .map_err(|_| wasmi::Error::new("outside the program's memory"))?;
                 written(caller.data_mut(), fd as usize - 1, &bytes)?;
                 total += len;
             }
@@ -482,11 +519,158 @@ pub(crate) fn link(linker: &mut Linker<State>) -> Result<(), wasmi::errors::Link
         "path_unlink_file",
         |_: u32, _: u32, _: u32| -> i32 { BADF },
     )?;
-    // Waiting (timers, sleep) is not available to a plugin.
+    // The rest of WASI preview 1, so that a program which could touch a
+    // file or a socket still loads; doing so tells it there is none.
+    linker.func_wrap(
+        MODULE,
+        "clock_res_get",
+        |mut caller: Caller<'_, State>, _id: u32, at: u32| -> Result<i32, wasmi::Error> {
+            let memory = memory(&caller)?;
+            write(&mut caller, memory, at, &1_000u64.to_le_bytes())?;
+            Ok(OK)
+        },
+    )?;
+    linker.func_wrap(
+        MODULE,
+        "fd_advise",
+        |_: u32, _: u64, _: u64, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(MODULE, "fd_allocate", |_: u32, _: u64, _: u64| -> i32 {
+        BADF
+    })?;
+    linker.func_wrap(MODULE, "fd_datasync", |_: u32| -> i32 { BADF })?;
+    linker.func_wrap(
+        MODULE,
+        "fd_fdstat_set_rights",
+        |_: u32, _: u64, _: u64| -> i32 { BADF },
+    )?;
+    linker.func_wrap(MODULE, "fd_filestat_get", |_: u32, _: u32| -> i32 { BADF })?;
+    linker.func_wrap(MODULE, "fd_filestat_set_size", |_: u32, _: u64| -> i32 {
+        BADF
+    })?;
+    linker.func_wrap(
+        MODULE,
+        "fd_filestat_set_times",
+        |_: u32, _: u64, _: u64, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(
+        MODULE,
+        "fd_pread",
+        |_: u32, _: u32, _: u32, _: u64, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(
+        MODULE,
+        "fd_pwrite",
+        |_: u32, _: u32, _: u32, _: u64, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(MODULE, "fd_renumber", |_: u32, _: u32| -> i32 { BADF })?;
+    linker.func_wrap(MODULE, "fd_sync", |_: u32| -> i32 { BADF })?;
+    linker.func_wrap(MODULE, "fd_tell", |_: u32, _: u32| -> i32 { SPIPE })?;
+    linker.func_wrap(
+        MODULE,
+        "path_link",
+        |_: u32, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(
+        MODULE,
+        "path_readlink",
+        |_: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(
+        MODULE,
+        "path_symlink",
+        |_: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(MODULE, "proc_raise", |_: u32| -> i32 { NOSYS })?;
+    linker.func_wrap(MODULE, "sock_accept", |_: u32, _: u32, _: u32| -> i32 {
+        BADF
+    })?;
+    linker.func_wrap(
+        MODULE,
+        "sock_recv",
+        |_: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(
+        MODULE,
+        "sock_send",
+        |_: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { BADF },
+    )?;
+    linker.func_wrap(MODULE, "sock_shutdown", |_: u32, _: u32| -> i32 { BADF })?;
+    linker.func_wrap(MODULE, "sched_yield", || -> i32 { OK })?;
+    linker.func_wrap(
+        MODULE,
+        "random_get",
+        |mut caller: Caller<'_, State>, buf: u32, len: u32| -> Result<i32, wasmi::Error> {
+            use std::hash::{BuildHasher, Hasher};
+            if len as usize > MESSAGE_LIMIT {
+                return Err(wasmi::Error::new("too many random bytes at once"));
+            }
+            let memory = memory(&caller)?;
+            // The standard library's per-process random keys, hashed anew
+            // for each eight bytes.
+            let mut bytes = vec![0u8; len as usize];
+            for chunk in bytes.chunks_mut(8) {
+                let word = std::hash::RandomState::new().build_hasher().finish();
+                chunk.copy_from_slice(&word.to_le_bytes()[..chunk.len()]);
+            }
+            write(&mut caller, memory, buf, &bytes)?;
+            Ok(OK)
+        },
+    )?;
+    // Waiting: a clock is slept on for a moment at most and then reported
+    // as due, which a program checks against the clock itself; input is
+    // always reported ready, since the read is where a program waits.
     linker.func_wrap(
         MODULE,
         "poll_oneoff",
-        |_: u32, _: u32, _: u32, _: u32| -> i32 { NOSYS },
+        |mut caller: Caller<'_, State>,
+         subs: u32,
+         events: u32,
+         count: u32,
+         nevents: u32|
+         -> Result<i32, wasmi::Error> {
+            let memory = memory(&caller)?;
+            if count == 0 || count > 64 {
+                return Err(wasmi::Error::new("poll: too many subscriptions"));
+            }
+            let mut nap: Option<Duration> = None;
+            let mut out = Vec::with_capacity(count as usize * 32);
+            for i in 0..count {
+                let mut sub = [0u8; 48];
+                memory
+                    .read(&caller, (subs + 48 * i) as usize, &mut sub)
+                    .map_err(|_| wasmi::Error::new("outside the program's memory"))?;
+                let tag = sub[8];
+                if tag == 0 {
+                    let timeout = u64::from_le_bytes(sub[24..32].try_into().unwrap_or_default());
+                    let absolute = sub[40] & 1 == 1;
+                    let wait = if absolute {
+                        timeout.saturating_sub(now())
+                    } else {
+                        timeout
+                    };
+                    let wait = Duration::from_nanos(wait).min(NAP);
+                    nap = Some(nap.map_or(wait, |n| n.min(wait)));
+                }
+                // An event: the subscription's userdata, no error, its kind.
+                let mut event = [0u8; 32];
+                event[..8].copy_from_slice(&sub[..8]);
+                event[10] = tag;
+                out.extend_from_slice(&event);
+            }
+            if let Some(nap) = nap {
+                if caller.data().stop.load(Ordering::Relaxed) {
+                    return Err(wasmi::Error::new("stopped"));
+                }
+                // Asleep is not at work: it does not count as the event's time.
+                let asleep = Instant::now();
+                std::thread::sleep(nap);
+                caller.data_mut().answering += asleep.elapsed();
+            }
+            write(&mut caller, memory, events, &out)?;
+            write(&mut caller, memory, nevents, &count.to_le_bytes())?;
+            Ok(OK)
+        },
     )?;
     linker.func_wrap(
         MODULE,

@@ -8740,4 +8740,43 @@ mod tests {
             None
         );
     }
+
+    #[gpui::test]
+    fn a_plugin_written_in_go_runs_like_any_other(cx: &mut TestAppContext) {
+        let mut installed = false;
+        let (_root, _data, store, ws, cx) = plugin_setup(cx, "plugin-go", |plugins| {
+            let go = plugin::testing::word_count_go();
+            installed = plugin::testing::install_go(&go, plugins).is_some();
+        });
+        if !installed {
+            eprintln!("go is not installed; skipped");
+            return;
+        }
+        // A module like any other, though it is a program inside.
+        assert!(!cx.read(|cx| store.read(cx).find("word-count-go").unwrap().script));
+        store.update(cx, |s, cx| s.enable("word-count-go", cx));
+        wait_for(cx, "the count", &|cx| {
+            plugin_status(&store, "word-count-go", cx).as_deref() == Some("3 words")
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        editor.update_in(cx, |e, _, cx| {
+            let end = e.text(cx).len();
+            e.select_range(end..end, cx)
+        });
+        cx.simulate_input(" né 😀 ");
+        wait_for(cx, "the new count", &|cx| {
+            plugin_status(&store, "word-count-go", cx).as_deref() == Some("5 words")
+        });
+        // Its positions are bytes, as the editor's are.
+        store.update(cx, |s, _| s.run_command("word-count-go", "insert"));
+        wait_for(cx, "the insertion", &|cx| {
+            editor.read(cx).text(cx) == "one two three né 😀 5 words"
+        });
+        store.update(cx, |s, cx| s.disable("word-count-go", cx));
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read(|cx| plugin_status(&store, "word-count-go", cx)),
+            None
+        );
+    }
 }

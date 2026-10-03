@@ -10,7 +10,7 @@ crates/
   rest/     HTTP: .http files, route detection, OpenAPI import, sending (no UI)
   ai/       local models: hardware, catalog, downloads, llama-server, benchmark (no UI)
   import/   settings, themes and key bindings of VS Code, Cursor, Zed and JetBrains IDEs (no UI)
-  plugin/   plugin host: manifest, permissions, the WebAssembly sandbox, its budget, and the JavaScript engine (no UI)
+  plugin/   plugin host: manifest, permissions, the WebAssembly sandbox, its budget, WASI programs and the JavaScript engine (no UI)
   plugin_sdk/  what a plugin is written against, and the messages it exchanges with the editor
   solder/   the app: GPUI window, editor element, file tree, tabs, status bar
 ```
@@ -608,24 +608,59 @@ network, `async` functions and promises work, `console.log` writes the plugin's
 log. Positions in `solder.editor()` and `solder.edit()` are JavaScript's (UTF-16
 units) in the text `editor()` last returned; the editor converts.
 
-An interpreter inside an interpreter is slow. Measured on an M4, release build,
-counting words on every change:
-
-| | Rust | TypeScript |
-|---|---|---|
-| Starting the plugin | 3 ms | 30 ms |
-| A 2 000 character file | 0.3 ms | 3 ms |
-| A 30 000 character file | 2 ms | 40 ms |
-
-A script that reads the whole file on every keystroke goes over the 4 ms on
-large files: its work then waits for a pause in typing, and it ends up marked
-Slow. Listen to `save` instead of `change`, or write that part in Rust. Regular
-expressions over long text cost the most (`split(/\s+/)` on the 30 000 characters
+An interpreter inside an interpreter is slow; see the table below. A script that
+reads the whole file on every keystroke goes over the 4 ms on large files: its
+work then waits for a pause in typing, and it ends up marked Slow. Listen to
+`save` instead of `change`, or write that part in Rust or Go. Regular
+expressions over long text cost the most (`split(/\s+/)` on 30 000 characters
 alone takes about 150 ms); plain string methods are several times cheaper.
 
-Go plugins, the registry and extensions of other editors are not there yet: VS
-Code extensions are Node programs with full access to the machine, and Zed's use
-the WebAssembly Component Model, which this interpreter does not run.
+### In Go
+
+A `plugin.wasm` can also be a program built for WASI: one that has a `_start`
+instead of `solder_event`. It runs in the same sandbox under the same
+permissions and budget, with no files and no network of its own; it reads events
+as lines on its input and writes requests as lines on its output, and what it
+prints otherwise is its log. `plugins/go` is the package that does this for Go,
+and `plugins/word-count-go` the example:
+
+```go
+func show(solder.Event) {
+	if file, err := solder.Editor(); err == nil {
+		solder.Status(fmt.Sprintf("%d words", len(strings.Fields(file.Text))))
+	}
+}
+
+func main() {
+	solder.On("open", show)
+	solder.On("change", show)
+	solder.Run()
+}
+```
+
+```bash
+cd plugins/word-count-go && GOOS=wasip1 GOARCH=wasm go build -ldflags="-s -w" -o plugin.wasm .
+```
+
+Positions are bytes, as in the editor. A panic in a handler fails that event and
+the program goes on. `time.Sleep` works and is not counted as the plugin's work.
+The package reads and writes its JSON itself: `encoding/json` works through
+reflection, and under the interpreter that alone took 25 ms for a 30 000
+character file.
+
+### How fast
+
+Measured on an M4, release build, counting words on every change:
+
+| | Rust | Go | TypeScript |
+|---|---|---|---|
+| Starting the plugin | 3 ms | 25 ms | 25 ms |
+| A 2 000 character file | 0.2 ms | 0.5 ms | 2.4 ms |
+| A 30 000 character file | 1.7 ms | 4.8 ms | 32 ms |
+
+The registry and extensions of other editors are not there yet: VS Code
+extensions are Node programs with full access to the machine, and Zed's use the
+WebAssembly Component Model, which this interpreter does not run.
 
 ## Settings from another editor
 

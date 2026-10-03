@@ -7,5 +7,5 @@
 
 It is compiled into the editor and runs inside the same sandbox as every
 other plugin. Its license (MIT) is in `QUICKJS-LICENSE`. To move to another
-release, replace the file, update the hash here and in `src/script.rs`, and run
+release, replace the file, update the hash here and in `src/wasi.rs`, and run
 the tests.
