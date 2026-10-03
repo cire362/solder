@@ -15,20 +15,48 @@ use serde::{Deserialize, Serialize};
 
 use crate::theme::{CODE_FONT, Theme};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// `system`, `dark`, `light`, or the name of a theme in the `themes`
+/// folder next to `settings.json`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ThemeMode {
     #[default]
     System,
     Dark,
     Light,
+    Named(String),
+}
+
+impl Serialize for ThemeMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::System => "system",
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Named(name) => name,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ThemeMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Ok(match name.as_str() {
+            "system" => Self::System,
+            "dark" => Self::Dark,
+            "light" => Self::Light,
+            _ => Self::Named(name),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// `system`, `dark` or `light`.
+    /// `system`, `dark`, `light`, or a theme in the `themes` folder.
     pub theme: ThemeMode,
+    /// The named theme, read when the settings are.
+    #[serde(skip)]
+    pub custom_theme: Option<Theme>,
     pub buffer_font_family: String,
     pub buffer_font_size: f32,
     pub buffer_line_height: f32,
@@ -57,6 +85,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: ThemeMode::System,
+            custom_theme: None,
             buffer_font_family: CODE_FONT.to_string(),
             buffer_font_size: 13.,
             buffer_line_height: 20.,
@@ -96,10 +125,12 @@ impl Settings {
     }
 
     pub fn theme(&self, appearance: gpui::WindowAppearance) -> Theme {
-        match self.theme {
-            ThemeMode::System => Theme::for_appearance(appearance),
-            ThemeMode::Dark => Theme::dark(),
-            ThemeMode::Light => Theme::light(),
+        match (&self.theme, &self.custom_theme) {
+            (ThemeMode::Named(_), Some(theme)) => theme.clone(),
+            (ThemeMode::Dark, _) => Theme::dark(),
+            (ThemeMode::Light, _) => Theme::light(),
+            // The system's, also for a named theme whose file is gone.
+            _ => Theme::for_appearance(appearance),
         }
     }
 }
@@ -120,6 +151,37 @@ pub fn settings_path() -> PathBuf {
 
 pub fn keymap_path() -> PathBuf {
     config_dir().join("keymap.json")
+}
+
+/// Bindings brought over from another editor. Loaded under `keymap.json`,
+/// so the user's own bindings win.
+pub const IMPORTED_KEYMAP: &str = "keymap-imported.json";
+
+/// Where the theme called `name` is kept: `themes/night-owl.json`.
+pub fn theme_path(dir: &Path, name: &str) -> PathBuf {
+    let slug: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    dir.join("themes")
+        .join(format!("{}.json", slug.trim_matches('-')))
+}
+
+/// Reads a named theme; blocking, on a small file.
+fn read_theme(dir: &Path, name: &str) -> Result<Theme, String> {
+    let path = theme_path(dir, name);
+    let text = std::fs::read_to_string(&path).map_err(|_| {
+        format!("settings.json: no theme \u{201c}{name}\u{201d} in the themes folder")
+    })?;
+    let file: import::ThemeFile = serde_json::from_str(&strip_comments(&text))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Theme::from_file(&file))
 }
 
 /// Drops `//` line comments so the files can be annotated (JSON with comments).
@@ -163,15 +225,16 @@ struct KeymapSection {
 }
 
 /// Builds user key bindings. Each value is an action name, or
-/// `[name, arguments]` for actions that take arguments.
-fn parse_keymap(source: &str, cx: &App) -> (Vec<KeyBinding>, Vec<String>) {
+/// `[name, arguments]` for actions that take arguments. `file` names the
+/// file in what is reported.
+pub(crate) fn parse_keymap(file: &str, source: &str, cx: &App) -> (Vec<KeyBinding>, Vec<String>) {
     let stripped = strip_comments(source);
     if stripped.trim().is_empty() {
         return (Vec::new(), Vec::new());
     }
     let sections: Vec<KeymapSection> = match serde_json::from_str(&stripped) {
         Ok(s) => s,
-        Err(e) => return (Vec::new(), vec![format!("keymap.json: {e}")]),
+        Err(e) => return (Vec::new(), vec![format!("{file}: {e}")]),
     };
     let mut bindings = Vec::new();
     let mut errors = Vec::new();
@@ -180,7 +243,7 @@ fn parse_keymap(source: &str, cx: &App) -> (Vec<KeyBinding>, Vec<String>) {
             Some(ctx) => match gpui::KeyBindingContextPredicate::parse(ctx) {
                 Ok(p) => Some(Rc::new(p)),
                 Err(e) => {
-                    errors.push(format!("keymap.json: context \u{201c}{ctx}\u{201d}: {e}"));
+                    errors.push(format!("{file}: context \u{201c}{ctx}\u{201d}: {e}"));
                     continue;
                 }
             },
@@ -192,19 +255,19 @@ fn parse_keymap(source: &str, cx: &App) -> (Vec<KeyBinding>, Vec<String>) {
                 serde_json::Value::Array(items) => match items.as_slice() {
                     [serde_json::Value::String(name), args] => (name.clone(), Some(args.clone())),
                     _ => {
-                        errors.push(format!("keymap.json: {keys}: expected [\"action\", args]"));
+                        errors.push(format!("{file}: {keys}: expected [\"action\", args]"));
                         continue;
                     }
                 },
                 _ => {
-                    errors.push(format!("keymap.json: {keys}: expected an action name"));
+                    errors.push(format!("{file}: {keys}: expected an action name"));
                     continue;
                 }
             };
             let action = match cx.build_action(&name, args) {
                 Ok(a) => a,
                 Err(e) => {
-                    errors.push(format!("keymap.json: {keys}: {e}"));
+                    errors.push(format!("{file}: {keys}: {e}"));
                     continue;
                 }
             };
@@ -217,7 +280,7 @@ fn parse_keymap(source: &str, cx: &App) -> (Vec<KeyBinding>, Vec<String>) {
                 cx.keyboard_mapper().as_ref(),
             ) {
                 Ok(b) => bindings.push(b),
-                Err(e) => errors.push(format!("keymap.json: {keys}: {e}")),
+                Err(e) => errors.push(format!("{file}: {keys}: {e}")),
             }
         }
     }
@@ -238,6 +301,7 @@ pub fn bind_defaults(cx: &mut App) {
     crate::file_diff::bind_keys(cx);
     crate::results::bind_keys(cx);
     crate::plugins_view::bind_keys(cx);
+    crate::import_view::bind_keys(cx);
     crate::structure::bind_keys(cx);
     crate::erd_view::bind_keys(cx);
     crate::ai_panel::bind_keys(cx);
@@ -251,10 +315,15 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-/// Loads both files and applies them. Safe to call again on change.
+/// Loads the config files and applies them. Safe to call again on change.
 pub fn reload(cx: &mut App) {
+    reload_from(&config_dir(), cx);
+}
+
+/// `reload`, from the config folder given.
+pub fn reload_from(dir: &Path, cx: &mut App) {
     let mut errors = Vec::new();
-    let settings = match parse_settings(&read(&settings_path())) {
+    let mut settings = match parse_settings(&read(&dir.join("settings.json"))) {
         Ok(s) => s,
         Err(e) => {
             errors.push(e);
@@ -262,14 +331,23 @@ pub fn reload(cx: &mut App) {
             cx.try_global::<Settings>().cloned().unwrap_or_default()
         }
     };
+    if let ThemeMode::Named(name) = &settings.theme {
+        match read_theme(dir, name) {
+            Ok(theme) => settings.custom_theme = Some(theme),
+            Err(e) => errors.push(e),
+        }
+    }
     cx.global_mut::<crate::perf::Perf>().hud_visible = settings.show_performance_hud;
     cx.set_global(settings);
 
     cx.clear_key_bindings();
     bind_defaults(cx);
-    let (bindings, keymap_errors) = parse_keymap(&read(&keymap_path()), cx);
-    cx.bind_keys(bindings);
-    errors.extend(keymap_errors);
+    // Later bindings win: the defaults, what was imported, the user's own.
+    for file in [IMPORTED_KEYMAP, "keymap.json"] {
+        let (bindings, keymap_errors) = parse_keymap(file, &read(&dir.join(file)), cx);
+        cx.bind_keys(bindings);
+        errors.extend(keymap_errors);
+    }
     for e in &errors {
         eprintln!("{e}");
     }
