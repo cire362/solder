@@ -8692,4 +8692,52 @@ mod tests {
             assert!(bindings.len() > 30);
         }
     }
+
+    #[gpui::test]
+    fn a_plugin_written_in_typescript_runs_like_any_other(cx: &mut TestAppContext) {
+        let (_root, data, store, ws, cx) = plugin_setup(cx, "plugin-ts", |plugins| {
+            plugin::testing::install_script(&plugin::testing::word_count_ts(), plugins);
+        });
+        // Listed as a script, and off until enabled.
+        assert!(cx.read(|cx| store.read(cx).find("word-count-ts").unwrap().script));
+        assert_eq!(
+            cx.read(|cx| store.read(cx).state("word-count-ts")),
+            PluginState::Disabled
+        );
+        store.update(cx, |s, cx| s.enable("word-count-ts", cx));
+        wait_for(cx, "the count", &|cx| {
+            plugin_status(&store, "word-count-ts", cx).as_deref() == Some("3 words")
+        });
+
+        // Typing reaches it; positions it edits by are JavaScript's, in a
+        // text with characters of two and four bytes.
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        editor.update_in(cx, |e, _, cx| {
+            let end = e.text(cx).len();
+            e.select_range(end..end, cx)
+        });
+        cx.simulate_input(" né 😀 ");
+        wait_for(cx, "the new count", &|cx| {
+            plugin_status(&store, "word-count-ts", cx).as_deref() == Some("5 words")
+        });
+        store.update(cx, |s, _| s.run_command("word-count-ts", "insert"));
+        wait_for(cx, "the insertion", &|cx| {
+            editor.read(cx).text(cx) == "one two three né 😀 5 words"
+        });
+
+        // The script is what was approved: another one stays off.
+        std::fs::write(
+            data.join("plugins/word-count-ts/plugin.js"),
+            "solder.on('open', () => solder.status('replaced'));",
+        )
+        .unwrap();
+        store.update(cx, |s, cx| s.scan(cx));
+        wait_for(cx, "the change", &|cx| {
+            store.read(cx).state("word-count-ts") == PluginState::Changed
+        });
+        assert_eq!(
+            cx.read(|cx| plugin_status(&store, "word-count-ts", cx)),
+            None
+        );
+    }
 }
