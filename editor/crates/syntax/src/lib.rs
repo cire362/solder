@@ -283,7 +283,7 @@ fn registry() -> &'static [(&'static [&'static str], Arc<Language>)] {
     static REGISTRY: OnceLock<Vec<(&'static [&'static str], Arc<Language>)>> = OnceLock::new();
     REGISTRY.get_or_init(|| {
         // TypeScript's query only adds TS-specific captures on top of the
-        // JavaScript one. Patterns listed first win, so TS goes first.
+        // JavaScript one. Later patterns win, so TS goes last.
         vec![
             (
                 &["rs"][..],
@@ -300,8 +300,8 @@ fn registry() -> &'static [(&'static [&'static str], Arc<Language>)] {
                     "TypeScript",
                     "//",
                     tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-                    tree_sitter_typescript::HIGHLIGHTS_QUERY,
-                    tree_sitter_javascript::HIGHLIGHT_QUERY
+                    tree_sitter_javascript::HIGHLIGHT_QUERY,
+                    tree_sitter_typescript::HIGHLIGHTS_QUERY
                 ),
             ),
             (
@@ -310,9 +310,9 @@ fn registry() -> &'static [(&'static [&'static str], Arc<Language>)] {
                     "TSX",
                     "//",
                     tree_sitter_typescript::LANGUAGE_TSX,
-                    tree_sitter_typescript::HIGHLIGHTS_QUERY,
+                    tree_sitter_javascript::HIGHLIGHT_QUERY,
                     tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
-                    tree_sitter_javascript::HIGHLIGHT_QUERY
+                    tree_sitter_typescript::HIGHLIGHTS_QUERY
                 ),
             ),
             (
@@ -321,8 +321,8 @@ fn registry() -> &'static [(&'static [&'static str], Arc<Language>)] {
                     "JavaScript",
                     "//",
                     tree_sitter_javascript::LANGUAGE,
-                    tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
-                    tree_sitter_javascript::HIGHLIGHT_QUERY
+                    tree_sitter_javascript::HIGHLIGHT_QUERY,
+                    tree_sitter_javascript::JSX_HIGHLIGHT_QUERY
                 ),
             ),
             (
@@ -556,8 +556,9 @@ impl SyntaxTree {
 
     /// Non-overlapping highlight spans intersecting `range`, sorted by start.
     /// Nested captures override their parents (an escape inside a string);
-    /// for the same node, the first matching pattern wins. An injected
-    /// language paints over the language it sits in.
+    /// for the same node, the last matching pattern wins, which is the order
+    /// highlight queries are written for: the general rule first, then its
+    /// exceptions. An injected language paints over the language it sits in.
     pub fn highlights(
         &self,
         rope: &Rope,
@@ -604,7 +605,6 @@ fn paint(language: &Language, tree: &Tree, rope: &Rope, range: &Range<usize>, sl
     let Some(hl) = language.highlighter() else {
         return;
     };
-    let mut painted: Vec<Range<usize>> = Vec::new();
     let mut cursor = QueryCursor::new();
     cursor.set_byte_range(range.clone());
     let mut captures = cursor.captures(&hl.query, tree.root_node(), RopeProvider(rope));
@@ -613,11 +613,9 @@ fn paint(language: &Language, tree: &Tree, rope: &Rope, range: &Range<usize>, sl
         let Some(kind) = hl.kinds[capture.index as usize] else {
             continue;
         };
+        // Captures come in document order, and for one node in the order
+        // of their patterns, so writing each over the last gives the rule.
         let node = capture.node.byte_range();
-        if painted.last().is_some_and(|r| *r == node) || painted.contains(&node) {
-            continue;
-        }
-        painted.push(node.clone());
         let start = node.start.max(range.start) - range.start;
         let end = node.end.min(range.end).saturating_sub(range.start);
         if start < end {
@@ -929,6 +927,30 @@ mod tests {
     }
 
     #[test]
+    fn a_later_pattern_wins_over_an_earlier_one() {
+        // Queries name every identifier a variable first and say what else
+        // it can be afterwards.
+        let spans = |path: &str, src: &str| {
+            let rope = Rope::from_str(src);
+            let lang = language_for_path(Path::new(path)).unwrap();
+            kinds(&SyntaxTree::parse(lang, &rope).unwrap(), &rope, src)
+        };
+        let ts = spans("a.ts", "function twice(n: number) { return go(n) }");
+        assert!(ts.contains(&("twice".into(), HighlightKind::Function)));
+        assert!(ts.contains(&("go".into(), HighlightKind::Function)));
+        assert!(ts.contains(&("n".into(), HighlightKind::Variable)));
+        assert!(ts.contains(&("number".into(), HighlightKind::Type)));
+        let tsx = spans("a.tsx", "const a = <Box size={n}>x</Box>;");
+        assert!(tsx.contains(&("size".into(), HighlightKind::Attribute)));
+        let rust = spans("a.rs", "fn f(s: S) { s.len(); s.field; }");
+        assert!(rust.contains(&("len".into(), HighlightKind::Function)));
+        assert!(rust.contains(&("field".into(), HighlightKind::Property)));
+        let py = spans("a.py", "def f(x):\n    return g(x)\n");
+        assert!(py.contains(&("f".into(), HighlightKind::Function)));
+        assert!(py.contains(&("g".into(), HighlightKind::Function)));
+    }
+
+    #[test]
     fn highlights_only_requested_range() {
         let src = "const a = 1;\nconst b = 2;\n";
         let rope = Rope::from_str(src);
@@ -1037,6 +1059,7 @@ mod tests {
         assert!(spans.contains(&("string".into(), HighlightKind::Type)));
         assert!(spans.contains(&("'hi'".into(), HighlightKind::String)));
         assert!(spans.contains(&("color".into(), HighlightKind::Property)));
+        assert!(spans.contains(&("go".into(), HighlightKind::Function)));
         assert!(spans.contains(&("1".into(), HighlightKind::Number)));
     }
 
