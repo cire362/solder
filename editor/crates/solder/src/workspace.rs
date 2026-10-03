@@ -8286,7 +8286,12 @@ mod tests {
         assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
 
         // Typing reaches it as changes.
-        cx.simulate_keystrokes("secondary-down");
+        // The cursor to the end, without a key that differs by platform.
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        editor.update_in(cx, |e, _, cx| {
+            let end = e.text(cx).len();
+            e.select_range(end..end, cx)
+        });
         cx.simulate_input(" four five");
         wait_for(cx, "the new count", &|cx| {
             plugin_status(&store, "word-count", cx).as_deref() == Some("5 words")
