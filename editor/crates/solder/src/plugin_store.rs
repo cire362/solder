@@ -2,7 +2,8 @@
 //! running ones. One store for all windows.
 //!
 //! A plugin is a folder under the data folder's `plugins` with a
-//! `plugin.json` and a `plugin.wasm`. Nothing runs until the user enables
+//! `plugin.json` and a `plugin.wasm` (or, written in JavaScript, a
+//! `plugin.js`). Nothing runs until the user enables
 //! it, which approves the permissions its manifest lists for exactly that
 //! module: if either changes, it stays off until enabled again.
 //!
@@ -22,8 +23,8 @@ use gpui::{
     App, AppContext, Context, Entity, Global, SharedString, Subscription, Task, WeakEntity,
 };
 use plugin::{
-    Activity, Budget, EditorText, Event, Host, HttpResponse, Manifest, Plugin, Reply, Request,
-    Stats,
+    Activity, Budget, Code, EditorText, Event, Host, HttpResponse, Manifest, Plugin, Reply,
+    Request, Stats,
 };
 use serde::{Deserialize, Serialize};
 
@@ -44,8 +45,11 @@ pub struct Installed {
     pub name: String,
     pub dir: PathBuf,
     pub manifest: Result<Manifest, String>,
-    /// SHA-256 of `plugin.wasm`; empty when it is missing.
+    /// SHA-256 of `plugin.wasm` or `plugin.js`; empty when both are
+    /// missing.
     pub hash: String,
+    /// Written in JavaScript: it has a `plugin.js`.
+    pub script: bool,
 }
 
 /// What the user agreed to when enabling a plugin.
@@ -344,7 +348,11 @@ impl PluginStore {
             Err(e) => return PluginState::Invalid(e.clone()),
         };
         if installed.hash.is_empty() {
-            return PluginState::Invalid(format!("{} is missing", plugin::MODULE));
+            return PluginState::Invalid(format!(
+                "Neither {} nor {} is there",
+                plugin::MODULE,
+                plugin::SCRIPT
+            ));
         }
         match self.enabled.get(name) {
             None => PluginState::Disabled,
@@ -425,15 +433,15 @@ impl PluginStore {
         };
         let name = name.to_string();
         cx.spawn(async move |this, cx| {
-            let path = installed.dir.join(plugin::MODULE);
-            let wasm = cx
+            let dir = installed.dir.clone();
+            let code = cx
                 .background_executor()
-                .spawn(async move { std::fs::read(path).ok() })
+                .spawn(async move { read_code(&dir) })
                 .await;
             this.update(cx, |this, cx| {
-                let Some(wasm) = wasm else { return };
+                let Some((code, hash)) = code else { return };
                 // Hashed again: the bytes that run are the bytes approved.
-                if approval != approval_of(&manifest, &ai::install::sha256_hex(&wasm)) {
+                if approval != approval_of(&manifest, &hash) {
                     // Replaced since the folder was read: show it as changed.
                     return this.scan(cx);
                 }
@@ -442,7 +450,7 @@ impl PluginStore {
                 }
                 let plugin = Plugin::start(
                     manifest,
-                    wasm,
+                    code,
                     this.host.clone(),
                     this.activity.clone(),
                     this.budget,
@@ -680,6 +688,18 @@ fn approval_of(manifest: &Manifest, hash: &str) -> Approval {
     }
 }
 
+/// What the plugin in `dir` runs, with its SHA-256: `plugin.wasm`, or
+/// `plugin.js` when there is no module. Blocking.
+fn read_code(dir: &Path) -> Option<(Code, String)> {
+    if let Ok(wasm) = std::fs::read(dir.join(plugin::MODULE)) {
+        let hash = ai::install::sha256_hex(&wasm);
+        return Some((Code::Module(wasm), hash));
+    }
+    let source = std::fs::read_to_string(dir.join(plugin::SCRIPT)).ok()?;
+    let hash = ai::install::sha256_hex(source.as_bytes());
+    Some((Code::Script(source), hash))
+}
+
 /// Every folder under `dir`, with its manifest and module hash; blocking.
 fn read_installed(dir: &Path) -> Vec<Installed> {
     // There for "Open folder" to show, before the first plugin.
@@ -696,14 +716,16 @@ fn read_installed(dir: &Path) -> Vec<Installed> {
                 Ok(manifest) => manifest.name.clone(),
                 Err(_) => entry.file_name().to_string_lossy().into_owned(),
             };
-            let hash = std::fs::read(dir.join(plugin::MODULE))
-                .map(|bytes| ai::install::sha256_hex(&bytes))
-                .unwrap_or_default();
+            let (script, hash) = match read_code(&dir) {
+                Some((code, hash)) => (matches!(code, Code::Script(_)), hash),
+                None => (false, String::new()),
+            };
             Installed {
                 name,
                 dir,
                 manifest,
                 hash,
+                script,
             }
         })
         .collect();

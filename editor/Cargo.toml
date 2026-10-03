@@ -45,3 +45,17 @@ incremental = false
 
 [profile.ci.package."*"]
 opt-level = 0
+
+# The plugin interpreter stays optimized under `ci`: unoptimized it runs some
+# fifty times slower, and the tests of script plugins wait on it.
+[profile.ci.package.wasmi]
+opt-level = 2
+
+[profile.ci.package.wasmi_core]
+opt-level = 2
+
+[profile.ci.package.wasmi_ir]
+opt-level = 2
+
+[profile.ci.package.wasmi_collections]
+opt-level = 2

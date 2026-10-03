@@ -8,6 +8,8 @@ use solder_plugin::{Event, Request};
 /// The file next to `plugin.wasm`.
 pub const MANIFEST: &str = "plugin.json";
 pub const MODULE: &str = "plugin.wasm";
+/// A plugin written in JavaScript has this instead of a module.
+pub const SCRIPT: &str = "plugin.js";
 
 /// Something a plugin may do once the user has agreed to it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

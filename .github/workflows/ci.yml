@@ -22,6 +22,8 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
+      # The editor's example plugins in TypeScript, checked where Node is.
+      - run: npm run plugins
       - run: npm run build
 
   editor:

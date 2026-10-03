@@ -217,11 +217,18 @@ impl Render for PluginsView {
             .installed
             .iter()
             .map(|p| {
-                let version = p
+                let mut version = p
                     .manifest
                     .as_ref()
                     .map(|m| m.version.clone())
                     .unwrap_or_default();
+                if p.script {
+                    version.push_str(if version.is_empty() {
+                        "JavaScript"
+                    } else {
+                        ", JavaScript"
+                    });
+                }
                 let slow = store.stats(&p.name).is_some_and(|s| s.slow());
                 (
                     p.name.clone().into(),
@@ -347,7 +354,7 @@ impl Render for PluginsView {
                             .text_size(UI_FONT_SIZE)
                             .text_color(theme.fg_subtle)
                             .child(if loaded {
-                                "No plugins yet. A plugin is a folder with plugin.json and plugin.wasm in the plugins folder."
+                                "No plugins yet. A plugin is a folder with plugin.json and plugin.wasm or plugin.js in the plugins folder."
                             } else {
                                 "Reading the plugins folder..."
                             }),

@@ -11,8 +11,9 @@
 
 mod manifest;
 mod runtime;
+mod script;
 pub mod testing;
 
-pub use manifest::{Command, MANIFEST, MODULE, Manifest, Permission, url_host};
-pub use runtime::{Activity, Budget, Host, Plugin, SLOW_AFTER, Stats};
+pub use manifest::{Command, MANIFEST, MODULE, Manifest, Permission, SCRIPT, url_host};
+pub use runtime::{Activity, Budget, Code, Host, Plugin, SLOW_AFTER, Stats};
 pub use solder_plugin::{EditorText, Event, HttpRequest, HttpResponse, Reply, Request};

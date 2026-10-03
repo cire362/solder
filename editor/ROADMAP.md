@@ -85,5 +85,7 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
       (and Zed: font, indent, format on save; themes from VS Code and Zed theme
       files, kept in `themes`; the editors' own keys and the bindings a user
       changed; offered once on a first launch; an import only adds)
-- [ ] Plugins in TypeScript and Go; the registry (needs the hosted service)
+- [x] Plugins in TypeScript and JavaScript (one `plugin.js` run by QuickJS inside
+      the same sandbox, with typings; the budget is measured in time)
+- [ ] Plugins in Go; the registry (needs the hosted service)
 - [ ] Preview environments per branch (needs the hosted service)

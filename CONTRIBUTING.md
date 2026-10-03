@@ -33,11 +33,13 @@ when the diff does not make it obvious.
 
 `scripts/check.sh` runs everything CI runs:
 
-- website: ESLint and TypeScript
+- website: ESLint and TypeScript, and the editor's example plugins written in
+  TypeScript (`npm run plugins`)
 - editor: `cargo fmt --check`, `cargo clippy` with warnings as errors, `cargo test`
 
 The checks use the `ci` Cargo profile and the committed lockfile. This profile
 keeps debug assertions and overflow checks, but disables dependency optimization
+(except for the plugin interpreter, which the tests of script plugins wait on)
 and uses line-table debug information for faster builds. Normal development and
 release profiles are unchanged.
 

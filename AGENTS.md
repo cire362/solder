@@ -95,6 +95,11 @@ Never guess a signature.
   before a request reaches the app (`plugin_store.rs`). The UI thread never
   waits for a plugin. Keep `wasmi` on `portable-dispatch`: its default
   dispatch overflowed the stack in dev builds and took the editor down.
+  A plugin's budget is time, read between slices of fuel; fuel itself is
+  not a measure (a unit is worth a hundred times less time in QuickJS, which
+  runs `plugin.js` plugins, than in a plugin compiled from Rust).
+  `editor/plugins/*/plugin.js` is compiled from `plugin.ts`; `npm run
+  plugins` checks it is current.
 
 ### Performance rules
 

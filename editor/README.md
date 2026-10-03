@@ -10,7 +10,7 @@ crates/
   rest/     HTTP: .http files, route detection, OpenAPI import, sending (no UI)
   ai/       local models: hardware, catalog, downloads, llama-server, benchmark (no UI)
   import/   settings, themes and key bindings of VS Code, Cursor, Zed and JetBrains IDEs (no UI)
-  plugin/   plugin host: manifest, permissions, the WebAssembly sandbox and its budget (no UI)
+  plugin/   plugin host: manifest, permissions, the WebAssembly sandbox, its budget, and the JavaScript engine (no UI)
   plugin_sdk/  what a plugin is written against, and the messages it exchanges with the editor
   solder/   the app: GPUI window, editor element, file tree, tabs, status bar
 ```
@@ -501,8 +501,9 @@ chat model Push just pushes.
 
 ## Plugins
 
-A plugin is a folder with a `plugin.json` and a `plugin.wasm` in the `plugins`
-folder of the app's data folder (`~/Library/Application Support/Solder/plugins`
+A plugin is a folder with a `plugin.json` and a `plugin.wasm` (or, written in
+JavaScript or TypeScript, a `plugin.js`) in the `plugins` folder of the app's
+data folder (`~/Library/Application Support/Solder/plugins`
 on macOS). **Workspace: Show plugins** in the command palette lists what is
 there, with **Open folder** to get to it.
 
@@ -529,16 +530,20 @@ asks the editor for, and only what its manifest declares is answered:
 | `fs:read` | Files of the project, by path from its root: not outside it, not `.env`, not what `.solderignore` keeps from AI |
 | `http:<host>` | Requests to that host. A redirect comes back as it is, so another host needs its own permission |
 
-Approval is for that list and that module (by SHA-256). If an update changes
-either, the plugin stays off and is marked **Changed** until you enable it again.
+Approval is for that list and that module or script (by SHA-256). If an update
+changes either, the plugin stays off and is marked **Changed** until you enable
+it again.
 
 Each plugin runs in its own WebAssembly instance (the `wasmi` interpreter, 64 MB
 of memory at most) on its own thread, and talks to the editor in JSON messages,
-so the editor never waits for it. Its work is counted: handling a `change`
-(typing) gets about 4 ms first; a plugin that needs more is paused and continues
-once typing has stopped for 150 ms. Three times over, or one event stopped at the
-limit of about 10 s, marks it **Slow** in the window and the status bar. An event that
-fails or is stopped ends there and the plugin starts again from a fresh instance.
+so the editor never waits for it. Its work is timed, not counting the wait for
+the editor's answers: handling a `change` (typing) gets 4 ms first; a plugin that
+needs more is paused and continues once typing has stopped for 150 ms. Three
+times over, or one event stopped at the limit of 10 s, marks it **Slow** in the
+window and the status bar. An event that fails or is stopped ends there and the
+plugin starts again from a fresh instance. (The interpreter can only be paused
+by running it out of fuel, so it runs in slices of fuel sized to last about a
+millisecond, and the clock is read between them.)
 
 Plugins are written in Rust against `crates/plugin_sdk` and built for
 `wasm32-unknown-unknown`; `plugins/word-count` is the example:
@@ -566,7 +571,58 @@ cd plugins/word-count && cargo build --release --target wasm32-unknown-unknown
 ```
 
 Copy `plugin.json` and `target/wasm32-unknown-unknown/release/word_count.wasm`
-(as `plugin.wasm`) into `plugins/word-count` in the data folder. TypeScript and
+(as `plugin.wasm`) into `plugins/word-count` in the data folder.
+
+### In TypeScript or JavaScript
+
+A plugin can be one script instead of a module: `plugin.js` next to the same
+`plugin.json`. It uses the global `solder`, typed in `plugins/solder.d.ts`;
+`plugins/word-count-ts` is the example:
+
+```ts
+function show(): void {
+  const words = solder.editor().text.split(" ").filter((w) => w.trim() !== "").length;
+  solder.status(`${words} words`);
+}
+
+solder.on("open", show);
+solder.on("change", show);
+
+solder.command("insert", () => {
+  const file = solder.editor();
+  if (file.path === null) return;
+  solder.edit(file.path, file.selectionStart, file.selectionEnd, "here");
+});
+```
+
+```bash
+npx tsc -p plugins/word-count-ts   # writes plugin.js next to plugin.ts
+```
+
+The script runs in QuickJS (`crates/plugin/assets`, MIT), which is itself a
+WebAssembly module inside the same sandbox, so the permissions, the 64 MB and the
+time budget hold for it as for any plugin. The engine gets no files, no network
+and no clock to wait on: only the lines it exchanges with the editor. So there
+are no modules to import, no `setTimeout` and no `fetch`; `solder.http` is the
+network, `async` functions and promises work, `console.log` writes the plugin's
+log. Positions in `solder.editor()` and `solder.edit()` are JavaScript's (UTF-16
+units) in the text `editor()` last returned; the editor converts.
+
+An interpreter inside an interpreter is slow. Measured on an M4, release build,
+counting words on every change:
+
+| | Rust | TypeScript |
+|---|---|---|
+| Starting the plugin | 3 ms | 30 ms |
+| A 2 000 character file | 0.3 ms | 3 ms |
+| A 30 000 character file | 2 ms | 40 ms |
+
+A script that reads the whole file on every keystroke goes over the 4 ms on
+large files: its work then waits for a pause in typing, and it ends up marked
+Slow. Listen to `save` instead of `change`, or write that part in Rust. Regular
+expressions over long text cost the most (`split(/\s+/)` on the 30 000 characters
+alone takes about 150 ms); plain string methods are several times cheaper.
+
 Go plugins, the registry and extensions of other editors are not there yet: VS
 Code extensions are Node programs with full access to the machine, and Zed's use
 the WebAssembly Component Model, which this interpreter does not run.

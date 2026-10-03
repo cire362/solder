@@ -12,9 +12,22 @@ pub fn word_count() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/word-count")
 }
 
+/// The example plugin written in TypeScript, with its compiled `plugin.js`.
+pub fn word_count_ts() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/word-count-ts")
+}
+
 /// The plugin that exercises every request.
 pub fn probe() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe")
+}
+
+/// The script that exercises every request from JavaScript.
+pub fn probe_script() -> String {
+    std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe.js"),
+    )
+    .expect("probe.js")
 }
 
 /// Compiles the plugin project in `dir` for wasm32-unknown-unknown (once per
@@ -81,5 +94,17 @@ pub fn install(dir: &Path, plugins: &Path) -> PathBuf {
     std::fs::create_dir_all(&dest).expect("the plugin folder");
     std::fs::copy(dir.join(crate::MANIFEST), dest.join(crate::MANIFEST)).expect("plugin.json");
     std::fs::write(dest.join(crate::MODULE), wasm).expect("plugin.wasm");
+    dest
+}
+
+/// Puts the script plugin in `dir` under `plugins`: a folder with
+/// `plugin.json` and `plugin.js`.
+pub fn install_script(dir: &Path, plugins: &Path) -> PathBuf {
+    let manifest = crate::Manifest::load(dir).expect("the plugin's manifest");
+    let dest = plugins.join(&manifest.name);
+    std::fs::create_dir_all(&dest).expect("the plugin folder");
+    for file in [crate::MANIFEST, crate::SCRIPT] {
+        std::fs::copy(dir.join(file), dest.join(file)).expect(file);
+    }
     dest
 }
