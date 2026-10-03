@@ -344,8 +344,10 @@ impl Adapter {
     }
 }
 
-// Process groups are signalled as `kill -SIG -PGID`, without `--`: dash
-// (Ubuntu's sh) reads `--` as a process id and fails.
+// The scripts below signal process groups with the shell's builtin kill, as
+// `kill -SIG -PGID` without `--`: dash (Ubuntu's sh) reads `--` as a process
+// id and fails. The opposite holds for the kill program from procps, which
+// needs `--` and without it cuts `-4724` down to `-4`; see `agent.rs`.
 
 /// Stops the adapter's group if the editor dies without stopping it (a
 /// crash or a kill), so no debugged program outlives it. The adapter itself

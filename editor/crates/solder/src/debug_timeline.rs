@@ -240,7 +240,8 @@ mod tests {
                  });\n\
                  server.listen(0, '127.0.0.1', () => {\n\
                  \x20 const { port } = server.address();\n\
-                 \x20 http.get(`http://127.0.0.1:${port}/users?id=1`, (r) => {\n\
+                 \x20 const url = `http://127.0.0.1:${port}/users?id=1`;\n\
+                 \x20 http.get(url, { agent: false }, (r) => {\n\
                  \x20   r.resume();\n\
                  \x20   r.on('end', () => server.close());\n\
                  \x20 });\n\
@@ -254,7 +255,7 @@ mod tests {
         let (preload, log) = prepare(&dir.join("data")).unwrap();
         let mut request = serde_json::json!({ "type": "pwa-node" });
         add_env(&mut request, &preload, &log);
-        let status = std::process::Command::new(node)
+        let mut node = std::process::Command::new(node)
             .arg("app.js")
             .current_dir(&dir)
             .env(
@@ -262,8 +263,21 @@ mod tests {
                 request["env"]["NODE_OPTIONS"].as_str().unwrap(),
             )
             .env("SOLDER_TIMELINE", &log)
-            .status()
+            .stdin(std::process::Stdio::null())
+            .spawn()
             .unwrap();
+        // A program that does not exit fails the test instead of hanging it.
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = node.try_wait().unwrap() {
+                break status;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(30) {
+                let _ = node.kill();
+                panic!("node did not exit");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         assert!(status.success());
         let mut entries = take_entries(&mut read_from(&log, 0).0);
         order(&mut entries);
@@ -277,7 +291,7 @@ mod tests {
                 (
                     Kind::Out,
                     &*format!("GET {}", seen[0].1.trim_start_matches("GET ")),
-                    Some(10)
+                    Some(11)
                 ),
                 (Kind::In, "GET /users?id=1", None),
                 (Kind::Sql, "select * from users", Some(5)),
