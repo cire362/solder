@@ -77,6 +77,10 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
       (JavaScript and TypeScript through js-debug: breakpoints, steps, stack,
       variables, console; a Next.js server and its page in one session; HTTP and
       SQL of the run, each linked to its line)
-- [ ] Plugin host: WebAssembly sandbox, declared permissions, per-frame time budget
+- [x] Plugin host: WebAssembly sandbox, declared permissions, per-frame time budget
+      (plugins in Rust against an SDK: commands, status bar, the open file, project
+      files, HTTP to declared hosts; approved per module; typing work over budget is
+      deferred and the plugin marked slow)
+- [ ] Plugins in TypeScript and Go; the registry
 - [ ] Import settings from VS Code, Cursor, JetBrains
 - [ ] Preview environments per branch (needs the hosted service)

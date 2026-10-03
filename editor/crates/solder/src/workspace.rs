@@ -79,6 +79,7 @@ actions!(
         ShowDatabase,
         ShowApi,
         ShowAi,
+        ShowPlugins,
         ToggleChat,
         ShowAgent,
         DebugStart,
@@ -258,6 +259,7 @@ pub struct Workspace {
     /// The last HTTP response, the dock's Response tab.
     response: Entity<crate::response::ResponseView>,
     show_response: bool,
+    plugins: Entity<crate::plugin_store::PluginStore>,
     debug: Entity<crate::debug::DebugStore>,
     debug_panel: Entity<crate::debug_panel::DebugPanel>,
     show_debug: bool,
@@ -297,6 +299,9 @@ impl Workspace {
         let database = cx.new(|_| DatabaseStore::new(root.clone()));
         let database_panel = cx.new(|cx| DatabasePanel::new(database.clone(), cx));
         let api_panel = cx.new(|cx| crate::api_panel::ApiPanel::new(root.clone(), cx));
+        let plugins = crate::plugin_store::PluginStore::global(cx);
+        let this = cx.entity().downgrade();
+        plugins.update(cx, |p, cx| p.set_workspace(this, root.clone(), cx));
         let debug = crate::debug::DebugStore::global(cx);
         let debug_panel =
             cx.new(|cx| crate::debug_panel::DebugPanel::new(debug.clone(), root.clone(), cx));
@@ -313,6 +318,16 @@ impl Workspace {
         let project_search = cx.new(|cx| ProjectSearch::new(root, window, cx));
         let search_bar = cx.new(|cx| BufferSearchBar::new(window, cx));
         let subscriptions = vec![
+            // Plugins' status texts are drawn in this window's status bar.
+            cx.observe(&plugins, |_, _, cx| cx.notify()),
+            // Plugins read and change the editor of the window in front.
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    let (weak, root) = (cx.entity().downgrade(), this.root(cx));
+                    this.plugins
+                        .update(cx, |p, cx| p.set_workspace(weak, root, cx));
+                }
+            }),
             cx.subscribe_in(&debug, window, |this, _, event, window, cx| match event {
                 crate::debug::DebugEvent::Paused(path, line) => {
                     // The window whose project holds the file shows it.
@@ -626,6 +641,7 @@ impl Workspace {
             dock_view: DockView::Terminal,
             response,
             show_response: false,
+            plugins,
             debug,
             debug_panel,
             show_debug: false,
@@ -643,7 +659,7 @@ impl Workspace {
         self.project.read(cx).root().to_path_buf()
     }
 
-    fn active_editor(&self) -> Option<&Entity<Editor>> {
+    pub(crate) fn active_editor(&self) -> Option<&Entity<Editor>> {
         self.panes
             .get(self.active_pane)
             .and_then(Pane::active_editor)
@@ -2169,6 +2185,13 @@ impl Workspace {
         cx.notify();
     }
 
+    fn show_plugins(&mut self, _: &ShowPlugins, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.plugins.clone();
+        self.toggle_modal(window, cx, move |_, cx| {
+            crate::plugins_view::PluginsView::new(store, cx)
+        });
+    }
+
     /// F5: start what is chosen (the file in front first), or continue.
     fn debug_start(&mut self, _: &DebugStart, _: &mut Window, cx: &mut Context<Self>) {
         if self.debug.read(cx).state.active() {
@@ -2976,7 +2999,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let palette = CommandPalette::new(window, cx);
+        let plugins = self.plugins.clone();
+        let palette = CommandPalette::new(plugins, window, cx);
         self.toggle_modal(window, cx, move |window, cx| {
             Picker::new(palette, window, cx)
         });
@@ -3347,6 +3371,19 @@ impl Workspace {
                 None => database::query_file_engines(path).map(|_| "No connection".to_string()),
             }
         });
+        // What plugins show, and a notice when one is slow; both open the
+        // Plugins window.
+        let plugins = self.plugins.read(cx);
+        let mut plugin_items: Vec<(String, bool)> = plugins
+            .status
+            .values()
+            .map(|text| (text.to_string(), false))
+            .collect();
+        match plugins.slow().as_slice() {
+            [] => {}
+            [name] => plugin_items.push((format!("Slow plugin: {name}"), true)),
+            names => plugin_items.push((format!("{} slow plugins", names.len()), true)),
+        }
         let item = |text: String| div().child(text);
         div()
             .h(px(STATUS_HEIGHT))
@@ -3387,6 +3424,21 @@ impl Workspace {
                     .flex()
                     .flex_none()
                     .gap_4()
+                    .children(
+                        plugin_items
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, (text, slow))| {
+                                div()
+                                    .id(("status-plugin", i))
+                                    .text_color(if slow { theme.warning } else { theme.fg_muted })
+                                    .hover(|d| d.text_color(theme.fg))
+                                    .child(text)
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(ShowPlugins), cx)
+                                    })
+                            }),
+                    )
                     .children(right.into_iter().map(item)),
             )
     }
@@ -3557,6 +3609,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_ai))
             .on_action(cx.listener(Self::toggle_chat))
             .on_action(cx.listener(Self::show_agent))
+            .on_action(cx.listener(Self::show_plugins))
             .on_action(cx.listener(Self::debug_start))
             .on_action(cx.listener(Self::debug_pick))
             .on_action(cx.listener(Self::debug_stop))
@@ -8154,5 +8207,274 @@ mod tests {
         assert_eq!(s, 0);
         assert!(cx.read(|cx| !store.read(cx).state.active()));
         assert!(cx.read(|cx| store.read(cx).paused.is_none()));
+    }
+
+    // -------------------------------------------------------------- plugins
+
+    use crate::plugin_store::{PluginState, PluginStore};
+
+    /// A project with `notes.txt` open and a plugins folder holding what
+    /// `install` puts there; nothing is enabled.
+    fn plugin_setup<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+        install: impl FnOnce(&Path),
+    ) -> (
+        PathBuf,
+        PathBuf,
+        Entity<PluginStore>,
+        Entity<Workspace>,
+        &'a mut VisualTestContext,
+    ) {
+        let root = db::testing::dir(&format!("ws-{name}"))
+            .canonicalize()
+            .unwrap();
+        std::fs::write(root.join("notes.txt"), "one two three").unwrap();
+        let data = db::testing::dir(&format!("ws-{name}-data"));
+        std::fs::create_dir_all(data.join("plugins")).unwrap();
+        install(&data.join("plugins"));
+        cx.executor().allow_parking();
+        let store = cx.update(|cx| {
+            let store = cx.new(|cx| PluginStore::new(data.clone(), cx));
+            PluginStore::set_global(store.clone(), cx);
+            store.update(cx, |s, cx| s.scan(cx));
+            store
+        });
+        let (ws, cx) = setup(cx, root.clone());
+        let notes = root.join("notes.txt");
+        ws.update_in(cx, |w, window, cx| w.open_path(notes, None, window, cx));
+        wait_for(cx, "the plugins folder", &|cx| {
+            store.read(cx).loaded && ws.read(cx).active_editor().is_some()
+        });
+        (root, data, store, ws, cx)
+    }
+
+    fn plugin_status(store: &Entity<PluginStore>, name: &str, cx: &App) -> Option<String> {
+        store.read(cx).status.get(name).map(|s| s.to_string())
+    }
+
+    #[gpui::test]
+    fn a_plugin_runs_once_its_permissions_are_approved(cx: &mut TestAppContext) {
+        let (_root, data, store, ws, cx) = plugin_setup(cx, "plugin-flow", |plugins| {
+            plugin::testing::install(&plugin::testing::word_count(), plugins);
+        });
+        // Installed is not running: no status, no commands.
+        assert_eq!(
+            cx.read(|cx| store.read(cx).state("word-count")),
+            PluginState::Disabled
+        );
+        assert!(cx.read(|cx| store.read(cx).commands().is_empty()));
+
+        // The Plugins window lists it with what enabling allows.
+        cx.dispatch_action(ShowPlugins);
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        let enable = cx
+            .debug_bounds("plugin-toggle-0")
+            .expect("the Enable button");
+        cx.simulate_click(enable.center(), gpui::Modifiers::default());
+        assert_eq!(
+            cx.read(|cx| store.read(cx).state("word-count")),
+            PluginState::Enabled
+        );
+        // It hears about the file in front and shows its count.
+        wait_for(cx, "the count", &|cx| {
+            plugin_status(&store, "word-count", cx).as_deref() == Some("3 words")
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+
+        // Typing reaches it as changes.
+        // The cursor to the end, without a key that differs by platform.
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        editor.update_in(cx, |e, _, cx| {
+            let end = e.text(cx).len();
+            e.select_range(end..end, cx)
+        });
+        cx.simulate_input(" four five");
+        wait_for(cx, "the new count", &|cx| {
+            plugin_status(&store, "word-count", cx).as_deref() == Some("5 words")
+        });
+
+        // Its command is in the palette and edits the file.
+        cx.simulate_keystrokes("secondary-shift-p");
+        cx.simulate_input("insert the count");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the insertion", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|e| e.read(cx).text(cx) == "one two three four five5 words")
+        });
+
+        // What was approved is kept for the next start.
+        let saved = data.join("plugins.json");
+        wait_for(cx, "plugins.json", &|_| {
+            std::fs::read_to_string(&saved).is_ok_and(|t| t.contains("editor:write"))
+        });
+
+        // Off: its text and commands go.
+        store.update(cx, |s, cx| s.disable("word-count", cx));
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| plugin_status(&store, "word-count", cx)), None);
+        assert!(cx.read(|cx| store.read(cx).commands().is_empty()));
+    }
+
+    #[gpui::test]
+    fn a_plugin_that_changed_stays_off_until_enabled_again(cx: &mut TestAppContext) {
+        let (_root, data, store, _ws, cx) = plugin_setup(cx, "plugin-changed", |plugins| {
+            plugin::testing::install(&plugin::testing::word_count(), plugins);
+        });
+        store.update(cx, |s, cx| s.enable("word-count", cx));
+        wait_for(cx, "the count", &|cx| {
+            plugin_status(&store, "word-count", cx).is_some()
+        });
+
+        // An update asks for more: it stops, and says so.
+        let manifest = data.join("plugins/word-count/plugin.json");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(
+            &manifest,
+            text.replace("\"statusBar\"", "\"statusBar\", \"fs:read\""),
+        )
+        .unwrap();
+        store.update(cx, |s, cx| s.scan(cx));
+        wait_for(cx, "the change", &|cx| {
+            store.read(cx).state("word-count") == PluginState::Changed
+        });
+        assert_eq!(cx.read(|cx| plugin_status(&store, "word-count", cx)), None);
+        assert!(cx.read(|cx| store.read(cx).stats("word-count").is_none()));
+
+        // The same holds for another module under the old manifest, and
+        // after a restart.
+        std::fs::write(&manifest, text).unwrap();
+        std::fs::write(
+            data.join("plugins/word-count/plugin.wasm"),
+            plugin::testing::build(&plugin::testing::probe()),
+        )
+        .unwrap();
+        let restarted = cx.update(|_, cx| {
+            let store = cx.new(|cx| PluginStore::new(data.clone(), cx));
+            store.update(cx, |s, cx| s.scan(cx));
+            store
+        });
+        wait_for(cx, "the restart", &|cx| restarted.read(cx).loaded);
+        assert_eq!(
+            cx.read(|cx| restarted.read(cx).state("word-count")),
+            PluginState::Changed
+        );
+        assert!(cx.read(|cx| restarted.read(cx).stats("word-count").is_none()));
+
+        // Enabling approves what is there now.
+        restarted.update(cx, |s, cx| s.enable("word-count", cx));
+        wait_for(cx, "the plugin", &|cx| {
+            restarted.read(cx).stats("word-count").is_some()
+        });
+        assert_eq!(
+            cx.read(|cx| restarted.read(cx).state("word-count")),
+            PluginState::Enabled
+        );
+    }
+
+    #[gpui::test]
+    fn plugins_reach_the_files_and_hosts_they_declared(cx: &mut TestAppContext) {
+        // A server that redirects once, then answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for reply in [
+                "HTTP/1.1 302 Found\r\nLocation: http://example.com/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = stream.read(&mut [0; 4096]);
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        let get = format!("get:http://127.0.0.1:{port}/x");
+        let commands = [
+            get.as_str(),
+            "get:http://example.com/",
+            "read:notes.txt",
+            "read:.env",
+            "read:../outside.txt",
+        ];
+        let (root, _data, store, _ws, cx) = plugin_setup(cx, "plugin-reach", |plugins| {
+            let dir = plugin::testing::install(&plugin::testing::probe(), plugins);
+            std::fs::write(
+                dir.join("plugin.json"),
+                serde_json::json!({
+                    "name": "probe",
+                    "permissions": ["statusBar", "fs:read", "http:127.0.0.1"],
+                    "commands": commands.iter().map(|c| serde_json::json!({"id": c, "title": c})).collect::<Vec<_>>(),
+                })
+                .to_string(),
+            )
+            .unwrap();
+        });
+        std::fs::write(root.join(".env"), "SECRET=1").unwrap();
+        store.update(cx, |s, cx| s.enable("probe", cx));
+        wait_for(cx, "the probe", &|cx| {
+            store.read(cx).stats("probe").is_some()
+        });
+        let mut run = |id: &str| {
+            store.update(cx, |s, cx| {
+                s.status.clear();
+                s.run_command("probe", id);
+                cx.notify();
+            });
+            wait_for(cx, id, &|cx| plugin_status(&store, "probe", cx).is_some());
+            cx.read(|cx| plugin_status(&store, "probe", cx).unwrap())
+        };
+        assert_eq!(run("read:notes.txt"), "one two three");
+        assert!(run("read:.env").contains("kept private"));
+        assert!(run("read:../outside.txt").contains("without .."));
+        // A redirect is handed back, not followed to another host.
+        assert_eq!(run(&get), "302 ");
+        assert_eq!(run(&get), "200 hello");
+        assert!(
+            run("get:http://example.com/")
+                .contains("did not declare the permission http:example.com")
+        );
+    }
+
+    #[gpui::test]
+    fn a_plugin_that_holds_up_typing_is_marked_slow(cx: &mut TestAppContext) {
+        let (_root, _data, store, _ws, cx) = plugin_setup(cx, "plugin-slow", |plugins| {
+            let dir = plugin::testing::install(&plugin::testing::probe(), plugins);
+            std::fs::write(
+                dir.join("plugin.json"),
+                r#"{"name": "probe", "permissions": ["statusBar"], "events": ["change"]}"#,
+            )
+            .unwrap();
+        });
+        store.update(cx, |s, cx| {
+            // The probe's change handler needs a few million.
+            s.set_budget(plugin::Budget {
+                typing: 100_000,
+                idle: Duration::from_millis(20),
+                ..Default::default()
+            });
+            s.enable("probe", cx);
+        });
+        wait_for(cx, "the probe", &|cx| {
+            store.read(cx).stats("probe").is_some()
+        });
+        assert!(cx.read(|cx| store.read(cx).slow().is_empty()));
+        // Each edit is handled, late, and counted against the plugin.
+        for round in 1..=plugin::SLOW_AFTER {
+            cx.simulate_input("x");
+            wait_for(cx, "the change", &|cx| {
+                let stats = store.read(cx).stats("probe").unwrap();
+                stats.events == u64::from(round) && stats.over_budget == round
+            });
+        }
+        assert!(cx.read(|cx| store.read(cx).slow() == ["probe"]));
+        assert_eq!(
+            cx.read(|cx| plugin_status(&store, "probe", cx)).as_deref(),
+            Some("change notes.txt")
+        );
     }
 }

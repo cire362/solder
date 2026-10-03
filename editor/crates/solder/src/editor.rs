@@ -316,6 +316,7 @@ impl Editor {
         if has_path {
             crate::lsp_store::LspStore::register(&document, cx);
         }
+        crate::plugin_store::PluginStore::register(&document, cx);
         Self::for_document(document, cx)
     }
 

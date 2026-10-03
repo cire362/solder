@@ -1,0 +1,19 @@
+[package]
+name = "plugin"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Runs plugins: manifest, permissions and the WebAssembly sandbox. No GPUI.
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+solder_plugin = { path = "../plugin_sdk" }
+# The interpreter plugins run in. No text format and no 64-bit memories:
+# plugins ship as binaries and stay small. `portable-dispatch` runs
+# instructions from a loop. The default dispatch relies on the compiler
+# turning calls into jumps, which it is not obliged to do: in a dev build
+# (dependencies at opt-level 2) a long loop in a plugin overflowed the
+# thread's stack, and that takes the whole editor down.
+wasmi = { version = "2.0", default-features = false, features = ["std", "validate", "portable-dispatch"] }

@@ -50,6 +50,10 @@ through GPUI's test context (see `workspace.rs` tests); features that talk
 to external processes (language servers, the terminal) are tested against
 real processes or the mock server in `editor/crates/solder/tests/fixtures`.
 
+The plugin host is tested against real plugins, which the tests build for
+WebAssembly; install the target once with
+`rustup target add wasm32-unknown-unknown`.
+
 Database drivers are tested against real servers in
 `editor/crates/db/tests/servers.rs`. CI starts Postgres, MySQL, Redis and
 MongoDB as service containers; locally each test is skipped unless its URL is

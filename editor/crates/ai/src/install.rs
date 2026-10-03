@@ -23,6 +23,14 @@ use crate::{
     hardware::{Backend, Hardware},
 };
 
+/// SHA-256 of `bytes`, in lowercase hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// The llama.cpp build Solder runs. Raising it means updating every hash.
 pub const LLAMA_BUILD: &str = "b11312";
 pub const HUB: &str = "https://huggingface.co";
