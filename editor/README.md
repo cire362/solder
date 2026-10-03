@@ -9,6 +9,8 @@ crates/
   db/       database connections: detection, drivers, statement splitting (no UI)
   rest/     HTTP: .http files, route detection, OpenAPI import, sending (no UI)
   ai/       local models: hardware, catalog, downloads, llama-server, benchmark (no UI)
+  plugin/   plugin host: manifest, permissions, the WebAssembly sandbox and its budget (no UI)
+  plugin_sdk/  what a plugin is written against, and the messages it exchanges with the editor
   solder/   the app: GPUI window, editor element, file tree, tabs, status bar
 ```
 
@@ -33,6 +35,7 @@ cargo run --release -p solder -- path/to/file-or-folder
 ```
 
 ```bash
+rustup target add wasm32-unknown-unknown   # once: the plugin tests build real plugins
 cargo test --workspace
 ```
 
@@ -494,6 +497,78 @@ nothing found the push goes ahead; otherwise the findings show above the commit
 box, each opening its file at its line, with **Push anyway** and **Cancel**. Turn
 it off under **Review before push** in the AI tab's Providers view; without a
 chat model Push just pushes.
+
+## Plugins
+
+A plugin is a folder with a `plugin.json` and a `plugin.wasm` in the `plugins`
+folder of the app's data folder (`~/Library/Application Support/Solder/plugins`
+on macOS). **Workspace: Show plugins** in the command palette lists what is
+there, with **Open folder** to get to it.
+
+```json
+{
+  "name": "word-count",
+  "version": "0.1.0",
+  "description": "Shows how many words the file in front has.",
+  "permissions": ["statusBar", "editor:read", "editor:write"],
+  "events": ["open", "change", "save"],
+  "commands": [{ "id": "insert", "title": "Word Count: Insert the count" }]
+}
+```
+
+Nothing runs until you enable it, and the window shows what enabling allows
+first. A plugin can compute inside its own memory and nothing else; the rest it
+asks the editor for, and only what its manifest declares is answered:
+
+| Permission | Allows |
+|---|---|
+| `statusBar` | Its text in the status bar |
+| `editor:read` | The file in front and its selection |
+| `editor:write` | Changing the file in front (one undo step per change) |
+| `fs:read` | Files of the project, by path from its root: not outside it, not `.env`, not what `.solderignore` keeps from AI |
+| `http:<host>` | Requests to that host. A redirect comes back as it is, so another host needs its own permission |
+
+Approval is for that list and that module (by SHA-256). If an update changes
+either, the plugin stays off and is marked **Changed** until you enable it again.
+
+Each plugin runs in its own WebAssembly instance (the `wasmi` interpreter, 64 MB
+of memory at most) on its own thread, and talks to the editor in JSON messages,
+so the editor never waits for it. Its work is counted: handling a `change`
+(typing) gets about 4 ms first; a plugin that needs more is paused and continues
+once typing has stopped for 150 ms. Three times over, or one event stopped at the
+limit of about 10 s, marks it **Slow** in the window and the status bar. An event that
+fails or is stopped ends there and the plugin starts again from a fresh instance.
+
+Plugins are written in Rust against `crates/plugin_sdk` and built for
+`wasm32-unknown-unknown`; `plugins/word-count` is the example:
+
+```rust
+use solder_plugin::{Event, Plugin};
+
+#[derive(Default)]
+struct WordCount;
+
+impl Plugin for WordCount {
+    fn event(&mut self, _: Event) {
+        if let Ok(editor) = solder_plugin::editor() {
+            let words = editor.text.split_whitespace().count();
+            solder_plugin::status(format!("{words} words"));
+        }
+    }
+}
+
+solder_plugin::register!(WordCount);
+```
+
+```bash
+cd plugins/word-count && cargo build --release --target wasm32-unknown-unknown
+```
+
+Copy `plugin.json` and `target/wasm32-unknown-unknown/release/word_count.wasm`
+(as `plugin.wasm`) into `plugins/word-count` in the data folder. TypeScript and
+Go plugins, the registry and extensions of other editors are not there yet: VS
+Code extensions are Node programs with full access to the machine, and Zed's use
+the WebAssembly Component Model, which this interpreter does not run.
 
 ## Measured so far
 

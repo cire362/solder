@@ -37,6 +37,8 @@ mod locations;
 mod lsp_store;
 mod perf;
 mod picker;
+mod plugin_store;
+mod plugins_view;
 mod project;
 mod project_panel;
 mod project_search;

@@ -90,6 +90,12 @@ Never guess a signature.
   connections in the app. TLS is rustls with the ring provider: keep
   `default-features = false` on driver crates so aws-lc is never built.
 
+- Plugins run in `crates/plugin` (no GPUI): one WebAssembly instance and one
+  thread per plugin, JSON messages both ways, permissions checked there
+  before a request reaches the app (`plugin_store.rs`). The UI thread never
+  waits for a plugin. Keep `wasmi` on `portable-dispatch`: its default
+  dispatch overflowed the stack in dev builds and took the editor down.
+
 ### Performance rules
 
 The site promises cold start, memory and input latency numbers

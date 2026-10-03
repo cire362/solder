@@ -79,10 +79,34 @@ fn client() -> &'static reqwest::Client {
 
 /// Sends `request`; the future can be awaited from any executor.
 pub fn send(request: Request) -> impl Future<Output = Result<Response, String>> + Send + 'static {
+    send_with(client(), request)
+}
+
+/// `send`, with a redirect answered as it is instead of followed. For
+/// callers allowed to reach one host only: a redirect could name another.
+pub fn send_direct(
+    request: Request,
+) -> impl Future<Output = Result<Response, String>> + Send + 'static {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(TIMEOUT)
+            .redirect_policy(reqwest::redirect::Policy::none())
+            .user_agent(concat!("Solder/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .expect("HTTP client")
+    });
+    send_with(client, request)
+}
+
+fn send_with(
+    client: &'static reqwest::Client,
+    request: Request,
+) -> impl Future<Output = Result<Response, String>> + Send + 'static {
     let handle = runtime().spawn(async move {
         let method = reqwest::Method::from_bytes(request.method.as_bytes())
             .map_err(|_| format!("{} is not an HTTP method", request.method))?;
-        let mut builder = client().request(method, &request.url);
+        let mut builder = client.request(method, &request.url);
         for (name, value) in &request.headers {
             builder = builder.header(name, value);
         }
@@ -187,6 +211,25 @@ mod tests {
         );
         assert_eq!(response.header("x-id"), Some("7"));
         assert_eq!(response.text(), "{\n  \"id\": 7,\n  \"ok\": 1\n}");
+    }
+
+    #[test]
+    fn a_direct_send_hands_back_a_redirect() {
+        let (url, server) = serve_once(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/elsewhere\r\nContent-Length: 0\r\n\r\n",
+        );
+        let request = Request {
+            method: "GET".into(),
+            url: format!("{url}/start"),
+            ..Default::default()
+        };
+        let response = futures_lite_block_on(send_direct(request)).unwrap();
+        server.join().unwrap();
+        assert_eq!(response.status, 302);
+        assert_eq!(
+            response.header("location"),
+            Some("http://127.0.0.1:1/elsewhere")
+        );
     }
 
     #[test]

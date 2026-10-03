@@ -1,21 +1,29 @@
 use gpui::{
-    Action, AnyElement, Context, DismissEvent, FocusHandle, SharedString, Task, Window, div,
-    prelude::*, px,
+    Action, AnyElement, Context, DismissEvent, Entity, FocusHandle, SharedString, Task, Window,
+    div, prelude::*, px,
 };
 
 use crate::{
     fuzzy,
     picker::{Picker, PickerDelegate, format_binding, highlighted_text},
+    plugin_store::PluginStore,
     theme::{ActiveTheme, UI_FONT_SIZE},
 };
 
 struct Command {
     name: String,
-    action: Box<dyn Action>,
+    run: Run,
     binding: Option<String>,
 }
 
+enum Run {
+    Action(Box<dyn Action>),
+    /// A running plugin's command: the plugin and the command's id.
+    Plugin(String, String),
+}
+
 pub struct CommandPalette {
+    plugins: Entity<PluginStore>,
     commands: Vec<Command>,
     matches: Vec<(usize, Vec<u32>)>,
     selected: usize,
@@ -54,7 +62,7 @@ pub fn humanize_action_name(name: &str) -> String {
 impl CommandPalette {
     /// Must be called while the palette's target still has focus, so the
     /// available actions and their key bindings are the target's.
-    pub fn new(window: &mut Window, cx: &mut gpui::App) -> Self {
+    pub fn new(plugins: Entity<PluginStore>, window: &mut Window, cx: &mut gpui::App) -> Self {
         let mut commands: Vec<Command> = window
             .available_actions(cx)
             .into_iter()
@@ -67,12 +75,24 @@ impl CommandPalette {
                 binding: window
                     .highest_precedence_binding_for_action(action.as_ref())
                     .map(|b| format_binding(&b)),
-                action,
+                run: Run::Action(action),
             })
             .collect();
+        commands.extend(
+            plugins
+                .read(cx)
+                .commands()
+                .into_iter()
+                .map(|(plugin, id, title)| Command {
+                    name: title,
+                    run: Run::Plugin(plugin, id),
+                    binding: None,
+                }),
+        );
         commands.sort_by(|a, b| a.name.cmp(&b.name));
         commands.dedup_by(|a, b| a.name == b.name);
         Self {
+            plugins,
             commands,
             matches: Vec::new(),
             selected: 0,
@@ -129,12 +149,14 @@ impl PickerDelegate for CommandPalette {
         let Some((ix, _)) = self.matches.get(self.selected) else {
             return;
         };
-        let action = self.commands[*ix].action.boxed_clone();
         if let Some(target) = &self.target {
             window.focus(target);
         }
-        // Dispatches to whatever has focus now, which is the target again.
-        window.dispatch_action(action, cx);
+        match &self.commands[*ix].run {
+            // Dispatches to whatever has focus now, which is the target again.
+            Run::Action(action) => window.dispatch_action(action.boxed_clone(), cx),
+            Run::Plugin(plugin, id) => self.plugins.read(cx).run_command(plugin, id),
+        }
         cx.emit(DismissEvent);
     }
 
