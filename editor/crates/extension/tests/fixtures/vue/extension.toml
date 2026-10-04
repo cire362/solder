@@ -1,0 +1,31 @@
+id = "vue"
+name = "Vue"
+version = "0.4.0"
+schema_version = 1
+description = "Vue support."
+repository = "https://github.com/zed-extensions/vue"
+authors = ["Zed Industries <support@zed.dev>"]
+themes = []
+icon_themes = []
+languages = ["languages/vue"]
+capabilities = []
+
+[lib]
+kind = "Rust"
+version = "0.7.0"
+
+[grammars.vue]
+repository = "https://github.com/tree-sitter-grammars/tree-sitter-vue"
+rev = "7e48557b903a9db9c38cea3b7839ef7e1f36c693"
+
+[language_servers.vue-language-server]
+language = "Vue.js"
+languages = []
+code_action_kinds = ["", "quickfix", "refactor.rewrite"]
+
+[language_servers.vue-language-server.language_ids]
+"Vue.js" = "vue"
+
+[context_servers]
+
+[slash_commands]

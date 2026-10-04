@@ -330,6 +330,30 @@ trait Calls: Send {
         server: &str,
         worktree: Resource<Worktree>,
     ) -> wasmtime::Result<Result<Option<String>, String>>;
+
+    /// What this extension's `server` adds to the initialization options of
+    /// `target`, a server that is not its own. Versions before 0.4 cannot
+    /// say, and add nothing.
+    fn additional_initialization_options(
+        &self,
+        _store: &mut Store<State>,
+        _server: &str,
+        _target: &str,
+        _worktree: Resource<Worktree>,
+    ) -> wasmtime::Result<Result<Option<String>, String>> {
+        Ok(Ok(None))
+    }
+
+    /// The same for the settings `target` is given.
+    fn additional_workspace_configuration(
+        &self,
+        _store: &mut Store<State>,
+        _server: &str,
+        _target: &str,
+        _worktree: Resource<Worktree>,
+    ) -> wasmtime::Result<Result<Option<String>, String>> {
+        Ok(Ok(None))
+    }
 }
 
 // --------------------------------------------- one world for each version
@@ -667,7 +691,39 @@ macro_rules! world_functions {
 macro_rules! start {
     ($bindings:ident) => {
         start!(@start $bindings);
+        start!(@by_id $bindings {});
+    };
+    // From 0.4, an extension may add to the options and settings of a
+    // server that is not its own.
+    ($bindings:ident, sets_up_others) => {
+        start!(@start $bindings);
+        start!(@by_id $bindings {
+            fn additional_initialization_options(
+                &self,
+                store: &mut Store<State>,
+                server: &str,
+                target: &str,
+                worktree: Resource<Worktree>,
+            ) -> wasmtime::Result<Result<Option<String>, String>> {
+                self.call_language_server_additional_initialization_options(
+                    store, server, target, worktree,
+                )
+            }
 
+            fn additional_workspace_configuration(
+                &self,
+                store: &mut Store<State>,
+                server: &str,
+                target: &str,
+                worktree: Resource<Worktree>,
+            ) -> wasmtime::Result<Result<Option<String>, String>> {
+                self.call_language_server_additional_workspace_configuration(
+                    store, server, target, worktree,
+                )
+            }
+        });
+    };
+    (@by_id $bindings:ident { $($more:tt)* }) => {
         impl Calls for $bindings::Extension {
             fn command(
                 &self,
@@ -703,6 +759,8 @@ macro_rules! start {
             ) -> wasmtime::Result<Result<Option<String>, String>> {
                 self.call_language_server_workspace_configuration(store, server, worktree)
             }
+
+            $($more)*
         }
     };
     ($bindings:ident, by_config) => {
@@ -979,6 +1037,32 @@ impl Host {
     ) -> Result<Option<String>, String> {
         self.ask(root, |extension, store, worktree| {
             extension.workspace_configuration(store, server, worktree)
+        })
+    }
+
+    /// The JSON this extension's `server` adds to the initialization options
+    /// of `target`, a server it does not bring itself: Vue's adds its plugin
+    /// to the TypeScript server's.
+    pub fn additional_initialization_options(
+        &self,
+        server: &str,
+        target: &str,
+        root: &Path,
+    ) -> Result<Option<String>, String> {
+        self.ask(root, |extension, store, worktree| {
+            extension.additional_initialization_options(store, server, target, worktree)
+        })
+    }
+
+    /// The JSON this extension's `server` adds to the settings of `target`.
+    pub fn additional_workspace_configuration(
+        &self,
+        server: &str,
+        target: &str,
+        root: &Path,
+    ) -> Result<Option<String>, String> {
+        self.ask(root, |extension, store, worktree| {
+            extension.additional_workspace_configuration(store, server, target, worktree)
         })
     }
 }
