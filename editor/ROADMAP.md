@@ -118,7 +118,7 @@ it runs with the user's rights, not in a sandbox. The items are in the order
 to build them.
 
 ### The Extensions tab
-- [ ] Extensions as a tab of the sidebar, next to Files and Git, in place of
+- [x] Extensions as a tab of the sidebar, next to Files and Git, in place of
       the window: installed, Zed's catalog and Open VSX in one list, search,
       one Install button, progress and errors on the row
 - [ ] Before the first install of an extension, what it will do outside a
