@@ -177,10 +177,13 @@ to build them.
       put a deadline on it (with interruption turned on in the engine, its
       store would trap at once). What is left is to reach into its store, to
       parse such grammars off the UI thread and give up on one that hangs,
-      or to change tree-sitter: a decision before it is work
+      or to change tree-sitter. Decided on 2026-10-05: left open until
+      tree-sitter has a way of its own, as Zed has no such limit either
 - [ ] Debug adapters of extensions, in the debugger
-- [ ] Slash commands and context servers of extensions, in the chat and the
-      agent
+- [ ] Context servers of extensions, in the agent. They are MCP servers
+      (context7, GitHub and Postgres are the most installed), and the agent
+      has no MCP client yet: the client and these servers are one update of
+      their own, after this block
 - [ ] Each new version of Zed's API as it is published (0.8 is the next;
       0.7.0 was still the newest on 2026-10-05)
 
@@ -226,10 +229,12 @@ to build them.
       the result is the list of what works
 
 ### What will not run
-Not tasks, but said so nobody waits for them: extensions whose licence or
-own checks tie them to Microsoft's products (Pylance, C# Dev Kit, Remote
-SSH, Live Share), and anything published only on Microsoft's Marketplace,
-which other editors may not use.
+Not tasks, but said so nobody waits for them: slash commands of Zed
+extensions, which no extension in Zed's catalog has (2026-10-05), so there is
+nothing to run them for; extensions whose licence or own checks tie them to
+Microsoft's products (Pylance, C# Dev Kit, Remote SSH, Live Share); and
+anything published only on Microsoft's Marketplace, which other editors may
+not use.
 
 ## 9. An editor shaped by its user
 
