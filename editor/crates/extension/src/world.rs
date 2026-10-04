@@ -9,11 +9,12 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command as Process, Stdio},
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{
     catalog::{client, describe, runtime},
@@ -21,6 +22,7 @@ use crate::{
 };
 
 pub const GITHUB: &str = "https://api.github.com";
+pub const NODE_DIST: &str = "https://nodejs.org/dist";
 
 /// The largest file an extension may download: language servers with their
 /// runtimes reach hundreds of megabytes.
@@ -64,6 +66,10 @@ pub struct System {
     pub npm: String,
     /// Where GitHub's API is; tests point it at a local server.
     pub github: String,
+    /// Where Node.js is published, and the folder Solder keeps one of its
+    /// own in for a machine that has none. Without the folder none is got.
+    pub node_dist: String,
+    pub node_home: Option<PathBuf>,
     /// The user's settings, for extensions that ask. The app gives this;
     /// without it they see none.
     pub settings: Option<SettingsFor>,
@@ -79,6 +85,8 @@ impl System {
             env,
             npm: "npm".into(),
             github: GITHUB.into(),
+            node_dist: NODE_DIST.into(),
+            node_home: None,
             settings: None,
             on_status: Box::new(on_status),
         }
@@ -90,6 +98,27 @@ impl System {
             .find(|(name, _)| name == "PATH")
             .into_iter()
             .flat_map(|(_, path)| std::env::split_paths(path))
+    }
+
+    /// The Node that Solder got for itself, if it did.
+    fn own_node(&self) -> Option<PathBuf> {
+        let node = self.node_home.as_ref()?.join("current/bin/node");
+        is_program(&node).then_some(node)
+    }
+
+    /// Runs npm: the user's, or the one that came with Solder's own Node,
+    /// which is a script that Node runs.
+    fn npm(&self, args: &[&str], dir: Option<&Path>) -> Result<String, String> {
+        if self.which(&self.npm).is_none()
+            && let Some(node) = self.own_node()
+            && let Some(home) = node.parent().and_then(Path::parent)
+        {
+            let cli = home.join("lib/node_modules/npm/bin/npm-cli.js");
+            let (node, cli) = (node.to_string_lossy(), cli.to_string_lossy());
+            let args: Vec<&str> = std::iter::once(&*cli).chain(args.iter().copied()).collect();
+            return self.output(&node, &args, dir);
+        }
+        self.output(&self.npm, args, dir)
     }
 
     /// Runs a program with the user's environment and gives its output, or
@@ -213,11 +242,118 @@ fn run(command: &mut Process) -> Result<(), String> {
 impl World for System {
     fn node(&self) -> Result<String, String> {
         self.which("node")
+            .or_else(|| Some(self.own_node()?.to_string_lossy().into_owned()))
             .ok_or_else(|| "Node.js was not found, and this language server needs it".to_string())
     }
 
+    /// Downloads the newest long-term release of Node.js for this machine
+    /// from where it is published, checks it against the published hash
+    /// and unpacks it into `node_home`. It stays there for every extension
+    /// and is not looked for again.
+    fn install_node(&self) -> Result<String, String> {
+        // Two extensions may need it at once; one download serves both.
+        static ONE: Mutex<()> = Mutex::new(());
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(node) = self.own_node() {
+            return Ok(node.to_string_lossy().into_owned());
+        }
+        let home = self
+            .node_home
+            .as_ref()
+            .ok_or("Node.js was not found, and this language server needs it")?;
+        let os = match std::env::consts::OS {
+            "macos" => "darwin",
+            "linux" => "linux",
+            other => return Err(format!("There is no Node.js to download for {other}")),
+        };
+        let arch = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            "x86_64" => "x64",
+            other => return Err(format!("There is no Node.js to download for {other}")),
+        };
+        (self.on_status)("Node.js", Status::Downloading);
+        let get = |url: String| {
+            self.fetch(HttpRequest {
+                method: "GET",
+                url,
+                headers: Vec::new(),
+                body: None,
+                redirects: None,
+            })
+        };
+        let result = (|| {
+            // The list is newest first; a long-term release has a name.
+            let index = get(format!("{}/index.json", self.node_dist))?;
+            let index: Value = serde_json::from_slice(&index.body)
+                .map_err(|_| "The list of Node.js releases could not be read")?;
+            let version = index
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|release| release["lts"].is_string())
+                .and_then(|release| release["version"].as_str())
+                .filter(|version| {
+                    version.starts_with('v')
+                        && version[1..].chars().all(|c| c.is_ascii_digit() || c == '.')
+                })
+                .ok_or("The list of Node.js releases names no long-term release")?
+                .to_string();
+            let name = format!("node-{version}-{os}-{arch}");
+            let file = format!("{name}.tar.gz");
+            let sums = get(format!("{}/{version}/SHASUMS256.txt", self.node_dist))?;
+            let sums = String::from_utf8_lossy(&sums.body).into_owned();
+            let expected = sums
+                .lines()
+                .filter_map(|line| line.split_once(char::is_whitespace))
+                .find(|(_, listed)| listed.trim() == file)
+                .map(|(hash, _)| hash.to_lowercase())
+                .ok_or_else(|| format!("Node.js {version} is not published for this machine"))?;
+            let archive = home.join(&file);
+            let url = format!("{}/{version}/{file}", self.node_dist);
+            self.download(&url, &archive, FileKind::Uncompressed)?;
+            let unpacked = (|| {
+                let bytes = std::fs::read(&archive).map_err(|e| e.to_string())?;
+                let hash: String = Sha256::digest(&bytes)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                if hash != expected {
+                    return Err(
+                        "The Node.js that was downloaded is not the one published".to_string()
+                    );
+                }
+                let staging = home.join("staging");
+                let _ = std::fs::remove_dir_all(&staging);
+                std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+                run(Process::new("tar")
+                    .arg("-xzf")
+                    .arg(&archive)
+                    .arg("-C")
+                    .arg(&staging))?;
+                let current = home.join("current");
+                let _ = std::fs::remove_dir_all(&current);
+                std::fs::rename(staging.join(&name), &current).map_err(|e| e.to_string())?;
+                let _ = std::fs::remove_dir_all(&staging);
+                Ok(())
+            })();
+            let _ = std::fs::remove_file(&archive);
+            unpacked?;
+            self.own_node()
+                .map(|node| node.to_string_lossy().into_owned())
+                .ok_or_else(|| "The Node.js that was downloaded has no node in it".to_string())
+        })();
+        (self.on_status)(
+            "Node.js",
+            match &result {
+                Ok(_) => Status::Ready,
+                Err(why) => Status::Failed(why.clone()),
+            },
+        );
+        result
+    }
+
     fn npm_latest(&self, package: &str) -> Result<String, String> {
-        let version = self.output(&self.npm, &["view", package, "version"], None)?;
+        let version = self.npm(&["view", package, "version"], None)?;
         if version.is_empty() {
             return Err(format!("npm knows no version of {package}"));
         }
@@ -227,8 +363,7 @@ impl World for System {
     fn npm_install(&self, dir: &Path, package: &str, version: &str) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let prefix = dir.to_string_lossy();
-        self.output(
-            &self.npm,
+        self.npm(
             &[
                 "install",
                 "--prefix",
@@ -605,6 +740,107 @@ mod tests {
         // No npm at all.
         let error = system(&[("PATH", "/nowhere")]).npm_latest("x").unwrap_err();
         assert!(error.starts_with("Could not run npm"), "{error}");
+    }
+
+    #[test]
+    fn a_node_of_its_own_is_downloaded_checked_and_then_kept() {
+        let dir = scratch("world-node");
+        let os = if cfg!(target_os = "macos") {
+            "darwin"
+        } else {
+            "linux"
+        };
+        let arch = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "x64"
+        };
+        let name = format!("node-v24.1.0-{os}-{arch}");
+        // What is published: a Node that says its version, and an npm that
+        // is a script for it, as in the real archive.
+        let pack = dir.join("pack");
+        executable(
+            &pack.join(&name).join("bin/node"),
+            "#!/bin/sh\ncase \"$2\" in view) echo 7.7.7 ;; *) echo \"node $*\" ;; esac\n",
+        );
+        write(
+            &pack.join(&name).join("lib/node_modules/npm/bin/npm-cli.js"),
+            "// npm",
+        );
+        let archive = tar(&pack);
+        let hash: String = Sha256::digest(&archive)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        // The newest release is not a long-term one and is passed over.
+        let index = r#"[{"version":"v25.0.0","lts":false},{"version":"v24.1.0","lts":"Krypton"},{"version":"v22.9.0","lts":"Jod"}]"#;
+        let route = |path: String| -> &'static str { Box::leak(path.into_boxed_str()) };
+        let sums = |hash: &str| format!("{hash}  {name}.tar.gz\n0000  node-v24.1.0-win-x64.zip\n");
+        let published = |hash: &str| {
+            serve(vec![
+                ("/dist/index.json", Served::ok(index.as_bytes().to_vec())),
+                (
+                    "/dist/v24.1.0/SHASUMS256.txt",
+                    Served::ok(sums(hash).into_bytes()),
+                ),
+                (
+                    route(format!("/dist/v24.1.0/{name}.tar.gz")),
+                    Served::ok(archive.clone()),
+                ),
+            ])
+        };
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let world = |base: &str, home: &Path| {
+            let said = said.clone();
+            let mut world = System::new(
+                vec![("PATH".to_string(), "/nowhere".to_string())],
+                move |what, status| said.lock().unwrap().push(format!("{what}: {status:?}")),
+            );
+            world.node_dist = format!("{base}/dist");
+            world.node_home = Some(home.to_path_buf());
+            world
+        };
+
+        // What was downloaded is not what was published: nothing is kept.
+        let (base, _) = published("00ff");
+        let home = dir.join("bad");
+        let wrong = world(&base, &home);
+        assert!(wrong.node().is_err());
+        let error = wrong.install_node().unwrap_err();
+        assert_eq!(
+            error,
+            "The Node.js that was downloaded is not the one published"
+        );
+        assert!(wrong.node().is_err());
+        assert!(!home.join("current").exists());
+
+        // The machine has no Node; one is got and found from then on,
+        // without asking again.
+        let (base, requests) = published(&hash);
+        let home = dir.join("node");
+        let own = world(&base, &home);
+        let node = own.install_node().unwrap();
+        assert_eq!(Path::new(&node), home.join("current/bin/node"));
+        assert_eq!(own.node(), Ok(node.clone()));
+        assert_eq!(own.install_node(), Ok(node));
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        // Nothing of the download is left next to it.
+        let left: Vec<String> = std::fs::read_dir(&home)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["current"]);
+        // npm is the one that came with it.
+        assert_eq!(own.npm_latest("some-server").unwrap(), "7.7.7");
+        let said = said.lock().unwrap();
+        assert!(
+            said.contains(&"Node.js: Downloading".to_string()),
+            "{said:?}"
+        );
+        assert!(said.contains(&"Node.js: Ready".to_string()), "{said:?}");
+        assert!(said.iter().any(|line| line.starts_with("Node.js: Failed")));
+        // With no folder to keep one in, none is got.
+        assert!(system(&[("PATH", "/nowhere")]).install_node().is_err());
     }
 
     #[test]

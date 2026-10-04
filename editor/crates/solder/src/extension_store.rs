@@ -172,6 +172,9 @@ fn host_in(
             let _ = statuses.unbounded_send((server.to_string(), status));
         });
         system.settings = Some(settings);
+        // Next to the extensions: their work folders are `work/<id>` under
+        // the same root.
+        system.node_home = work_dir.ancestors().nth(2).map(install::node_dir);
         Arc::new(system)
     });
     let world = Arc::new(Gate::new(world, gated.refusals, gated.did));

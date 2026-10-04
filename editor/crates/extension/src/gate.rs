@@ -52,6 +52,9 @@ pub enum Event {
 
 pub type Did = Arc<Mutex<BTreeSet<Event>>>;
 
+/// Where Node.js comes from, as the record and a refusal name it.
+const NODE: &str = "https://nodejs.org";
+
 pub struct Gate {
     world: Arc<dyn World>,
     refusals: Arc<Mutex<Refusals>>,
@@ -119,7 +122,14 @@ impl Gate {
 
 impl World for Gate {
     fn node(&self) -> Result<String, String> {
-        self.world.node()
+        // The machine has none and Solder got none yet: getting one is a
+        // download like any other the extension causes.
+        self.world.node().or_else(|_| {
+            let host = self.may_download(NODE)?;
+            let node = self.world.install_node()?;
+            self.note(Event::Downloaded(host));
+            Ok(node)
+        })
     }
 
     fn npm_latest(&self, package: &str) -> Result<String, String> {
@@ -201,7 +211,10 @@ mod tests {
 
     impl World for Open {
         fn node(&self) -> Result<String, String> {
-            Ok("node".into())
+            Err("no Node here".into())
+        }
+        fn install_node(&self) -> Result<String, String> {
+            Ok("own/bin/node".into())
         }
         fn npm_latest(&self, _: &str) -> Result<String, String> {
             Ok("1.0.0".into())
@@ -274,6 +287,8 @@ mod tests {
         .unwrap_err();
         gate.status("demo-ls", Status::Failed("no release".into()));
         gate.status("demo-ls", Status::Downloading);
+        // The machine has no Node: one is got, which is a download.
+        assert_eq!(gate.node(), Ok("own/bin/node".into()));
         let seen = |did: &Did| did.lock().unwrap().iter().cloned().collect::<Vec<_>>();
         assert_eq!(
             seen(&did),
@@ -281,6 +296,7 @@ mod tests {
                 Event::Ran("gem install solargraph".into()),
                 Event::Installed("typescript".into()),
                 Event::Downloaded("github.com".into()),
+                Event::Downloaded("nodejs.org".into()),
                 Event::Failed("demo-ls: no release".into()),
             ]
         );
@@ -315,15 +331,16 @@ mod tests {
         // A command the manifest does not declare never reaches the world;
         // the host says so, and that is written down too.
         gate.undeclared(&command);
-        // Looking for a program and reading the environment are not
-        // things to take back.
-        assert_eq!(gate.node(), Ok("node".into()));
+        // Nor is a Node of Solder's own got for it while it may not
+        // download.
+        assert!(gate.node().is_err());
         assert_eq!(
             seen(&did),
             [
                 Event::Downloaded("example.com".into()),
                 Event::Refused("Download from example.com".into()),
                 Event::Refused("Download from github.com".into()),
+                Event::Refused("Download from nodejs.org".into()),
                 Event::Refused("Install typescript from npm".into()),
                 Event::Refused("Run gem install solargraph".into()),
                 Event::Refused(

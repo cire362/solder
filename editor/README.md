@@ -711,6 +711,13 @@ budget for each call; its files are one folder
 (`extensions/work/<id>` in the app's data folder). The server itself is a
 program Solder starts with your rights, as Zed does.
 
+Many servers are written in JavaScript and need Node.js. Yours is used when
+you have one. When the machine has none, Solder downloads the newest
+long-term release from nodejs.org the first time a server needs it, checks
+it against the published hash and keeps it in `extensions/node` in the app's
+data folder, for every extension; the status bar says so while it downloads.
+It is not updated on its own: delete that folder to get a newer one.
+
 An icon theme puts a picture next to each file in the tree and on tabs, by
 the file's name and ending. Press **Use** on it in the Extensions tab, or
 name it in `settings.json` (`"icon_theme": "Catppuccin Mocha"`); with none

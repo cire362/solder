@@ -124,8 +124,13 @@ pub enum Status {
 
 /// Everything an extension reaches outside its sandbox through.
 pub trait World: Send + Sync + 'static {
-    /// The path of Node.js.
+    /// The path of Node.js: the user's, or one Solder got earlier.
     fn node(&self) -> Result<String, String>;
+    /// Gets a Node.js of Solder's own for a machine that has none, and
+    /// gives its path. A world that cannot says so.
+    fn install_node(&self) -> Result<String, String> {
+        Err("Node.js was not found, and this language server needs it".into())
+    }
     fn npm_latest(&self, package: &str) -> Result<String, String>;
     /// Installs a package under `dir/node_modules`.
     fn npm_install(&self, dir: &Path, package: &str, version: &str) -> Result<(), String>;

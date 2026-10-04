@@ -57,6 +57,11 @@ pub fn dir_for(root: &Path, origin: Origin, id: &str) -> PathBuf {
     root.join(origin.folder()).join(id)
 }
 
+/// Where Solder keeps a Node.js of its own, for a machine that has none.
+pub fn node_dir(root: &Path) -> PathBuf {
+    root.join("node")
+}
+
 /// The folder a Zed extension's code keeps what it downloads in.
 pub fn work_dir(root: &Path, id: &str) -> PathBuf {
     root.join("work").join(id)

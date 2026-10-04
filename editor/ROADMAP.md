@@ -165,8 +165,9 @@ to build them.
       installed the same way
 - [x] Icon themes: file icons in the tree and on tabs, chosen in the
       Extensions tab or by `icon_theme` in `settings.json`
-- [ ] A Node of Solder's own for servers written in JavaScript when the
-      machine has none, downloaded on first need
+- [x] A Node of Solder's own for servers written in JavaScript when the
+      machine has none, downloaded on first need: the newest long-term
+      release, checked against its published hash, with the npm it brings
 - [x] The commands an extension may run and the hosts it may download from,
       granted or refused per extension (Zed's capabilities): commands, npm,
       downloads and single hosts, each taken back or given again in the
