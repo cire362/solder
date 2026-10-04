@@ -72,6 +72,13 @@ jobs:
       SOLDER_TEST_MONGO: mongodb://localhost:57017/solder
     steps:
       - uses: actions/checkout@v4
+      # The build with wasmtime, its test binaries and the database containers
+      # no longer fit in what a runner has free: the last step ran out of
+      # space. These preinstalled toolchains are not used by this job.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
       # cmake is for wasmtime, which runs the grammars of extensions.
       - name: System libraries for GPUI
         run: |
