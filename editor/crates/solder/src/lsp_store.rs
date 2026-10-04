@@ -508,7 +508,17 @@ impl LspStore {
                 let set_up = this.set_up.entry(key.clone()).or_default();
                 add(&mut set_up.options, added.initialization_options);
                 add(&mut set_up.settings, added.configuration);
-                let settings = set_up.settings.clone();
+                // What the user set for the server stays on top.
+                let mut settings = set_up.settings.clone();
+                let users = Settings::get(cx)
+                    .language_servers
+                    .get(key.name)
+                    .and_then(|server| server.settings.clone());
+                match (settings.as_mut(), users) {
+                    (Some(settings), Some(users)) => extension::host::merge_json(settings, users),
+                    (None, Some(users)) => settings = Some(users),
+                    (_, None) => {}
+                }
                 match this.servers.get(&key) {
                     Some(ServerState::Running { .. }) if options_changed => {
                         this.restart(key, spec, cx)
@@ -567,13 +577,43 @@ impl LspStore {
         cx.notify();
         let store = crate::extension_store::ExtensionStore::global(cx);
         let resolving = store.update(cx, |store, cx| store.resolve(&server, &key.root, cx));
+        // What the user set for this server is applied here as well as
+        // given to the extension, which may not look at it: their program
+        // in place of the extension's, their options and settings on top.
+        let overrides = Settings::get(cx)
+            .language_servers
+            .get(key.name)
+            .cloned()
+            .unwrap_or_default();
         cx.spawn(async move |this, cx| {
             let result = match resolving.await {
-                Ok(resolved) => {
-                    let command = ServerCommand {
-                        program: PathBuf::from(resolved.command.command),
-                        args: resolved.command.args,
-                        env: resolved.command.env,
+                Ok(mut resolved) => {
+                    let on_top =
+                        |under: &mut Option<serde_json::Value>, over: Option<serde_json::Value>| {
+                            match (under.as_mut(), over) {
+                                (Some(under), Some(over)) => {
+                                    extension::host::merge_json(under, over)
+                                }
+                                (None, Some(over)) => *under = Some(over),
+                                (_, None) => {}
+                            }
+                        };
+                    on_top(
+                        &mut resolved.initialization_options,
+                        overrides.initialization_options,
+                    );
+                    on_top(&mut resolved.configuration, overrides.settings);
+                    let command = match overrides.command {
+                        Some(program) => ServerCommand {
+                            program: PathBuf::from(program),
+                            args: overrides.args.unwrap_or(resolved.command.args),
+                            env: resolved.command.env,
+                        },
+                        None => ServerCommand {
+                            program: PathBuf::from(resolved.command.command),
+                            args: overrides.args.unwrap_or(resolved.command.args),
+                            env: resolved.command.env,
+                        },
                     };
                     let (name, root) = (key.name, key.root.clone());
                     let spawned = cx
@@ -641,11 +681,17 @@ impl LspStore {
         cx.notify();
         // The user's options, and on top of them what extensions add.
         let mut options = overrides.initialization_options;
-        let (added, settings) = self
+        let (added, mut settings) = self
             .set_up
             .get(&key)
             .map(|set_up| (set_up.options.clone(), set_up.settings.clone()))
             .unwrap_or_default();
+        // The settings the user gave the server, over what extensions add.
+        match (settings.as_mut(), overrides.settings) {
+            (Some(settings), Some(users)) => extension::host::merge_json(settings, users),
+            (None, Some(users)) => settings = Some(users),
+            (_, None) => {}
+        }
         match (options.as_mut(), added) {
             (Some(options), Some(added)) => extension::host::merge_json(options, added),
             (None, Some(added)) => options = Some(added),

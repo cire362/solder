@@ -708,6 +708,31 @@ TypeScript server's too, that server is started with the plugin (started
 again, if it ran without), and the questions Vue's server has for it pass
 through the editor.
 
+What you set for a server in `settings.json` applies to the servers of
+extensions as it does to Solder's own:
+
+```json
+{
+  "language_servers": {
+    "vscode-html-language-server": {
+      "command": "/opt/bin/my-html-server",
+      "args": ["--stdio"],
+      "initialization_options": { "provideFormatter": false },
+      "settings": { "html": { "format": { "enable": false } } },
+      "disabled": false
+    }
+  }
+}
+```
+
+`command` and `args` replace the program the extension would start,
+`initialization_options` and `settings` go on top of what it gives, and
+`settings` is what the server is told and answered when it asks. The same
+entry is handed to the extension when it asks for the user's settings, and
+some ask by a name of their own: Vue's reads `"vue"`, not the id of its
+server. A language's tab size comes from `indent_size`. A change takes effect
+when the server next starts.
+
 That is why such an extension **asks first**. It is downloaded and read, and
 then waits: the tab shows what installing it allows (the servers it gets, the
 commands its manifest declares), and nothing is in place until you press

@@ -142,8 +142,10 @@ to build them.
       server, which then serves Vue files too and is started again if it ran
       without the plugin; the questions Vue's server has for it pass through
       the editor
-- [ ] The user's settings reach the extension: a server's binary, options and
-      settings from `settings.json`, and the language's tab size
+- [x] The user's settings reach the extension: a server's binary, options and
+      settings from `settings.json`, and the language's tab size. The editor
+      also applies them itself to a server an extension brings, for the
+      extensions that do not ask
 - [ ] The rest of a language's files: indentation, brackets, the outline,
       and from `config.toml` the pairs that close themselves, the block
       comment and the word characters

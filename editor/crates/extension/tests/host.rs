@@ -20,6 +20,8 @@ struct Script {
     log: Mutex<Vec<String>>,
     /// Where `which` finds the server, if it is on the user's PATH.
     on_path: Option<String>,
+    /// What the user set for a server, by the name an extension asks with.
+    settings: Vec<(&'static str, String)>,
     latest: String,
 }
 
@@ -90,6 +92,15 @@ impl World for Script {
 
     fn status(&self, server: &str, status: Status) {
         self.note(format!("{server}: {status:?}"));
+    }
+
+    fn settings(&self, category: &str, key: Option<&str>) -> Option<String> {
+        self.note(format!("settings {category} {key:?}"));
+        let (_, json) = self
+            .settings
+            .iter()
+            .find(|(name, _)| category == "lsp" && key == Some(name))?;
+        Some(json.clone())
     }
 }
 
@@ -386,5 +397,58 @@ fn an_extension_adds_to_the_options_of_a_server_that_is_not_its_own() {
     assert_eq!(
         old.additional_initialization_options("nginx", "typescript-language-server", &project),
         Ok(None)
+    );
+}
+
+#[test]
+fn the_users_settings_reach_the_extension() {
+    let project = work_dir("host-settings-project");
+    let vue = "vue-language-server";
+    let json =
+        |text: Option<String>| serde_json::from_str::<serde_json::Value>(&text.unwrap()).unwrap();
+
+    // Nothing set: Vue's extension gives its own defaults.
+    let world = Arc::new(Script {
+        latest: "3.0.0".into(),
+        ..Default::default()
+    });
+    let host = Host::load(
+        &fixture("vue"),
+        &work_dir("host-settings-unset"),
+        world.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        json(host.initialization_options(vue, &project).unwrap()),
+        serde_json::json!({})
+    );
+    let defaults = json(host.workspace_configuration(vue, &project).unwrap());
+    assert_eq!(defaults["vue.inlayHints.missingProps"], true);
+    // It asks by a name of its own choosing, not by the server's id.
+    assert!(
+        world
+            .take()
+            .contains(&"settings lsp Some(\"vue\")".to_string())
+    );
+
+    // Set: what the user wrote is what the server will be sent.
+    let options = serde_json::json!({ "typescript": { "tsdk": "/opt/typescript/lib" } });
+    let settings = serde_json::json!({ "vue.inlayHints.missingProps": false });
+    let world = Arc::new(Script {
+        latest: "3.0.0".into(),
+        settings: vec![(
+            "vue",
+            extension::world::lsp_settings(None, None, Some(&options), Some(&settings)),
+        )],
+        ..Default::default()
+    });
+    let host = Host::load(&fixture("vue"), &work_dir("host-settings-set"), world).unwrap();
+    assert_eq!(
+        json(host.initialization_options(vue, &project).unwrap()),
+        options
+    );
+    assert_eq!(
+        json(host.workspace_configuration(vue, &project).unwrap()),
+        settings
     );
 }

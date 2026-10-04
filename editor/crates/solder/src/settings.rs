@@ -79,6 +79,8 @@ pub struct ServerOverride {
     pub args: Option<Vec<String>>,
     pub disabled: bool,
     pub initialization_options: Option<serde_json::Value>,
+    /// What the server is told its settings are, and answered when it asks.
+    pub settings: Option<serde_json::Value>,
 }
 
 impl Default for Settings {
