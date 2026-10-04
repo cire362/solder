@@ -159,6 +159,7 @@ export const DOC_GROUPS: DocGroup[] = [
           { h: "What asks first", id: "asks-first" },
           { p: "An extension's own code runs in a sandbox: it can compute, and it can write to one folder of its own. A language server is different. It is a program the extension downloads and Solder starts with your rights." },
           { p: "So an extension that brings a server, or declares commands it runs, is downloaded and then waits. The tab shows what installing it allows, and nothing is put in place until you press **Install** there. A later version asks again only if it wants something new." },
+          { p: "What you allowed can be taken back for one extension: its details have a **Refuse** button for the commands it runs, for npm, for downloads, and for each host it downloaded from. Below them the tab lists what its code did since Solder started, and what it asked for and did not get." },
           { h: "Updates, and turning one off", id: "manage" },
           { list: [
             "Newer versions are looked for when the tab is opened. **Update** on a row installs one, and the button next to the search installs all of them.",

@@ -15,7 +15,8 @@ use std::{
 };
 
 use extension::{
-    Entry, Extension, Origin, Snippet, catalog,
+    Entry, Event, Extension, Origin, Refusals, Snippet, catalog,
+    gate::{Did, Gate},
     host::{CodeLabel, Completion, Host, Status, World},
     install::{self, Progress, Staged},
     world::{SettingsFor, System},
@@ -124,6 +125,9 @@ pub struct ExtensionStore {
     scans: usize,
     /// The loaded code of extensions, by extension id.
     hosts: HashMap<String, Slot>,
+    /// By extension id. Kept when the code is loaded again, so what an
+    /// extension did is not forgotten with it.
+    gates: HashMap<String, Gated>,
     /// The extension servers that were asked for their command already, by
     /// extension and server id: that is when an extension installs what it
     /// needs, and it comes before anything else is asked of it.
@@ -140,6 +144,14 @@ pub struct ExtensionStore {
     _pump: Task<()>,
 }
 
+/// What stands between one extension and the world: what the user took
+/// back from it, which the gate reads at every call, and what it did.
+#[derive(Clone, Default)]
+struct Gated {
+    refusals: Arc<Mutex<Refusals>>,
+    did: Did,
+}
+
 /// The loaded code of an extension: what its slot holds, or loaded now.
 /// Blocking, and slow the first time.
 fn host_in(
@@ -149,6 +161,7 @@ fn host_in(
     world: Option<Arc<dyn World>>,
     statuses: mpsc::UnboundedSender<(String, Status)>,
     settings: SettingsFor,
+    gated: Gated,
 ) -> Result<Arc<Host>, String> {
     let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(host) = &*slot {
@@ -161,6 +174,7 @@ fn host_in(
         system.settings = Some(settings);
         Arc::new(system)
     });
+    let world = Arc::new(Gate::new(world, gated.refusals, gated.did));
     let host = Arc::new(Host::load(extension, work_dir, world)?);
     *slot = Some(host.clone());
     Ok(host)
@@ -238,6 +252,7 @@ impl ExtensionStore {
             documents: Vec::new(),
             scans: 0,
             hosts: HashMap::new(),
+            gates: HashMap::new(),
             resolved: Arc::default(),
             world: None,
             statuses,
@@ -390,6 +405,11 @@ impl ExtensionStore {
                     .retain(|(extension, _)| loaded.contains(&extension));
                 if let (Some(state), false) = (state, this.loaded) {
                     this.state = state;
+                    // A gate made before the decisions were read.
+                    for (id, gated) in &this.gates {
+                        *gated.refusals.lock().unwrap_or_else(|e| e.into_inner()) =
+                            this.state.refusals(Origin::Zed, id);
+                    }
                 }
                 this.installed = installed;
                 this.snippets = snippets;
@@ -630,13 +650,22 @@ impl ExtensionStore {
         let statuses = self.statuses.clone();
         let resolved = self.resolved.clone();
         let settings = self.settings_for();
+        let gated = self.gated(&extension.id);
         let (id, root) = (server.id.clone(), root.to_path_buf());
         let (tx, rx) = futures::channel::oneshot::channel();
         let spawned = std::thread::Builder::new()
             .name("solder-extension".into())
             .spawn(move || {
                 let answer = (|| {
-                    let host = host_in(&slot, &extension, &work_dir, world, statuses, settings)?;
+                    let host = host_in(
+                        &slot,
+                        &extension,
+                        &work_dir,
+                        world,
+                        statuses,
+                        settings,
+                        gated.clone(),
+                    )?;
                     let json = |text: Option<String>| {
                         text.and_then(|text| serde_json::from_str(&text).ok())
                     };
@@ -651,6 +680,15 @@ impl ExtensionStore {
                         configuration: json(host.workspace_configuration(&id, &root)?),
                     })
                 })();
+                // A server that could not be got ready is part of what the
+                // extension did, in the words the status bar had.
+                if let Err(error) = &answer {
+                    gated
+                        .did
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(Event::Failed(format!("{id}: {error}")));
+                }
                 let _ = tx.send(answer);
             });
         if let Err(error) = spawned {
@@ -681,7 +719,8 @@ impl ExtensionStore {
             };
             let slot = self.hosts.entry(extension.id.clone()).or_default().clone();
             let work_dir = install::work_dir(&self.root, &extension.id);
-            asked.push((server.id, extension, slot, work_dir));
+            let gated = self.gated(&extension.id);
+            asked.push((server.id, extension, slot, work_dir, gated));
         }
         let world = self.world.clone();
         let statuses = self.statuses.clone();
@@ -702,7 +741,7 @@ impl ExtensionStore {
                         None => *into = Some(more),
                     }
                 };
-                for (id, extension, slot, work_dir) in asked {
+                for (id, extension, slot, work_dir, gated) in asked {
                     let Ok(host) = host_in(
                         &slot,
                         &extension,
@@ -710,6 +749,7 @@ impl ExtensionStore {
                         world.clone(),
                         statuses.clone(),
                         settings.clone(),
+                        gated,
                     ) else {
                         continue;
                     };
@@ -905,6 +945,48 @@ impl ExtensionStore {
             .detach();
     }
 
+    fn gated(&mut self, id: &str) -> Gated {
+        let refused = self.state.refusals(Origin::Zed, id);
+        self.gates
+            .entry(id.to_string())
+            .or_insert_with(|| Gated {
+                refusals: Arc::new(Mutex::new(refused)),
+                did: Did::default(),
+            })
+            .clone()
+    }
+
+    /// What the user took back from the code of the Zed extension `id`.
+    pub fn refusals(&self, id: &str) -> Refusals {
+        self.state.refusals(Origin::Zed, id)
+    }
+
+    /// Takes something back from an extension's code, or gives it back.
+    /// It holds from the next thing the extension asks for: what it
+    /// already started keeps running.
+    pub fn set_refusals(&mut self, id: &str, refused: Refusals, cx: &mut Context<Self>) {
+        if let Some(gated) = self.gates.get(id) {
+            *gated.refusals.lock().unwrap_or_else(|e| e.into_inner()) = refused.clone();
+        }
+        self.state.set_refusals(Origin::Zed, id, refused);
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// What the code of the Zed extension `id` did outside its sandbox
+    /// since the app started, and what it was refused.
+    pub fn did(&self, id: &str) -> Vec<Event> {
+        self.gates.get(id).map_or_else(Vec::new, |gated| {
+            gated
+                .did
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned()
+                .collect()
+        })
+    }
+
     pub fn is_off(&self, origin: Origin, id: &str) -> bool {
         self.state.is_off(origin, id)
     }
@@ -1008,6 +1090,9 @@ impl ExtensionStore {
         // Installed again later, it is a first install: on, following
         // updates, and asked what it may do.
         self.state.forget(origin, id);
+        if origin == Origin::Zed {
+            self.gates.remove(id);
+        }
         self.updates.remove(&key);
         self.save_state(cx);
         cx.spawn(async move |this, cx| {

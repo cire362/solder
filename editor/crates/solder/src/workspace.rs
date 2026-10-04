@@ -10072,4 +10072,103 @@ brackets = [
         assert_eq!(painted.filter, 0..9);
         assert_eq!(labels.1, None);
     }
+
+    #[gpui::test]
+    fn what_an_extension_may_do_is_taken_back_and_what_it_did_is_shown(cx: &mut TestAppContext) {
+        // Zed's real Vue extension, installed. Its code gets its server
+        // from npm, which in this world makes the files it then looks for.
+        let root = db::testing::dir("ws-gate").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        let data = db::testing::dir("ws-gate-data");
+        let installed = data.join("extensions/zed/vue");
+        std::fs::create_dir_all(&installed).unwrap();
+        let fixtures =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../extension/tests/fixtures/vue");
+        for file in ["extension.toml", "extension.wasm"] {
+            std::fs::copy(fixtures.join(file), installed.join(file)).unwrap();
+        }
+        // The catalogs are a server that has nothing: the tab is opened
+        // below, and no test goes to the real ones.
+        let (base, _) = serve(Vec::new());
+        cx.executor().allow_parking();
+        let store = cx.update(|cx| {
+            let store = cx.new(|cx| {
+                let mut store =
+                    ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
+                store.zed_url = base.clone();
+                store.open_vsx_url = base.clone();
+                store.world = Some(std::sync::Arc::new(VueWorld {
+                    node: "node".into(),
+                    settings: store.settings_for(),
+                }));
+                store
+            });
+            ExtensionStore::set_global(store.clone(), cx);
+            store.update(cx, |s, cx| s.scan(cx));
+            store
+        });
+        let (_ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "the extensions folder", &|cx| store.read(cx).loaded);
+        let server = cx.read(|cx| store.read(cx).servers_for("Vue.js")[0].clone());
+        let resolve = |cx: &mut VisualTestContext| {
+            let asked = store.update(cx, |store, cx| store.resolve(&server, &root, cx));
+            cx.executor().block(asked)
+        };
+        let did = |cx: &mut VisualTestContext| cx.read(|cx| store.read(cx).did("vue"));
+        let npm = extension::Event::Installed("@vue/language-server".into());
+        let refused = extension::Event::Refused("Install @vue/language-server from npm".into());
+
+        // Allowed everything, as installing it did: it installs its server,
+        // and that is written down.
+        assert!(did(cx).is_empty());
+        resolve(cx).unwrap();
+        assert!(did(cx).contains(&npm), "{:?}", did(cx));
+        assert!(!did(cx).contains(&refused));
+
+        // npm is taken back with the button in its details.
+        cx.dispatch_action(ShowExtensions);
+        let button = bounds_soon(cx, "extension-may-npm-0");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        wait_for(cx, "npm to be refused", &|cx| {
+            store.read(cx).refusals("vue").npm
+        });
+        wait_for(cx, "the decision on disk", &|_| {
+            std::fs::read_to_string(data.join("extensions/state.json"))
+                .is_ok_and(|text| text.contains("\"npm\": true"))
+        });
+        // What it has running goes on. Started afresh (off and on again),
+        // it asks npm once more, is refused and says why; nothing else was
+        // taken from it.
+        resolve(cx).unwrap();
+        store.update(cx, |store, cx| {
+            store.set_off(Origin::Zed, "vue", true, cx);
+            store.set_off(Origin::Zed, "vue", false, cx);
+        });
+        let error = resolve(cx).unwrap_err();
+        assert!(error.contains("refused for this extension"), "{error}");
+        assert!(did(cx).contains(&refused), "{:?}", did(cx));
+        // So is the server that could not be got ready for it.
+        assert!(
+            did(cx).iter().any(|event| matches!(event,
+                extension::Event::Failed(what) if what.starts_with("vue-language-server: "))),
+            "{:?}",
+            did(cx)
+        );
+        // What it did before is still there to read.
+        assert!(did(cx).contains(&npm));
+
+        // Given back with the same button, it works again, and the file
+        // has no trace of the refusal.
+        cx.run_until_parked();
+        let button = bounds_soon(cx, "extension-may-npm-0");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        wait_for(cx, "npm to be allowed", &|cx| {
+            !store.read(cx).refusals("vue").npm
+        });
+        resolve(cx).unwrap();
+        wait_for(cx, "the decision on disk", &|_| {
+            std::fs::read_to_string(data.join("extensions/state.json"))
+                .is_ok_and(|text| !text.contains("refused"))
+        });
+    }
 }

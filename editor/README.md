@@ -764,6 +764,17 @@ then waits: the tab shows what installing it allows (the servers it gets, the
 commands its manifest declares), and nothing is in place until you press
 **Install** there. A later version asks again only for what is new.
 
+What installing allowed can be taken back afterwards, for that extension
+alone. Under **It may** in its details, each of these has a **Refuse**
+button, which turns into **Allow**: running the commands it declares,
+installing packages from npm, downloading files, and each host it has
+downloaded from. A refusal holds from the next thing the extension asks for;
+a server it already started keeps running. Below that the tab lists what
+its code did since Solder started (what it ran, installed and downloaded
+from where) and what it asked for and did not get: what was refused, a
+command its manifest does not declare, a server it could not get ready. So
+what works is read from what happened, not from the manifest.
+
 For an installed extension the tab has:
 
 - **Update**, when its catalog has a newer version. They are looked for when

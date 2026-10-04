@@ -134,7 +134,9 @@ Never guess a signature.
   WebAssembly component in wasmtime, with one folder of its own and a fuel
   budget per call. All it does outside goes through the `World` trait
   (`world.rs` is the real one: npm with `--ignore-scripts`, GitHub
-  releases, downloads). Its calls block for as long as a download takes:
+  releases, downloads), and through a `Gate` in front of it (`gate.rs`),
+  which refuses what the user took back from that extension and writes
+  down what it did. A new way out of the sandbox goes through both. Its calls block for as long as a download takes:
   `ExtensionStore::resolve` runs them on a thread of their own, never on
   the UI thread or the background executor. The files in
   `crates/extension/wit` are Zed's and stay as published. Each version of

@@ -5,9 +5,9 @@
 //! The catalogs are asked when the tab is opened and when the search
 //! changes, never at startup.
 
-use std::time::Duration;
+use std::{rc::Rc, time::Duration};
 
-use extension::{Code, Entry, Extension, Origin, manifest::zed_equivalent};
+use extension::{Code, Entry, Event, Extension, Origin, Refusals, manifest::zed_equivalent};
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable, KeyBinding, SharedString,
     Subscription, Task, Window, actions, div, prelude::*, px, uniform_list,
@@ -535,6 +535,128 @@ impl ExtensionsPanel {
                             .into(),
                         theme.fg_subtle,
                     ));
+                }
+                // What its code may do outside its sandbox, each to take
+                // back or give again, and what it did since the app started.
+                if installed.origin == Origin::Zed && installed.runs_code() {
+                    let refused = store.refusals(&installed.id);
+                    let did = store.did(&installed.id);
+                    let view = cx.entity();
+                    let id = installed.id.clone();
+                    let may = |name: &'static str,
+                               index: usize,
+                               what: String,
+                               no: bool,
+                               change: Rc<dyn Fn(&mut Refusals)>| {
+                        let (view, id, refused) = (view.clone(), id.clone(), refused.clone());
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(UI_FONT_SIZE)
+                                    .text_color(if no { theme.fg_subtle } else { theme.fg_muted })
+                                    .child(what),
+                            )
+                            .child(
+                                ui::button(
+                                    (name, index),
+                                    if no { "Allow" } else { "Refuse" },
+                                    false,
+                                    theme,
+                                    move |_, _, cx| {
+                                        let mut refused = refused.clone();
+                                        change(&mut refused);
+                                        let id = id.clone();
+                                        view.update(cx, |this, cx| {
+                                            this.store.update(cx, |store, cx| {
+                                                store.set_refusals(&id, refused, cx)
+                                            })
+                                        })
+                                    },
+                                )
+                                .debug_selector(move || format!("{name}-{index}"))
+                                .h(px(20.)),
+                            )
+                    };
+                    details = details.child(heading("IT MAY"));
+                    if !installed.commands.is_empty() {
+                        details = details.child(may(
+                            "extension-may-run",
+                            0,
+                            "Run the commands it declares".into(),
+                            refused.commands,
+                            Rc::new(|r| r.commands = !r.commands),
+                        ));
+                    }
+                    details = details
+                        .child(may(
+                            "extension-may-npm",
+                            0,
+                            "Install packages from npm".into(),
+                            refused.npm,
+                            Rc::new(|r| r.npm = !r.npm),
+                        ))
+                        .child(may(
+                            "extension-may-download",
+                            0,
+                            "Download files".into(),
+                            refused.downloads,
+                            Rc::new(|r| r.downloads = !r.downloads),
+                        ));
+                    // The hosts it went to, and those it may not go to.
+                    let mut hosts = refused.hosts.clone();
+                    for event in &did {
+                        if let Event::Downloaded(host) = event
+                            && !hosts.contains(host)
+                        {
+                            hosts.push(host.clone());
+                        }
+                    }
+                    hosts.sort();
+                    if !refused.downloads {
+                        for (i, host) in hosts.into_iter().enumerate() {
+                            let no = refused.hosts.contains(&host);
+                            let toggled = host.clone();
+                            details = details.child(may(
+                                "extension-may-host",
+                                i,
+                                format!("Download from {host}"),
+                                no,
+                                Rc::new(move |r| {
+                                    match r.hosts.iter().position(|h| *h == toggled) {
+                                        Some(at) => {
+                                            r.hosts.remove(at);
+                                        }
+                                        None => r.hosts.push(toggled.clone()),
+                                    }
+                                }),
+                            ));
+                        }
+                    }
+                    if !did.is_empty() {
+                        details = details.child(heading("SINCE SOLDER STARTED, IT"));
+                        for event in did {
+                            let (text, color) = match event {
+                                Event::Ran(command) => (format!("Ran {command}"), theme.fg_muted),
+                                Event::Installed(package) => {
+                                    (format!("Installed {package} from npm"), theme.fg_muted)
+                                }
+                                Event::Downloaded(host) => {
+                                    (format!("Downloaded from {host}"), theme.fg_muted)
+                                }
+                                Event::Refused(what) => {
+                                    (format!("Was refused: {what}"), theme.warning)
+                                }
+                                Event::Failed(what) => (format!("Failed: {what}"), theme.error),
+                            };
+                            details = details.child(line(text.into(), color));
+                        }
+                    }
                 }
                 let missing = not_running(installed);
                 if !missing.is_empty() {

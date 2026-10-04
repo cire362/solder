@@ -132,8 +132,10 @@ to build them.
 - [x] Updates: newer versions are looked for when the tab is opened, never at
       startup; update one or all; keep a version
 - [x] Turn an extension off without removing it
-- [ ] For each installed extension, what works and what does not, from what it
-      asked for at run time and did not get, not from its manifest alone
+- [x] For each installed extension, what works and what does not, from what it
+      asked for at run time and did not get, not from its manifest alone:
+      what its code ran, installed and downloaded since the app started, what
+      it was refused, and which server it could not get ready
 - [x] A section on extensions in `editor/README.md` and in the website's docs
 
 ### Zed extensions, complete
@@ -165,8 +167,10 @@ to build them.
       Extensions tab or by `icon_theme` in `settings.json`
 - [ ] A Node of Solder's own for servers written in JavaScript when the
       machine has none, downloaded on first need
-- [ ] The commands an extension may run and the hosts it may download from,
-      granted or refused per extension (Zed's capabilities)
+- [x] The commands an extension may run and the hosts it may download from,
+      granted or refused per extension (Zed's capabilities): commands, npm,
+      downloads and single hosts, each taken back or given again in the
+      extension's details
 - [ ] A time limit for a grammar's scanner, which today can hold a parse
 - [ ] Debug adapters of extensions, in the debugger
 - [ ] Slash commands and context servers of extensions, in the chat and the

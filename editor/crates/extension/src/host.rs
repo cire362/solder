@@ -149,6 +149,9 @@ pub trait World: Send + Sync + 'static {
     fn settings(&self, _category: &str, _key: Option<&str>) -> Option<String> {
         None
     }
+    /// The extension tried to run a command its manifest does not declare,
+    /// and was not let. For the record of what it did; nothing to answer.
+    fn undeclared(&self, _command: &Command) {}
 }
 
 /// Adds `more` to `into`, the way one extension's options are added to a
@@ -324,6 +327,7 @@ impl State {
 
     fn run_declared(&self, command: Command) -> Result<Output, String> {
         if !declared(&self.commands, &command) {
+            self.world.undeclared(&command);
             return Err(format!(
                 "The extension's manifest does not declare that it runs {}",
                 command.command
