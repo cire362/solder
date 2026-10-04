@@ -11,6 +11,7 @@
 //! Open VSX, [`install`] downloads an extension and puts it in place.
 
 pub mod catalog;
+pub mod host;
 pub mod install;
 pub mod manifest;
 pub mod snippet;

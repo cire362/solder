@@ -126,6 +126,10 @@ schema_version = 1
 description = "Demo language."
 snippets = "./extra/all.json"
 icon_themes = ["icon_themes/demo.json"]
+capabilities = [
+    { kind = "process:exec", command = "demo-ls", args = ["--version"] },
+    { kind = "download_file", host = "example.com", path = ["**"] },
+]
 
 [lib]
 kind = "Rust"
@@ -139,6 +143,9 @@ rev = "abc"
 name = "Demo LS"
 language = "Demo"
 languages = ["Demo", "Demo Template"]
+
+[language_servers.demo-ls.language_ids]
+"Demo Template" = "demo-template"
 "#,
     );
     write(&dir.join("extension.wasm"), "component");

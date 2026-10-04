@@ -350,6 +350,10 @@ mod tests {
         assert_eq!(installed.servers.len(), 1);
         assert_eq!(installed.servers[0].name, "Demo LS");
         assert_eq!(installed.servers[0].languages, ["Demo", "Demo Template"]);
+        assert_eq!(
+            installed.servers[0].language_ids,
+            [("Demo Template".to_string(), "demo-template".to_string())]
+        );
 
         let snippets: Vec<_> = installed
             .snippets
@@ -369,6 +373,10 @@ mod tests {
             ]
         );
         assert_eq!(installed.missing, ["Icon themes"]);
+        assert_eq!(
+            installed.commands,
+            [("demo-ls".to_string(), vec!["--version".to_string()])]
+        );
         assert_eq!(
             installed.provides(),
             "1 language, 2 themes, 2 snippet files"
