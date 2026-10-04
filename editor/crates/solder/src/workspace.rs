@@ -8917,14 +8917,22 @@ mod tests {
     fn a_zed_extension_installs_from_the_catalog_and_works(cx: &mut TestAppContext) {
         let _languages = extension_languages();
         let catalog = r#"{"data":[{"id":"vue","name":"Vue","version":"0.4.0","description":"Vue support.","download_count":675263,"provides":["languages","grammars","language-servers"]}]}"#;
+        // The catalog lists the version the archive holds, and says a newer
+        // one is out when it is asked about what is installed.
+        let newest = r#"{"data":[{"id":"vue","name":"Vue","version":"0.5.0","description":"Vue support.","download_count":675263,"provides":["languages"]}]}"#;
         let (base, requests) = serve(vec![
             ("/extensions", Served::ok(catalog.as_bytes().to_vec())),
+            (
+                "/extensions/updates",
+                Served::ok(newest.as_bytes().to_vec()),
+            ),
             (
                 "/extensions/vue/download",
                 Served::ok(vue_archive("ext-zed")),
             ),
         ]);
         let (config, store, ws, cx) = extension_setup(cx, "ext-zed", &base);
+        let folder = cx.read(|cx| store.read(cx).root.clone());
         let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
         let language = |cx: &App| editor.read(cx).doc(cx).language_name();
         // Nothing installed: the file is plain text.
@@ -9009,13 +9017,73 @@ mod tests {
         );
         assert!(config.join("themes/demo-dark.json").is_file());
 
-        // Removed, the file is plain text again.
-        click(cx, "extension-act-0");
+        // Opening the tab asked the catalog about what is installed, and it
+        // has a newer version: the row offers it, and so does Update all.
+        let has_update = |cx: &App| {
+            store
+                .read(cx)
+                .updates
+                .contains_key(&(Origin::Zed, "vue".into()))
+        };
+        wait_for(cx, "the update", &has_update);
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.starts_with("/extensions/updates?") && r.ends_with("&ids=vue"))
+        );
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("extensions-update-all").is_some());
+        // Kept on its version, it is offered no update; following again,
+        // the catalog is asked and offers it.
+        click(cx, "extension-keep");
+        assert!(!cx.read(|cx| has_update(cx)));
+        click(cx, "extension-keep");
+        wait_for(cx, "the update again", &has_update);
+
+        // Turned off, it stays installed and its language is gone; turned
+        // on, the language is back. The decision is written down.
+        click(cx, "extension-off");
+        wait_for(cx, "the language to go", &|cx| language(cx).is_none());
+        assert!(cx.read(|cx| store.read(cx).find(Origin::Zed, "vue").is_some()));
+        wait_for(cx, "the decision on disk", &|_| {
+            std::fs::read_to_string(folder.join("state.json"))
+                .is_ok_and(|text| text.contains("\"zed/vue\"") && text.contains("\"off\": true"))
+        });
+        click(cx, "extension-off");
+        wait_for(cx, "the language to return", &|cx| {
+            language(cx) == Some("Vue.js")
+        });
+
+        // Update all downloads it again.
+        let downloads = |requests: &std::sync::Mutex<Vec<String>>| {
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.starts_with("/extensions/vue/download"))
+                .count()
+        };
+        assert_eq!(downloads(&requests), 1);
+        click(cx, "extensions-update-all");
+        wait_for(cx, "the update to install", &|cx| {
+            downloads(&requests) == 2 && store.read(cx).installing.is_empty()
+        });
+
+        // Removed, the file is plain text again, and nothing is remembered
+        // about the extension.
+        cx.run_until_parked();
+        click(cx, "extension-remove");
         wait_for(cx, "the removal", &|cx| {
             store.read(cx).loaded && store.read(cx).installed.is_empty()
         });
         assert_eq!(cx.read(|cx| language(cx)), None);
         assert!(cx.read(|cx| editor.read(cx).doc(cx).syntax().is_none()));
+        wait_for(cx, "the decisions to be forgotten", &|_| {
+            std::fs::read_to_string(folder.join("state.json"))
+                .is_ok_and(|text| !text.contains("vue"))
+        });
     }
 
     #[gpui::test]
@@ -9212,7 +9280,36 @@ mod tests {
             catalog.searched && catalog.query == "html" && !catalog.entries.is_empty()
         });
         cx.run_until_parked();
+        // This extension brings a language server, so it is downloaded and
+        // then waits: nothing is installed until what it would do is read
+        // and allowed.
+        let folder = cx.read(|cx| store.read(cx).root.clone());
+        let waiting = |cx: &App| {
+            store
+                .read(cx)
+                .pending
+                .contains_key(&(Origin::Zed, "html".into()))
+        };
         click(cx, "extension-act-0");
+        wait_for(cx, "the download", &waiting);
+        assert!(cx.read(|cx| store.read(cx).find(Origin::Zed, "html").is_none()));
+        assert_eq!(
+            cx.read(|cx| store.read(cx).asks(Origin::Zed, "html")),
+            ["Download and start the language server vscode-html-language-server"]
+        );
+        // Refused, the download is dropped and nothing was installed.
+        cx.run_until_parked();
+        click(cx, "extension-refuse");
+        assert!(!cx.read(|cx| waiting(cx)));
+        wait_for(cx, "the download to be dropped", &|_| {
+            !folder.join(".staging/zed-html").exists()
+        });
+        assert!(!folder.join("zed/html").exists());
+        // Asked for again and allowed, it is installed.
+        click(cx, "extension-act-0");
+        wait_for(cx, "the second download", &waiting);
+        cx.run_until_parked();
+        click(cx, "extension-allow");
         wait_for(cx, "the install", &|cx| {
             store.read(cx).find(Origin::Zed, "html").is_some()
         });

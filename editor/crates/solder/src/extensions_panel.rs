@@ -48,6 +48,9 @@ enum State {
     /// Installed, and a catalog has this newer version.
     Update(String),
     Installing(Option<f32>),
+    /// Downloaded, and waiting for the user to allow what it would do
+    /// outside a sandbox.
+    Review,
 }
 
 #[derive(Clone)]
@@ -59,6 +62,8 @@ struct Row {
     /// The second line: what it is, or why installing it failed.
     note: SharedString,
     failed: bool,
+    /// Installed and turned off.
+    off: bool,
     state: State,
     /// What to download: the catalog's record, when a catalog has one.
     entry: Option<Entry>,
@@ -69,6 +74,9 @@ pub struct ExtensionsPanel {
     input: Entity<Editor>,
     selected: usize,
     search: Option<Task<()>>,
+    /// The tab was opened and the newest versions were not asked for yet:
+    /// that waits for the folder to be read.
+    wants_updates: bool,
     _subscriptions: [Subscription; 2],
 }
 
@@ -84,7 +92,13 @@ impl ExtensionsPanel {
     pub fn new(store: Entity<ExtensionStore>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| Editor::single_line("Search extensions", cx));
         let subscriptions = [
-            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.observe(&store, |this, store, cx| {
+                if this.wants_updates && store.read(cx).loaded {
+                    this.wants_updates = false;
+                    store.update(cx, |store, cx| store.check_updates(cx));
+                }
+                cx.notify()
+            }),
             cx.subscribe(&input, |this, _, event, cx| {
                 if let EditorEvent::Edited = event {
                     this.selected = 0;
@@ -98,13 +112,16 @@ impl ExtensionsPanel {
             input,
             selected: 0,
             search: None,
+            wants_updates: false,
             _subscriptions: subscriptions,
         }
     }
 
-    /// The tab came to the front: read the folder again, and ask the
-    /// catalogs if they were not asked this question yet.
+    /// The tab came to the front: read the folder again, look for newer
+    /// versions of what is in it, and ask the catalogs if they were not
+    /// asked this question yet.
     pub fn shown(&mut self, cx: &mut Context<Self>) {
+        self.wants_updates = true;
         self.store.update(cx, |store, cx| store.scan(cx));
         self.search_now(false, cx);
     }
@@ -170,13 +187,19 @@ impl ExtensionsPanel {
             {
                 continue;
             }
-            let entry = listed(installed.origin, &installed.id).cloned();
-            let state = match (
-                &entry,
-                store.installing.get(&key(installed.origin, &installed.id)),
-            ) {
+            let this = key(installed.origin, &installed.id);
+            // The newest version: what was asked for when the tab opened,
+            // or what a search happens to list. Not for one kept back.
+            let kept = store.is_kept(installed.origin, &installed.id);
+            let entry = store
+                .updates
+                .get(&this)
+                .or(listed(installed.origin, &installed.id))
+                .cloned();
+            let state = match (&entry, store.installing.get(&this)) {
                 (_, Some(progress)) => State::Installing(progress.fraction()),
-                (Some(entry), None) if entry.version != installed.version => {
+                _ if store.pending.contains_key(&this) => State::Review,
+                (Some(entry), None) if entry.version != installed.version && !kept => {
                     State::Update(entry.version.clone())
                 }
                 _ => State::Installed,
@@ -189,14 +212,35 @@ impl ExtensionsPanel {
                 version: installed.version.clone().into(),
                 note,
                 failed,
+                off: store.is_off(installed.origin, &installed.id),
                 state,
                 entry,
             });
         }
-        // The catalogs' answers in one list. Each catalog orders its own by
-        // how well they match, and the two orders cannot be compared, so
-        // they take turns. With nothing searched for, both are lists of the
-        // most downloaded and merge by that.
+        // What waits to be allowed stays in the list whatever is searched
+        // for: it was downloaded and needs an answer.
+        for ((origin, id), staged) in &store.pending {
+            if store.find(*origin, id).is_some() {
+                continue;
+            }
+            let waiting = &staged.extension;
+            rows.push(Row {
+                origin: *origin,
+                id: waiting.id.clone(),
+                name: waiting.name.clone().into(),
+                version: waiting.version.clone().into(),
+                note: waiting.description.clone().into(),
+                failed: false,
+                off: false,
+                state: State::Review,
+                entry: listed(*origin, id).cloned(),
+            });
+        }
+        // The catalogs' answers in one list. Each catalog orders its own, by
+        // how well they match or by downloads when nothing is searched for,
+        // and neither order compares across catalogs (Open VSX counts ten
+        // times the downloads), so the two take turns, Zed's first: its
+        // extensions are the ones that work here in full.
         let mut offered: Vec<(usize, &Entry)> = CATALOGS
             .iter()
             .flat_map(|origin| {
@@ -205,15 +249,12 @@ impl ExtensionsPanel {
                     .entries
                     .iter()
                     .filter(|entry| store.find(entry.origin, &entry.id).is_none())
+                    .filter(|entry| !store.pending.contains_key(&key(entry.origin, &entry.id)))
                     .take(LISTED)
                     .enumerate()
             })
             .collect();
-        if query.is_empty() {
-            offered.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.downloads));
-        } else {
-            offered.sort_by_key(|(place, entry)| (*place, entry.origin));
-        }
+        offered.sort_by_key(|(place, entry)| (*place, entry.origin));
         for (_, entry) in offered {
             let state = match store.installing.get(&key(entry.origin, &entry.id)) {
                 Some(progress) => State::Installing(progress.fraction()),
@@ -227,6 +268,7 @@ impl ExtensionsPanel {
                 version: entry.version.clone().into(),
                 note,
                 failed,
+                off: false,
                 state,
                 entry: Some(entry.clone()),
             });
@@ -264,6 +306,8 @@ impl ExtensionsPanel {
                 (State::Installing(_), _) => store.cancel(row.origin, &row.id),
                 (State::Available | State::Update(_), Some(entry)) => store.install(entry, cx),
                 (State::Installed, _) => store.remove(row.origin, &row.id, cx),
+                // Waiting to be allowed: the answer is given below the
+                // list, next to what it asks for.
                 _ => {}
             });
     }
@@ -319,6 +363,57 @@ impl ExtensionsPanel {
             details = details.child(line(error.clone().into(), theme.error));
         }
 
+        // What a downloaded extension would do outside a sandbox, and the
+        // two answers. Nothing of it is in place until Install is pressed.
+        let asks = store.asks(row.origin, &row.id);
+        if !asks.is_empty() {
+            details = details.child(heading("INSTALLING IT LETS IT"));
+            for what in asks {
+                details = details.child(line(what.into(), theme.fg));
+            }
+            let (allow, refuse) = (cx.entity(), cx.entity());
+            let (origin, id) = (row.origin, row.id.clone());
+            let refused = id.clone();
+            details = details.child(
+                div()
+                    .pt_1()
+                    .flex()
+                    .gap_1()
+                    .child(
+                        ui::button(
+                            "extension-allow",
+                            "Install",
+                            true,
+                            theme,
+                            move |_, _, cx| {
+                                allow.update(cx, |this, cx| {
+                                    this.store
+                                        .update(cx, |store, cx| store.allow(origin, &id, cx))
+                                })
+                            },
+                        )
+                        .debug_selector(|| "extension-allow".into())
+                        .h(px(22.)),
+                    )
+                    .child(
+                        ui::button(
+                            "extension-refuse",
+                            "Cancel",
+                            false,
+                            theme,
+                            move |_, _, cx| {
+                                refuse.update(cx, |this, cx| {
+                                    this.store
+                                        .update(cx, |store, cx| store.refuse(origin, &refused, cx))
+                                })
+                            },
+                        )
+                        .debug_selector(|| "extension-refuse".into())
+                        .h(px(22.)),
+                    ),
+            );
+        }
+
         // A VS Code extension for a language: the Zed one brings a grammar
         // and a language server, which this one cannot. Said first, where
         // it is seen without scrolling: it is what to do next.
@@ -355,6 +450,80 @@ impl ExtensionsPanel {
 
         match installed {
             Some(installed) => {
+                let off = store.is_off(installed.origin, &installed.id);
+                let kept = store.is_kept(installed.origin, &installed.id);
+                let (toggle, keep, remove) = (cx.entity(), cx.entity(), cx.entity());
+                let (origin, id) = (installed.origin, installed.id.clone());
+                let (keep_id, remove_id) = (id.clone(), id.clone());
+                details = details.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .child(
+                            ui::button(
+                                "extension-off",
+                                if off { "Turn on" } else { "Turn off" },
+                                false,
+                                theme,
+                                move |_, _, cx| {
+                                    toggle.update(cx, |this, cx| {
+                                        this.store.update(cx, |store, cx| {
+                                            store.set_off(origin, &id, !off, cx)
+                                        })
+                                    })
+                                },
+                            )
+                            .debug_selector(|| "extension-off".into())
+                            .h(px(22.)),
+                        )
+                        .child(
+                            ui::button(
+                                "extension-keep",
+                                if kept {
+                                    "Follow updates"
+                                } else {
+                                    "Keep this version"
+                                },
+                                false,
+                                theme,
+                                move |_, _, cx| {
+                                    keep.update(cx, |this, cx| {
+                                        this.store.update(cx, |store, cx| {
+                                            store.set_kept(origin, &keep_id, !kept, cx)
+                                        })
+                                    })
+                                },
+                            )
+                            .debug_selector(|| "extension-keep".into())
+                            .h(px(22.)),
+                        )
+                        // The row's button removes too, but it becomes Update
+                        // when there is one; here Remove is always at hand.
+                        .child(
+                            ui::button(
+                                "extension-remove",
+                                "Remove",
+                                false,
+                                theme,
+                                move |_, _, cx| {
+                                    remove.update(cx, |this, cx| {
+                                        this.store.update(cx, |store, cx| {
+                                            store.remove(origin, &remove_id, cx)
+                                        })
+                                    })
+                                },
+                            )
+                            .debug_selector(|| "extension-remove".into())
+                            .h(px(22.)),
+                        ),
+                );
+                if off {
+                    details = details.child(line(
+                        "Turned off: its languages, snippets and servers are not used.".into(),
+                        theme.fg_subtle,
+                    ));
+                }
                 details = details
                     .child(heading("SOLDER USES"))
                     .child(line(installed.provides().into(), theme.fg_muted));
@@ -486,6 +655,8 @@ impl Render for ExtensionsPanel {
         let count = rows.len();
         let store = self.store.read(cx);
         let folder = store.root.clone();
+        let updates = store.updates.len();
+        let update_all = self.store.clone();
 
         // What the catalogs are doing, under the list: one that is being
         // asked, and one that could not be.
@@ -535,9 +706,12 @@ impl Render for ExtensionsPanel {
                         State::Update(_) => ("Update", true),
                         State::Installed => ("Remove", false),
                         State::Installing(_) => ("Cancel", false),
+                        State::Review => ("Review", true),
                     };
                     let badge: Option<(SharedString, gpui::Hsla)> = match &row.state {
+                        State::Installed if row.off => Some(("Off".into(), theme.fg_subtle)),
                         State::Installed => Some(("Installed".into(), theme.git_added)),
+                        State::Review => Some(("Asks first".into(), theme.warning)),
                         State::Update(version) => {
                             Some((format!("{version} is out").into(), theme.warning))
                         }
@@ -663,6 +837,22 @@ impl Render for ExtensionsPanel {
                     .items_center()
                     .gap_1()
                     .child(ui::text_field(self.input.clone(), focused, &theme))
+                    .when(updates > 0, |d| {
+                        d.child(
+                            ui::button(
+                                "extensions-update-all",
+                                format!("Update {updates}"),
+                                true,
+                                &theme,
+                                move |_, _, cx| {
+                                    update_all.update(cx, |store, cx| store.update_all(cx))
+                                },
+                            )
+                            .debug_selector(|| "extensions-update-all".into())
+                            .flex_none()
+                            .h(px(28.)),
+                        )
+                    })
                     .child(
                         ui::button(
                             "extensions-folder",

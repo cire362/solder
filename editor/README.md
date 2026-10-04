@@ -665,6 +665,52 @@ The registry and extensions of other editors are not there yet: VS Code
 extensions are Node programs with full access to the machine, and Zed's use the
 WebAssembly Component Model, which this interpreter does not run.
 
+## Extensions
+
+Extensions made for Zed and VS Code install from their public catalogs:
+Zed's own and Open VSX. Solder has no service of its own for this, and the
+catalogs are asked only when the **Extensions** tab of the sidebar is opened
+and when you search in it (**Workspace: Show extensions** in the command
+palette opens it too).
+
+The tab lists what is installed, then the answers of both catalogs in turn.
+Select a row to see what Solder uses of that extension and what does not run
+here.
+
+| From | Solder uses | Does not run here |
+|---|---|---|
+| A Zed extension | Languages (highlighting, and the languages inside them), snippets, themes, one language server | Icon themes, slash commands, context servers, debug adapters |
+| A VS Code extension | Themes (JSON), snippets | Its code, TextMate grammars, everything the code would add |
+
+A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
+It is compiled on the first file that needs it and runs in wasmtime inside
+the parser, where it sees nothing but the text.
+
+A language server comes from the extension's own code, a WebAssembly
+component built against Zed's extension API (every version from 0.0.1 to 0.7
+runs). Asked for the server, it looks on your PATH, asks npm or GitHub for
+the newest version, downloads it into its own folder and answers with the
+program to start. That code runs in a sandbox with a memory limit and a
+budget for each call; its files are one folder
+(`extensions/work/<id>` in the app's data folder). The server itself is a
+program Solder starts with your rights, as Zed does.
+
+That is why such an extension **asks first**. It is downloaded and read, and
+then waits: the tab shows what installing it allows (the servers it gets, the
+commands its manifest declares), and nothing is in place until you press
+**Install** there. A later version asks again only for what is new.
+
+For an installed extension the tab has:
+
+- **Update**, when its catalog has a newer version. They are looked for when
+  the tab is opened; the button next to the search installs all of them.
+- **Keep this version**: no update is offered for it.
+- **Turn off**: it stays installed and its languages, snippets and servers
+  are not used.
+- **Remove**: deletes it and the servers it downloaded.
+
+These decisions are kept in `extensions/state.json`.
+
 ## Settings from another editor
 
 On a first launch (no `~/.config/solder/settings.json` yet) Solder looks for VS

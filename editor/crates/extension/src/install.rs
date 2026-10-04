@@ -94,6 +94,17 @@ pub fn remove(root: &Path, origin: Origin, id: &str) -> Result<(), String> {
     }
 }
 
+/// An extension that was downloaded, unpacked and read, and waits in the
+/// staging folder to be put in place or dropped.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Staged {
+    /// What the download contains. Its paths point into the staging folder.
+    pub extension: Extension,
+    /// The folder under `zed/` or `vscode/` it will get: the catalog's id.
+    folder: String,
+    staging: PathBuf,
+}
+
 /// Downloads `entry` and installs it under `root`, replacing an older copy.
 /// The future can be awaited from any executor.
 pub fn install(
@@ -101,6 +112,19 @@ pub fn install(
     root: PathBuf,
     progress: Arc<Progress>,
 ) -> impl Future<Output = Result<Extension, String>> + Send + 'static {
+    let fetching = fetch(entry, root.clone(), progress);
+    async move { commit(fetching.await?, &root) }
+}
+
+/// Downloads `entry` into the staging folder under `root` and reads it,
+/// without touching what is installed: the caller looks at what it would
+/// do, then calls [`commit`] or [`discard`]. The future can be awaited from
+/// any executor.
+pub fn fetch(
+    entry: Entry,
+    root: PathBuf,
+    progress: Arc<Progress>,
+) -> impl Future<Output = Result<Staged, String>> + Send + 'static {
     let handle = runtime().spawn(async move {
         if !valid_id(&entry.id) {
             return Err(format!("{} is not an extension id", entry.id));
@@ -109,19 +133,39 @@ pub fn install(
             .join(".staging")
             .join(format!("{}-{}", entry.origin.folder(), entry.id));
         let _ = tokio::fs::remove_dir_all(&staging).await;
-        let result = stage(&entry, &root, &staging, &progress).await;
-        let _ = tokio::fs::remove_dir_all(&staging).await;
+        let result = stage(&entry, &staging, &progress).await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_dir_all(&staging).await;
+        }
         result
     });
     async move { handle.await.map_err(|e| e.to_string())? }
 }
 
-async fn stage(
-    entry: &Entry,
-    root: &Path,
-    staging: &Path,
-    progress: &Progress,
-) -> Result<Extension, String> {
+/// Puts a fetched extension in place, over an older copy; blocking.
+pub fn commit(staged: Staged, root: &Path) -> Result<Extension, String> {
+    let result = (|| {
+        let dest = dir_for(root, staged.extension.origin, &staged.folder);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        match std::fs::remove_dir_all(&dest) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
+            _ => {}
+        }
+        std::fs::rename(&staged.extension.dir, &dest).map_err(|e| e.to_string())?;
+        manifest::read(&dest)
+    })();
+    let _ = std::fs::remove_dir_all(&staged.staging);
+    result
+}
+
+/// Drops a fetched extension that will not be installed; blocking.
+pub fn discard(staged: Staged) {
+    let _ = std::fs::remove_dir_all(&staged.staging);
+}
+
+async fn stage(entry: &Entry, staging: &Path, progress: &Progress) -> Result<Staged, String> {
     tokio::fs::create_dir_all(staging)
         .await
         .map_err(|e| e.to_string())?;
@@ -144,8 +188,8 @@ async fn stage(
             return Err("The download does not match the SHA-256 its catalog publishes".into());
         }
     }
-    let (entry, root, staging) = (entry.clone(), root.to_path_buf(), staging.to_path_buf());
-    tokio::task::spawn_blocking(move || place(&entry, &root, &staging, &archive))
+    let (entry, staging) = (entry.clone(), staging.to_path_buf());
+    tokio::task::spawn_blocking(move || unpack(&entry, &staging, &archive))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -201,9 +245,9 @@ fn run(command: &mut Command) -> Result<(), String> {
     }
 }
 
-/// Unpacks the archive, checks that it is the extension asked for, and moves
-/// it to its place; blocking.
-fn place(entry: &Entry, root: &Path, staging: &Path, archive: &Path) -> Result<Extension, String> {
+/// Unpacks the archive and checks that it is the extension asked for;
+/// blocking.
+fn unpack(entry: &Entry, staging: &Path, archive: &Path) -> Result<Staged, String> {
     let content = staging.join("content");
     std::fs::create_dir_all(&content).map_err(|e| e.to_string())?;
     let found = match entry.origin {
@@ -241,16 +285,12 @@ fn place(entry: &Entry, root: &Path, staging: &Path, archive: &Path) -> Result<E
     if read.origin != entry.origin || !read.id.eq_ignore_ascii_case(&entry.id) {
         return Err(format!("The download is {}, not {}", read.id, entry.id));
     }
-    let dest = dir_for(root, entry.origin, &entry.id);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    match std::fs::remove_dir_all(&dest) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
-        _ => {}
-    }
-    std::fs::rename(&found, &dest).map_err(|e| e.to_string())?;
-    manifest::read(&dest)
+    let _ = std::fs::remove_file(archive);
+    Ok(Staged {
+        extension: read,
+        folder: entry.id.clone(),
+        staging: staging.to_path_buf(),
+    })
 }
 
 /// An extension is plain files and folders. A link could point outside its
@@ -385,6 +425,13 @@ mod tests {
             [("demo-ls".to_string(), vec!["--version".to_string()])]
         );
         assert_eq!(
+            installed.outside(),
+            [
+                "Download and start the language server Demo LS",
+                "Run demo-ls --version",
+            ]
+        );
+        assert_eq!(
             installed.provides(),
             "1 language, 1 language server, 2 themes, 2 snippet files"
         );
@@ -396,6 +443,45 @@ mod tests {
         assert!(super::installed(&root).is_empty());
         remove(&root, Origin::Zed, "demo").unwrap();
         assert!(remove(&root, Origin::Zed, "../x").is_err());
+    }
+
+    #[test]
+    fn a_fetched_extension_waits_until_it_is_committed_or_dropped() {
+        let dir = scratch("fetch");
+        zed_extension(&dir.join("source"));
+        let (base, _) = serve(vec![("/demo.tgz", Served::ok(tar(&dir.join("source"))))]);
+        let root = dir.join("root");
+        write(&root.join("zed/demo/old.txt"), "the installed copy");
+        let wanted = entry(Origin::Zed, "demo", format!("{base}/demo.tgz"));
+
+        // Fetched: read and ready, and what is installed is untouched.
+        let staged = block(fetch(wanted.clone(), root.clone(), Progress::new())).unwrap();
+        assert_eq!(staged.extension.name, "Demo");
+        assert_eq!(staged.extension.servers[0].name, "Demo LS");
+        assert!(staged.extension.dir.starts_with(root.join(".staging")));
+        assert!(root.join("zed/demo/old.txt").is_file());
+        // Dropped: nothing is left of it.
+        discard(staged);
+        assert!(
+            std::fs::read_dir(root.join(".staging"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert!(root.join("zed/demo/old.txt").is_file());
+
+        // Fetched again and committed: it replaces the installed copy.
+        let staged = block(fetch(wanted, root.clone(), Progress::new())).unwrap();
+        let installed = commit(staged, &root).unwrap();
+        assert_eq!(installed.dir, root.join("zed/demo"));
+        assert!(!root.join("zed/demo/old.txt").exists());
+        assert!(root.join("zed/demo/extension.toml").is_file());
+        assert!(
+            std::fs::read_dir(root.join(".staging"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
