@@ -24,7 +24,7 @@ mod editor_lsp;
 mod element;
 mod erd_view;
 mod extension_store;
-mod extensions_view;
+mod extensions_panel;
 mod file_diff;
 mod file_finder;
 mod fuzzy;

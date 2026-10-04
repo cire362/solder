@@ -109,7 +109,7 @@ Never guess a signature.
   tree-sitter grammar in WebAssembly: `crates/syntax` compiles it on the
   first file that needs it, never on the UI thread (`Language::is_ready`),
   and parsers that run such grammars come from a pool. The network is used
-  only when the Extensions window searches or installs, and only against
+  only when the Extensions tab is opened, searches or installs, and only against
   Zed's catalog and Open VSX. An archive is unpacked in a staging folder
   and checked before it replaces anything. Highlight queries follow the
   rule that the last matching pattern wins.

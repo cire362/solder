@@ -1,0 +1,701 @@
+//! The Extensions tab of the sidebar: what is installed and the catalogs of
+//! Zed and Open VSX in one list, with one button to install. For each
+//! extension it says what Solder takes from it and what it leaves out.
+//!
+//! The catalogs are asked when the tab is opened and when the search
+//! changes, never at startup.
+
+use std::time::Duration;
+
+use extension::{Code, Entry, Extension, Origin, manifest::zed_equivalent};
+use gpui::{
+    AnyElement, App, Context, Entity, FocusHandle, Focusable, KeyBinding, SharedString,
+    Subscription, Task, Window, actions, div, prelude::*, px, uniform_list,
+};
+
+use crate::{
+    editor::{Editor, EditorEvent},
+    extension_store::{ExtensionStore, key},
+    theme::{ActiveTheme, Theme, UI_FONT_SIZE},
+    ui,
+};
+
+actions!(extensions_panel, [SelectNext, SelectPrevious, Confirm]);
+
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("down", SelectNext, Some("ExtensionsPanel")),
+        KeyBinding::new("up", SelectPrevious, Some("ExtensionsPanel")),
+        KeyBinding::new("enter", Confirm, Some("ExtensionsPanel")),
+    ]);
+}
+
+/// Two lines: the name with where it is from, and what it is.
+const ROW: gpui::Pixels = px(46.);
+/// How long typing must pause before the catalogs are asked.
+const DEBOUNCE: Duration = Duration::from_millis(300);
+const CATALOGS: [Origin; 2] = [Origin::Zed, Origin::VsCode];
+/// How many of a catalog's answers are listed. Zed's answers with a thousand
+/// when nothing is searched for; past the first hundred, searching is the
+/// way to find one.
+const LISTED: usize = 100;
+
+/// Where the extension of a row stands.
+#[derive(Clone, Debug, PartialEq)]
+enum State {
+    Available,
+    Installed,
+    /// Installed, and a catalog has this newer version.
+    Update(String),
+    Installing(Option<f32>),
+}
+
+#[derive(Clone)]
+struct Row {
+    origin: Origin,
+    id: String,
+    name: SharedString,
+    version: SharedString,
+    /// The second line: what it is, or why installing it failed.
+    note: SharedString,
+    failed: bool,
+    state: State,
+    /// What to download: the catalog's record, when a catalog has one.
+    entry: Option<Entry>,
+}
+
+pub struct ExtensionsPanel {
+    store: Entity<ExtensionStore>,
+    input: Entity<Editor>,
+    selected: usize,
+    search: Option<Task<()>>,
+    _subscriptions: [Subscription; 2],
+}
+
+/// The name a catalog goes by in the list.
+fn catalog_name(origin: Origin) -> &'static str {
+    match origin {
+        Origin::Zed => "Zed",
+        Origin::VsCode => "Open VSX",
+    }
+}
+
+impl ExtensionsPanel {
+    pub fn new(store: Entity<ExtensionStore>, cx: &mut Context<Self>) -> Self {
+        let input = cx.new(|cx| Editor::single_line("Search extensions", cx));
+        let subscriptions = [
+            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.subscribe(&input, |this, _, event, cx| {
+                if let EditorEvent::Edited = event {
+                    this.selected = 0;
+                    this.search_soon(cx);
+                    cx.notify();
+                }
+            }),
+        ];
+        Self {
+            store,
+            input,
+            selected: 0,
+            search: None,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// The tab came to the front: read the folder again, and ask the
+    /// catalogs if they were not asked this question yet.
+    pub fn shown(&mut self, cx: &mut Context<Self>) {
+        self.store.update(cx, |store, cx| store.scan(cx));
+        self.search_now(false, cx);
+    }
+
+    /// Asks both catalogs for what is typed. Without `again`, a catalog that
+    /// already answered this query is left alone.
+    fn search_now(&mut self, again: bool, cx: &mut Context<Self>) {
+        self.search = None;
+        let query = self.input.read(cx).text(cx);
+        self.store.update(cx, |store, cx| {
+            for origin in CATALOGS {
+                let catalog = store.catalog(origin);
+                // Asked or being asked this very question. One still being
+                // asked something else is asked again: its answer is dropped.
+                let answered = (catalog.searching || catalog.searched) && catalog.query == query;
+                if again || !answered {
+                    store.search(origin, &query, cx);
+                }
+            }
+        });
+    }
+
+    /// Asks the catalogs once typing has paused.
+    fn search_soon(&mut self, cx: &mut Context<Self>) {
+        self.search = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DEBOUNCE).await;
+            this.update(cx, |this, cx| this.search_now(false, cx)).ok();
+        }));
+    }
+
+    /// Puts `query` in the search field and asks for it at once.
+    pub fn search_for(&mut self, query: &str, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, cx| input.set_text(query, false, cx));
+        self.selected = 0;
+        self.search_now(false, cx);
+        cx.notify();
+    }
+
+    /// What is installed that matches the search, then what the catalogs
+    /// answered and is not installed, Zed's first.
+    fn rows(&self, cx: &App) -> Vec<Row> {
+        let store = self.store.read(cx);
+        let query = self.input.read(cx).text(cx).to_lowercase();
+        let listed = |origin: Origin, id: &str| {
+            store
+                .catalog(origin)
+                .entries
+                .iter()
+                .find(|entry| entry.id.eq_ignore_ascii_case(id))
+        };
+        let note = |origin: Origin, id: &str, description: &str| -> (SharedString, bool) {
+            match store.errors.get(&key(origin, id)) {
+                Some(error) => (error.clone().into(), true),
+                None => (description.to_string().into(), false),
+            }
+        };
+        let mut rows = Vec::new();
+        for installed in &store.installed {
+            if !query.is_empty()
+                && !installed.name.to_lowercase().contains(&query)
+                && !installed.id.to_lowercase().contains(&query)
+            {
+                continue;
+            }
+            let entry = listed(installed.origin, &installed.id).cloned();
+            let state = match (
+                &entry,
+                store.installing.get(&key(installed.origin, &installed.id)),
+            ) {
+                (_, Some(progress)) => State::Installing(progress.fraction()),
+                (Some(entry), None) if entry.version != installed.version => {
+                    State::Update(entry.version.clone())
+                }
+                _ => State::Installed,
+            };
+            let (note, failed) = note(installed.origin, &installed.id, &installed.description);
+            rows.push(Row {
+                origin: installed.origin,
+                id: installed.id.clone(),
+                name: installed.name.clone().into(),
+                version: installed.version.clone().into(),
+                note,
+                failed,
+                state,
+                entry,
+            });
+        }
+        // The catalogs' answers in one list. Each catalog orders its own by
+        // how well they match, and the two orders cannot be compared, so
+        // they take turns. With nothing searched for, both are lists of the
+        // most downloaded and merge by that.
+        let mut offered: Vec<(usize, &Entry)> = CATALOGS
+            .iter()
+            .flat_map(|origin| {
+                store
+                    .catalog(*origin)
+                    .entries
+                    .iter()
+                    .filter(|entry| store.find(entry.origin, &entry.id).is_none())
+                    .take(LISTED)
+                    .enumerate()
+            })
+            .collect();
+        if query.is_empty() {
+            offered.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.downloads));
+        } else {
+            offered.sort_by_key(|(place, entry)| (*place, entry.origin));
+        }
+        for (_, entry) in offered {
+            let state = match store.installing.get(&key(entry.origin, &entry.id)) {
+                Some(progress) => State::Installing(progress.fraction()),
+                None => State::Available,
+            };
+            let (note, failed) = note(entry.origin, &entry.id, &entry.description);
+            rows.push(Row {
+                origin: entry.origin,
+                id: entry.id.clone(),
+                name: entry.name.clone().into(),
+                version: entry.version.clone().into(),
+                note,
+                failed,
+                state,
+                entry: Some(entry.clone()),
+            });
+        }
+        rows
+    }
+
+    fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        let count = self.rows(cx).len();
+        if count > 0 {
+            self.selected = (self.selected + 1).min(count - 1);
+            cx.notify();
+        }
+    }
+
+    fn select_previous(&mut self, _: &SelectPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        self.selected = self.selected.saturating_sub(1);
+        cx.notify();
+    }
+
+    /// Enter installs or updates the selected extension. Removing takes the
+    /// button: it should not happen by a slip of the hand.
+    fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(row) = self.rows(cx).get(self.selected)
+            && matches!(row.state, State::Available | State::Update(_))
+        {
+            self.act(row.clone(), cx);
+        }
+    }
+
+    /// What the row's button does.
+    fn act(&mut self, row: Row, cx: &mut Context<Self>) {
+        self.store
+            .update(cx, |store, cx| match (&row.state, row.entry) {
+                (State::Installing(_), _) => store.cancel(row.origin, &row.id),
+                (State::Available | State::Update(_), Some(entry)) => store.install(entry, cx),
+                (State::Installed, _) => store.remove(row.origin, &row.id, cx),
+                _ => {}
+            });
+    }
+
+    fn badge(text: SharedString, color: gpui::Hsla, theme: &Theme) -> AnyElement {
+        div()
+            .flex_none()
+            .px_1p5()
+            .rounded(px(6.))
+            .bg(theme.bg)
+            .text_size(px(11.))
+            .text_color(color)
+            .child(text)
+            .into_any_element()
+    }
+
+    /// The selected extension: what it is, what Solder takes from it and
+    /// what it does not.
+    fn render_details(&self, row: &Row, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let store = self.store.read(cx);
+        let line = |text: SharedString, color: gpui::Hsla| {
+            div().text_size(UI_FONT_SIZE).text_color(color).child(text)
+        };
+        let heading = |text: &'static str| {
+            div()
+                .pt_1()
+                .text_size(px(10.5))
+                .text_color(theme.fg_subtle)
+                .child(text)
+        };
+        let mut details = div()
+            .id("extension-details")
+            .flex_none()
+            .max_h(px(280.))
+            .overflow_y_scroll()
+            .border_t_1()
+            .border_color(theme.line)
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_1();
+
+        let installed = store.find(row.origin, &row.id);
+        let description = match (&row.entry, installed) {
+            (_, Some(installed)) => installed.description.clone(),
+            (Some(entry), None) => entry.description.clone(),
+            (None, None) => String::new(),
+        };
+        if !description.is_empty() {
+            details = details.child(line(description.into(), theme.fg));
+        }
+        if let Some(error) = store.errors.get(&key(row.origin, &row.id)) {
+            details = details.child(line(error.clone().into(), theme.error));
+        }
+
+        // A VS Code extension for a language: the Zed one brings a grammar
+        // and a language server, which this one cannot. Said first, where
+        // it is seen without scrolling: it is what to do next.
+        if row.origin == Origin::VsCode
+            && let Some(zed) = zed_equivalent(&row.id)
+        {
+            let view = cx.entity();
+            // The sentence, then the button under it: side by side they do
+            // not fit a sidebar.
+            details = details
+                .child(div().pt_1().child(line(
+                    format!("For the language itself, install {zed} from Zed's catalog.").into(),
+                    theme.fg_muted,
+                )))
+                .child(
+                    div().flex().child(
+                        ui::button(
+                            "extension-equivalent",
+                            "Find it",
+                            false,
+                            theme,
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.search_for(zed, cx);
+                                    window.focus(&this.input.focus_handle(cx));
+                                })
+                            },
+                        )
+                        .debug_selector(|| "extension-equivalent".into())
+                        .h(px(22.)),
+                    ),
+                );
+        }
+
+        match installed {
+            Some(installed) => {
+                details = details
+                    .child(heading("SOLDER USES"))
+                    .child(line(installed.provides().into(), theme.fg_muted));
+                // Said before a file needs it: this is the one thing an
+                // extension does outside its sandbox.
+                if installed.runs_code() && !installed.servers.is_empty() {
+                    details = details.child(line(
+                        "Its language server is downloaded and started when a file needs it."
+                            .into(),
+                        theme.fg_subtle,
+                    ));
+                }
+                let missing = not_running(installed);
+                if !missing.is_empty() {
+                    details = details.child(heading("DOES NOT RUN HERE"));
+                    for what in missing {
+                        details = details.child(line(what.into(), theme.fg_muted));
+                    }
+                }
+                if !installed.themes.is_empty() {
+                    details = details.child(heading("THEMES"));
+                    let view = cx.entity();
+                    details = details.child(div().flex().flex_wrap().gap_1().children(
+                        installed.themes.iter().enumerate().map(|(i, theme_file)| {
+                            let (view, theme_file) = (view.clone(), theme_file.clone());
+                            ui::button(
+                                ("extension-theme", i),
+                                format!("Use {}", theme_file.name),
+                                false,
+                                theme,
+                                move |_, _, cx| {
+                                    let theme_file = theme_file.clone();
+                                    view.update(cx, |this, cx| {
+                                        this.store
+                                            .update(cx, |store, cx| store.use_theme(theme_file, cx))
+                                    })
+                                },
+                            )
+                            .debug_selector(move || format!("extension-theme-{i}"))
+                            .h(px(22.))
+                        }),
+                    ));
+                    match &store.theme_status {
+                        Some(Ok(name)) => {
+                            details = details.child(line(
+                                format!("The theme is now {name}").into(),
+                                theme.fg_subtle,
+                            ))
+                        }
+                        Some(Err(error)) => {
+                            details = details.child(line(error.clone().into(), theme.error))
+                        }
+                        None => {}
+                    }
+                }
+            }
+            None => {
+                if let Some(entry) = &row.entry
+                    && !entry.provides.is_empty()
+                {
+                    details = details.child(heading("HAS")).child(line(
+                        entry.provides.join(", ").replace('-', " ").into(),
+                        theme.fg_muted,
+                    ));
+                }
+                if row.origin == Origin::VsCode {
+                    details = details.child(line(
+                        "From a VS Code extension Solder takes themes and snippets. Its code needs VS Code and does not run here.".into(),
+                        theme.fg_subtle,
+                    ));
+                }
+            }
+        }
+
+        details.into_any_element()
+    }
+}
+
+/// What an installed extension has that Solder does not run, in words.
+fn not_running(extension: &Extension) -> Vec<String> {
+    let mut missing = extension.missing.clone();
+    // A language server is the extension's code at work. Code built for a
+    // version of Zed's API this host does not have stays unused.
+    if let (false, Code::Zed { api }) = (extension.servers.is_empty(), &extension.code)
+        && !extension.runs_code()
+    {
+        let names: Vec<&str> = extension.servers.iter().map(|s| s.name.as_str()).collect();
+        missing.insert(
+            0,
+            format!(
+                "Language server {} (built for Zed's extension API {api})",
+                names.join(", ")
+            ),
+        );
+    }
+    let plain = extension
+        .languages
+        .iter()
+        .filter(|l| l.grammar.is_none())
+        .count();
+    if plain > 0 && extension.origin == Origin::Zed {
+        missing.push(format!("{plain} of its languages (the grammar is missing)"));
+    }
+    missing
+}
+
+/// `1.2M`, `34K`, `512`: download counts as the catalogs show them.
+fn downloads(count: u64) -> String {
+    match count {
+        0 => String::new(),
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1_000_000.),
+        n if n >= 1_000 => format!("{}K", n / 1_000),
+        n => n.to_string(),
+    }
+}
+
+impl Focusable for ExtensionsPanel {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.input.focus_handle(cx)
+    }
+}
+
+impl Render for ExtensionsPanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let rows = self.rows(cx);
+        self.selected = self.selected.min(rows.len().saturating_sub(1));
+        let selected = self.selected;
+        let count = rows.len();
+        let store = self.store.read(cx);
+        let folder = store.root.clone();
+
+        // What the catalogs are doing, under the list: one that is being
+        // asked, and one that could not be.
+        let searching = CATALOGS
+            .iter()
+            .any(|origin| store.catalog(*origin).searching);
+        let failures: Vec<SharedString> = CATALOGS
+            .iter()
+            .filter_map(|origin| {
+                let error = store.catalog(*origin).error.as_ref()?;
+                Some(format!("{}: {error}", catalog_name(*origin)).into())
+            })
+            .collect();
+        let empty: Option<SharedString> = (count == 0).then(|| {
+            if !store.loaded || searching {
+                "Looking...".into()
+            } else if failures.is_empty() {
+                "Nothing found".into()
+            } else {
+                "Nothing to show".into()
+            }
+        });
+        let focused = self.input.focus_handle(cx).is_focused(window);
+        let details = rows
+            .get(selected)
+            .map(|row| self.render_details(row, &theme, cx));
+
+        let downloads_of: Vec<SharedString> = rows
+            .iter()
+            .map(|row| {
+                row.entry
+                    .as_ref()
+                    .map(|entry| downloads(entry.downloads))
+                    .unwrap_or_default()
+                    .into()
+            })
+            .collect();
+        let view = cx.entity();
+        let list = uniform_list("extensions", count, move |range, _, cx| {
+            let theme = cx.theme().clone();
+            range
+                .map(|i| {
+                    let row = rows[i].clone();
+                    let (select, act) = (view.clone(), view.clone());
+                    let (label, primary) = match &row.state {
+                        State::Available => ("Install", true),
+                        State::Update(_) => ("Update", true),
+                        State::Installed => ("Remove", false),
+                        State::Installing(_) => ("Cancel", false),
+                    };
+                    let badge: Option<(SharedString, gpui::Hsla)> = match &row.state {
+                        State::Installed => Some(("Installed".into(), theme.git_added)),
+                        State::Update(version) => {
+                            Some((format!("{version} is out").into(), theme.warning))
+                        }
+                        State::Installing(Some(done)) => {
+                            Some((format!("{:.0}%", done * 100.).into(), theme.fg_muted))
+                        }
+                        State::Installing(None) => Some(("Downloading".into(), theme.fg_muted)),
+                        State::Available => None,
+                    };
+                    let source: SharedString = match row.origin {
+                        Origin::Zed => "Zed".into(),
+                        Origin::VsCode => "VS Code".into(),
+                    };
+                    let acted = row.clone();
+                    div()
+                        .id(("extension", i))
+                        .debug_selector(move || format!("extension-{i}"))
+                        .w_full()
+                        .h(ROW)
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .when(i == selected, |d| d.bg(theme.bg_elev))
+                        .hover(|d| d.bg(theme.bg_elev))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .text_size(UI_FONT_SIZE)
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_color(theme.fg)
+                                                .child(row.name),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .text_size(px(11.))
+                                                .text_color(theme.fg_subtle)
+                                                .child(source),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .text_size(px(11.))
+                                                .text_color(theme.fg_subtle)
+                                                .child(row.version),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .text_size(px(11.))
+                                                .text_color(theme.fg_subtle)
+                                                .child(downloads_of[i].clone()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(11.5))
+                                        .text_color(if row.failed {
+                                            theme.error
+                                        } else {
+                                            theme.fg_subtle
+                                        })
+                                        .child(row.note),
+                                ),
+                        )
+                        .children(badge.map(|(text, color)| Self::badge(text, color, &theme)))
+                        .child(
+                            ui::button(
+                                ("extension-act", i),
+                                label,
+                                primary,
+                                &theme,
+                                move |_, _, cx| {
+                                    let acted = acted.clone();
+                                    act.update(cx, |this, cx| {
+                                        this.selected = i;
+                                        this.act(acted, cx);
+                                    })
+                                },
+                            )
+                            .debug_selector(move || format!("extension-act-{i}"))
+                            .flex_none()
+                            .h(px(22.)),
+                        )
+                        .on_click(move |_, _, cx| {
+                            select.update(cx, |this, cx| {
+                                this.selected = i;
+                                cx.notify();
+                            })
+                        })
+                })
+                .collect()
+        })
+        .size_full();
+
+        div()
+            .key_context("ExtensionsPanel")
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::confirm))
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_none()
+                    .px_2()
+                    .pb_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(ui::text_field(self.input.clone(), focused, &theme))
+                    .child(
+                        ui::button(
+                            "extensions-folder",
+                            "Folder",
+                            false,
+                            &theme,
+                            move |_, _, cx| cx.reveal_path(&folder),
+                        )
+                        .flex_none()
+                        .h(px(28.)),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().map(|d| {
+                match empty {
+                    Some(text) => d.child(
+                        div()
+                            .p_3()
+                            .text_size(UI_FONT_SIZE)
+                            .text_color(theme.fg_subtle)
+                            .child(text),
+                    ),
+                    None => d.child(list),
+                }
+            }))
+            .children(failures.into_iter().map(|failure| {
+                div()
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .text_size(px(11.5))
+                    .text_color(theme.error)
+                    .child(failure)
+            }))
+            .children(details)
+    }
+}

@@ -158,7 +158,7 @@ pub fn bind_keys(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
 
-const SIDEBAR_WIDTH: f32 = 330.;
+const SIDEBAR_WIDTH: f32 = 390.;
 
 /// The bottom dock's tab in front.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,6 +202,7 @@ enum SidebarTab {
     Database,
     Api,
     Ai,
+    Extensions,
 }
 
 struct Modal {
@@ -244,6 +245,7 @@ pub struct Workspace {
     database_panel: Entity<DatabasePanel>,
     api_panel: Entity<crate::api_panel::ApiPanel>,
     ai_panel: Entity<crate::ai_panel::AiPanel>,
+    extensions_panel: Entity<crate::extensions_panel::ExtensionsPanel>,
     chat: Entity<crate::chat_panel::ChatPanel>,
     agent: Entity<crate::agent_panel::AgentPanel>,
     /// The right dock shows the agent rather than the chat.
@@ -312,6 +314,9 @@ impl Workspace {
         let ai_store = crate::ai_store::AiStore::global(cx);
         ai_store.update(cx, |s, _| s.add_root(root.clone()));
         let ai_panel = cx.new(|cx| crate::ai_panel::AiPanel::new(ai_store.clone(), cx));
+        let extensions = crate::extension_store::ExtensionStore::global(cx);
+        let extensions_panel =
+            cx.new(|cx| crate::extensions_panel::ExtensionsPanel::new(extensions, cx));
         let weak = cx.entity().downgrade();
         let chat =
             cx.new(|cx| crate::chat_panel::ChatPanel::new(ai_store.clone(), weak.clone(), cx));
@@ -633,6 +638,7 @@ impl Workspace {
             database_panel,
             api_panel: api_panel.clone(),
             ai_panel,
+            extensions_panel,
             chat,
             agent,
             agent_shown: false,
@@ -1448,6 +1454,9 @@ impl Workspace {
         if tab == Some(SidebarTab::Ai) {
             self.ai_panel.update(cx, |p, cx| p.shown(cx));
         }
+        if tab == Some(SidebarTab::Extensions) {
+            self.extensions_panel.update(cx, |p, cx| p.shown(cx));
+        }
         cx.notify();
     }
 
@@ -2253,10 +2262,8 @@ impl Workspace {
     }
 
     fn show_extensions(&mut self, _: &ShowExtensions, window: &mut Window, cx: &mut Context<Self>) {
-        let store = crate::extension_store::ExtensionStore::global(cx);
-        self.toggle_modal(window, cx, move |_, cx| {
-            crate::extensions_view::ExtensionsView::new(store, cx)
-        });
+        self.set_sidebar(Some(SidebarTab::Extensions), cx);
+        window.focus(&self.extensions_panel.focus_handle(cx));
     }
 
     /// F5: start what is chosen (the file in front first), or continue.
@@ -3313,6 +3320,7 @@ impl Workspace {
             let active = tab == this_tab;
             div()
                 .id(id)
+                .debug_selector(move || id.to_string())
                 .h(px(24.))
                 .px_1()
                 .flex()
@@ -3331,6 +3339,7 @@ impl Workspace {
                     SidebarTab::Database => this.show_database(&ShowDatabase, window, cx),
                     SidebarTab::Api => this.show_api(&ShowApi, window, cx),
                     SidebarTab::Ai => this.show_ai(&ShowAi, window, cx),
+                    SidebarTab::Extensions => this.show_extensions(&ShowExtensions, window, cx),
                 }))
         };
         div()
@@ -3366,7 +3375,12 @@ impl Workspace {
                         SidebarTab::Database,
                     ))
                     .child(tab_button("sidebar-api", "API", SidebarTab::Api))
-                    .child(tab_button("sidebar-ai", "AI", SidebarTab::Ai)),
+                    .child(tab_button("sidebar-ai", "AI", SidebarTab::Ai))
+                    .child(tab_button(
+                        "sidebar-extensions",
+                        "Extensions",
+                        SidebarTab::Extensions,
+                    )),
             )
             .child(div().flex_1().min_h_0().pt_1().map(|d| match tab {
                 SidebarTab::Files => d.child(self.project_panel.clone()),
@@ -3376,6 +3390,7 @@ impl Workspace {
                 SidebarTab::Database => d.child(self.database_panel.clone()),
                 SidebarTab::Api => d.child(self.api_panel.clone()),
                 SidebarTab::Ai => d.child(self.ai_panel.clone()),
+                SidebarTab::Extensions => d.child(self.extensions_panel.clone()),
             }))
     }
 
@@ -8915,24 +8930,28 @@ mod tests {
         // Nothing installed: the file is plain text.
         assert_eq!(cx.read(|cx| language(cx)), None);
 
-        cx.dispatch_action(ShowExtensions);
-        cx.run_until_parked();
-        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
-        assert!(cx.debug_bounds("extension-0").is_none());
-        // The catalog is asked only when its tab is opened.
+        // The catalogs are asked when the tab is opened, not before.
         assert!(requests.lock().unwrap().is_empty());
-        click(cx, "extensions-zed");
-        wait_for(cx, "the catalog", &|cx| {
-            !store.read(cx).catalog(Origin::Zed).entries.is_empty()
+        click(cx, "sidebar-extensions");
+        assert!(cx.read(|cx| ws.read(cx).sidebar == Some(SidebarTab::Extensions)));
+        wait_for(cx, "the catalogs", &|cx| {
+            let store = store.read(cx);
+            !store.catalog(Origin::Zed).entries.is_empty() && store.catalog(Origin::VsCode).searched
         });
         cx.run_until_parked();
+        // Both were asked for what they have most of. Open VSX is not there
+        // in this test: the list still shows what Zed's catalog answered.
+        {
+            let asked = requests.lock().unwrap();
+            assert!(asked.iter().any(|r| r.starts_with("/extensions?")));
+            assert!(asked.iter().any(|r| r.starts_with("/api/-/search?")));
+        }
+        assert!(cx.read(|cx| store.read(cx).catalog(Origin::VsCode).error.is_some()));
         click(cx, "extension-act-0");
         wait_for(cx, "the install", &|cx| {
             store.read(cx).find(Origin::Zed, "vue").is_some()
         });
-        cx.simulate_keystrokes("escape");
-        cx.run_until_parked();
-        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+        cx.update(|window, cx| window.focus(&editor.focus_handle(cx)));
 
         // The file that was already open is now Vue, with its script
         // highlighted as TypeScript.
@@ -8974,9 +8993,12 @@ mod tests {
         assert!(text.ends_with("<section>\n  App\n</section>"), "{text:?}");
         assert_eq!(selected, "App");
 
-        // One of its themes becomes the editor's.
+        // One of its themes becomes the editor's. The extension is the
+        // first row now, and the catalog's record of it is not repeated.
         cx.dispatch_action(ShowExtensions);
         cx.run_until_parked();
+        assert!(cx.debug_bounds("extension-0").is_some());
+        assert!(cx.debug_bounds("extension-1").is_none());
         click(cx, "extension-theme-0");
         wait_for(cx, "the theme", &|cx| {
             store.read(cx).theme_status == Some(Ok("Demo Dark".into()))
@@ -9022,10 +9044,9 @@ mod tests {
         let (_config, store, ws, cx) = extension_setup(cx, "ext-vsx", &base);
 
         cx.dispatch_action(ShowExtensions);
-        cx.run_until_parked();
-        click(cx, "extensions-open-vsx");
-        wait_for(cx, "the catalog", &|cx| {
-            !store.read(cx).catalog(Origin::VsCode).entries.is_empty()
+        wait_for(cx, "the catalogs", &|cx| {
+            let store = store.read(cx);
+            !store.catalog(Origin::VsCode).entries.is_empty() && store.catalog(Origin::Zed).searched
         });
         cx.run_until_parked();
         // Enter installs what is selected.
@@ -9048,14 +9069,15 @@ mod tests {
         // this one installs Vue into it.
         assert_eq!(installed.languages[0].suffixes, ["dm", "Demofile"]);
         assert!(syntax::language_for_path(Path::new("notes.dm")).is_none());
-        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        assert!(cx.read(|cx| ws.read(cx).sidebar == Some(SidebarTab::Extensions)));
 
-        // The window points to the Zed extension for the language and
-        // searches for it.
+        // The tab points to the Zed extension for the language and searches
+        // for it.
         cx.run_until_parked();
         click(cx, "extension-equivalent");
         wait_for(cx, "Zed's catalog", &|cx| {
-            store.read(cx).catalog(Origin::Zed).searched
+            let catalog = store.read(cx).catalog(Origin::Zed);
+            catalog.searched && catalog.query == "vue"
         });
         assert!(
             requests
@@ -9180,17 +9202,21 @@ mod tests {
         // Installing the extension is all it takes: the open file gets its
         // language, and the language its server.
         cx.dispatch_action(ShowExtensions);
-        cx.run_until_parked();
-        click(cx, "extensions-zed");
+        // Searching while the catalogs are still answering the tab's first
+        // question asks them again: the answer that counts is the one to
+        // what is typed now.
+        let panel = cx.read(|cx| ws.read(cx).extensions_panel.clone());
+        panel.update(cx, |panel, cx| panel.search_for("html", cx));
         wait_for(cx, "the catalog", &|cx| {
-            !store.read(cx).catalog(Origin::Zed).entries.is_empty()
+            let catalog = store.read(cx).catalog(Origin::Zed);
+            catalog.searched && catalog.query == "html" && !catalog.entries.is_empty()
         });
         cx.run_until_parked();
         click(cx, "extension-act-0");
         wait_for(cx, "the install", &|cx| {
             store.read(cx).find(Origin::Zed, "html").is_some()
         });
-        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| window.focus(&editor.focus_handle(cx)));
         wait_for(cx, "the language server", &|cx| {
             lsp.read(cx)
                 .capabilities(editor.read(cx).document())
