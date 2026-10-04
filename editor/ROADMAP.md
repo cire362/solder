@@ -95,7 +95,8 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
       its themes and snippets and points to the Zed one for its language
 - [x] Language servers of Zed extensions: the extension's own code, run in
       wasmtime, gets the server (npm, a GitHub release) and says how to start
-      it. Extensions built for Zed's API 0.6 and 0.7; one server per language
-- [ ] Extensions built for older versions of Zed's API (0.1 to 0.5)
+      it. One server per language
+- [x] Extensions built for every version of Zed's API so far, 0.0.1 to 0.7:
+      each of its nine worlds has its bindings, over one implementation
 - [ ] The plugin registry (needs the hosted service)
 - [ ] Preview environments per branch (needs the hosted service)
