@@ -153,8 +153,11 @@ to build them.
       two patterns), brackets, the outline (in the project map the AI gets;
       there is no outline to look at yet), and from `config.toml` the pairs
       that close themselves, the block comment and the word characters
-- [ ] Completion and symbol labels as the extension paints them
-      (`labels-for-completions`, `labels-for-symbols`)
+- [x] Completion labels as the extension paints them
+      (`labels-for-completions`): colored as code in the file's language,
+      with the typed word matched against the part that is the name
+- [ ] Symbol labels (`labels-for-symbols`). The editor has no list of a
+      file's or a project's symbols to paint them in; it comes with one
 - [ ] The languages Zed builds in and so does not list in its catalog (C,
       C++, Markdown, YAML, shell): grammars and servers of our own for them,
       installed the same way

@@ -46,7 +46,7 @@ pub enum HighlightKind {
 impl HighlightKind {
     /// Maps a capture name such as `function.method` to a kind, trying the most
     /// specific names first.
-    fn from_capture(name: &str) -> Option<Self> {
+    pub fn from_capture(name: &str) -> Option<Self> {
         use HighlightKind::*;
         Some(match name {
             "string.special.key" => Property,
@@ -492,6 +492,16 @@ fn language_named(name: &str) -> Option<Arc<Language>> {
                 .find(|language| language.answers_to(&name))
                 .cloned()
         })
+}
+
+/// The highlights of a piece of code on its own, such as the label of a
+/// completion. It is parsed here, which for an extension's language is
+/// more than a keystroke should wait for: call off the UI thread.
+pub fn highlight_code(language: &Arc<Language>, code: &str) -> Vec<(Range<usize>, HighlightKind)> {
+    let rope = Rope::from_str(code);
+    SyntaxTree::parse(language.clone(), &rope)
+        .map(|tree| tree.highlights(&rope, 0..rope.len_bytes()))
+        .unwrap_or_default()
 }
 
 /// A parsed buffer. Cheap to move across threads, so the first parse of a large

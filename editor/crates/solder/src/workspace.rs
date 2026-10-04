@@ -10012,5 +10012,22 @@ brackets = [
                 has("println") && has("vue_println")
             })
         });
+        // Vue's extension paints what its server answered: a property as a
+        // tag, followed by its detail. The typed word is matched against
+        // the name alone. What the TypeScript server answered is not
+        // Vue's to paint and stays as it came.
+        let labels = cx.read(|cx| {
+            let menu = editor.read(cx).completion.as_ref().unwrap();
+            let label = |name: &str| {
+                let index = menu.items.iter().position(|item| item.label == name)?;
+                menu.labels[index].clone()
+            };
+            (label("vue_title"), label("println"))
+        });
+        let painted = labels.0.expect("a label painted by Vue's extension");
+        assert_eq!(painted.text, "vue_title a prop");
+        assert_eq!(painted.runs, [(0..9, syntax::HighlightKind::Tag)]);
+        assert_eq!(painted.filter, 0..9);
+        assert_eq!(labels.1, None);
     }
 }

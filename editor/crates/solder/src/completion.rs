@@ -3,13 +3,139 @@
 
 use std::{ops::Range, sync::Arc};
 
-use gpui::{Hsla, UniformListScrollHandle};
+use extension::host::{CodeLabel, Completion, LabelSpan};
+use gpui::{HighlightStyle, Hsla, SharedString, StyledText, UniformListScrollHandle};
 use lsp::{Encoding, types as lt};
+use syntax::HighlightKind;
 
 use crate::{fuzzy, theme::Theme};
 
+/// A completion's label as the extension that brought its server paints
+/// it: the text to show, colored as code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Label {
+    pub text: String,
+    pub runs: Vec<(Range<usize>, HighlightKind)>,
+    /// The part of the text the typed word is matched against.
+    pub filter: Range<usize>,
+}
+
+impl Label {
+    /// Puts together what an extension answered. `language` is the file's:
+    /// the label's code is highlighted with its grammar, which parses it,
+    /// so this is for a background thread.
+    pub fn paint(label: &CodeLabel, language: Option<&Arc<syntax::Language>>) -> Label {
+        let mut code: Option<Vec<(Range<usize>, HighlightKind)>> = None;
+        let mut text = String::new();
+        let mut runs = Vec::new();
+        for span in &label.spans {
+            match span {
+                LabelSpan::Code(range) => {
+                    let Some(part) = label.code.get(range.clone()) else {
+                        continue;
+                    };
+                    let highlights = code.get_or_insert_with(|| {
+                        language
+                            .map(|language| syntax::highlight_code(language, &label.code))
+                            .unwrap_or_default()
+                    });
+                    for (at, kind) in highlights.iter() {
+                        let start = at.start.max(range.start);
+                        let end = at.end.min(range.end);
+                        if start < end {
+                            let at = text.len() + start - range.start;
+                            runs.push((at..at + end - start, *kind));
+                        }
+                    }
+                    text.push_str(part);
+                }
+                LabelSpan::Literal {
+                    text: literal,
+                    highlight,
+                } => {
+                    let kind = highlight.as_deref().and_then(HighlightKind::from_capture);
+                    if let Some(kind) = kind {
+                        runs.push((text.len()..text.len() + literal.len(), kind));
+                    }
+                    text.push_str(literal);
+                }
+            }
+        }
+        // A menu row is one line.
+        if text.contains('\n') {
+            text = text.replace('\n', " ");
+        }
+        let filter = match text.get(label.filter.clone()) {
+            Some(_) if !label.filter.is_empty() => label.filter.clone(),
+            _ => 0..text.len(),
+        };
+        Label { text, runs, filter }
+    }
+
+    /// The text as an element: its code colors, and `accent` on the
+    /// characters of the filter part that the typed word matched.
+    pub fn styled(&self, positions: &[u32], theme: &Theme) -> StyledText {
+        let mut colors: Vec<Option<Hsla>> = vec![None; self.text.len()];
+        for (range, kind) in &self.runs {
+            if let Some(slots) = colors.get_mut(range.clone()) {
+                slots.fill(Some(theme.syntax.color(*kind)));
+            }
+        }
+        let mut matched = positions.iter().peekable();
+        for (i, (byte, c)) in self.text[self.filter.clone()].char_indices().enumerate() {
+            if matched.peek().is_some_and(|p| **p as usize == i) {
+                matched.next();
+                let start = self.filter.start + byte;
+                colors[start..start + c.len_utf8()].fill(Some(theme.accent));
+            }
+        }
+        // One highlight for each stretch of one color, in order.
+        let mut highlights = Vec::new();
+        let mut start = 0;
+        for end in 1..=colors.len() {
+            if end == colors.len() || colors[end] != colors[start] {
+                if let Some(color) = colors[start] {
+                    highlights.push((
+                        start..end,
+                        HighlightStyle {
+                            color: Some(color),
+                            ..Default::default()
+                        },
+                    ));
+                }
+                start = end;
+            }
+        }
+        StyledText::new(SharedString::from(self.text.clone())).with_highlights(highlights)
+    }
+}
+
+/// What an extension is told about a completion when it is asked to paint
+/// it.
+pub fn for_extension(item: &lt::CompletionItem) -> Completion {
+    Completion {
+        label: item.label.clone(),
+        detail: item.detail.clone(),
+        label_detail: item.label_details.as_ref().and_then(|d| d.detail.clone()),
+        label_description: item
+            .label_details
+            .as_ref()
+            .and_then(|d| d.description.clone()),
+        kind: item
+            .kind
+            .and_then(|kind| serde_json::to_value(kind).ok()?.as_i64())
+            .map(|kind| kind as i32),
+        format: item
+            .insert_text_format
+            .and_then(|format| serde_json::to_value(format).ok()?.as_i64())
+            .map(|format| format as i32),
+    }
+}
+
 pub struct CompletionMenu {
     pub items: Arc<Vec<lt::CompletionItem>>,
+    /// For each item, how its extension paints it, if it does.
+    pub labels: Vec<Option<Label>>,
     pub encoding: Encoding,
     /// Indices into `items` that match what has been typed, best first, with
     /// the matched character positions in the label.
@@ -22,15 +148,27 @@ pub struct CompletionMenu {
 
 impl CompletionMenu {
     pub fn new(items: Vec<lt::CompletionItem>, encoding: Encoding, word_start: usize) -> Self {
-        let mut items = items;
+        let items = items.into_iter().map(|item| (item, None)).collect();
+        Self::painted(items, encoding, word_start)
+    }
+
+    /// A menu of items that may each come with a label an extension
+    /// painted.
+    pub fn painted(
+        mut items: Vec<(lt::CompletionItem, Option<Label>)>,
+        encoding: Encoding,
+        word_start: usize,
+    ) -> Self {
         // Server order is only a hint; sort_text is the contract.
-        items.sort_by(|a, b| {
+        items.sort_by(|(a, _), (b, _)| {
             let ka = a.sort_text.as_deref().unwrap_or(&a.label);
             let kb = b.sort_text.as_deref().unwrap_or(&b.label);
             ka.cmp(kb)
         });
+        let (items, labels) = items.into_iter().unzip();
         Self {
             items: Arc::new(items),
+            labels,
             encoding,
             filtered: Vec::new(),
             selected: 0,
@@ -52,7 +190,12 @@ impl CompletionMenu {
             fuzzy::fuzzy_match(keys.iter().copied(), query, 200, false)
                 .into_iter()
                 .map(|m| {
-                    let label = &self.items[m.index].label;
+                    // The matched characters are shown in what is drawn:
+                    // the painted label's filter part, or the plain label.
+                    let label = match &self.labels[m.index] {
+                        Some(label) => &label.text[label.filter.clone()],
+                        None => &self.items[m.index].label,
+                    };
                     (m.index, fuzzy::positions(label, query, false))
                 })
                 .collect()
@@ -213,5 +356,81 @@ mod tests {
         assert!(menu.filter("tos"));
         assert_eq!(menu.selected_item().unwrap().label, "to_string");
         assert!(!menu.filter("zzz"));
+    }
+
+    #[test]
+    fn a_label_is_put_together_from_what_an_extension_answered() {
+        let js = syntax::language_for_path(std::path::Path::new("a.js")).unwrap();
+        // Code that is parsed and shown in part, around text of its own.
+        let label = CodeLabel {
+            code: "function go(a) {}".into(),
+            spans: vec![
+                LabelSpan::Literal {
+                    text: "fn ".into(),
+                    highlight: Some("keyword".into()),
+                },
+                LabelSpan::Code(9..14),
+                LabelSpan::Literal {
+                    text: " -> void".into(),
+                    highlight: None,
+                },
+                // Out of the code's range: left out, not a panic.
+                LabelSpan::Code(40..50),
+            ],
+            filter: 3..5,
+        };
+        let painted = Label::paint(&label, Some(&js));
+        assert_eq!(painted.text, "fn go(a) -> void");
+        assert_eq!(painted.filter, 3..5);
+        let kinds: Vec<(&str, HighlightKind)> = painted
+            .runs
+            .iter()
+            .map(|(range, kind)| (&painted.text[range.clone()], *kind))
+            .collect();
+        assert_eq!(kinds[0], ("fn ", HighlightKind::Keyword));
+        assert!(
+            kinds.contains(&("go", HighlightKind::Function)),
+            "{kinds:?}"
+        );
+        assert!(kinds.contains(&("a", HighlightKind::Variable)), "{kinds:?}");
+        // A filter range that is not in the text means all of it.
+        let odd = CodeLabel {
+            code: String::new(),
+            spans: vec![LabelSpan::Literal {
+                text: "né".into(),
+                highlight: Some("tag".into()),
+            }],
+            filter: 0..2,
+        };
+        let painted = Label::paint(&odd, None);
+        assert_eq!(painted.filter, 0..3);
+        assert_eq!(painted.runs, [(0..3, HighlightKind::Tag)]);
+
+        // In the menu, the typed word is matched against the item and
+        // shown in the part of the label that is its name.
+        let item = lt::CompletionItem {
+            label: "go".into(),
+            ..Default::default()
+        };
+        let label = Label::paint(&label, Some(&js));
+        let mut menu = CompletionMenu::painted(vec![(item, Some(label))], Encoding::Utf8, 0);
+        assert!(menu.filter("g"));
+        assert_eq!(menu.filtered, [(0, vec![0])]);
+
+        let item = lt::CompletionItem {
+            label: "div".into(),
+            detail: Some("An element".into()),
+            kind: Some(lt::CompletionItemKind::PROPERTY),
+            insert_text_format: Some(lt::InsertTextFormat::SNIPPET),
+            label_details: Some(lt::CompletionItemLabelDetails {
+                detail: Some("(…)".into()),
+                description: None,
+            }),
+            ..Default::default()
+        };
+        let told = for_extension(&item);
+        assert_eq!((told.kind, told.format), (Some(10), Some(2)));
+        assert_eq!(told.label_detail.as_deref(), Some("(…)"));
+        assert_eq!(told.detail.as_deref(), Some("An element"));
     }
 }

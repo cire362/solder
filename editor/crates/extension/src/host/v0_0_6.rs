@@ -19,4 +19,4 @@ types_only!(api: lsp);
 tools!(api);
 worktree!(bindings, located);
 world_functions!(bindings);
-start!(bindings);
+start!(bindings, before_label_details);

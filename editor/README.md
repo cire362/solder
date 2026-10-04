@@ -711,6 +711,10 @@ budget for each call; its files are one folder
 (`extensions/work/<id>` in the app's data folder). The server itself is a
 program Solder starts with your rights, as Zed does.
 
+An extension may also paint the completions of its server: Vue's shows a
+property as a tag followed by its detail. Its answer is colored as code in
+the file's language, and what you type is matched against the name in it.
+
 A file can have several servers: the one Solder knows for its language and
 every one that installed extensions bring for it. Their diagnostics show
 together, their completions make one menu and their code actions one list;

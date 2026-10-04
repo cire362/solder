@@ -12,13 +12,14 @@ use lsp::{Encoding, types as lt};
 use text::Buffer;
 
 use crate::{
-    completion::{CompletionMenu, expand_snippet, kind_badge},
+    completion::{CompletionMenu, Label, expand_snippet, for_extension, kind_badge},
     document::Severity,
     editor::{
         ConfirmCompletion, Editor, EditorEvent, FindReferences, FormatDocument, GoToDefinition,
         HideCompletions, NextDiagnostic, PrevDiagnostic, RenameSymbol, SelectNextCompletion,
         SelectPrevCompletion, ShowCompletions, ShowHover,
     },
+    extension_store::ExtensionStore,
     lsp_store::{LspStore, ServerAction, from_range, to_position},
     picker::highlighted_text,
     settings::Settings,
@@ -302,29 +303,47 @@ impl Editor {
         // to it when they arrive.
         let encoding = requests[0].1;
         self.completion_task = Some(cx.spawn(async move |this, cx| {
-            let responses = futures::future::join_all(
-                requests
-                    .into_iter()
-                    .map(|(_, encoding, request)| async move { (encoding, request.await) }),
-            )
-            .await;
-            this.update(cx, |this, cx| {
-                let buffer = this.document.read(cx).text();
-                let mut items = Vec::new();
-                for (from, response) in responses {
-                    let mut answered = match response {
+            let responses = futures::future::join_all(requests.into_iter().map(
+                |(server, encoding, request)| async move {
+                    let answered = match request.await {
                         Ok(Some(lt::CompletionResponse::Array(items))) => items,
                         Ok(Some(lt::CompletionResponse::List(list))) => list.items,
                         _ => Vec::new(),
                     };
+                    (server, encoding, answered)
+                },
+            ))
+            .await;
+            // A server an extension brought: the extension may paint the
+            // labels of what it answered.
+            let mut painted = Vec::new();
+            for (server, _, answered) in &responses {
+                let labels = this
+                    .update(cx, |this, cx| this.completion_labels(server, answered, cx))
+                    .ok()
+                    .flatten();
+                painted.push(match labels {
+                    Some(labels) => labels.await,
+                    None => Vec::new(),
+                });
+            }
+            this.update(cx, |this, cx| {
+                let buffer = this.document.read(cx).text();
+                let mut items = Vec::new();
+                for ((_, from, mut answered), labels) in responses.into_iter().zip(painted) {
                     if from != encoding {
                         for item in &mut answered {
                             recode_item(item, buffer, from, encoding);
                         }
                     }
-                    items.extend(answered);
+                    let mut labels = labels.into_iter();
+                    items.extend(
+                        answered
+                            .into_iter()
+                            .map(|item| (item, labels.next().flatten())),
+                    );
                 }
-                items.extend(snippets);
+                items.extend(snippets.into_iter().map(|item| (item, None)));
                 // The cursor may have moved while we waited.
                 let head_now = this.newest_range().end;
                 if items.is_empty() || head_now < start {
@@ -332,7 +351,7 @@ impl Editor {
                     cx.notify();
                     return;
                 }
-                let mut menu = CompletionMenu::new(items, encoding, start);
+                let mut menu = CompletionMenu::painted(items, encoding, start);
                 let query = this
                     .document
                     .read(cx)
@@ -532,6 +551,34 @@ impl Editor {
         self.select_range(start + selection.start..start + selection.end, cx);
     }
 
+    /// The labels of `items` as the extension that brought `server` paints
+    /// them, if one did and its code is running. The extension is asked on
+    /// a thread of its own and the labels are put together in the
+    /// background: their code is parsed with the file's grammar.
+    fn completion_labels(
+        &self,
+        server: &str,
+        items: &[lt::CompletionItem],
+        cx: &App,
+    ) -> Option<Task<Vec<Option<Label>>>> {
+        if items.is_empty() {
+            return None;
+        }
+        let asked = ExtensionStore::try_global(cx)?.read(cx).labels(
+            server,
+            items.iter().map(for_extension).collect(),
+            cx,
+        )?;
+        let language = self.doc(cx).syntax().map(|s| s.language().clone());
+        Some(cx.background_executor().spawn(async move {
+            asked
+                .await
+                .iter()
+                .map(|label| Some(Label::paint(label.as_ref()?, language.as_ref())))
+                .collect()
+        }))
+    }
+
     pub(crate) fn render_completions(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let menu = self.completion.as_ref()?;
         let layout = self.layout.as_ref()?;
@@ -543,71 +590,75 @@ impl Editor {
         let theme = cx.theme().clone();
         let count = menu.filtered.len();
         let height = COMPLETION_ROW_HEIGHT * count.min(COMPLETION_ROWS) as f32 + px(8.);
-        let list =
-            uniform_list(
-                "completions",
-                count,
-                cx.processor(move |this, range: Range<usize>, _, cx| {
-                    let theme = cx.theme().clone();
-                    let Some(menu) = this.completion.as_ref() else {
-                        return Vec::new();
-                    };
-                    range
-                        .map(|ix| {
-                            let (item_ix, positions) = &menu.filtered[ix];
-                            let item = &menu.items[*item_ix];
-                            let (badge, color) = kind_badge(item.kind, &theme);
-                            let detail = item
+        let list = uniform_list(
+            "completions",
+            count,
+            cx.processor(move |this, range: Range<usize>, _, cx| {
+                let theme = cx.theme().clone();
+                let Some(menu) = this.completion.as_ref() else {
+                    return Vec::new();
+                };
+                range
+                    .map(|ix| {
+                        let (item_ix, positions) = &menu.filtered[ix];
+                        let item = &menu.items[*item_ix];
+                        let (badge, color) = kind_badge(item.kind, &theme);
+                        // A label its extension painted says all there
+                        // is to say, the detail included.
+                        let label = menu.labels[*item_ix].as_ref();
+                        let detail = match label {
+                            Some(_) => String::new(),
+                            None => item
                                 .label_details
                                 .as_ref()
                                 .and_then(|d| d.description.clone().or(d.detail.clone()))
                                 .or_else(|| item.detail.clone())
-                                .unwrap_or_default();
-                            div()
-                                .id(ix)
-                                .h(COMPLETION_ROW_HEIGHT)
-                                .mx_1()
-                                .px_1p5()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .rounded(px(6.))
-                                .when(ix == menu.selected, |d| d.bg(theme.accent_soft))
-                                .child(div().w(px(14.)).flex_none().text_color(color).child(badge))
-                                .child(div().flex_none().text_color(theme.fg).child(
-                                    highlighted_text(
-                                        &item.label,
-                                        positions,
-                                        theme.fg,
-                                        theme.accent,
-                                    ),
-                                ))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_right()
-                                        .text_size(px(11.))
-                                        .text_color(theme.fg_subtle)
-                                        .child(detail),
-                                )
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, window, cx| {
-                                        if let Some(menu) = this.completion.as_mut() {
-                                            menu.selected = ix;
-                                        }
-                                        this.confirm_completion(&ConfirmCompletion, window, cx);
-                                    }),
-                                )
-                        })
-                        .collect()
-                }),
-            )
-            .track_scroll(menu.scroll.clone())
-            .h(height)
-            .py_1();
+                                .unwrap_or_default(),
+                        };
+                        let text = match label {
+                            Some(label) => label.styled(positions, &theme),
+                            None => {
+                                highlighted_text(&item.label, positions, theme.fg, theme.accent)
+                            }
+                        };
+                        div()
+                            .id(ix)
+                            .h(COMPLETION_ROW_HEIGHT)
+                            .mx_1()
+                            .px_1p5()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded(px(6.))
+                            .when(ix == menu.selected, |d| d.bg(theme.accent_soft))
+                            .child(div().w(px(14.)).flex_none().text_color(color).child(badge))
+                            .child(div().flex_none().text_color(theme.fg).child(text))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_right()
+                                    .text_size(px(11.))
+                                    .text_color(theme.fg_subtle)
+                                    .child(detail),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    if let Some(menu) = this.completion.as_mut() {
+                                        menu.selected = ix;
+                                    }
+                                    this.confirm_completion(&ConfirmCompletion, window, cx);
+                                }),
+                            )
+                    })
+                    .collect()
+            }),
+        )
+        .track_scroll(menu.scroll.clone())
+        .h(height)
+        .py_1();
         let settings = Settings::get(cx);
         Some(
             deferred(

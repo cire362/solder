@@ -16,7 +16,7 @@ use std::{
 
 use extension::{
     Entry, Extension, Origin, Snippet, catalog,
-    host::{Host, Status, World},
+    host::{CodeLabel, Completion, Host, Status, World},
     install::{self, Progress, Staged},
     world::{SettingsFor, System},
 };
@@ -508,6 +508,46 @@ impl ExtensionStore {
                     })
             })
             .collect()
+    }
+
+    /// How the extension that brought `server` wants these completions of
+    /// it shown, one answer for each. `None` when no extension's code is
+    /// running for that server: one is not started for a menu's sake, and
+    /// a server that runs was started by its extension. An extension that
+    /// is busy, or fails, paints nothing.
+    pub fn labels(
+        &self,
+        server: &str,
+        completions: Vec<Completion>,
+        cx: &App,
+    ) -> Option<Task<Vec<Option<CodeLabel>>>> {
+        let extension = self.installed.iter().find(|extension| {
+            extension.runs_code()
+                && !self.is_off(extension.origin, &extension.id)
+                && extension.servers.iter().any(|s| s.id == server)
+        })?;
+        let host = self
+            .hosts
+            .get(&extension.id)?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
+        let server = server.to_string();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        std::thread::Builder::new()
+            .name("solder-extension".into())
+            .spawn(move || {
+                let labels = host
+                    .labels_for_completions(&server, &completions)
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+                let _ = tx.send(labels);
+            })
+            .ok()?;
+        Some(
+            cx.background_executor()
+                .spawn(async move { rx.await.unwrap_or_default() }),
+        )
     }
 
     /// Asks the extension how to start `server` for the project in `root`.

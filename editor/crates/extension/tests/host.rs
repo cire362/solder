@@ -8,7 +8,8 @@ use std::{
 };
 
 use extension::host::{
-    Command, FileKind, Host, HttpRequest, HttpResponse, Output, Release, Status, World,
+    CodeLabel, Command, Completion, FileKind, Host, HttpRequest, HttpResponse, LabelSpan, Output,
+    Release, Status, World,
 };
 
 const PACKAGE: &str = "@zed-industries/vscode-langservers-extracted";
@@ -451,4 +452,57 @@ fn the_users_settings_reach_the_extension() {
         json(host.workspace_configuration(vue, &project).unwrap()),
         settings
     );
+}
+
+#[test]
+fn every_version_that_can_label_completions_is_asked() {
+    // What a server sent, with all the protocol can say about an item.
+    let completions = [
+        Completion {
+            label: "div".into(),
+            detail: Some("An element".into()),
+            label_detail: Some("(…)".into()),
+            label_description: Some("html".into()),
+            kind: Some(10),
+            format: Some(2),
+        },
+        Completion {
+            label: "plain".into(),
+            kind: Some(99),
+            ..Default::default()
+        },
+    ];
+    // These extensions do not paint their completions: each is asked in
+    // the words of its own version and leaves both as the server sent
+    // them. 0.0.1 had no such question and is not asked.
+    let labels = |name: &str| {
+        let extension = fixture(name);
+        let work = work_dir(&format!("host-{name}-labels"));
+        let host = Host::load(&extension, &work, Arc::new(Script::default())).unwrap();
+        host.labels_for_completions(&extension.servers[0].id, &completions)
+    };
+    for name in ["pest", "nginx", "terraform", "ledger", "html"] {
+        assert_eq!(labels(name), Some(Ok(vec![None, None])), "{name}");
+    }
+    // Vue's does: a property is shown as a tag, followed by its detail,
+    // and only the name is what the typed word is matched against.
+    let painted = CodeLabel {
+        code: String::new(),
+        spans: vec![
+            LabelSpan::Literal {
+                text: "div".into(),
+                highlight: Some("tag".into()),
+            },
+            LabelSpan::Literal {
+                text: " ".into(),
+                highlight: None,
+            },
+            LabelSpan::Literal {
+                text: "An element".into(),
+                highlight: None,
+            },
+        ],
+        filter: 0..3,
+    };
+    assert_eq!(labels("vue"), Some(Ok(vec![Some(painted), None])));
 }
