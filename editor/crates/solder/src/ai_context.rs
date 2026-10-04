@@ -277,7 +277,9 @@ fn build_map(
         let relative = policy.relative(&path).unwrap();
         let mut entry = serde_json::to_string(&relative.to_string_lossy()).unwrap();
         let extension = path.extension().and_then(|extension| extension.to_str());
-        if matches!(
+        // Declarations of the languages Solder knows, and of an extension's
+        // language that has a query for them.
+        let outlined = matches!(
             extension,
             Some(
                 "rs" | "ts"
@@ -292,8 +294,8 @@ fn build_map(
                     | "py"
                     | "pyi"
             )
-        ) && let Some(source) = read_source(&path, &mut budget)
-        {
+        ) || syntax::language_for_path(&path).is_some_and(|l| l.has_outline());
+        if outlined && let Some(source) = read_source(&path, &mut budget) {
             for symbol in syntax::outline(&path, &source, 16, || cancelled.load(Ordering::Relaxed))
             {
                 entry.push_str(&format!(

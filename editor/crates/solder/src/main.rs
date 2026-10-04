@@ -34,6 +34,7 @@ mod git_store;
 mod go_to_line;
 mod import_settings;
 mod import_view;
+mod indent;
 mod inline_completion;
 mod inline_edit;
 mod key_prompts;

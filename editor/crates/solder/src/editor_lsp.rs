@@ -50,14 +50,16 @@ pub struct LspLocation {
     pub encoding: Encoding,
 }
 
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_' || c == '$'
+/// `extra` is what the language adds to the word a completion goes on
+/// from: the `-` of a class name in markup.
+fn is_word_char(c: char, extra: &str) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$' || extra.contains(c)
 }
 
-fn word_start(buffer: &Buffer, offset: usize) -> usize {
+fn word_start(buffer: &Buffer, offset: usize, extra: &str) -> usize {
     let mut start = offset;
     while let Some(c) = buffer.char_before(start) {
-        if !is_word_char(c) {
+        if !is_word_char(c, extra) {
             break;
         }
         start -= c.len_utf8();
@@ -202,7 +204,12 @@ impl Editor {
             triggers.iter().any(|t| t.ends_with(c)) || (c == '.' && self.schema_source.is_some());
         if is_trigger {
             self.request_completions(Some(c), cx);
-        } else if is_word_char(c) {
+        } else if is_word_char(
+            c,
+            &self
+                .doc(cx)
+                .completion_characters_at(self.newest_range().end),
+        ) {
             if self.completion.is_some() {
                 self.refilter_completions(cx);
             } else {
@@ -245,7 +252,8 @@ impl Editor {
 
     fn request_completions(&mut self, trigger: Option<char>, cx: &mut Context<Self>) {
         let head = self.newest_range().end;
-        let start = word_start(self.document.read(cx).text(), head);
+        let extra = self.doc(cx).completion_characters_at(head);
+        let start = word_start(self.document.read(cx).text(), head, &extra);
         if let Some(source) = self.schema_source.clone() {
             self.schema_completions(&source, start, head, cx);
             return;
@@ -664,7 +672,7 @@ impl Editor {
     fn show_hover_at(&mut self, offset: usize, cx: &mut Context<Self>) {
         let doc = self.document.read(cx);
         let buffer = doc.text();
-        let word = buffer.word_range_at(offset);
+        let word = buffer.word_range_at(offset, &doc.word_characters_at(offset));
         let mut blocks: Vec<HoverBlock> = doc
             .diagnostics()
             .iter()
@@ -866,7 +874,7 @@ impl Editor {
     ) {
         let head = self.newest_range().end;
         let buffer = self.document.read(cx).text();
-        let word = buffer.word_range_at(head);
+        let word = buffer.word_range_at(head, &self.doc(cx).word_characters_at(head));
         if word.is_empty() {
             return;
         }
@@ -1038,8 +1046,8 @@ mod tests {
     #[test]
     fn word_start_stops_at_punctuation() {
         let b = Buffer::new("foo.bar_baz");
-        assert_eq!(word_start(&b, 11), 4);
-        assert_eq!(word_start(&b, 4), 4);
+        assert_eq!(word_start(&b, 11, ""), 4);
+        assert_eq!(word_start(&b, 4, ""), 4);
     }
 }
 

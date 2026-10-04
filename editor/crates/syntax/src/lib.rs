@@ -20,8 +20,10 @@ use tree_sitter::{
 };
 
 mod outline;
+mod rules;
 mod wasm;
 pub use outline::{Symbol, outline};
+pub use rules::{Editing, Indent, Line, Pair};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -94,6 +96,7 @@ pub struct LanguageSpec {
     pub grammar: PathBuf,
     pub highlights: Option<PathBuf>,
     pub injections: Option<PathBuf>,
+    pub editing: Editing,
 }
 
 enum Source {
@@ -101,7 +104,7 @@ enum Source {
         grammar: tree_sitter::Language,
         query: fn() -> String,
     },
-    Wasm(LanguageSpec),
+    Wasm(Box<LanguageSpec>),
 }
 
 pub struct Language {
@@ -112,6 +115,7 @@ pub struct Language {
     grammar: OnceLock<Option<tree_sitter::Language>>,
     highlighter: OnceLock<Option<Highlighter>>,
     injector: OnceLock<Option<Injector>>,
+    rules: OnceLock<rules::Rules>,
 }
 
 struct Highlighter {
@@ -219,6 +223,24 @@ impl Language {
             .as_ref()
     }
 
+    fn rules(&self) -> &rules::Rules {
+        self.rules.get_or_init(|| rules::Rules::load(self))
+    }
+
+    /// What the extension that brought the language says about typing in
+    /// it. A built-in language has none: the editor's own rules hold there.
+    pub fn editing(&self) -> Option<&Editing> {
+        match &self.source {
+            Source::Native { .. } => None,
+            Source::Wasm(spec) => Some(&spec.editing),
+        }
+    }
+
+    /// Whether [`outline`] has more than a guess to go by for this language.
+    pub fn has_outline(&self) -> bool {
+        self.editing().is_some_and(|e| e.outline.is_some())
+    }
+
     /// The lowercase names this language goes by elsewhere: what snippet
     /// files and VS Code call it, and for an extension's language its
     /// aliases and file endings.
@@ -302,6 +324,7 @@ macro_rules! lang {
             grammar: OnceLock::new(),
             highlighter: OnceLock::new(),
             injector: OnceLock::new(),
+            rules: OnceLock::new(),
         })
     };
 }
@@ -408,16 +431,17 @@ pub fn set_extension_languages(specs: Vec<LanguageSpec>) {
         .map(|spec| {
             let kept = old
                 .iter()
-                .find(|l| matches!(&l.source, Source::Wasm(known) if *known == spec));
+                .find(|l| matches!(&l.source, Source::Wasm(known) if **known == spec));
             match kept {
                 Some(language) => language.clone(),
                 None => Arc::new(Language {
                     name: intern(&spec.name),
                     line_comment: spec.line_comment.as_deref().map(intern),
-                    source: Source::Wasm(spec),
+                    source: Source::Wasm(Box::new(spec)),
                     grammar: OnceLock::new(),
                     highlighter: OnceLock::new(),
                     injector: OnceLock::new(),
+                    rules: OnceLock::new(),
                 }),
             }
         })
@@ -501,6 +525,7 @@ impl SyntaxTree {
         // the caller already expects to wait, and not at the first paint.
         if matches!(language.source, Source::Wasm(_)) {
             language.highlighter();
+            language.rules();
         }
         let layers = parse_layers(&language, &tree, rope, &[], None)?;
         Some(Self {
@@ -522,10 +547,22 @@ impl SyntaxTree {
     /// The language the byte at `offset` is written in: the innermost
     /// injected one that covers it, or the file's own.
     pub fn language_at(&self, offset: usize) -> &Arc<Language> {
+        self.tree_at(offset).0
+    }
+
+    fn tree_at(&self, offset: usize) -> (&Arc<Language>, &Tree) {
+        self.trees_at(offset)
+            .next()
+            .expect("the file's own tree is always there")
+    }
+
+    /// The trees that cover `offset`, the innermost first and the file's
+    /// own last.
+    fn trees_at(&self, offset: usize) -> impl Iterator<Item = (&Arc<Language>, &Tree)> {
         self.layers
             .iter()
             .rev()
-            .find(|layer| {
+            .filter(move |layer| {
                 layer.start <= offset
                     && offset <= layer.end
                     && layer
@@ -534,7 +571,8 @@ impl SyntaxTree {
                         .iter()
                         .any(|r| r.start_byte <= offset && offset <= r.end_byte)
             })
-            .map_or(&self.language, |layer| &layer.language)
+            .map(|layer| (&layer.language, &layer.tree))
+            .chain(std::iter::once((&self.language, &self.tree)))
     }
 
     /// Shifts the old tree to match an edit. Call once per applied edit, in
@@ -761,6 +799,7 @@ fn inject(
         drop(parser);
         // Compiled here for the same reason as in `SyntaxTree::parse`.
         target.highlighter();
+        target.rules();
         let layer = Layer {
             language: target,
             tree: parsed,
@@ -1034,6 +1073,13 @@ mod tests {
                 grammar: dir.join("vue.wasm"),
                 highlights: Some(dir.join("highlights.scm")),
                 injections: Some(dir.join("injections.scm")),
+                editing: Editing {
+                    indents: Some(dir.join("indents.scm")),
+                    brackets: Some(dir.join("brackets.scm")),
+                    outline: Some(dir.join("outline.scm")),
+                    overrides: Some(dir.join("overrides.scm")),
+                    ..Default::default()
+                },
             },
             // The same grammar under a name only one test opens files of, so
             // that test sees it before anything has compiled it.
@@ -1132,6 +1178,233 @@ mod tests {
         let spans = kinds(&fresh, buffer.rope(), &src);
         assert!(!spans.iter().any(|(text, _)| text == "const"));
         assert!(spans.contains(&("color".into(), HighlightKind::Property)));
+    }
+
+    const TEMPLATE: &str = "<template>\n  <div class=\"box\">\n    <p>{{ msg }}</p>\n  </div>\n  <!-- a \"note\" -->\n</template>\n";
+
+    #[test]
+    fn an_extensions_queries_find_brackets_and_scopes() {
+        let rope = Rope::from_str(TEMPLATE);
+        let tree = SyntaxTree::parse(vue(), &rope).unwrap();
+        let at = |what: &str| TEMPLATE.find(what).unwrap();
+        let pair = |offset: usize| {
+            let (open, close) = tree.brackets_at(&rope, offset).unwrap()?;
+            Some((open.start, &TEMPLATE[open], close.start, &TEMPLATE[close]))
+        };
+        // On a bracket, and right after its other half.
+        let div = at("<div");
+        let div_end = at("\">") + 1;
+        assert_eq!(pair(div), Some((div, "<", div_end, ">")));
+        assert_eq!(pair(div_end + 1), Some((div, "<", div_end, ">")));
+        // Brackets longer than a character.
+        let open = at("{{");
+        assert_eq!(pair(open + 1), Some((open, "{{", at("}}"), "}}")));
+        assert_eq!(
+            pair(at("</div")),
+            Some((at("</div"), "</", at("</div") + 5, ">"))
+        );
+        // Between two: the one under the cursor, not the one behind it.
+        let p = at("<p>");
+        assert_eq!(pair(p + 3), Some((open, "{{", at("}}"), "}}")));
+        // Nothing in the middle of a word.
+        assert_eq!(pair(at("box") + 1), None);
+        // Right after `{{` the script inside has begun, and the bracket is
+        // still the template's.
+        assert_eq!(pair(open + 2), Some((open, "{{", at("}}"), "}}")));
+        // Inside the script, the script's language answers, and it has no
+        // query: the caller looks at the characters.
+        assert_eq!(tree.brackets_at(&rope, at("msg") + 1), None);
+        // A language with no query for it says so, and the caller looks at
+        // the characters instead.
+        let js = language_for_path(Path::new("a.js")).unwrap();
+        let rope_js = Rope::from_str("f(1)");
+        let tree_js = SyntaxTree::parse(js, &rope_js).unwrap();
+        assert_eq!(tree_js.brackets_at(&rope_js, 1), None);
+
+        let scope = |offset: usize, name: &str| tree.in_scope(&rope, offset, &[name.to_string()]);
+        let value = at("\"box\"");
+        assert!(scope(value + 2, "string"));
+        assert!(!scope(value + 2, "comment"));
+        // Before the opening quote is not yet inside.
+        assert!(!scope(value, "string"));
+        assert!(scope(at("note"), "comment"));
+        assert!(!scope(at("msg"), "string"));
+        assert!(!tree_js.in_scope(&rope_js, 2, &["string".to_string()]));
+    }
+
+    #[test]
+    fn an_extensions_query_says_how_deep_a_line_goes() {
+        let rope = Rope::from_str(TEMPLATE);
+        let tree = SyntaxTree::parse(vue(), &rope).unwrap();
+        let at = |what: &str| TEMPLATE.find(what).unwrap();
+        assert!(tree.indents_at(at("<div")));
+        let indent = |line: Line| tree.indent(&rope, line, false, false);
+        // Enter after an opening tag: one level deeper than the tag.
+        let div = at("<div");
+        let cut = at("\">") + 2;
+        let line = Line {
+            above_row: 1,
+            above_start: div,
+            cut,
+            start: cut,
+        };
+        assert_eq!(
+            indent(line),
+            Indent {
+                row: 1,
+                levels: 1,
+                in_error: false
+            }
+        );
+        // Enter between a tag and its end: the end goes under the tag, and
+        // it is the pair in `config.toml` that asks for a line in between.
+        let p = at("<p>");
+        let line = Line {
+            above_row: 2,
+            above_start: p,
+            cut: p + 3,
+            start: p + 3,
+        };
+        assert_eq!(
+            indent(Line {
+                cut: at("{{"),
+                start: at("{{"),
+                ..line
+            }),
+            Indent {
+                row: 2,
+                levels: 1,
+                in_error: false
+            }
+        );
+        let empty = Rope::from_str("<template>\n  <p></p>\n</template>\n");
+        let empty_tree = SyntaxTree::parse(vue(), &empty).unwrap();
+        let line = Line {
+            above_row: 1,
+            above_start: 13,
+            cut: 16,
+            start: 16,
+        };
+        assert_eq!(
+            empty_tree.indent(&empty, line, false, false),
+            Indent {
+                row: 1,
+                levels: 0,
+                in_error: false
+            }
+        );
+        // After a line that closed its own tag: as deep as that line.
+        let cut = at("</p>") + 4;
+        let line = Line {
+            above_row: 2,
+            above_start: p,
+            cut,
+            start: cut,
+        };
+        assert_eq!(
+            indent(line),
+            Indent {
+                row: 2,
+                levels: 0,
+                in_error: false
+            }
+        );
+        // A closing tag on a line of its own goes back to the row that
+        // opened it.
+        let close = at("</div>");
+        let line = Line {
+            above_row: 2,
+            above_start: p,
+            cut: close - 2,
+            start: close,
+        };
+        assert_eq!(
+            indent(line),
+            Indent {
+                row: 1,
+                levels: 0,
+                in_error: false
+            }
+        );
+        // What the patterns of `config.toml` answered counts next to the
+        // query: deeper, back, or both at once, which cancel out.
+        let plain = Line {
+            above_row: 4,
+            above_start: at("<!--"),
+            cut: at("</template>"),
+            start: at("</template>"),
+        };
+        let after_comment = |increase, decrease| {
+            let line = Line {
+                cut: at("-->") + 3,
+                start: at("-->") + 3,
+                ..plain
+            };
+            tree.indent(&rope, line, increase, decrease)
+        };
+        assert_eq!(
+            after_comment(false, false),
+            Indent {
+                row: 4,
+                levels: 0,
+                in_error: false
+            }
+        );
+        assert_eq!(
+            after_comment(true, false),
+            Indent {
+                row: 4,
+                levels: 1,
+                in_error: false
+            }
+        );
+        assert_eq!(
+            after_comment(false, true),
+            Indent {
+                row: 4,
+                levels: -1,
+                in_error: false
+            }
+        );
+        assert_eq!(
+            after_comment(true, true),
+            Indent {
+                row: 4,
+                levels: 0,
+                in_error: false
+            }
+        );
+        // The end of the template, as it stands: back to the row it opened on.
+        assert_eq!(
+            indent(plain),
+            Indent {
+                row: 0,
+                levels: 0,
+                in_error: false
+            }
+        );
+    }
+
+    #[test]
+    fn an_extensions_query_lists_what_a_file_declares() {
+        vue();
+        let symbols = outline(Path::new("App.vue"), TEMPLATE, 16, || false);
+        let seen: Vec<(&str, &str, usize)> = symbols
+            .iter()
+            .map(|s| (&*s.kind, s.name.as_str(), s.line))
+            .collect();
+        assert_eq!(seen, [("<", "div", 2), ("<", "p", 3)]);
+        assert_eq!(
+            outline(Path::new("App.vue"), TEMPLATE, 1, || false).len(),
+            1
+        );
+        let vue = language_for_path(Path::new("App.vue")).unwrap();
+        assert!(vue.has_outline());
+        assert!(
+            !language_for_path(Path::new("a.untouched"))
+                .unwrap()
+                .has_outline()
+        );
     }
 
     #[test]

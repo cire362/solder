@@ -159,12 +159,28 @@ line_comments = ["// ", "/// "]
 code_fence_block_name = "dm"
 brackets = [
     { start = "{", end = "}", close = true, newline = true },
+    { start = "\"", end = "\"", close = true, newline = false, not_in = ["string"] },
+    { start = "", end = "x", close = true, newline = false },
+]
+autoclose_before = ";:.,=}])>"
+block_comment = ["/* ", " */"]
+word_characters = ["-", "$"]
+completion_query_characters = ["-"]
+increase_indent_pattern = '^.*\{\s*$'
+decrease_indent_patterns = [
+    { pattern = '^\s*\}', valid_after = ["if"] },
+    { pattern = '^\s*end\b' },
 ]
 "#,
     );
     write(
         &dir.join("languages/demo/highlights.scm"),
         "(comment) @comment",
+    );
+    write(&dir.join("languages/demo/indents.scm"), "(block) @indent");
+    write(
+        &dir.join("languages/demo/overrides.scm"),
+        "(string) @string",
     );
     write(&dir.join("languages/demo/injections.scm"), "");
     write(

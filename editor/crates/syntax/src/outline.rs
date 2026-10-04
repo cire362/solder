@@ -1,15 +1,19 @@
 use std::{
+    borrow::Cow,
     ops::ControlFlow,
     path::Path,
     time::{Duration, Instant},
 };
 
-use tree_sitter::{Node, ParseOptions, ParseState};
+use tree_sitter::{Node, ParseOptions, ParseState, QueryCursor, StreamingIterator};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Symbol {
     pub name: String,
-    pub kind: &'static str,
+    /// `fn`, `type` or `const` for a built-in language. For an extension's,
+    /// the word its outline query shows before the name (`def`, `class`),
+    /// or `item` when it shows none.
+    pub kind: Cow<'static, str>,
     pub line: usize,
 }
 
@@ -42,6 +46,40 @@ pub fn outline(
         return Vec::new();
     };
     let mut symbols = Vec::new();
+    // An extension's language says what its declarations are in a query.
+    if let Some(outline) = &language.rules().outline {
+        let text = |node: Node<'_>| node.utf8_text(source.as_bytes()).ok();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&outline.query, tree.root_node(), source.as_bytes());
+        while let Some(m) = matches.next() {
+            if cancelled() || Instant::now() >= deadline || symbols.len() >= limit {
+                break;
+            }
+            let Some(item) = m.nodes_for_capture_index(outline.item).next() else {
+                continue;
+            };
+            let name: Vec<&str> = m
+                .nodes_for_capture_index(outline.name)
+                .filter_map(text)
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            let kind = outline
+                .context
+                .and_then(|context| m.nodes_for_capture_index(context).find_map(text))
+                .and_then(|context| context.split_whitespace().next())
+                .map_or(Cow::Borrowed("item"), |word| {
+                    Cow::Owned(word.chars().take(16).collect())
+                });
+            symbols.push(Symbol {
+                name: name.join(" ").chars().take(120).collect(),
+                kind,
+                line: item.start_position().row + 1,
+            });
+        }
+        return symbols;
+    }
     let mut cursor = tree.walk();
     loop {
         if cancelled() || Instant::now() >= deadline || symbols.len() >= limit {
@@ -58,7 +96,7 @@ pub fn outline(
         {
             symbols.push(Symbol {
                 name: name_text.chars().take(120).collect(),
-                kind,
+                kind: Cow::Borrowed(kind),
                 line: node.start_position().row + 1,
             });
         }

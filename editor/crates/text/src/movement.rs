@@ -53,10 +53,12 @@ enum CharClass {
     Punct,
 }
 
-fn class(c: char) -> CharClass {
+/// `extra` is what a language counts as part of a word besides letters,
+/// digits and `_`: the `-` of a CSS name, the `$` of a PHP variable.
+fn class(c: char, extra: &str) -> CharClass {
     if c.is_whitespace() {
         CharClass::Space
-    } else if c.is_alphanumeric() || c == '_' {
+    } else if c.is_alphanumeric() || c == '_' || extra.contains(c) {
         CharClass::Word
     } else {
         CharClass::Punct
@@ -90,15 +92,15 @@ impl Buffer {
     }
 
     /// Skips whitespace backwards, then a run of one character class.
-    pub fn prev_word_start(&self, offset: usize) -> usize {
+    pub fn prev_word_start(&self, offset: usize, extra: &str) -> usize {
         let rope = self.rope();
         let mut idx = rope.byte_to_char(self.clip_offset(offset));
-        while idx > 0 && class(rope.char(idx - 1)) == CharClass::Space {
+        while idx > 0 && class(rope.char(idx - 1), extra) == CharClass::Space {
             idx -= 1;
         }
         if idx > 0 {
-            let run = class(rope.char(idx - 1));
-            while idx > 0 && class(rope.char(idx - 1)) == run {
+            let run = class(rope.char(idx - 1), extra);
+            while idx > 0 && class(rope.char(idx - 1), extra) == run {
                 idx -= 1;
             }
         }
@@ -106,16 +108,16 @@ impl Buffer {
     }
 
     /// Skips whitespace forwards, then a run of one character class.
-    pub fn next_word_end(&self, offset: usize) -> usize {
+    pub fn next_word_end(&self, offset: usize, extra: &str) -> usize {
         let rope = self.rope();
         let len = rope.len_chars();
         let mut idx = rope.byte_to_char(self.clip_offset(offset));
-        while idx < len && class(rope.char(idx)) == CharClass::Space {
+        while idx < len && class(rope.char(idx), extra) == CharClass::Space {
             idx += 1;
         }
         if idx < len {
-            let run = class(rope.char(idx));
-            while idx < len && class(rope.char(idx)) == run {
+            let run = class(rope.char(idx), extra);
+            while idx < len && class(rope.char(idx), extra) == run {
                 idx += 1;
             }
         }
@@ -123,7 +125,7 @@ impl Buffer {
     }
 
     /// The word (or single punctuation run) around `offset`, for double-click.
-    pub fn word_range_at(&self, offset: usize) -> Range<usize> {
+    pub fn word_range_at(&self, offset: usize, extra: &str) -> Range<usize> {
         let rope = self.rope();
         let len = rope.len_chars();
         let idx = rope.byte_to_char(self.clip_offset(offset));
@@ -134,13 +136,14 @@ impl Buffer {
         } else {
             return offset..offset;
         };
-        let run = class(rope.char(probe));
+        let run = class(rope.char(probe), extra);
         let mut start = probe;
-        while start > 0 && rope.char(start - 1) != '\n' && class(rope.char(start - 1)) == run {
+        while start > 0 && rope.char(start - 1) != '\n' && class(rope.char(start - 1), extra) == run
+        {
             start -= 1;
         }
         let mut end = probe;
-        while end < len && rope.char(end) != '\n' && class(rope.char(end)) == run {
+        while end < len && rope.char(end) != '\n' && class(rope.char(end), extra) == run {
             end += 1;
         }
         rope.char_to_byte(start)..rope.char_to_byte(end)
@@ -311,12 +314,23 @@ mod tests {
     #[test]
     fn word_motion() {
         let b = Buffer::new("let foo_bar = baz();");
-        assert_eq!(b.next_word_end(0), 3);
-        assert_eq!(b.next_word_end(3), 11);
-        assert_eq!(b.next_word_end(11), 13);
-        assert_eq!(b.prev_word_start(11), 4);
-        assert_eq!(b.prev_word_start(20), 17);
-        assert_eq!(b.word_range_at(6), 4..11);
+        assert_eq!(b.next_word_end(0, ""), 3);
+        assert_eq!(b.next_word_end(3, ""), 11);
+        assert_eq!(b.next_word_end(11, ""), 13);
+        assert_eq!(b.prev_word_start(11, ""), 4);
+        assert_eq!(b.prev_word_start(20, ""), 17);
+        assert_eq!(b.word_range_at(6, ""), 4..11);
+    }
+
+    #[test]
+    fn a_language_adds_to_what_a_word_is() {
+        let b = Buffer::new(".main-nav { color: $accent; }");
+        assert_eq!(b.word_range_at(3, ""), 1..5);
+        assert_eq!(b.word_range_at(3, "-$"), 1..9);
+        assert_eq!(b.next_word_end(1, "-$"), 9);
+        assert_eq!(b.prev_word_start(9, "-$"), 1);
+        assert_eq!(b.word_range_at(20, "-$"), 19..26);
+        assert_eq!(b.word_range_at(20, ""), 20..26);
     }
 
     #[test]

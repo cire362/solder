@@ -679,12 +679,28 @@ here.
 
 | From | Solder uses | Does not run here |
 |---|---|---|
-| A Zed extension | Languages (highlighting, and the languages inside them), snippets, themes, its language servers | Icon themes, slash commands, context servers, debug adapters |
+| A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, its language servers | Icon themes, slash commands, context servers, debug adapters |
 | A VS Code extension | Themes (JSON), snippets | Its code, TextMate grammars, everything the code would add |
 
 A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
 It is compiled on the first file that needs it and runs in wasmtime inside
 the parser, where it sees nothing but the text.
+
+The other files of a language are read too, and mean here what they mean in
+Zed:
+
+| File | What it gives |
+|---|---|
+| `config.toml`: `brackets`, `autoclose_before` | The pairs that close themselves, are typed over and take a line between them on Enter. `not_in` keeps a pair from closing inside a string or a comment |
+| `config.toml`: `block_comment` | `cmd-/` in a language with no comment that runs to the end of a line: each line goes between the two ends |
+| `config.toml`: `word_characters`, `completion_query_characters` | What a word is for moving, selecting and deleting by word, and for the word a completion goes on from |
+| `config.toml`: `increase_indent_pattern`, `decrease_indent_pattern` | A line after one that matches the first is deeper; a line that matches the second goes one level back as it is typed |
+| `indents.scm` | How deep the line after Enter goes, and where a closing word or tag goes when it is typed |
+| `brackets.scm` | The bracket at the cursor and its other half, which may be words or tags |
+| `overrides.scm` | Where a string or a comment is, for `not_in` |
+| `outline.scm` | What a file declares, in the project map the AI gets |
+
+A language built into Solder keeps the editor's own rules for all of this.
 
 A language server comes from the extension's own code, a WebAssembly
 component built against Zed's extension API (every version from 0.0.1 to 0.7

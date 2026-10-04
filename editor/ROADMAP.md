@@ -109,8 +109,9 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 ## 8. Extensions, in full
 
 Where it stands: extensions install from Zed's catalog and Open VSX. A Zed
-extension brings its languages, snippets, themes and one language server. A
-VS Code extension brings its themes and snippets only.
+extension brings its languages (highlighting and how they are typed),
+snippets, themes and language servers. A VS Code extension brings its themes
+and snippets only.
 
 The two kinds are different work. A Zed extension is data plus a small
 sandboxed program with a fixed interface, so it can be supported completely.
@@ -148,9 +149,10 @@ to build them.
       settings from `settings.json`, and the language's tab size. The editor
       also applies them itself to a server an extension brings, for the
       extensions that do not ask
-- [ ] The rest of a language's files: indentation, brackets, the outline,
-      and from `config.toml` the pairs that close themselves, the block
-      comment and the word characters
+- [x] The rest of a language's files: indentation (`indents.scm` and the
+      two patterns), brackets, the outline (in the project map the AI gets;
+      there is no outline to look at yet), and from `config.toml` the pairs
+      that close themselves, the block comment and the word characters
 - [ ] Completion and symbol labels as the extension paints them
       (`labels-for-completions`, `labels-for-symbols`)
 - [ ] The languages Zed builds in and so does not list in its catalog (C,

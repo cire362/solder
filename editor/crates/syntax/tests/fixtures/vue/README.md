@@ -7,3 +7,5 @@ does: compiled to WebAssembly, with its queries in files.
   MIT, https://github.com/tree-sitter-grammars/tree-sitter-vue
 - `highlights.scm`, `injections.scm`: from Zed's Vue extension 0.4.0.
   Apache-2.0, https://github.com/zed-extensions/vue
+- `brackets.scm`, `indents.scm`, `overrides.scm`, `outline.scm`: written for
+  these tests, in the form Zed's extensions use.

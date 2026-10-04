@@ -308,6 +308,49 @@ impl Document {
         }
     }
 
+    /// The language at `offset`: the file's own, or the one a part of it is
+    /// written in.
+    pub fn language_at(&self, offset: usize) -> Option<Arc<syntax::Language>> {
+        match &self.syntax {
+            Some(syntax) => Some(syntax.language_at(offset).clone()),
+            None => self
+                .path
+                .as_deref()
+                .or(self.language_path.as_deref())
+                .and_then(syntax::language_for_path),
+        }
+    }
+
+    /// What the language at `offset` counts as part of a word besides
+    /// letters, digits and `_`.
+    pub fn word_characters_at(&self, offset: usize) -> String {
+        self.language_at(offset)
+            .and_then(|l| l.editing().map(|e| e.word_characters.clone()))
+            .unwrap_or_default()
+    }
+
+    /// The same for the word a completion goes on from.
+    pub fn completion_characters_at(&self, offset: usize) -> String {
+        self.language_at(offset)
+            .and_then(|l| l.editing().map(|e| e.completion_characters.clone()))
+            .unwrap_or_default()
+    }
+
+    /// The two ends of a comment at `offset`, for a language that has no
+    /// comment that runs to the end of the line.
+    pub fn block_comment_at(&self, offset: usize) -> Option<(String, String)> {
+        self.language_at(offset)?.editing()?.block_comment.clone()
+    }
+
+    /// Whether `offset` is inside one of the places the language gives
+    /// these names to: `string`, `comment`. Unknown while the tree is behind
+    /// the text, and then the answer is no.
+    pub fn in_scope(&self, offset: usize, scopes: &[String]) -> bool {
+        self.syntax
+            .as_ref()
+            .is_some_and(|s| !s.is_stale() && s.in_scope(self.text.rope(), offset, scopes))
+    }
+
     /// The names snippet files may use for the language at `offset`.
     pub fn language_ids_at(&self, offset: usize) -> Vec<String> {
         match &self.syntax {

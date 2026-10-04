@@ -124,7 +124,12 @@ Never guess a signature.
   only when the Extensions tab is opened, searches or installs, and only against
   Zed's catalog and Open VSX. An archive is unpacked in a staging folder
   and checked before it replaces anything. Highlight queries follow the
-  rule that the last matching pattern wins.
+  rule that the last matching pattern wins. What such a language says
+  about typing (`syntax::Editing` from its `config.toml`, the queries in
+  `crates/syntax/src/rules.rs`) holds for that language only: a built-in
+  one keeps the editor's own rules. Indentation follows Zed's rules
+  (`SyntaxTree::indent`), so that a query means here what it means there;
+  the language's patterns are compiled in `indent.rs`, which has the regex.
   The code of a Zed extension runs in `crates/extension/src/host.rs`: a
   WebAssembly component in wasmtime, with one folder of its own and a fuel
   budget per call. All it does outside goes through the `World` trait

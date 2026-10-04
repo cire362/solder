@@ -614,15 +614,25 @@ fn layout(
             highlights.push(fill(rect, color));
         }
     }
-    if focused
-        && !single_line
-        && editor.selections.len() == 1
-        && editor.selections[0].is_empty()
-        && let Some((a, b)) = buffer.matching_bracket(newest_head, 20_000)
-    {
-        for at in [a, b] {
-            for rect in range_rects(at..at + 1) {
-                highlights.push(fill(rect, theme.bracket));
+    if focused && !single_line && editor.selections.len() == 1 && editor.selections[0].is_empty() {
+        // A language from an extension says in a query what its brackets
+        // are, which may be words or tags. Any other is read by its
+        // characters, as is a tree that is behind the text.
+        let by_query = doc
+            .syntax()
+            .filter(|syntax| !syntax.is_stale())
+            .and_then(|syntax| syntax.brackets_at(buffer.rope(), newest_head));
+        let pair = match by_query {
+            Some(pair) => pair,
+            None => buffer
+                .matching_bracket(newest_head, 20_000)
+                .map(|(a, b)| (a..a + 1, b..b + 1)),
+        };
+        if let Some((open, close)) = pair {
+            for range in [open, close] {
+                for rect in range_rects(range) {
+                    highlights.push(fill(rect, theme.bracket));
+                }
             }
         }
     }

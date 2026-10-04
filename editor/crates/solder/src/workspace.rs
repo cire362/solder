@@ -8878,9 +8878,30 @@ mod tests {
         );
         write_file(
             &dir.join("languages/vue/config.toml"),
-            "name = \"Vue.js\"\ngrammar = \"vue\"\npath_suffixes = [\"vue\"]\ncode_fence_block_name = \"vue\"\n",
+            r#"name = "Vue.js"
+grammar = "vue"
+path_suffixes = ["vue"]
+code_fence_block_name = "vue"
+block_comment = ["<!-- ", " -->"]
+autoclose_before = ";:.,=}])>"
+word_characters = ["-"]
+increase_indent_pattern = ':\s*$'
+decrease_indent_pattern = '^\s*end\b'
+brackets = [
+    { start = "{", end = "}", close = true, newline = true },
+    { start = "<", end = ">", close = true, newline = true, not_in = ["string", "comment"] },
+    { start = "\"", end = "\"", close = true, newline = false, not_in = ["string"] },
+]
+"#,
         );
-        for query in ["highlights.scm", "injections.scm"] {
+        for query in [
+            "highlights.scm",
+            "injections.scm",
+            "indents.scm",
+            "brackets.scm",
+            "overrides.scm",
+            "outline.scm",
+        ] {
             std::fs::copy(fixtures.join(query), dir.join("languages/vue").join(query)).unwrap();
         }
         std::fs::create_dir_all(dir.join("grammars")).unwrap();
@@ -9084,6 +9105,176 @@ mod tests {
             std::fs::read_to_string(folder.join("state.json"))
                 .is_ok_and(|text| !text.contains("vue"))
         });
+    }
+
+    #[gpui::test]
+    fn a_language_of_an_extension_is_typed_the_way_its_files_say(cx: &mut TestAppContext) {
+        let _languages = extension_languages();
+        let catalog = r#"{"data":[{"id":"vue","name":"Vue","version":"0.4.0","description":"Vue support.","download_count":1,"provides":["languages"]}]}"#;
+        let (base, _) = serve(vec![
+            ("/extensions", Served::ok(catalog.as_bytes().to_vec())),
+            (
+                "/extensions/vue/download",
+                Served::ok(vue_archive("ext-typing")),
+            ),
+        ]);
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-typing", &base);
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        cx.dispatch_action(ShowExtensions);
+        wait_for(cx, "the catalog", &|cx| {
+            !store.read(cx).catalog(Origin::Zed).entries.is_empty()
+        });
+        store.update(cx, |store, cx| {
+            let entry = store.catalog(Origin::Zed).entries[0].clone();
+            store.install(entry, cx)
+        });
+        wait_for(cx, "the language", &|cx| {
+            let doc = editor.read(cx).doc(cx);
+            doc.language_name() == Some("Vue.js") && doc.syntax().is_some()
+        });
+        cx.update(|window, cx| window.focus(&editor.focus_handle(cx)));
+
+        // The whole file becomes `text`, with the cursor where `|` is.
+        let put = |cx: &mut VisualTestContext, text: &str| {
+            let at = text.find('|').unwrap();
+            let text = text.replacen('|', "", 1);
+            editor.update_in(cx, |e, _, cx| {
+                let all = 0..e.text(cx).len();
+                e.select_range(all, cx);
+                e.insert(&text, cx);
+                e.select_range(at..at, cx);
+            });
+            wait_for(cx, "the tree", &|cx| {
+                editor
+                    .read(cx)
+                    .doc(cx)
+                    .syntax()
+                    .is_some_and(|s| !s.is_stale())
+            });
+        };
+        // The text with `|` where the cursor is.
+        let seen = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.read(|cx| {
+                let editor = editor.read(cx);
+                let mut text = editor.text(cx);
+                text.insert(editor.newest_range().end, '|');
+                text
+            })
+        };
+
+        // Enter after a tag that opens: one level deeper, by `indents.scm`.
+        put(
+            cx,
+            "<template>\n  <div class=\"main-nav\">|\n  </div>\n</template>\n",
+        );
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            seen(cx),
+            "<template>\n  <div class=\"main-nav\">\n    |\n  </div>\n</template>\n"
+        );
+        // `<` closes itself, as `config.toml` lists it, and its `>` is
+        // typed over.
+        cx.simulate_input("<");
+        assert!(seen(cx).contains("    <|>\n"), "{}", seen(cx));
+        cx.simulate_input("p>a");
+        assert!(seen(cx).contains("    <p>a|\n"), "{}", seen(cx));
+        // Enter after a line that closed its own tag: no deeper.
+        cx.simulate_input("</p>");
+        cx.simulate_keystrokes("enter");
+        assert!(
+            seen(cx).contains("    <p>a</p>\n    |\n  </div>"),
+            "{}",
+            seen(cx)
+        );
+
+        // A closing tag typed on a line of its own goes back under the tag
+        // it closes.
+        put(
+            cx,
+            "<template>\n  <div>\n    <p>a</p>\n    |\n</template>\n",
+        );
+        cx.simulate_input("</div>");
+        assert_eq!(
+            seen(cx),
+            "<template>\n  <div>\n    <p>a</p>\n  </div>|\n</template>\n"
+        );
+
+        // The two patterns of `config.toml`: the line after one that ends
+        // in a colon is deeper, and `end` goes back as it is typed. When
+        // the word turns out to be another, the line returns.
+        put(
+            cx,
+            "<template>\n  <div>\n    then:|\n  </div>\n</template>\n",
+        );
+        cx.simulate_keystrokes("enter");
+        assert!(seen(cx).contains("    then:\n      |\n"), "{}", seen(cx));
+        cx.simulate_input("en");
+        assert!(seen(cx).contains("    then:\n      en|\n"), "{}", seen(cx));
+        cx.simulate_input("d");
+        assert!(seen(cx).contains("    then:\n    end|\n"), "{}", seen(cx));
+        cx.simulate_input("less");
+        assert!(
+            seen(cx).contains("    then:\n      endless|\n"),
+            "{}",
+            seen(cx)
+        );
+        // A line the user moved stays where it was put while what is typed
+        // changes nothing about it.
+        put(
+            cx,
+            "<template>\n  <div>\n    <p>a</p>\n|\n  </div>\n</template>\n",
+        );
+        cx.simulate_input("text");
+        assert!(seen(cx).contains("</p>\ntext|\n"), "{}", seen(cx));
+
+        // A quote closes itself where a value starts, and not inside one:
+        // `overrides.scm` says where a string is.
+        put(cx, "<template>\n  <div class=|>\n  </div>\n</template>\n");
+        cx.simulate_input("\"");
+        assert!(seen(cx).contains("class=\"|\">"), "{}", seen(cx));
+        put(
+            cx,
+            "<template>\n  <div class=\"a |b\">\n  </div>\n</template>\n",
+        );
+        cx.simulate_input("\"");
+        assert!(seen(cx).contains("class=\"a \"|b\">"), "{}", seen(cx));
+        // Backspace between the two halves of a pair takes both.
+        put(cx, "<template>\n  <div>\n    |\n  </div>\n</template>\n");
+        cx.simulate_input("{");
+        assert!(seen(cx).contains("    {|}\n"), "{}", seen(cx));
+        cx.simulate_keystrokes("backspace");
+        assert!(seen(cx).contains("<div>\n    |\n"), "{}", seen(cx));
+
+        // The language has no comment that runs to the end of a line: a
+        // line goes between the two ends of the other kind, and back.
+        put(
+            cx,
+            "<template>\n  <div>\n    <p>a|</p>\n  </div>\n</template>\n",
+        );
+        cx.simulate_keystrokes("secondary-/");
+        assert!(
+            seen(cx).contains("\n    <!-- <p>a|</p> -->\n"),
+            "{}",
+            seen(cx)
+        );
+        cx.simulate_keystrokes("secondary-/");
+        assert!(seen(cx).contains("\n    <p>a|</p>\n"), "{}", seen(cx));
+        // In the script it is the script's `//`, as before.
+        put(
+            cx,
+            "<template></template>\n<script setup lang=\"ts\">\nconst a| = 1\n</script>\n",
+        );
+        cx.simulate_keystrokes("secondary-/");
+        assert!(seen(cx).contains("\n// const a| = 1\n"), "{}", seen(cx));
+
+        // `-` is part of a word here.
+        put(
+            cx,
+            "<template>\n  <div class=\"|main-nav\">\n  </div>\n</template>\n",
+        );
+        cx.simulate_keystrokes("alt-right");
+        assert!(seen(cx).contains("\"main-nav|\""), "{}", seen(cx));
     }
 
     #[gpui::test]

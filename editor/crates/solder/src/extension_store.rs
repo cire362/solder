@@ -422,6 +422,29 @@ impl ExtensionStore {
                     grammar: grammar.module.clone(),
                     highlights: grammar.highlights.clone(),
                     injections: grammar.injections.clone(),
+                    editing: syntax::Editing {
+                        pairs: language
+                            .pairs
+                            .iter()
+                            .map(|pair| syntax::Pair {
+                                start: pair.start.clone(),
+                                end: pair.end.clone(),
+                                close: pair.close,
+                                newline: pair.newline,
+                                not_in: pair.not_in.clone(),
+                            })
+                            .collect(),
+                        autoclose_before: language.autoclose_before.clone(),
+                        block_comment: language.block_comment.clone(),
+                        word_characters: language.word_characters.clone(),
+                        completion_characters: language.completion_characters.clone(),
+                        increase_indent: language.increase_indent.clone(),
+                        decrease_indent: language.decrease_indent.clone(),
+                        indents: grammar.indents.clone(),
+                        brackets: grammar.brackets.clone(),
+                        outline: grammar.outline.clone(),
+                        overrides: grammar.overrides.clone(),
+                    },
                 })
             })
             .collect();

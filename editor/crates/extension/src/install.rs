@@ -392,6 +392,35 @@ mod tests {
             grammar.highlights,
             Some(home.join("languages/demo/highlights.scm"))
         );
+        // The rest of what the language's folder says about typing in it.
+        assert_eq!(
+            grammar.indents,
+            Some(home.join("languages/demo/indents.scm"))
+        );
+        assert_eq!(
+            grammar.overrides,
+            Some(home.join("languages/demo/overrides.scm"))
+        );
+        assert_eq!(grammar.brackets, None);
+        assert_eq!(grammar.outline, None);
+        // A pair with an empty end is not one.
+        assert_eq!(demo.pairs.len(), 2);
+        assert_eq!(
+            (demo.pairs[0].start.as_str(), demo.pairs[0].end.as_str()),
+            ("{", "}")
+        );
+        assert!(demo.pairs[0].close && demo.pairs[0].newline);
+        assert_eq!(demo.pairs[1].not_in, ["string"]);
+        assert!(!demo.pairs[1].newline);
+        assert_eq!(demo.autoclose_before.as_deref(), Some(";:.,=}])>"));
+        assert_eq!(demo.block_comment, Some(("/*".into(), "*/".into())));
+        assert_eq!(demo.word_characters, "-$");
+        assert_eq!(demo.completion_characters, "-");
+        assert_eq!(demo.increase_indent.as_deref(), Some(r"^.*\{\s*$"));
+        assert_eq!(
+            demo.decrease_indent.as_deref(),
+            Some(r"(?:^\s*\})|(?:^\s*end\b)")
+        );
         assert!(installed.languages[1].grammar.is_none());
 
         assert_eq!(installed.servers.len(), 1);
