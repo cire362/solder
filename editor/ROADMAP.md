@@ -172,11 +172,17 @@ to build them.
       granted or refused per extension (Zed's capabilities): commands, npm,
       downloads and single hosts, each taken back or given again in the
       extension's details
-- [ ] A time limit for a grammar's scanner, which today can hold a parse
+- [ ] A time limit for a grammar's scanner, which today can hold a parse.
+      tree-sitter 0.26 makes the WebAssembly store itself and has no way to
+      put a deadline on it (with interruption turned on in the engine, its
+      store would trap at once). What is left is to reach into its store, to
+      parse such grammars off the UI thread and give up on one that hangs,
+      or to change tree-sitter: a decision before it is work
 - [ ] Debug adapters of extensions, in the debugger
 - [ ] Slash commands and context servers of extensions, in the chat and the
       agent
-- [ ] Each new version of Zed's API as it is published (0.8 is the next)
+- [ ] Each new version of Zed's API as it is published (0.8 is the next;
+      0.7.0 was still the newest on 2026-10-05)
 
 ### VS Code extensions: what needs no code
 - [ ] TextMate grammars: highlighting for the languages only VS Code has an
