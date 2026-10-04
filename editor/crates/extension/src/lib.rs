@@ -9,6 +9,8 @@
 //!
 //! [`manifest`] reads a folder, [`catalog`] searches Zed's catalog and
 //! Open VSX, [`install`] downloads an extension and puts it in place.
+//! [`host`] runs the code of a Zed extension in a sandbox, and [`world`] is
+//! what that code reaches outside it: npm, GitHub, downloads.
 
 pub mod catalog;
 pub mod host;
@@ -16,6 +18,7 @@ pub mod install;
 pub mod manifest;
 pub mod snippet;
 pub mod testing;
+pub mod world;
 
 pub use catalog::Entry;
 pub use manifest::{Code, Extension, Grammar, Language, Origin, Server, SnippetFile};
