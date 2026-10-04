@@ -72,8 +72,7 @@ pub fn installed(root: &Path) -> Vec<Extension> {
             }
         }
     }
-    extensions
-        .sort_by(|a, b| (a.name.to_lowercase(), a.origin).cmp(&(b.name.to_lowercase(), b.origin)));
+    extensions.sort_by_key(|e| (e.name.to_lowercase(), e.origin));
     extensions
 }
 

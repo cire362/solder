@@ -129,7 +129,7 @@ pub fn search(
             Origin::Zed => {
                 let mut entries = parse_zed(&base, &answer);
                 if browsing {
-                    entries.sort_by(|a, b| b.downloads.cmp(&a.downloads));
+                    entries.sort_by_key(|entry| std::cmp::Reverse(entry.downloads));
                 }
                 entries
             }

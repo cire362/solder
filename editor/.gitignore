@@ -1,4 +1,0 @@
-/target
-# Plugin projects build for wasm32 on their own.
-/plugins/*/target
-/crates/plugin/tests/fixtures/*/target

@@ -1,8 +1,0 @@
-{
-  "name": "word-count-go",
-  "version": "0.1.0",
-  "description": "Shows how many words the file in front has. Written in Go.",
-  "permissions": ["statusBar", "editor:read", "editor:write"],
-  "events": ["open", "change", "save"],
-  "commands": [{ "id": "insert", "title": "Word Count (Go): Insert the count" }]
-}
