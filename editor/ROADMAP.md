@@ -121,15 +121,17 @@ to build them.
 - [x] Extensions as a tab of the sidebar, next to Files and Git, in place of
       the window: installed, Zed's catalog and Open VSX in one list, search,
       one Install button, progress and errors on the row
-- [ ] Before the first install of an extension, what it will do outside a
-      sandbox: the servers it downloads and starts, the commands its manifest
-      declares, and for a VS Code extension that its code runs unconfined
-- [ ] Updates: newer versions are looked for when the tab is opened, never at
+- [x] Before the first install of an extension, what it will do outside a
+      sandbox: the servers it downloads and starts and the commands its
+      manifest declares. It is downloaded and waits until that is allowed; a
+      later version asks only for what is new. (A VS Code extension's code
+      does not run yet, so it has nothing to ask.)
+- [x] Updates: newer versions are looked for when the tab is opened, never at
       startup; update one or all; keep a version
-- [ ] Turn an extension off without removing it
+- [x] Turn an extension off without removing it
 - [ ] For each installed extension, what works and what does not, from what it
       asked for at run time and did not get, not from its manifest alone
-- [ ] A section on extensions in `editor/README.md` and in the website's docs
+- [x] A section on extensions in `editor/README.md` and in the website's docs
 
 ### Zed extensions, complete
 - [ ] Every language server an extension lists for a language, not only the
