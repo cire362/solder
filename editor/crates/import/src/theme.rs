@@ -621,6 +621,37 @@ pub fn from_zed(theme: &Value) -> Option<ThemeFile> {
     palette.finish(theme["name"].as_str()?, theme["appearance"].as_str())
 }
 
+/// Every theme of the Zed theme file at `path`; blocking.
+pub fn all_zed(path: &Path) -> Vec<ThemeFile> {
+    let Some(file) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| jsonc::parse(&text).ok())
+    else {
+        return Vec::new();
+    };
+    file["themes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(from_zed)
+        .collect()
+}
+
+/// Every theme the VS Code extension in `dir` contributes, named by its
+/// label; blocking. `label` turns a `%key%` label into its text.
+pub fn all_vscode(dir: &Path, manifest: &Value, label: impl Fn(&str) -> String) -> Vec<ThemeFile> {
+    manifest["contributes"]["themes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|theme| {
+            let name = label(theme["label"].as_str().or(theme["id"].as_str())?);
+            let path = dir.join(theme["path"].as_str()?);
+            from_vscode(&name, &read_vscode(&path, 0)?, theme["uiTheme"].as_str())
+        })
+        .collect()
+}
+
 /// The theme Zed calls `name`, looked for in every `.json` directly in
 /// `theme_dirs`; blocking.
 pub fn find_zed(name: &str, theme_dirs: &[PathBuf]) -> Option<ThemeFile> {

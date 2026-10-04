@@ -11,7 +11,7 @@ publish = false
 [workspace.dependencies]
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 ropey = "1.6"
-tree-sitter = "0.25"
+tree-sitter = "0.26"
 mimalloc = { version = "0.1", default-features = false }
 unicode-segmentation = "1.12"
 text = { path = "crates/text" }

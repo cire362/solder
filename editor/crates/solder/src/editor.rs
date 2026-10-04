@@ -317,6 +317,7 @@ impl Editor {
             crate::lsp_store::LspStore::register(&document, cx);
         }
         crate::plugin_store::PluginStore::register(&document, cx);
+        crate::extension_store::ExtensionStore::register(&document, cx);
         Self::for_document(document, cx)
     }
 
@@ -1202,12 +1203,17 @@ impl Editor {
             cx.propagate();
             return;
         }
-        let prefix = match self.doc(cx).language_name() {
-            Some("Python") => "#",
-            Some("Rust" | "TypeScript" | "TSX" | "JavaScript" | "Go" | "JSON") => "//",
-            _ => return,
-        };
         let rows: Vec<usize> = self.selected_row_blocks(cx).into_iter().flatten().collect();
+        let Some(prefix) = rows.first().and_then(|row| {
+            // Past the indent, so a line inside a script block answers for
+            // the script and not for the markup around it.
+            let line = self.buf(cx).line_str(*row);
+            let indent = line.len() - line.trim_start().len();
+            self.doc(cx)
+                .line_comment_at(self.buf(cx).line_start(*row) + indent)
+        }) else {
+            return;
+        };
         let lines: Vec<(usize, String)> = rows
             .iter()
             .map(|r| (*r, self.buf(cx).line_str(*r).into_owned()))

@@ -247,6 +247,12 @@ impl Editor {
             self.schema_completions(&source, start, head, cx);
             return;
         }
+        // Snippets answer to a typed word, not to a trigger character.
+        let snippets = if trigger.is_none() {
+            self.snippet_items(start, head, cx)
+        } else {
+            Vec::new()
+        };
         let Some((encoding, request)) =
             self.lsp_request::<lt::request::Completion>(cx, |id, enc, buf| lt::CompletionParams {
                 text_document_position: Self::position_params(id, enc, buf, head),
@@ -262,16 +268,24 @@ impl Editor {
                 }),
             })
         else {
+            // No language server for this file: the snippets are the menu.
+            if !snippets.is_empty() {
+                let mut menu = CompletionMenu::new(snippets, lsp::Encoding::Utf8, start);
+                let query = self.document.read(cx).text().text_for_range(start..head);
+                self.completion = menu.filter(&query).then_some(menu);
+                cx.notify();
+            }
             return;
         };
         self.completion_task = Some(cx.spawn(async move |this, cx| {
             let response = request.await;
             this.update(cx, |this, cx| {
-                let items = match response {
+                let mut items = match response {
                     Ok(Some(lt::CompletionResponse::Array(items))) => items,
                     Ok(Some(lt::CompletionResponse::List(list))) => list.items,
                     _ => Vec::new(),
                 };
+                items.extend(snippets);
                 // The cursor may have moved while we waited.
                 let head_now = this.newest_range().end;
                 if items.is_empty() || head_now < start {
@@ -290,6 +304,55 @@ impl Editor {
             })
             .ok();
         }));
+    }
+
+    /// The snippets of installed extensions whose prefix starts with the
+    /// word being typed, as completion items. Their file variables are
+    /// filled in and their lines indented like the line they go into.
+    fn snippet_items(&self, start: usize, head: usize, cx: &App) -> Vec<lt::CompletionItem> {
+        let Some(store) = crate::extension_store::ExtensionStore::try_global(cx) else {
+            return Vec::new();
+        };
+        let document = self.document.read(cx);
+        let buffer = document.text();
+        let query = buffer.text_for_range(start..head).to_lowercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let ids = document.language_ids_at(start);
+        let line = buffer.line_str(buffer.offset_to_point(start).row);
+        let indent = &line[..line.len() - line.trim_start().len()];
+        let unit = document.indent_unit();
+        let path = document.path();
+        let part = |part: Option<&std::ffi::OsStr>| part.map(|p| p.to_string_lossy().into_owned());
+        let lookup = |name: &str| match name {
+            "TM_FILENAME" => part(path?.file_name()),
+            "TM_FILENAME_BASE" => part(path?.file_stem()),
+            "TM_DIRECTORY" => part(path?.parent().map(|p| p.as_os_str())),
+            "TM_FILEPATH" => part(path.map(|p| p.as_os_str())),
+            _ => None,
+        };
+        store
+            .read(cx)
+            .snippets_for(&ids)
+            .into_iter()
+            .filter(|snippet| snippet.prefix.to_lowercase().starts_with(&query))
+            .take(50)
+            .map(|snippet| lt::CompletionItem {
+                label: snippet.prefix.clone(),
+                kind: Some(lt::CompletionItemKind::SNIPPET),
+                detail: Some(snippet.description.clone()),
+                insert_text: Some(
+                    extension::snippet::resolve(&snippet.body, &lookup)
+                        .replace('\t', unit)
+                        .replace('\n', &format!("\n{indent}")),
+                ),
+                insert_text_format: Some(lt::InsertTextFormat::SNIPPET),
+                // After what the language server offers.
+                sort_text: Some(format!("~{}", snippet.prefix)),
+                ..Default::default()
+            })
+            .collect()
     }
 
     fn schema_completions(

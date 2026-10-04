@@ -301,6 +301,7 @@ pub fn bind_defaults(cx: &mut App) {
     crate::file_diff::bind_keys(cx);
     crate::results::bind_keys(cx);
     crate::plugins_view::bind_keys(cx);
+    crate::extensions_view::bind_keys(cx);
     crate::import_view::bind_keys(cx);
     crate::structure::bind_keys(cx);
     crate::erd_view::bind_keys(cx);

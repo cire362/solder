@@ -72,13 +72,14 @@ jobs:
       SOLDER_TEST_MONGO: mongodb://localhost:57017/solder
     steps:
       - uses: actions/checkout@v4
+      # cmake is for wasmtime, which runs the grammars of extensions.
       - name: System libraries for GPUI
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev \
             libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
-            libasound2-dev libzstd-dev pkg-config
+            libasound2-dev libzstd-dev pkg-config cmake
       # The plugin tests build a Go plugin for WASI; without Go they skip.
       - uses: actions/setup-go@v5
         with:

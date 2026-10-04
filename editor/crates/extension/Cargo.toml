@@ -1,0 +1,17 @@
+[package]
+name = "extension"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Extensions made for Zed and VS Code: what one contains, where to get it,
+# and how it lands on disk. No GPUI: the app decides what to do with them.
+[dependencies]
+import = { path = "../import" }
+reqwest = { package = "zed-reqwest", version = "0.12.15-zed", default-features = false, features = ["http2", "rustls-tls-native-roots"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "time", "fs", "io-util"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }

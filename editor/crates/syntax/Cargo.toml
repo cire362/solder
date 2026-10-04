@@ -7,7 +7,7 @@ publish.workspace = true
 
 [dependencies]
 text.workspace = true
-tree-sitter.workspace = true
+tree-sitter = { workspace = true, features = ["wasm"] }
 ropey.workspace = true
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
