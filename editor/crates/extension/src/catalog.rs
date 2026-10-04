@@ -189,24 +189,95 @@ fn parse_open_vsx(answer: &Value) -> Vec<Entry> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|item| {
-            let id = format!("{}.{}", text(&item["namespace"]), text(&item["name"]));
-            let url = text(&item["files"]["download"]);
-            (valid_id(&id) && !url.is_empty()).then(|| Entry {
-                origin: Origin::VsCode,
-                name: Some(text(&item["displayName"]))
-                    .filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| text(&item["name"])),
-                version: text(&item["version"]),
-                description: text(&item["description"]),
-                downloads: item["downloadCount"].as_u64().unwrap_or(0),
-                provides: Vec::new(),
-                sha256_url: item["files"]["sha256"].as_str().map(str::to_string),
-                url,
-                id,
-            })
-        })
+        .filter_map(open_vsx_entry)
         .collect()
+}
+
+/// One extension as Open VSX describes it, in a search or on its own.
+fn open_vsx_entry(item: &Value) -> Option<Entry> {
+    let id = format!("{}.{}", text(&item["namespace"]), text(&item["name"]));
+    let url = text(&item["files"]["download"]);
+    (valid_id(&id) && !url.is_empty()).then(|| Entry {
+        origin: Origin::VsCode,
+        name: Some(text(&item["displayName"]))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| text(&item["name"])),
+        version: text(&item["version"]),
+        description: text(&item["description"]),
+        downloads: item["downloadCount"].as_u64().unwrap_or(0),
+        provides: Vec::new(),
+        sha256_url: item["files"]["sha256"].as_str().map(str::to_string),
+        url,
+        id,
+    })
+}
+
+async fn json(url: &str) -> Result<Value, String> {
+    let mut response = client()
+        .get(url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(describe)?;
+    if !response.status().is_success() {
+        return Err(format!("The catalog answered {}", response.status()));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(describe)? {
+        if body.len() + chunk.len() > ANSWER_LIMIT {
+            return Err("The catalog's answer is too large".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| "The catalog's answer is not JSON".to_string())
+}
+
+/// The newest version the catalog at `base` has of each of `ids`, to compare
+/// with what is installed. Zed's answers for all in one request; Open VSX
+/// is asked for each, and one it does not have is left out. The future can
+/// be awaited from any executor.
+pub fn latest(
+    origin: Origin,
+    base: &str,
+    ids: Vec<String>,
+) -> impl Future<Output = Result<Vec<Entry>, String>> + Send + 'static {
+    let base = base.trim_end_matches('/').to_string();
+    let ids: Vec<String> = ids.into_iter().filter(|id| valid_id(id)).collect();
+    let handle = runtime().spawn(async move {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        match origin {
+            Origin::Zed => {
+                let url = format!(
+                    "{base}/extensions/updates?min_schema_version=0&max_schema_version=1\
+                     &min_wasm_api_version=0.0.1&max_wasm_api_version={ZED_API}&ids={}",
+                    ids.join(",")
+                );
+                Ok(parse_zed(&base, &json(&url).await?))
+            }
+            Origin::VsCode => {
+                let mut entries = Vec::new();
+                let mut failure = None;
+                for id in &ids {
+                    let Some((namespace, name)) = id.split_once('.') else {
+                        continue;
+                    };
+                    match json(&format!("{base}/api/{namespace}/{name}")).await {
+                        Ok(answer) => entries.extend(open_vsx_entry(&answer)),
+                        Err(error) => failure = Some(error),
+                    }
+                }
+                // Nothing at all came back: say why. Otherwise an extension
+                // the catalog no longer has is no reason to hide the rest.
+                match (entries.is_empty(), failure) {
+                    (true, Some(error)) => Err(error),
+                    _ => Ok(entries),
+                }
+            }
+        }
+    });
+    async move { handle.await.map_err(|e| e.to_string())? }
 }
 
 #[cfg(test)]
@@ -290,6 +361,52 @@ mod tests {
             block(search(Origin::VsCode, &base, "")).unwrap_err(),
             "The catalog's answer is not JSON"
         );
+    }
+
+    #[test]
+    fn asks_for_the_newest_versions_of_what_is_installed() {
+        let zed = r#"{"data":[{"id":"vue","name":"Vue","version":"0.5.0","download_count":1}]}"#;
+        let volar = r#"{"namespace":"Vue","name":"volar","version":"3.4.0","displayName":"Vue (Official)",
+            "files":{"download":"https://open-vsx.org/volar.vsix","sha256":"https://open-vsx.org/volar.sha256"}}"#;
+        let (base, requests) = serve(vec![
+            ("/extensions/updates", Served::ok(zed.as_bytes().to_vec())),
+            ("/api/Vue/volar", Served::ok(volar.as_bytes().to_vec())),
+        ]);
+        let found = block(latest(
+            Origin::Zed,
+            &base,
+            vec!["vue".into(), "html".into(), "../x".into()],
+        ));
+        assert_eq!(found.unwrap()[0].version, "0.5.0");
+        assert_eq!(
+            requests.lock().unwrap()[0],
+            "/extensions/updates?min_schema_version=0&max_schema_version=1&min_wasm_api_version=0.0.1&max_wasm_api_version=0.7.0&ids=vue,html"
+        );
+        // Open VSX is asked for each; one it no longer has is left out.
+        let found = block(latest(
+            Origin::VsCode,
+            &base,
+            vec!["Vue.volar".into(), "gone.extension".into()],
+        ))
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (found[0].id.as_str(), found[0].version.as_str()),
+            ("Vue.volar", "3.4.0")
+        );
+        // None of them answered: the reason is given.
+        assert_eq!(
+            block(latest(Origin::VsCode, &base, vec!["gone.extension".into()])).unwrap_err(),
+            "The catalog answered 404 Not Found"
+        );
+        // Nothing installed, nothing asked.
+        let before = requests.lock().unwrap().len();
+        assert!(
+            block(latest(Origin::Zed, &base, Vec::new()))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(requests.lock().unwrap().len(), before);
     }
 
     #[test]

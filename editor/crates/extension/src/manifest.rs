@@ -105,6 +105,28 @@ impl Extension {
         matches!(&self.code, Code::Zed { api } if crate::host::runs(api))
     }
 
+    /// What it does outside a sandbox once installed, each in a sentence
+    /// for the user: the language servers its code downloads and starts,
+    /// and the commands its manifest declares. Empty for an extension that
+    /// is only data, and for code Solder does not run.
+    pub fn outside(&self) -> Vec<String> {
+        if !self.runs_code() {
+            return Vec::new();
+        }
+        let servers = self
+            .servers
+            .iter()
+            .map(|server| format!("Download and start the language server {}", server.name));
+        let commands = self.commands.iter().map(|(program, args)| {
+            if args.is_empty() {
+                format!("Run {program}")
+            } else {
+                format!("Run {program} {}", args.join(" "))
+            }
+        });
+        servers.chain(commands).collect()
+    }
+
     /// One line on what Solder takes from it.
     pub fn provides(&self) -> String {
         let count = |n: usize, one: &str, many: &str| match n {
