@@ -25,7 +25,7 @@ worktree!(bindings, located);
 key_value_store!(bindings);
 project!(bindings);
 world_functions!(bindings);
-start!(bindings);
+start!(bindings, sets_up_others);
 
 impl api::dap::Host for State {
     fn resolve_tcp_template(

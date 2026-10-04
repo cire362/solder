@@ -83,7 +83,10 @@ Never guess a signature.
   brings. Answers that add up (completions, code actions, diagnostics) come
   from all of them, each in its server's own position encoding: convert
   before mixing. A request with one answer goes to the first server that
-  advertises it (`LspStore::request`).
+  advertises it (`LspStore::request`). Extensions may add to the options
+  of a server Solder knows; options are read once, at the start, so such a
+  server is started again (`LspStore::restart`) when they change, and a
+  start that finishes after a later one began is dropped.
 - Language-server requests triggered by typing must run after the current
   effect cycle (`cx.defer`), so the `didChange` for what was just typed
   reaches the server first. See `Editor::after_typing`.

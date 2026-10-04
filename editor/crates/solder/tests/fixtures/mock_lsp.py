@@ -55,6 +55,16 @@ def rng(text, start, end):
 # completion and names its actions after itself, so the test can tell whose
 # answer is whose. UTF-16 positions make its ranges differ from the first's.
 TAG = os.environ.get("MOCK_LSP_TAG", "")
+# Set for the server that plays Vue's: like it, it has the TypeScript server
+# asked something through the editor whenever a file opens or changes, and
+# writes down what comes back.
+ASKS_TSSERVER = bool(os.environ.get("MOCK_LSP_ASKS_TSSERVER"))
+
+
+def ask_tsserver(uri):
+    if ASKS_TSSERVER:
+        send({"jsonrpc": "2.0", "method": "tsserver/request",
+              "params": [[7, "_vue:projectInfo", {"file": uri}]]})
 
 
 def publish(uri):
@@ -116,6 +126,7 @@ while True:
         note("open", doc.get("languageId"))
         docs[doc["uri"]] = doc["text"]
         publish(doc["uri"])
+        ask_tsserver(doc["uri"])
     elif method == "textDocument/didChange":
         uri = params["textDocument"]["uri"]
         text = docs[uri]
@@ -129,6 +140,7 @@ while True:
                 text = change["text"]
         docs[uri] = text
         publish(uri)
+        ask_tsserver(uri)
     elif method == "textDocument/completion":
         send({"jsonrpc": "2.0", "id": mid, "result": [
             {"label": "println", "kind": 3, "insertText": "println!(\"$1\")", "insertTextFormat": 2},
@@ -177,6 +189,12 @@ while True:
         by = (params["data"].get("by") or "") + ("" if TAG == (params["data"].get("by") or "") else " (asked of the wrong server)")
         params["edit"] = {"changes": {uri: [{"range": {"start": zero, "end": zero}, "newText": f"// header {by}".rstrip() + "\n"}]}}
         send({"jsonrpc": "2.0", "id": mid, "result": params})
+    elif method == "tsserver/response":
+        note("tsserver", params)
+    elif method == "workspace/executeCommand" and params.get("command") == "typescript.tsserverRequest":
+        # What the TypeScript server does with a question passed on to it.
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "body": {"asked": params["arguments"][0], "about": params["arguments"][1]}}})
     elif method == "workspace/executeCommand":
         uri = params["arguments"][0]
         zero = {"line": 0, "character": 0}

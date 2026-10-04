@@ -136,11 +136,12 @@ to build them.
 ### Zed extensions, complete
 - [x] Every language server an extension lists for a language, not only the
       first, next to the one Solder knows for it, with their answers merged
-      (completions, diagnostics, actions). Dockerfile has two; Vue needs the
-      next item as well
-- [ ] One extension setting up another's server
-      (`language-server-additional-*`: Vue adds its plugin to the TypeScript
-      server)
+      (completions, diagnostics, actions). Dockerfile has two
+- [x] One extension setting up another's server
+      (`language-server-additional-*`): Vue adds its plugin to the TypeScript
+      server, which then serves Vue files too and is started again if it ran
+      without the plugin; the questions Vue's server has for it pass through
+      the editor
 - [ ] The user's settings reach the extension: a server's binary, options and
       settings from `settings.json`, and the language's tab size
 - [ ] The rest of a language's files: indentation, brackets, the outline,

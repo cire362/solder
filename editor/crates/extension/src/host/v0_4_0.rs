@@ -25,4 +25,4 @@ worktree!(bindings, located);
 key_value_store!(bindings);
 project!(bindings);
 world_functions!(bindings);
-start!(bindings);
+start!(bindings, sets_up_others);

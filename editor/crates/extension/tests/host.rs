@@ -54,7 +54,10 @@ impl World for Script {
             format!(r#"{{"version": "{version}"}}"#),
         )
         .unwrap();
-        std::fs::write(package.join("bin").join(SERVER), "").unwrap();
+        // The file each of the fixtures looks for once its package is there.
+        for server in [SERVER, "vue-language-server.js"] {
+            std::fs::write(package.join("bin").join(server), "").unwrap();
+        }
         Ok(())
     }
 
@@ -323,5 +326,65 @@ fn an_extension_for_api_0_3_0_asks_for_a_pre_release() {
             "ledger-language-server: CheckingForUpdate",
             "release claytonrcarter/ledger-language-server None pre=true",
         ]
+    );
+}
+
+#[test]
+fn an_extension_adds_to_the_options_of_a_server_that_is_not_its_own() {
+    // Vue's extension brings its own server and needs the TypeScript server
+    // to load a plugin: from API 0.4 it can say so.
+    let extension = fixture("vue");
+    let work = work_dir("host-vue");
+    let world = Arc::new(Script {
+        latest: "3.0.0".into(),
+        ..Default::default()
+    });
+    let host = Host::load(&extension, &work, world.clone()).unwrap();
+    let project = work_dir("host-vue-project");
+    let vue = "vue-language-server";
+
+    // Its own server first: that installs the server and the plugin.
+    let command = host.language_server_command(vue, &project).unwrap();
+    assert_eq!(command.command, "/opt/node/bin/node");
+    let script = work.join("node_modules/@vue/language-server/bin/vue-language-server.js");
+    assert_eq!(command.args, [script.to_str().unwrap(), "--stdio"]);
+    let did = world.take();
+    for package in ["@vue/language-server", "@vue/typescript-plugin"] {
+        assert!(did.contains(&format!("install {package}@3.0.0")), "{did:?}");
+    }
+
+    // For the TypeScript server it has a plugin, found in its own folder.
+    let added = host
+        .additional_initialization_options(vue, "typescript-language-server", &project)
+        .unwrap()
+        .expect("something for the TypeScript server");
+    let added: serde_json::Value = serde_json::from_str(&added).unwrap();
+    assert_eq!(added["plugins"][0]["name"], "@vue/typescript-plugin");
+    assert_eq!(added["plugins"][0]["location"], work.to_str().unwrap());
+    // For another one that speaks TypeScript it has settings instead.
+    let settings = host
+        .additional_workspace_configuration(vue, "vtsls", &project)
+        .unwrap()
+        .expect("settings for vtsls");
+    let settings: serde_json::Value = serde_json::from_str(&settings).unwrap();
+    assert_eq!(
+        settings["vtsls"]["tsserver"]["globalPlugins"][0]["name"],
+        "@vue/typescript-plugin"
+    );
+    // And nothing for a server it has no business with.
+    assert_eq!(
+        host.additional_initialization_options(vue, "gopls", &project),
+        Ok(None)
+    );
+    assert_eq!(
+        host.additional_workspace_configuration(vue, "gopls", &project),
+        Ok(None)
+    );
+
+    // An extension built before 0.4 cannot add anything, and is not asked.
+    let (_, _, old) = ask("nginx", Some("/usr/local/bin/nginx-language-server"));
+    assert_eq!(
+        old.additional_initialization_options("nginx", "typescript-language-server", &project),
+        Ok(None)
     );
 }

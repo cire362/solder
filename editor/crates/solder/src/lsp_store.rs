@@ -207,6 +207,36 @@ fn supports(caps: &lt::ServerCapabilities, method: &str) -> bool {
     }
 }
 
+/// What extensions added to one of the servers Solder knows: Vue's adds its
+/// plugin to the TypeScript server's options.
+#[derive(Default)]
+struct SetUp {
+    /// The extension servers that were asked already, by id.
+    asked: Vec<String>,
+    options: Option<serde_json::Value>,
+    settings: Option<serde_json::Value>,
+}
+
+/// A server Solder knows that also serves a language an extension brings,
+/// once that extension is installed, and what it is told the language is.
+/// A Vue file is the TypeScript server's too: Vue's own server leaves the
+/// script to it, and asks it questions through the editor.
+fn companion(language: &str) -> Option<(ServerSpec, &'static str)> {
+    match language {
+        "Vue.js" => Some((spec_for("TypeScript")?, "vue.js")),
+        _ => None,
+    }
+}
+
+/// What Vue's server sends to have the TypeScript server asked something,
+/// and what it is sent back.
+enum TsserverResponse {}
+
+impl lt::notification::Notification for TsserverResponse {
+    type Params = serde_json::Value;
+    const METHOD: &'static str = "tsserver/response";
+}
+
 impl Attached {
     fn new(key: ServerKey, language_id: Option<String>) -> Self {
         Self {
@@ -221,6 +251,11 @@ impl Attached {
 pub struct LspStore {
     servers: HashMap<ServerKey, ServerState>,
     docs: HashMap<EntityId, DocEntry>,
+    /// What extensions added to the servers Solder knows.
+    set_up: HashMap<ServerKey, SetUp>,
+    /// How many times each server was started. A start that finishes after
+    /// a later one began is dropped.
+    starts: HashMap<ServerKey, u64>,
     /// Latest progress or error message, shown in the status bar.
     status: Option<SharedString>,
 }
@@ -329,18 +364,36 @@ impl LspStore {
         };
         let doc = document.read(cx);
         let mut wanted: Vec<(Attached, Option<ServerSpec>, Option<ExtensionServer>)> = Vec::new();
+        let mut asking: Option<(ServerKey, ServerSpec, Vec<ExtensionServer>)> = None;
         if let (Some(path), Some(language)) = (doc.path(), doc.language_name()) {
             entry.uri = path_to_uri(path);
-            if let Some(spec) = spec_for(language) {
+            let brought = crate::extension_store::ExtensionStore::try_global(cx)
+                .map(|store| store.read(cx).servers_for(language))
+                .unwrap_or_default();
+            // The server Solder knows for the language, or one it knows
+            // that goes with the extension's.
+            let known = spec_for(language).map(|spec| (spec, None)).or_else(|| {
+                let (spec, id) = companion(language).filter(|_| !brought.is_empty())?;
+                Some((spec, Some(id.to_string())))
+            });
+            if let Some((spec, language_id)) = known {
                 let key = ServerKey {
                     name: spec.name,
                     root: find_root(path, spec.root_markers),
                 };
-                wanted.push((Attached::new(key, None), Some(spec), None));
+                // Extensions that were not asked yet what they add to it.
+                let set_up = self.set_up.entry(key.clone()).or_default();
+                let fresh: Vec<ExtensionServer> = brought
+                    .iter()
+                    .filter(|server| !set_up.asked.contains(&server.id))
+                    .cloned()
+                    .collect();
+                set_up.asked.extend(fresh.iter().map(|s| s.id.clone()));
+                if !fresh.is_empty() {
+                    asking = Some((key.clone(), spec, fresh));
+                }
+                wanted.push((Attached::new(key, language_id), Some(spec), None));
             }
-            let brought = crate::extension_store::ExtensionStore::try_global(cx)
-                .map(|store| store.read(cx).servers_for(language))
-                .unwrap_or_default();
             for server in brought {
                 let key = ServerKey {
                     name: intern(&server.id),
@@ -402,15 +455,93 @@ impl LspStore {
             });
         }
         for (key, opened, spec, server) in starting {
+            // A server that extensions still have something to add to waits
+            // for that: it is started, or started again, when they answered.
+            let waits = asking.as_ref().is_some_and(|(asked, ..)| *asked == key);
             match (self.servers.get(&key), spec, server) {
                 (Some(ServerState::Running { .. }), ..) if opened => {}
                 (Some(ServerState::Running { .. }), ..) => self.open(id, &key, cx),
                 (Some(ServerState::Starting | ServerState::Failed), ..) => {}
+                (None, Some(spec), _) if waits => {
+                    self.servers.insert(key, ServerState::Starting);
+                    self.status = Some(format!("Starting {}...", spec.name).into());
+                    cx.notify();
+                }
                 (None, Some(spec), _) => self.start(key, spec, cx),
                 (None, None, Some(server)) => self.start_from_extension(key, server, cx),
                 (None, None, None) => {}
             }
         }
+        if let Some((key, spec, servers)) = asking {
+            self.set_up_server(key, spec, servers, cx);
+        }
+    }
+
+    /// Asks the extensions behind `servers` what they add to the options
+    /// and settings of a server Solder knows, then starts it with them. If
+    /// it runs already and its options changed, it is started again: they
+    /// are read once, at the start.
+    fn set_up_server(
+        &mut self,
+        key: ServerKey,
+        spec: ServerSpec,
+        servers: Vec<ExtensionServer>,
+        cx: &mut Context<Self>,
+    ) {
+        let store = crate::extension_store::ExtensionStore::global(cx);
+        let adding = store.update(cx, |store, cx| {
+            store.additions(spec.name, servers, &key.root, cx)
+        });
+        cx.spawn(async move |this, cx| {
+            let added = adding.await;
+            this.update(cx, |this, cx| {
+                let add = |into: &mut Option<serde_json::Value>,
+                           more: Option<serde_json::Value>| {
+                    match (into.as_mut(), more) {
+                        (Some(into), Some(more)) => extension::host::merge_json(into, more),
+                        (None, Some(more)) => *into = Some(more),
+                        (_, None) => {}
+                    }
+                };
+                let options_changed = added.initialization_options.is_some();
+                let settings_changed = added.configuration.is_some();
+                let set_up = this.set_up.entry(key.clone()).or_default();
+                add(&mut set_up.options, added.initialization_options);
+                add(&mut set_up.settings, added.configuration);
+                let settings = set_up.settings.clone();
+                match this.servers.get(&key) {
+                    Some(ServerState::Running { .. }) if options_changed => {
+                        this.restart(key, spec, cx)
+                    }
+                    Some(ServerState::Running { server, .. }) => {
+                        if let (true, Some(settings)) = (settings_changed, settings) {
+                            server.set_configuration(settings);
+                        }
+                    }
+                    // Not started yet, or a start that began before the
+                    // extensions answered: this one has what they added.
+                    _ => this.start(key, spec, cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Stops a running server and starts it again with the options it has
+    /// now. Its documents are opened in the new one.
+    fn restart(&mut self, key: ServerKey, spec: ServerSpec, cx: &mut Context<Self>) {
+        if let Some(ServerState::Running { server, .. }) = self.servers.remove(&key) {
+            server.kill();
+        }
+        for entry in self.docs.values_mut() {
+            for attached in &mut entry.servers {
+                if attached.key == key {
+                    attached.opened = false;
+                }
+            }
+        }
+        self.start(key, spec, cx);
     }
 
     /// The extensions that are installed and on changed: every document
@@ -508,7 +639,21 @@ impl LspStore {
         self.servers.insert(key.clone(), ServerState::Starting);
         self.status = Some(format!("Starting {}...", spec.name).into());
         cx.notify();
-        let options = overrides.initialization_options;
+        // The user's options, and on top of them what extensions add.
+        let mut options = overrides.initialization_options;
+        let (added, settings) = self
+            .set_up
+            .get(&key)
+            .map(|set_up| (set_up.options.clone(), set_up.settings.clone()))
+            .unwrap_or_default();
+        match (options.as_mut(), added) {
+            (Some(options), Some(added)) => extension::host::merge_json(options, added),
+            (None, Some(added)) => options = Some(added),
+            (_, None) => {}
+        }
+        let starts = self.starts.entry(key.clone()).or_default();
+        *starts += 1;
+        let this_start = *starts;
         cx.spawn(async move |this, cx| {
             let root = key.root.clone();
             let spawned = cx
@@ -523,7 +668,16 @@ impl LspStore {
                 Err(e) => Err(e),
             };
             this.update(cx, |this, cx| match result {
-                Ok((server, notifications)) => this.started(key, server, notifications, cx),
+                // A later start began while this one was on its way: that
+                // one has the newer options, and this server is not needed.
+                Ok((server, _)) if this.starts.get(&key) != Some(&this_start) => server.kill(),
+                Err(_) if this.starts.get(&key) != Some(&this_start) => {}
+                Ok((server, notifications)) => {
+                    if let Some(settings) = settings {
+                        server.set_configuration(settings);
+                    }
+                    this.started(key, server, notifications, cx)
+                }
                 Err(err) => {
                     let message = format!(
                         "{} failed to start: {err}. {}",
@@ -775,6 +929,61 @@ impl LspStore {
                         doc.set_diagnostics(merged, cx);
                     });
                 }
+            }
+            // Vue's server asking the TypeScript server something: it sends
+            // the questions here, each is passed on as a command, and the
+            // answers go back the same way.
+            "tsserver/request" => {
+                let Some(asking) = self.server(key).cloned() else {
+                    return;
+                };
+                // The TypeScript server of a file this server has too.
+                let typescript = self
+                    .docs
+                    .values()
+                    .filter(|entry| entry.servers.iter().any(|a| a.key == *key))
+                    .flat_map(|entry| &entry.servers)
+                    .find(|a| a.key.name == "typescript-language-server")
+                    .and_then(|a| self.server(&a.key))
+                    .cloned();
+                let questions: Vec<(serde_json::Value, String, serde_json::Value)> = n
+                    .params
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|question| {
+                        Some((
+                            question.get(0)?.clone(),
+                            question.get(1)?.as_str()?.to_string(),
+                            question.get(2).cloned().unwrap_or_default(),
+                        ))
+                    })
+                    .collect();
+                cx.background_executor()
+                    .spawn(async move {
+                        for (id, command, payload) in questions {
+                            // Without a TypeScript server the answer is
+                            // nothing: Vue's server goes on without it.
+                            let body = match &typescript {
+                                Some(typescript) => typescript
+                                    .request::<lt::request::ExecuteCommand>(
+                                        lt::ExecuteCommandParams {
+                                            command: "typescript.tsserverRequest".into(),
+                                            arguments: vec![command.into(), payload],
+                                            work_done_progress_params: Default::default(),
+                                        },
+                                    )
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|mut answer| answer.get_mut("body").map(|b| b.take()))
+                                    .unwrap_or_default(),
+                                None => serde_json::Value::Null,
+                            };
+                            asking.notify::<TsserverResponse>(serde_json::json!([[id, body]]));
+                        }
+                    })
+                    .detach();
             }
             "$/progress" => {
                 let Ok(params) = serde_json::from_value::<lt::ProgressParams>(n.params) else {
