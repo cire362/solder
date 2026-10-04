@@ -15,3 +15,7 @@ serde_json = "1.0.151"
 sha2 = "0.10.9"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "time", "fs", "io-util"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+# Runs the code of Zed extensions (WebAssembly components). The same
+# wasmtime that tree-sitter brings for grammars; keep the versions together.
+wasmtime = { version = "36", default-features = false, features = ["runtime", "cranelift", "component-model", "std"] }
+wasmtime-wasi = { version = "36", default-features = false }

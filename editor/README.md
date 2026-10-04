@@ -5,7 +5,8 @@ The native editor behind the website in `../src`. Rust, GPU-rendered UI, no Elec
 ```
 crates/
   text/     rope buffer, edits, undo history, cursor movement (no UI, fully unit-tested)
-  extension/ extensions of Zed and VS Code: manifests, the two catalogs, installing
+  extension/ extensions of Zed and VS Code: manifests, the two catalogs, installing,
+            and the sandbox that runs a Zed extension's code to get its language server
   syntax/   tree-sitter parsing and highlighting for Rust, TS/TSX, JS, JSON, CSS, Go, Python,
             and for the languages of extensions (grammars in WebAssembly)
   db/       database connections: detection, drivers, statement splitting (no UI)

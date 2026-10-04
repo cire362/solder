@@ -56,6 +56,9 @@ pub struct Server {
     pub id: String,
     pub name: String,
     pub languages: Vec<String>,
+    /// What the server calls a language, where it differs from the
+    /// language's name: `("TSX", "typescriptreact")`.
+    pub language_ids: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,11 +92,19 @@ pub struct Extension {
     pub languages: Vec<Language>,
     pub servers: Vec<Server>,
     pub code: Code,
+    /// The commands its manifest declares its code runs: a program and the
+    /// arguments it may be given (`*` for any one, `**` for any that remain).
+    pub commands: Vec<(String, Vec<String>)>,
     /// What it has that Solder does not run, in words for the user.
     pub missing: Vec<String>,
 }
 
 impl Extension {
+    /// Whether its code runs in Solder's host.
+    pub fn runs_code(&self) -> bool {
+        matches!(&self.code, Code::Zed { api } if crate::host::runs(api))
+    }
+
     /// One line on what Solder takes from it.
     pub fn provides(&self) -> String {
         let count = |n: usize, one: &str, many: &str| match n {
@@ -108,6 +119,15 @@ impl Extension {
             .count();
         let parts: Vec<String> = [
             count(highlighted, "language", "languages"),
+            count(
+                if self.runs_code() {
+                    self.servers.len()
+                } else {
+                    0
+                },
+                "language server",
+                "language servers",
+            ),
             count(self.themes.len(), "theme", "themes"),
             count(self.snippets.len(), "snippet file", "snippet files"),
         ]
@@ -283,10 +303,17 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
                 languages.insert(0, language.to_string());
             }
             languages.dedup();
+            let language_ids = server["language_ids"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(language, id)| Some((language.clone(), id.as_str()?.to_string())))
+                .collect();
             Server {
                 name: server["name"].as_str().unwrap_or(id).to_string(),
                 id: id.clone(),
                 languages,
+                language_ids,
             }
         })
         .collect();
@@ -298,6 +325,14 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
     } else {
         Code::None
     };
+
+    let commands = manifest["capabilities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|capability| capability["kind"] == "process:exec")
+        .map(|capability| (text(&capability["command"]), strings(&capability["args"])))
+        .collect();
 
     let has = |key: &str| match &manifest[key] {
         Value::Object(table) => !table.is_empty(),
@@ -331,6 +366,7 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         languages,
         servers,
         code,
+        commands,
         missing,
     })
 }
@@ -459,6 +495,7 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         languages,
         servers: Vec::new(),
         code,
+        commands: Vec::new(),
         missing,
     })
 }

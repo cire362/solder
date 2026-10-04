@@ -113,6 +113,16 @@ Never guess a signature.
   Zed's catalog and Open VSX. An archive is unpacked in a staging folder
   and checked before it replaces anything. Highlight queries follow the
   rule that the last matching pattern wins.
+  The code of a Zed extension runs in `crates/extension/src/host.rs`: a
+  WebAssembly component in wasmtime, with one folder of its own and a fuel
+  budget per call. All it does outside goes through the `World` trait
+  (`world.rs` is the real one: npm with `--ignore-scripts`, GitHub
+  releases, downloads). Its calls block for as long as a download takes:
+  `ExtensionStore::resolve` runs them on a thread of their own, never on
+  the UI thread or the background executor. The files in
+  `crates/extension/wit` are Zed's and stay as published; a new API version
+  is a new folder next to them. Keep `wasmtime` and `wasmtime-wasi` on the
+  version tree-sitter brings.
 
 ### Performance rules
 

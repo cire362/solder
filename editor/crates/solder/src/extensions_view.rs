@@ -272,6 +272,15 @@ impl ExtensionsView {
                 details = details
                     .child(heading("SOLDER USES"))
                     .child(line(installed.provides().into(), theme.fg_muted));
+                // Said before a file needs it: this is the one thing an
+                // extension does outside its sandbox.
+                if installed.runs_code() && !installed.servers.is_empty() {
+                    details = details.child(line(
+                        "Its language server is downloaded and started when a file needs it."
+                            .into(),
+                        theme.fg_subtle,
+                    ));
+                }
                 let missing = not_running(installed);
                 if !missing.is_empty() {
                     details = details.child(heading("DOES NOT RUN HERE"));
@@ -378,9 +387,19 @@ impl ExtensionsView {
 /// What an installed extension has that Solder does not run, in words.
 fn not_running(extension: &Extension) -> Vec<String> {
     let mut missing = extension.missing.clone();
-    if !extension.servers.is_empty() && matches!(extension.code, Code::Zed { .. }) {
+    // A language server is the extension's code at work. Code built for a
+    // version of Zed's API this host does not have stays unused.
+    if let (false, Code::Zed { api }) = (extension.servers.is_empty(), &extension.code)
+        && !extension.runs_code()
+    {
         let names: Vec<&str> = extension.servers.iter().map(|s| s.name.as_str()).collect();
-        missing.insert(0, format!("Language server: {}", names.join(", ")));
+        missing.insert(
+            0,
+            format!(
+                "Language server {} (built for Zed's extension API {api})",
+                names.join(", ")
+            ),
+        );
     }
     let plain = extension
         .languages
