@@ -21,10 +21,13 @@ stack and the measured performance numbers.
 
 - Never commit to `main` directly. Branch from an up-to-date `main`:
   `feat/<topic>`, `fix/<topic>`, `perf/<topic>`, `refactor/<topic>`,
-  `docs/<topic>`, `chore/<topic>`, `ci/<topic>`. A large feature (a roadmap
-  item) gets its own branch, and its follow-up work stays on that branch. A
-  small change that is already checked (a visual fix, a lint, a bug found on
-  the way) does not get a branch of its own: commit it separately on the
+  `docs/<topic>`, `chore/<topic>`, `ci/<topic>`. A branch is for a large
+  update: a whole block of the roadmap (all of "Zed extensions, complete"),
+  not each of its items. All of its work is committed to that one branch and
+  it is merged once, when the whole update is ready: do not open a branch or
+  a pull request per item, and do not wait for a merge to go on. A small
+  change that is already checked (a visual fix, a lint, a bug found on the
+  way) does not get a branch of its own either: commit it separately on the
   branch in progress and mention it in that pull request.
 - Commits follow Conventional Commits with a scope: `site`, `editor`, `text`,
   `syntax`, `lsp`, `terminal`, `git`, `services`, `db`, `ci`. Example:
