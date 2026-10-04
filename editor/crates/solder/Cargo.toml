@@ -1,0 +1,37 @@
+[package]
+name = "solder"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+alacritty_terminal = "0.26"
+db = { path = "../db" }
+dirs = "7.0.0"
+futures = "0.3.34"
+gpui.workspace = true
+grep-matcher = "0.1.9"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
+ignore = "0.4.33"
+lsp = { version = "0.1.0", path = "../lsp" }
+mimalloc.workspace = true
+notify = "8.2.0"
+nucleo-matcher = "0.3.1"
+regex = "1.13.1"
+ai = { path = "../ai" }
+dap = { path = "../dap" }
+import = { path = "../import" }
+extension = { path = "../extension" }
+plugin = { path = "../plugin" }
+rest = { path = "../rest" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+syntax.workspace = true
+text.workspace = true
+trash = "5.2.9"
+unicode-segmentation.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

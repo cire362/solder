@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "types": [],
+    "strict": true,
+    "noEmitOnError": true,
+    "removeComments": false
+  },
+  "files": ["plugin.ts", "../solder.d.ts"]
+}
