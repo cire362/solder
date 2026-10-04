@@ -17,7 +17,7 @@ use std::{
 use extension::{
     Entry, Extension, Origin, Snippet, catalog,
     host::{Host, Status, World},
-    install::{self, Progress},
+    install::{self, Progress, Staged},
     world::System,
 };
 use futures::{StreamExt, channel::mpsc};
@@ -71,6 +71,8 @@ type Slot = Arc<Mutex<Option<Arc<Host>>>>;
 
 /// The snippets of one file and the languages they are for.
 struct SnippetSet {
+    /// The extension the file belongs to.
+    owner: Key,
     languages: Vec<String>,
     snippets: Vec<Snippet>,
 }
@@ -92,6 +94,13 @@ pub struct ExtensionStore {
     pub zed_url: String,
     pub open_vsx_url: String,
     pub installing: HashMap<Key, Arc<Progress>>,
+    /// Downloaded and read, waiting for the user to allow what they would
+    /// do outside a sandbox.
+    pub pending: HashMap<Key, Staged>,
+    /// Newer versions the catalogs have of what is installed.
+    pub updates: HashMap<Key, Entry>,
+    /// What the user decided: turned off, kept on a version, allowed.
+    state: extension::State,
     /// Why the last install or removal of an extension failed.
     pub errors: HashMap<Key, String>,
     /// What "Use" last did with a theme.
@@ -149,6 +158,9 @@ impl ExtensionStore {
             zed_url: catalog::ZED.into(),
             open_vsx_url: catalog::OPEN_VSX.into(),
             installing: HashMap::new(),
+            pending: HashMap::new(),
+            updates: HashMap::new(),
+            state: extension::State::default(),
             errors: HashMap::new(),
             theme_status: None,
             documents: Vec::new(),
@@ -229,24 +241,35 @@ impl ExtensionStore {
         self.scans += 1;
         let scan = self.scans;
         let root = self.root.clone();
+        // The decisions are read from disk once; after that the store has
+        // the newer ones and writes them back.
+        let first = !self.loaded;
         cx.spawn(async move |this, cx| {
-            let (installed, snippets) = cx
+            let (installed, snippets, state) = cx
                 .background_executor()
                 .spawn(async move {
                     let installed = install::installed(&root);
                     let snippets: Vec<SnippetSet> = installed
                         .iter()
-                        .flat_map(|extension| &extension.snippets)
-                        .filter_map(|file| {
+                        .flat_map(|extension| {
+                            let owner = key(extension.origin, &extension.id);
+                            extension
+                                .snippets
+                                .iter()
+                                .map(move |file| (owner.clone(), file))
+                        })
+                        .filter_map(|(owner, file)| {
                             let text = std::fs::read_to_string(&file.path).ok()?;
                             Some(SnippetSet {
+                                owner,
                                 languages: file.languages.clone(),
                                 snippets: extension::snippet::parse(&text),
                             })
                         })
                         .filter(|set| !set.snippets.is_empty())
                         .collect();
-                    (installed, snippets)
+                    let state = first.then(|| extension::State::load(&root));
+                    (installed, snippets, state)
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -260,9 +283,22 @@ impl ExtensionStore {
                     let before = this.installed.iter().find(|e| e.id == *id);
                     before.is_some() && before == installed.iter().find(|e| e.id == *id)
                 });
+                if let (Some(state), false) = (state, this.loaded) {
+                    this.state = state;
+                }
                 this.installed = installed;
                 this.snippets = snippets;
                 this.loaded = true;
+                // What was updated, removed or kept back is no update.
+                let (installed, state) = (&this.installed, &this.state);
+                this.updates.retain(|(origin, id), entry| {
+                    !state.is_kept(*origin, id)
+                        && installed.iter().any(|e| {
+                            e.origin == *origin
+                                && e.id.eq_ignore_ascii_case(id)
+                                && e.version != entry.version
+                        })
+                });
                 this.sync_languages(cx);
                 cx.notify();
             })
@@ -275,6 +311,7 @@ impl ExtensionStore {
         let specs: Vec<syntax::LanguageSpec> = self
             .installed
             .iter()
+            .filter(|extension| !self.is_off(extension.origin, &extension.id))
             .flat_map(|extension| &extension.languages)
             .filter_map(|language| {
                 let grammar = language.grammar.as_ref()?;
@@ -310,6 +347,7 @@ impl ExtensionStore {
         };
         self.snippets
             .iter()
+            .filter(|set| !self.state.is_off(set.owner.0, &set.owner.1))
             .filter(|set| applies(&set.languages))
             .flat_map(|set| &set.snippets)
             .filter(|snippet| applies(&snippet.scopes))
@@ -322,6 +360,7 @@ impl ExtensionStore {
         self.installed
             .iter()
             .filter(|extension| extension.runs_code())
+            .filter(|extension| !self.is_off(extension.origin, &extension.id))
             .find_map(|extension| {
                 let server = extension
                     .servers
@@ -439,7 +478,9 @@ impl ExtensionStore {
         .detach();
     }
 
-    /// Downloads and installs `entry`, replacing an older copy.
+    /// Downloads `entry` and installs it over an older copy. If it would do
+    /// something outside a sandbox that it was not allowed before, it waits
+    /// in `pending` for [`Self::allow`] or [`Self::refuse`].
     pub fn install(&mut self, entry: Entry, cx: &mut Context<Self>) {
         let key = key(entry.origin, &entry.id);
         if self.installing.contains_key(&key) {
@@ -448,8 +489,11 @@ impl ExtensionStore {
         let progress = Progress::new();
         self.installing.insert(key.clone(), progress.clone());
         self.errors.remove(&key);
+        // A download of the same extension takes the staging folder of one
+        // that was waiting.
+        self.pending.remove(&key);
         cx.notify();
-        let installing = install::install(entry, self.root.clone(), progress);
+        let fetching = install::fetch(entry, self.root.clone(), progress);
         // The download reports through atomics; repaint while it runs.
         let ticking = key.clone();
         cx.spawn(async move |this, cx| {
@@ -468,11 +512,16 @@ impl ExtensionStore {
         })
         .detach();
         cx.spawn(async move |this, cx| {
-            let result = installing.await;
+            let fetched = fetching.await;
             this.update(cx, |this, cx| {
                 this.installing.remove(&key);
-                match result {
-                    Ok(_) => this.scan(cx),
+                match fetched {
+                    Ok(staged) if this.state.asks(&staged.extension).is_empty() => {
+                        this.commit(key, staged, cx)
+                    }
+                    Ok(staged) => {
+                        this.pending.insert(key, staged);
+                    }
                     Err(error) => {
                         this.errors.insert(key, error);
                     }
@@ -482,6 +531,155 @@ impl ExtensionStore {
             .ok();
         })
         .detach();
+    }
+
+    /// Puts a fetched extension in place and reads the folder again.
+    fn commit(&mut self, key: Key, staged: Staged, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { install::commit(staged, &root) })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(_) => {
+                        this.updates.remove(&key);
+                    }
+                    Err(error) => {
+                        this.errors.insert(key, error);
+                    }
+                }
+                this.scan(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// What the extension waiting under this id would do outside a sandbox
+    /// that it was not allowed yet.
+    pub fn asks(&self, origin: Origin, id: &str) -> Vec<String> {
+        self.pending
+            .get(&key(origin, id))
+            .map(|staged| self.state.asks(&staged.extension))
+            .unwrap_or_default()
+    }
+
+    /// The user read what the waiting extension would do and agreed.
+    pub fn allow(&mut self, origin: Origin, id: &str, cx: &mut Context<Self>) {
+        let key = key(origin, id);
+        let Some(staged) = self.pending.remove(&key) else {
+            return;
+        };
+        self.state.allow(&staged.extension);
+        self.save_state(cx);
+        self.commit(key, staged, cx);
+        cx.notify();
+    }
+
+    /// The user did not agree: the download is dropped.
+    pub fn refuse(&mut self, origin: Origin, id: &str, cx: &mut Context<Self>) {
+        if let Some(staged) = self.pending.remove(&key(origin, id)) {
+            cx.background_executor()
+                .spawn(async move { install::discard(staged) })
+                .detach();
+            cx.notify();
+        }
+    }
+
+    /// Writes the decisions next to the extensions, off the UI thread.
+    fn save_state(&self, cx: &mut Context<Self>) {
+        let (state, root) = (self.state.clone(), self.root.clone());
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(error) = state.save(&root) {
+                    eprintln!("extensions: could not save state.json: {error}");
+                }
+            })
+            .detach();
+    }
+
+    pub fn is_off(&self, origin: Origin, id: &str) -> bool {
+        self.state.is_off(origin, id)
+    }
+
+    /// Turns an extension off or on without removing it. Off, its languages,
+    /// snippets and servers are not used.
+    pub fn set_off(&mut self, origin: Origin, id: &str, off: bool, cx: &mut Context<Self>) {
+        self.state.set_off(origin, id, off);
+        self.save_state(cx);
+        if let Some(extension) = self.find(origin, id) {
+            let id = extension.id.clone();
+            self.hosts.remove(&id);
+        }
+        self.sync_languages(cx);
+        cx.notify();
+    }
+
+    pub fn is_kept(&self, origin: Origin, id: &str) -> bool {
+        self.state.is_kept(origin, id)
+    }
+
+    /// Keeps an extension on the version it has, or lets it follow updates.
+    pub fn set_kept(&mut self, origin: Origin, id: &str, kept: bool, cx: &mut Context<Self>) {
+        self.state.set_kept(origin, id, kept);
+        self.save_state(cx);
+        if kept {
+            self.updates.remove(&key(origin, id));
+        } else {
+            self.check_updates(cx);
+        }
+        cx.notify();
+    }
+
+    /// Asks the catalogs for the newest versions of what is installed and
+    /// not kept back. Called when the Extensions tab is opened.
+    pub fn check_updates(&mut self, cx: &mut Context<Self>) {
+        for origin in [Origin::Zed, Origin::VsCode] {
+            // A catalog knows an extension by the name of its folder.
+            let ids: Vec<String> = self
+                .installed
+                .iter()
+                .filter(|e| e.origin == origin && !self.state.is_kept(origin, &e.id))
+                .filter_map(|e| Some(e.dir.file_name()?.to_string_lossy().into_owned()))
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            let base = match origin {
+                Origin::Zed => self.zed_url.clone(),
+                Origin::VsCode => self.open_vsx_url.clone(),
+            };
+            let asking = catalog::latest(origin, &base, ids);
+            cx.spawn(async move |this, cx| {
+                // A catalog that cannot be reached offers no updates; the
+                // list above already says so when it is searched.
+                let Ok(newest) = asking.await else {
+                    return;
+                };
+                this.update(cx, |this, cx| {
+                    for entry in newest {
+                        let newer = this
+                            .find(origin, &entry.id)
+                            .is_some_and(|installed| installed.version != entry.version);
+                        if newer && !this.state.is_kept(origin, &entry.id) {
+                            this.updates.insert(key(origin, &entry.id), entry);
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    /// Installs every update there is.
+    pub fn update_all(&mut self, cx: &mut Context<Self>) {
+        for entry in self.updates.values().cloned().collect::<Vec<_>>() {
+            self.install(entry, cx);
+        }
     }
 
     pub fn cancel(&mut self, origin: Origin, id: &str) {
@@ -502,6 +700,11 @@ impl ExtensionStore {
         };
         let key = key(origin, id);
         let root = self.root.clone();
+        // Installed again later, it is a first install: on, following
+        // updates, and asked what it may do.
+        self.state.forget(origin, id);
+        self.updates.remove(&key);
+        self.save_state(cx);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()

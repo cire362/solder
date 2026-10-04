@@ -159,6 +159,10 @@ pattern for new widgets instead of calling `cx.propagate()` everywhere.
   `crates/solder/tests/fixtures/mock_lsp.py`, git tests create a throwaway
   repository, database drivers run against the servers CI starts
   (`crates/db/tests/servers.rs`, see CONTRIBUTING.md). Call `cx.executor().allow_parking()` and poll with a timeout.
+- `debug_bounds` in a UI test says where an element was last drawn, and
+  GPUI 0.2.2 never forgets one: it cannot tell that an element is gone.
+  Assert that on the state behind it. For one that should appear, wait for
+  it (`bounds_soon` in `workspace.rs`) and do not look in the same breath.
 - Tests must not depend on tools that may be missing on CI (CI is Ubuntu:
   `git`, `python3` and `/bin/sh` are there; `rust-analyzer` is not).
 
