@@ -327,6 +327,14 @@ impl ExtensionStore {
                 })
             })
             .collect();
+        // The servers extensions bring may have changed with them, also
+        // for languages Solder has on its own. Told once this update is
+        // over: the documents ask this store which servers are theirs.
+        cx.defer(|cx| {
+            if let Some(lsp) = LspStore::global(cx) {
+                lsp.update(cx, |lsp, cx| lsp.extension_servers_changed(cx));
+            }
+        });
         if specs == self.languages {
             return;
         }
@@ -354,29 +362,31 @@ impl ExtensionStore {
             .collect()
     }
 
-    /// The server an installed extension brings for `language`, if its code
-    /// is one Solder runs.
-    pub fn server_for(&self, language: &str) -> Option<ExtensionServer> {
+    /// The servers installed extensions bring for `language`: every one
+    /// that lists it, of every extension that is on and whose code Solder
+    /// runs, in the order the extensions and their manifests give.
+    pub fn servers_for(&self, language: &str) -> Vec<ExtensionServer> {
         self.installed
             .iter()
             .filter(|extension| extension.runs_code())
             .filter(|extension| !self.is_off(extension.origin, &extension.id))
-            .find_map(|extension| {
-                let server = extension
+            .flat_map(|extension| {
+                extension
                     .servers
                     .iter()
-                    .find(|server| server.languages.iter().any(|l| l == language))?;
-                Some(ExtensionServer {
-                    extension: extension.id.clone(),
-                    id: server.id.clone(),
-                    name: server.name.clone(),
-                    language_id: server
-                        .language_ids
-                        .iter()
-                        .find(|(name, _)| name == language)
-                        .map(|(_, id)| id.clone()),
-                })
+                    .filter(|server| server.languages.iter().any(|l| l == language))
+                    .map(|server| ExtensionServer {
+                        extension: extension.id.clone(),
+                        id: server.id.clone(),
+                        name: server.name.clone(),
+                        language_id: server
+                            .language_ids
+                            .iter()
+                            .find(|(name, _)| name == language)
+                            .map(|(_, id)| id.clone()),
+                    })
             })
+            .collect()
     }
 
     /// Asks the extension how to start `server` for the project in `root`.

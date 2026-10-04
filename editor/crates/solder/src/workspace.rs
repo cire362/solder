@@ -740,11 +740,11 @@ impl Workspace {
                     this.apply_workspace_edit(edit.clone(), *encoding, cx)
                 }
                 EditorEvent::StageRows { rows } => this.stage_rows(editor, rows.clone(), cx),
-                EditorEvent::ShowCodeActions { actions, encoding } => {
+                EditorEvent::ShowCodeActions { actions } => {
                     if actions.is_empty() {
                         return;
                     }
-                    let picker = CodeActionPicker::new(editor.clone(), actions.clone(), *encoding);
+                    let picker = CodeActionPicker::new(editor.clone(), actions.clone());
                     this.toggle_modal(window, cx, move |window, cx| {
                         Picker::new(picker, window, cx)
                     });
@@ -9315,9 +9315,9 @@ mod tests {
         });
         cx.update(|window, cx| window.focus(&editor.focus_handle(cx)));
         wait_for(cx, "the language server", &|cx| {
-            lsp.read(cx)
-                .capabilities(editor.read(cx).document())
-                .is_some()
+            !lsp.read(cx)
+                .all_capabilities(editor.read(cx).document())
+                .is_empty()
         });
         assert_eq!(cx.read(|cx| lsp.read(cx).status().cloned()), None);
 
@@ -9360,5 +9360,172 @@ mod tests {
             installed.unwrap().provides(),
             "1 language, 1 language server"
         );
+    }
+
+    #[gpui::test]
+    fn a_file_with_two_language_servers_gets_the_answers_of_both(cx: &mut TestAppContext) {
+        // Rust has a server Solder knows; here it is the mock. An installed
+        // extension brings a second one for the language: Zed's real HTML
+        // extension, whose code finds "its" server on the PATH, where the
+        // test has put the mock again, tagged so its answers can be told
+        // apart, and counting columns in UTF-16 where the first counts bytes.
+        let root = db::testing::dir("ws-two-servers").canonicalize().unwrap();
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let file = root.join("src/main.rs");
+        std::fs::write(&file, "fn helper() {}\n// TODO one\n// FIXME two\n").unwrap();
+        let mock = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        let scratch = db::testing::dir("ws-two-servers-second");
+        let script = scratch.join("vscode-html-language-server");
+        write_file(
+            &script,
+            &format!(
+                "#!/bin/sh\nMOCK_LSP_TAG=second exec python3 '{}'\n",
+                mock.display()
+            ),
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let data = db::testing::dir("ws-two-servers-data");
+        let installed = data.join("extensions/zed/second");
+        write_file(
+            &installed.join("extension.toml"),
+            "id = \"second\"\nname = \"Second\"\nversion = \"1.0.0\"\nschema_version = 1\n\n[lib]\nkind = \"Rust\"\nversion = \"0.7.0\"\n\n[language_servers.vscode-html-language-server]\nlanguage = \"Rust\"\n",
+        );
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../extension/tests/fixtures/html/extension.wasm"),
+            installed.join("extension.wasm"),
+        )
+        .unwrap();
+        cx.executor().allow_parking();
+        let store = cx.update(|cx| {
+            let store = cx.new(|cx| {
+                let mut store =
+                    ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
+                let world = ServerOnPath(script.to_string_lossy().into_owned());
+                store.world = Some(std::sync::Arc::new(world));
+                store
+            });
+            ExtensionStore::set_global(store.clone(), cx);
+            store.update(cx, |s, cx| s.scan(cx));
+            store
+        });
+        let (ws, cx) = setup(cx, root.clone());
+        cx.update(|_, cx| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "rust-analyzer".into(),
+                settings::ServerOverride {
+                    command: Some("python3".into()),
+                    args: Some(vec![mock.display().to_string()]),
+                    ..Default::default()
+                },
+            );
+            cx.set_global(settings);
+        });
+        wait_for(cx, "the extensions folder", &|cx| store.read(cx).loaded);
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(file.clone(), None, window, cx)
+        });
+        wait_for(cx, "the file", &|cx| ws.read(cx).active_editor().is_some());
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let lsp = cx.read(|cx| LspStore::global(cx).unwrap());
+        wait_for(cx, "both servers", &|cx| {
+            lsp.read(cx)
+                .all_capabilities(editor.read(cx).document())
+                .len()
+                == 2
+        });
+
+        // Each reports its own, and the file shows both, in order.
+        let reported = |cx: &App| -> Vec<(String, &'static str)> {
+            editor
+                .read(cx)
+                .doc(cx)
+                .diagnostics()
+                .iter()
+                .map(|d| (d.message.clone(), d.server))
+                .collect()
+        };
+        wait_for(cx, "the diagnostics of both", &|cx| reported(cx).len() == 2);
+        assert_eq!(
+            cx.read(|cx| reported(cx)),
+            [
+                ("found TODO".to_string(), "rust-analyzer"),
+                ("found FIXME".to_string(), "vscode-html-language-server"),
+            ]
+        );
+        // One of them changing its mind leaves the other's in place: the
+        // word the second reports is edited away.
+        editor.update_in(cx, |e, _, cx| {
+            let at = e.text(cx).find("FIXME").unwrap();
+            e.select_range(at..at + 5, cx)
+        });
+        cx.update(|window, cx| window.focus(&editor.focus_handle(cx)));
+        cx.simulate_input("LATER");
+        wait_for(cx, "the second to take its report back", &|cx| {
+            reported(cx) == [("found TODO".to_string(), "rust-analyzer")]
+        });
+
+        // Completions come from both in one menu.
+        editor.update_in(cx, |e, _, cx| {
+            let end = e.text(cx).len();
+            e.select_range(end..end, cx)
+        });
+        cx.simulate_input("pri");
+        wait_for(cx, "completions of both", &|cx| {
+            editor.read(cx).completion.as_ref().is_some_and(|menu| {
+                let has = |label: &str| menu.items.iter().any(|item| item.label == label);
+                has("println") && has("second_println")
+            })
+        });
+        cx.simulate_keystrokes("escape");
+
+        // Code actions are listed together, and one that is picked goes
+        // back to the server it came from to be filled in.
+        cx.simulate_keystrokes("secondary-.");
+        wait_for(cx, "code actions", &|cx| ws.read(cx).modal.is_some());
+        cx.simulate_input("second add");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the second server's edit", &|cx| {
+            editor.read(cx).text(cx).starts_with("// header second\n")
+        });
+        cx.simulate_keystrokes("secondary-.");
+        wait_for(cx, "code actions again", &|cx| ws.read(cx).modal.is_some());
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the first server's edit", &|cx| {
+            editor
+                .read(cx)
+                .text(cx)
+                .starts_with("// header\n// header second\n")
+        });
+
+        // Turning the extension off leaves the file with the first server
+        // only, and takes the second's reports with it.
+        editor.update_in(cx, |e, _, cx| {
+            let end = e.text(cx).len();
+            e.select_range(end..end, cx)
+        });
+        cx.simulate_input("\n// FIXME again\n");
+        wait_for(cx, "a report of the second", &|cx| {
+            reported(cx)
+                .iter()
+                .any(|(_, server)| *server == "vscode-html-language-server")
+        });
+        store.update(cx, |store, cx| {
+            store.set_off(Origin::Zed, "second", true, cx)
+        });
+        wait_for(cx, "the second server to leave the file", &|cx| {
+            lsp.read(cx)
+                .all_capabilities(editor.read(cx).document())
+                .len()
+                == 1
+                && reported(cx)
+                    .iter()
+                    .all(|(_, server)| *server == "rust-analyzer")
+        });
     }
 }

@@ -228,8 +228,7 @@ pub enum EditorEvent {
     RenameRequested { current: String },
     /// Code actions for the cursor came back; the workspace shows a picker.
     ShowCodeActions {
-        actions: Vec<lsp::types::CodeActionOrCommand>,
-        encoding: lsp::Encoding,
+        actions: Vec<crate::lsp_store::ServerAction>,
     },
     /// Stage these rows of the file (the workspace owns the repository).
     StageRows { rows: Range<usize> },

@@ -98,7 +98,7 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
       its themes and snippets and points to the Zed one for its language
 - [x] Language servers of Zed extensions: the extension's own code, run in
       wasmtime, gets the server (npm, a GitHub release) and says how to start
-      it. One server per language
+      it
 - [x] Extensions built for every version of Zed's API so far, 0.0.1 to 0.7:
       each of its nine worlds has its bindings, over one implementation
 - [ ] The plugin registry (needs the hosted service)
@@ -134,9 +134,10 @@ to build them.
 - [x] A section on extensions in `editor/README.md` and in the website's docs
 
 ### Zed extensions, complete
-- [ ] Every language server an extension lists for a language, not only the
-      first, with their answers merged (completions, diagnostics, actions).
-      Vue needs this, and Dockerfile has two
+- [x] Every language server an extension lists for a language, not only the
+      first, next to the one Solder knows for it, with their answers merged
+      (completions, diagnostics, actions). Dockerfile has two; Vue needs the
+      next item as well
 - [ ] One extension setting up another's server
       (`language-server-additional-*`: Vue adds its plugin to the TypeScript
       server)

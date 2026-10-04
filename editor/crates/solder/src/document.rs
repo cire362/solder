@@ -39,6 +39,9 @@ pub struct Diagnostic {
     pub severity: Severity,
     pub message: String,
     pub source: Option<String>,
+    /// The language server that reported it. A file may have several, and
+    /// each replaces only its own.
+    pub server: &'static str,
 }
 
 pub enum DocumentEvent {

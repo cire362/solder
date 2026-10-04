@@ -679,7 +679,7 @@ here.
 
 | From | Solder uses | Does not run here |
 |---|---|---|
-| A Zed extension | Languages (highlighting, and the languages inside them), snippets, themes, one language server | Icon themes, slash commands, context servers, debug adapters |
+| A Zed extension | Languages (highlighting, and the languages inside them), snippets, themes, its language servers | Icon themes, slash commands, context servers, debug adapters |
 | A VS Code extension | Themes (JSON), snippets | Its code, TextMate grammars, everything the code would add |
 
 A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
@@ -694,6 +694,12 @@ program to start. That code runs in a sandbox with a memory limit and a
 budget for each call; its files are one folder
 (`extensions/work/<id>` in the app's data folder). The server itself is a
 program Solder starts with your rights, as Zed does.
+
+A file can have several servers: the one Solder knows for its language and
+every one that installed extensions bring for it. Their diagnostics show
+together, their completions make one menu and their code actions one list;
+a request with one answer (hover, definition, rename, formatting) goes to
+the first server that says it gives it.
 
 That is why such an extension **asks first**. It is downloaded and read, and
 then waits: the tab shows what installing it allows (the servers it gets, the

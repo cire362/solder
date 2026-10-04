@@ -50,13 +50,20 @@ def rng(text, start, end):
     return {"start": position(text, start), "end": position(text, end)}
 
 
+# A test that runs two servers on one file starts the second with
+# MOCK_LSP_TAG set. Tagged, the server reports other words, offers another
+# completion and names its actions after itself, so the test can tell whose
+# answer is whose. UTF-16 positions make its ranges differ from the first's.
+TAG = os.environ.get("MOCK_LSP_TAG", "")
+
+
 def publish(uri):
     text = docs[uri]
     diags = []
-    for word, severity in (("TODO", 2), ("boom", 1)):
+    for word, severity in ((("FIXME", 2),) if TAG else (("TODO", 2), ("boom", 1))):
         for m in re.finditer(word, text):
             diags.append({"range": rng(text, m.start(), m.end()), "severity": severity,
-                          "message": f"found {word}", "source": "mock"})
+                          "message": f"found {word}", "source": TAG or "mock"})
     send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
           "params": {"uri": uri, "diagnostics": diags}})
 
@@ -90,7 +97,7 @@ while True:
     if method == "initialize":
         note("initialize", params.get("initializationOptions"))
         send({"jsonrpc": "2.0", "id": mid, "result": {"capabilities": {
-            "positionEncoding": "utf-8",
+            "positionEncoding": "utf-16" if TAG else "utf-8",
             "textDocumentSync": 2,
             "completionProvider": {"triggerCharacters": ["."]},
             "hoverProvider": True,
@@ -127,6 +134,8 @@ while True:
             {"label": "println", "kind": 3, "insertText": "println!(\"$1\")", "insertTextFormat": 2},
             {"label": "print", "kind": 3, "detail": "macro"},
             {"label": "helper", "kind": 3},
+        ] if not TAG else [
+            {"label": f"{TAG}_println", "kind": 3},
         ]})
     elif method == "textDocument/hover":
         send({"jsonrpc": "2.0", "id": mid, "result": {"contents": {
@@ -157,14 +166,16 @@ while True:
             {"range": rng(text, 0, len(text.encode())), "newText": formatted}]})
     elif method == "textDocument/codeAction":
         uri = params["textDocument"]["uri"]
+        prefix = f"{TAG}: " if TAG else ""
         send({"jsonrpc": "2.0", "id": mid, "result": [
-            {"title": "Add header", "data": {"uri": uri}},
+            {"title": prefix + "Add header", "data": {"uri": uri, "by": TAG}},
             {"title": "Touch file", "command": {"title": "Touch file", "command": "mock.touch", "arguments": [uri]}},
         ]})
     elif method == "codeAction/resolve":
         uri = params["data"]["uri"]
         zero = {"line": 0, "character": 0}
-        params["edit"] = {"changes": {uri: [{"range": {"start": zero, "end": zero}, "newText": "// header\n"}]}}
+        by = (params["data"].get("by") or "") + ("" if TAG == (params["data"].get("by") or "") else " (asked of the wrong server)")
+        params["edit"] = {"changes": {uri: [{"range": {"start": zero, "end": zero}, "newText": f"// header {by}".rstrip() + "\n"}]}}
         send({"jsonrpc": "2.0", "id": mid, "result": params})
     elif method == "workspace/executeCommand":
         uri = params["arguments"][0]

@@ -12,6 +12,7 @@ use crate::{
     editor::Editor,
     editor_lsp::LspLocation,
     fuzzy,
+    lsp_store::ServerAction,
     picker::{Picker, PickerDelegate, highlighted_text},
     theme::{ActiveTheme, UI_FONT_SIZE},
     workspace::{Jump, Workspace},
@@ -255,32 +256,26 @@ impl PickerDelegate for RenamePrompt {
     }
 }
 
-/// `cmd-.`: pick one of the server's code actions.
+/// `cmd-.`: pick one of the code actions the file's servers offer.
 pub struct CodeActionPicker {
     editor: Entity<Editor>,
-    actions: Vec<lsp::types::CodeActionOrCommand>,
-    encoding: lsp::Encoding,
+    actions: Vec<ServerAction>,
     matches: Vec<(usize, Vec<u32>)>,
     selected: usize,
 }
 
 impl CodeActionPicker {
-    pub fn new(
-        editor: Entity<Editor>,
-        actions: Vec<lsp::types::CodeActionOrCommand>,
-        encoding: lsp::Encoding,
-    ) -> Self {
+    pub fn new(editor: Entity<Editor>, actions: Vec<ServerAction>) -> Self {
         Self {
             editor,
             actions,
-            encoding,
             matches: Vec::new(),
             selected: 0,
         }
     }
 
-    fn title(action: &lsp::types::CodeActionOrCommand) -> &str {
-        match action {
+    fn title(action: &ServerAction) -> &str {
+        match &action.action {
             lsp::types::CodeActionOrCommand::Command(c) => &c.title,
             lsp::types::CodeActionOrCommand::CodeAction(a) => &a.title,
         }
@@ -331,9 +326,8 @@ impl PickerDelegate for CodeActionPicker {
             return;
         };
         let action = self.actions[*ix].clone();
-        let encoding = self.encoding;
         self.editor
-            .update(cx, |e, cx| e.apply_code_action(action, encoding, cx));
+            .update(cx, |e, cx| e.apply_code_action(action, cx));
         cx.emit(DismissEvent);
     }
 
