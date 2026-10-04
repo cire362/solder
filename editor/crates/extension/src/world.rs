@@ -31,6 +31,31 @@ const FETCH_LIMIT: usize = 64 * 1024 * 1024;
 /// Hears what an extension says about a server it is getting ready.
 type OnStatus = Box<dyn Fn(&str, Status) + Send + Sync>;
 
+/// Gives the user's settings for a category and a key, as JSON, or `None`
+/// when nothing is set there.
+pub type SettingsFor = std::sync::Arc<dyn Fn(&str, Option<&str>) -> Option<String> + Send + Sync>;
+
+/// A language server's settings in the shape Zed's API gives an extension:
+/// the program to run in place of its own, and what the server is sent.
+pub fn lsp_settings(
+    command: Option<&str>,
+    args: Option<&[String]>,
+    initialization_options: Option<&Value>,
+    settings: Option<&Value>,
+) -> String {
+    serde_json::json!({
+        "binary": command.map(|path| serde_json::json!({ "path": path, "arguments": args })),
+        "initialization_options": initialization_options,
+        "settings": settings,
+    })
+    .to_string()
+}
+
+/// A language's settings in the shape Zed's API gives an extension.
+pub fn language_settings(tab_size: usize) -> String {
+    serde_json::json!({ "tab_size": tab_size.max(1) }).to_string()
+}
+
 pub struct System {
     /// The environment the user's tools start with: their shell's, where
     /// PATH has Node and whatever else they installed.
@@ -39,6 +64,9 @@ pub struct System {
     pub npm: String,
     /// Where GitHub's API is; tests point it at a local server.
     pub github: String,
+    /// The user's settings, for extensions that ask. The app gives this;
+    /// without it they see none.
+    pub settings: Option<SettingsFor>,
     on_status: OnStatus,
 }
 
@@ -51,6 +79,7 @@ impl System {
             env,
             npm: "npm".into(),
             github: GITHUB.into(),
+            settings: None,
             on_status: Box::new(on_status),
         }
     }
@@ -416,6 +445,10 @@ impl World for System {
     fn status(&self, server: &str, status: Status) {
         (self.on_status)(server, status);
     }
+
+    fn settings(&self, category: &str, key: Option<&str>) -> Option<String> {
+        self.settings.as_ref()?(category, key)
+    }
 }
 
 #[cfg(test)]
@@ -463,6 +496,48 @@ mod tests {
                 .unwrap_err()
                 .starts_with("Node.js was not found")
         );
+    }
+
+    #[test]
+    fn settings_have_the_shape_extensions_read() {
+        let json = |text: String| serde_json::from_str::<Value>(&text).unwrap();
+        let args = vec!["--stdio".to_string()];
+        let options = serde_json::json!({ "provideFormatter": false });
+        assert_eq!(
+            json(lsp_settings(
+                Some("/opt/bin/ls"),
+                Some(&args),
+                Some(&options),
+                None
+            )),
+            serde_json::json!({
+                "binary": { "path": "/opt/bin/ls", "arguments": ["--stdio"] },
+                "initialization_options": { "provideFormatter": false },
+                "settings": null
+            })
+        );
+        // Nothing set: every part is null, as when Zed has none.
+        assert_eq!(
+            json(lsp_settings(None, None, None, None)),
+            serde_json::json!({ "binary": null, "initialization_options": null, "settings": null })
+        );
+        assert_eq!(
+            json(language_settings(2)),
+            serde_json::json!({ "tab_size": 2 })
+        );
+        // An extension reads this into a number that cannot be zero.
+        assert_eq!(
+            json(language_settings(0)),
+            serde_json::json!({ "tab_size": 1 })
+        );
+
+        let mut world = system(&[]);
+        assert_eq!(world.settings("lsp", Some("vue")), None);
+        world.settings = Some(std::sync::Arc::new(|category, key| {
+            (category == "lsp" && key == Some("vue")).then(|| "{}".to_string())
+        }));
+        assert_eq!(world.settings("lsp", Some("vue")), Some("{}".to_string()));
+        assert_eq!(world.settings("lsp", Some("html")), None);
     }
 
     #[test]

@@ -18,12 +18,17 @@ use extension::{
     Entry, Extension, Origin, Snippet, catalog,
     host::{Host, Status, World},
     install::{self, Progress, Staged},
-    world::System,
+    world::{SettingsFor, System},
 };
 use futures::{StreamExt, channel::mpsc};
 use gpui::{App, AppContext, Context, Entity, Global, SharedString, Task, WeakEntity};
 
-use crate::{document::Document, import_settings, lsp_store::LspStore};
+use crate::{
+    document::Document,
+    import_settings,
+    lsp_store::LspStore,
+    settings::{ServerOverride, Settings},
+};
 
 /// An extension by where it is from and its id in lowercase: the two
 /// catalogs do not agree with the manifests on the case of ids.
@@ -125,6 +130,10 @@ pub struct ExtensionStore {
     pub world: Option<Arc<dyn World>>,
     /// Where extensions report on the servers they are getting ready.
     statuses: mpsc::UnboundedSender<(String, Status)>,
+    /// The user's settings as extensions ask for them. They ask from their
+    /// own threads, so this is a copy, renewed when the settings change.
+    asked: Arc<Mutex<Asked>>,
+    _settings: gpui::Subscription,
     _pump: Task<()>,
 }
 
@@ -136,22 +145,29 @@ fn host_in(
     work_dir: &Path,
     world: Option<Arc<dyn World>>,
     statuses: mpsc::UnboundedSender<(String, Status)>,
+    settings: SettingsFor,
 ) -> Result<Arc<Host>, String> {
     let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(host) = &*slot {
         return Ok(host.clone());
     }
     let world = world.unwrap_or_else(|| {
-        Arc::new(System::new(
-            extension::world::user_env(),
-            move |server, status| {
-                let _ = statuses.unbounded_send((server.to_string(), status));
-            },
-        ))
+        let mut system = System::new(extension::world::user_env(), move |server, status| {
+            let _ = statuses.unbounded_send((server.to_string(), status));
+        });
+        system.settings = Some(settings);
+        Arc::new(system)
     });
     let host = Arc::new(Host::load(extension, work_dir, world)?);
     *slot = Some(host.clone());
     Ok(host)
+}
+
+/// What of the user's settings extensions may ask for.
+#[derive(Default)]
+struct Asked {
+    servers: std::collections::BTreeMap<String, ServerOverride>,
+    indent: usize,
 }
 
 struct GlobalExtensionStore(Entity<ExtensionStore>);
@@ -183,6 +199,18 @@ impl ExtensionStore {
                 }
             }
         });
+        let asked = Arc::new(Mutex::new(Asked::default()));
+        let copy = |asked: &Mutex<Asked>, cx: &App| {
+            if let Some(settings) = cx.try_global::<Settings>() {
+                *asked.lock().unwrap_or_else(|e| e.into_inner()) = Asked {
+                    servers: settings.language_servers.clone(),
+                    indent: settings.indent_size,
+                };
+            }
+        };
+        copy(&asked, cx);
+        let watched = asked.clone();
+        let watching = cx.observe_global::<Settings>(move |_, cx| copy(&watched, cx));
         Self {
             root,
             config,
@@ -206,6 +234,8 @@ impl ExtensionStore {
             resolved: Arc::default(),
             world: None,
             statuses,
+            asked,
+            _settings: watching,
             _pump: pump,
         }
     }
@@ -233,6 +263,31 @@ impl ExtensionStore {
         cx.set_global(GlobalExtensionStore(store.clone()));
         store.update(cx, |s, cx| s.scan(cx));
         store
+    }
+
+    /// The user's settings in the form an extension asks for them: for a
+    /// server, by the name it asks with, what `language_servers` has under
+    /// that name; for a language, the indent. Nothing set gives `None`.
+    pub fn settings_for(&self) -> SettingsFor {
+        let asked = self.asked.clone();
+        Arc::new(move |category, key| {
+            let asked = asked.lock().unwrap_or_else(|e| e.into_inner());
+            match category {
+                "lsp" => {
+                    let server = asked.servers.get(key?)?;
+                    Some(extension::world::lsp_settings(
+                        server.command.as_deref(),
+                        server.args.as_deref(),
+                        server.initialization_options.as_ref(),
+                        server.settings.as_ref(),
+                    ))
+                }
+                "language" if asked.indent > 0 => {
+                    Some(extension::world::language_settings(asked.indent))
+                }
+                _ => None,
+            }
+        })
     }
 
     pub fn try_global(cx: &App) -> Option<Entity<ExtensionStore>> {
@@ -449,13 +504,14 @@ impl ExtensionStore {
         let world = self.world.clone();
         let statuses = self.statuses.clone();
         let resolved = self.resolved.clone();
+        let settings = self.settings_for();
         let (id, root) = (server.id.clone(), root.to_path_buf());
         let (tx, rx) = futures::channel::oneshot::channel();
         let spawned = std::thread::Builder::new()
             .name("solder-extension".into())
             .spawn(move || {
                 let answer = (|| {
-                    let host = host_in(&slot, &extension, &work_dir, world, statuses)?;
+                    let host = host_in(&slot, &extension, &work_dir, world, statuses, settings)?;
                     let json = |text: Option<String>| {
                         text.and_then(|text| serde_json::from_str(&text).ok())
                     };
@@ -505,6 +561,7 @@ impl ExtensionStore {
         let world = self.world.clone();
         let statuses = self.statuses.clone();
         let resolved = self.resolved.clone();
+        let settings = self.settings_for();
         let (target, root) = (target.to_string(), root.to_path_buf());
         let (tx, rx) = futures::channel::oneshot::channel();
         let spawned = std::thread::Builder::new()
@@ -527,6 +584,7 @@ impl ExtensionStore {
                         &work_dir,
                         world.clone(),
                         statuses.clone(),
+                        settings.clone(),
                     ) else {
                         continue;
                     };

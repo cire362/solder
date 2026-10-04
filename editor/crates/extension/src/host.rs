@@ -103,6 +103,14 @@ pub trait World: Send + Sync + 'static {
     /// The environment programs of the project start with.
     fn env(&self) -> Vec<(String, String)>;
     fn status(&self, server: &str, status: Status);
+    /// The user's settings as an extension asks for them: for a language
+    /// server (`lsp`, by the name the extension knows it under) or a
+    /// language (`language`, by its name), in the JSON Zed's API gives.
+    /// `None` when the user set nothing: the extension then sees what Zed
+    /// gives in that case.
+    fn settings(&self, _category: &str, _key: Option<&str>) -> Option<String> {
+        None
+    }
 }
 
 /// Adds `more` to `into`, the way one extension's options are added to a
@@ -221,10 +229,9 @@ fn declared(commands: &[(String, Vec<String>)], command: &Command) -> bool {
 
 // ------------------------------------------- what every version asks, once
 
-/// The user's settings for a language or a server. Solder has none of its
-/// own for either yet, so an extension sees what Zed gives when nothing is
-/// set.
-fn settings(category: &str) -> Result<String, String> {
+/// What an extension is told the settings are when the user set none: what
+/// Zed gives in that case.
+fn unset(category: &str) -> Result<String, String> {
     match category {
         "language" => Ok(r#"{"tab_size":4}"#.into()),
         "lsp" => Ok(r#"{"binary":null,"initialization_options":null,"settings":null}"#.into()),
@@ -668,9 +675,11 @@ macro_rules! world_functions {
                 &mut self,
                 _: Option<$bindings::SettingsLocation>,
                 category: String,
-                _key: Option<String>,
+                key: Option<String>,
             ) -> Result<String, String> {
-                settings(&category)
+                self.world
+                    .settings(&category, key.as_deref())
+                    .map_or_else(|| unset(&category), Ok)
             }
 
             fn download_file(

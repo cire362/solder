@@ -9260,6 +9260,25 @@ mod tests {
         }
 
         let (_config, store, ws, cx) = extension_setup(cx, "ext-lsp", &base);
+        // The user has options and settings of their own for this server.
+        // Its extension does not ask for them, so the editor adds them to
+        // what the extension says.
+        cx.update(|_, cx| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "vscode-html-language-server".into(),
+                settings::ServerOverride {
+                    initialization_options: Some(
+                        serde_json::json!({ "embeddedLanguages": { "css": true } }),
+                    ),
+                    settings: Some(
+                        serde_json::json!({ "html": { "format": { "enable": false } } }),
+                    ),
+                    ..Default::default()
+                },
+            );
+            cx.set_global(settings);
+        });
         let world = ServerOnPath(script.to_string_lossy().into_owned());
         store.update(cx, |store, _| {
             store.world = Some(std::sync::Arc::new(world))
@@ -9336,7 +9355,14 @@ mod tests {
         });
         assert_eq!(
             sent("initialize"),
-            Some(serde_json::json!({ "provideFormatter": true }))
+            Some(serde_json::json!({
+                "provideFormatter": true,
+                "embeddedLanguages": { "css": true }
+            }))
+        );
+        assert_eq!(
+            sent("configuration"),
+            Some(serde_json::json!({ "html": { "format": { "enable": false } } }))
         );
         assert_eq!(sent("open"), Some(serde_json::json!("html")));
 
@@ -9534,6 +9560,8 @@ mod tests {
     /// extension then looks for.
     struct VueWorld {
         node: String,
+        /// The user's settings, as the store gives them to extensions.
+        settings: extension::world::SettingsFor,
     }
 
     impl extension::host::World for VueWorld {
@@ -9579,6 +9607,9 @@ mod tests {
             Vec::new()
         }
         fn status(&self, _: &str, _: extension::host::Status) {}
+        fn settings(&self, category: &str, key: Option<&str>) -> Option<String> {
+            (self.settings)(category, key)
+        }
     }
 
     /// What a mock server wrote down under `what`, in order.
@@ -9671,6 +9702,7 @@ mod tests {
                     ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
                 store.world = Some(std::sync::Arc::new(VueWorld {
                     node: node.to_string_lossy().into_owned(),
+                    settings: store.settings_for(),
                 }));
                 store
             });
@@ -9686,6 +9718,18 @@ mod tests {
                 settings::ServerOverride {
                     command: Some(typescript.display().to_string()),
                     args: Some(Vec::new()),
+                    ..Default::default()
+                },
+            );
+            // What the user wants of Vue's server, under the name its
+            // extension asks by.
+            settings.language_servers.insert(
+                "vue".into(),
+                settings::ServerOverride {
+                    initialization_options: Some(
+                        serde_json::json!({ "typescript": { "tsdk": "/opt/typescript/lib" } }),
+                    ),
+                    settings: Some(serde_json::json!({ "vue.inlayHints.missingProps": false })),
                     ..Default::default()
                 },
             );
@@ -9736,6 +9780,19 @@ mod tests {
                 == 2
         });
         assert_eq!(noted(&vue_log, "open"), ["vue"]);
+        // The user's settings reached it through its extension, which read
+        // them in place of its own defaults.
+        assert_eq!(
+            noted(&vue_log, "initialize"),
+            [serde_json::json!({ "typescript": { "tsdk": "/opt/typescript/lib" } })]
+        );
+        wait_for(cx, "the settings to reach Vue's server", &|_| {
+            !noted(&vue_log, "configuration").is_empty()
+        });
+        assert_eq!(
+            noted(&vue_log, "configuration"),
+            [serde_json::json!({ "vue.inlayHints.missingProps": false })]
+        );
 
         // Vue's server has the TypeScript server asked something through
         // the editor each time the file changes; the answer goes back.
