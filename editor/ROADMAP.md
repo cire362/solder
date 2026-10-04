@@ -4,7 +4,9 @@ Everything the website promises, grouped into phases. Each phase only depends on
 the ones above it. Optimization work (see README) starts after phase 7.
 Phase 8 goes past what the website promises: it is what it takes for an
 extension made for Zed or VS Code to be installed with one button and work
-as it does in the editor it was made for.
+as it does in the editor it was made for. Phase 9 makes the window the
+user's own: where every panel and button is, how it looks and which keys
+drive it.
 
 Status: `[x]` done, `[~]` partial, `[ ]` not started.
 
@@ -211,3 +213,64 @@ Not tasks, but said so nobody waits for them: extensions whose licence or
 own checks tie them to Microsoft's products (Pylance, C# Dev Kit, Remote
 SSH, Live Share), and anything published only on Microsoft's Marketplace,
 which other editors may not use.
+
+## 9. An editor shaped by its user
+
+Where it stands: keys are the user's (`keymap.json`), and so are the colors
+(a theme file, 34 tokens). The rest is fixed in code: the sidebar is on the
+left and 390 px wide, the chat on the right, the terminal at the bottom, the
+sidebar's tabs and the status bar's items in one order, the interface font
+and its size, and there are no icons, only words.
+
+How it is built: `layout.json`, next to `settings.json`, is the truth and is
+read again when it is saved. Whatever is done by hand in the window (a border
+dragged, a tab moved, a button hidden from its menu) is written to the same
+file, so the two never disagree. It starts after the Zed items of phase 8.
+
+### The layout file
+- [ ] `layout.json`: the sizes that are constants today (sidebar, chat,
+      terminal dock, title bar, tab bar, status bar), read at start and when
+      the file is saved. A mistake in it is reported like one in
+      `settings.json`, and the last layout that was right stays
+- [ ] Docks on the left, right and bottom, and any panel in any of them:
+      Files, Search, Git, Services, Database, API, AI, Extensions, the chat,
+      the agent, the terminal, the debugger. Their order in a dock, which
+      are hidden, which one is open
+- [ ] The title bar and the status bar as lists of items: which are there, in
+      what order, on which side. The tab bar: above or below the editor, or
+      none
+- [ ] An item is drawn as a word, an icon or both, and its command and icon
+      can be changed, so a button for any command can be put on a bar
+- [ ] The interface font, its size and how dense rows are, in
+      `settings.json`
+
+### By hand
+- [ ] Borders are dragged to resize; a double click puts a size back
+- [ ] A panel's tab is dragged to another place in its dock or to another
+      dock; an item of a bar is dragged along it or to the other bar
+- [ ] A menu on every panel tab and bar item: hide, move to, and the list of
+      what is hidden, to bring it back
+- [ ] A command that puts the layout back as it came
+
+### Layouts by name
+- [ ] Several layouts kept by name (writing, review, debugging), switched by
+      a command or a key; the one a project was left in is the one it opens
+      with
+- [ ] Key layouts by name: the built-in one, the ones that follow other
+      editors, and the user's own, switched by a command, with `keymap.json`
+      still on top
+
+### Themes
+- [ ] Every color in the window comes from a token a theme can set: the ones
+      still written in code become tokens
+- [ ] Shapes as tokens next to colors: the radii, the spacing, the width of
+      borders
+- [ ] A theme file is applied as it is saved, and any token can be set in
+      `settings.json` on top of the theme in use
+
+### Icons
+- [ ] A set of icons of Solder's own for buttons, panels and the bars
+      (Phosphor, MIT, drawn from files kept in the app, so nothing is
+      downloaded)
+- [ ] File icons in the tree and on tabs from the icon themes of Zed and
+      VS Code extensions (the items of phase 8), chosen in `settings.json`
