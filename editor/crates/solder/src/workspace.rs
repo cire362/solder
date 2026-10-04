@@ -4278,6 +4278,22 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
+    /// Where an element is, once it is on screen.
+    fn bounds_soon(
+        cx: &mut VisualTestContext,
+        selector: &'static str,
+    ) -> gpui::Bounds<gpui::Pixels> {
+        for _ in 0..500 {
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+            if let Some(bounds) = cx.debug_bounds(selector) {
+                return bounds;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {selector} on screen");
+    }
+
     #[gpui::test]
     fn git_stage_lines_revert_and_commit(cx: &mut TestAppContext) {
         let root = git_fixture("git-flow");
@@ -6885,10 +6901,9 @@ mod tests {
         cx.run_until_parked();
         let pick = cx.debug_bounds("chat-model").unwrap();
         cx.simulate_click(pick.center(), gpui::Modifiers::default());
-        cx.run_until_parked();
-        let model = cx
-            .debug_bounds("chat-model-custom-proxy-model-a")
-            .expect("in the picker");
+        // The list is drawn from the providers' models, which may still be
+        // settling when the picker opens: wait for the row, do not assume it.
+        let model = bounds_soon(cx, "chat-model-custom-proxy-model-a");
         cx.simulate_click(model.center(), gpui::Modifiers::default());
         let chat = cx.read(|cx| ws.read(cx).chat.clone());
         let input = cx.read(|cx| chat.read(cx).input());

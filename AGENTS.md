@@ -120,9 +120,13 @@ Never guess a signature.
   releases, downloads). Its calls block for as long as a download takes:
   `ExtensionStore::resolve` runs them on a thread of their own, never on
   the UI thread or the background executor. The files in
-  `crates/extension/wit` are Zed's and stay as published; a new API version
-  is a new folder next to them. Keep `wasmtime` and `wasmtime-wasi` on the
-  version tree-sitter brings.
+  `crates/extension/wit` are Zed's and stay as published. Each version of
+  the API that changed the world has a folder there and a module in
+  `src/host/`, which is only the bindings and a few macro lines: what the
+  functions do is written once in `host.rs`. A new version is a new folder
+  and a new module, never an edit to an old one, since extensions built for
+  the old one stay in the catalog. Keep `wasmtime` and `wasmtime-wasi` on
+  the version tree-sitter brings.
 
 ### Performance rules
 

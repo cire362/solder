@@ -1035,6 +1035,15 @@ mod tests {
                 highlights: Some(dir.join("highlights.scm")),
                 injections: Some(dir.join("injections.scm")),
             },
+            // The same grammar under a name only one test opens files of, so
+            // that test sees it before anything has compiled it.
+            LanguageSpec {
+                name: "Untouched".into(),
+                suffixes: vec!["untouched".into()],
+                symbol: "vue".into(),
+                grammar: dir.join("vue.wasm"),
+                ..Default::default()
+            },
             LanguageSpec {
                 name: "Dockerfile".into(),
                 suffixes: vec!["Dockerfile".into(), "dockerfile".into()],
@@ -1051,10 +1060,13 @@ mod tests {
     fn an_extension_language_is_found_by_suffix_or_whole_name() {
         let vue = vue();
         assert_eq!(vue.name, "Vue.js");
-        assert!(
-            !vue.is_ready(),
-            "nothing is compiled before a file needs it"
-        );
+        // Nothing is compiled before a file needs it. Asked of a language
+        // no other test parses: the tests share one registry, and by now
+        // another may have opened a Vue file.
+        let untouched = language_for_path(Path::new("a.untouched")).unwrap();
+        assert!(!untouched.is_ready());
+        assert!(SyntaxTree::parse(untouched.clone(), &Rope::from_str("<p>hi</p>")).is_some());
+        assert!(untouched.is_ready());
         let name = |path: &str| language_for_path(Path::new(path)).map(|l| l.name);
         assert_eq!(name("src/Dockerfile"), Some("Dockerfile"));
         assert_eq!(name("api.dockerfile"), Some("Dockerfile"));

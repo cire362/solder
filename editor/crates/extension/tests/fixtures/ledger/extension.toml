@@ -1,0 +1,32 @@
+id = "ledger"
+name = "Ledger"
+version = "0.2.0"
+schema_version = 1
+description = "Support for ledger journal files"
+repository = "https://github.com/mrkstwrt/zed-ledger"
+authors = ["Mark Stewart <me@markstewart.dev>"]
+themes = []
+icon_themes = []
+languages = ["languages/ledger"]
+capabilities = []
+
+[lib]
+kind = "Rust"
+version = "0.3.0"
+
+[grammars.ledger]
+repository = "https://github.com/cbarrete/tree-sitter-ledger"
+rev = "96c92d4908a836bf8f661166721c98439f8afb80"
+
+[language_servers.ledger-language-server]
+language = "Ledger"
+languages = []
+
+[language_servers.ledger-language-server.language_ids]
+Ledger = "ledger"
+
+[context_servers]
+
+[slash_commands]
+
+[indexed_docs_providers]

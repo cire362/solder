@@ -1,5 +1,6 @@
-//! The host against a real extension: Zed's HTML extension, in a world
-//! that answers from a script.
+//! The host against real extensions, in a world that answers from a script:
+//! Zed's HTML extension for the whole path, and one extension for each shape
+//! the API has had before it.
 
 use std::{
     path::{Path, PathBuf},
@@ -57,8 +58,10 @@ impl World for Script {
         Ok(())
     }
 
-    fn release(&self, repo: &str, _: Option<&str>, _: bool) -> Result<Release, String> {
-        Err(format!("unexpected release of {repo}"))
+    /// GitHub cannot be reached: an extension that needs a release says so.
+    fn release(&self, repo: &str, tag: Option<&str>, pre: bool) -> Result<Release, String> {
+        self.note(format!("release {repo} {tag:?} pre={pre}"));
+        Err("GitHub is out of reach".into())
     }
 
     fn download(&self, url: &str, _: &Path, _: FileKind) -> Result<(), String> {
@@ -87,9 +90,15 @@ impl World for Script {
     }
 }
 
-fn html() -> extension::Extension {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/html");
+fn fixture(name: &str) -> extension::Extension {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
     extension::manifest::read(&dir).unwrap()
+}
+
+fn html() -> extension::Extension {
+    fixture("html")
 }
 
 fn work_dir(name: &str) -> PathBuf {
@@ -174,11 +183,11 @@ fn what_cannot_be_run_says_why() {
     let world = Arc::new(Script::default());
     let mut old = html();
     old.code = extension::Code::Zed {
-        api: "0.1.0".into(),
+        api: "0.8.0".into(),
     };
     assert_eq!(
         Host::load(&old, &work, world.clone()).err().unwrap(),
-        "It was built for version 0.1.0 of Zed's extension API, which Solder does not run yet"
+        "It was built for version 0.8.0 of Zed's extension API, which Solder does not run yet"
     );
     let mut plain = html();
     plain.code = extension::Code::None;
@@ -223,4 +232,96 @@ fn what_cannot_be_run_says_why() {
         .language_server_command(SERVER, &work_dir("host-refuse-project"))
         .unwrap_err();
     assert!(error.contains("npm was not found"), "{error}");
+}
+
+/// Loads a fixture in a world where the server is, or is not, on the PATH,
+/// asks for its server, and gives the answer and what the extension did.
+fn ask(name: &str, on_path: Option<&str>) -> (Result<Command, String>, Vec<String>, Host) {
+    let extension = fixture(name);
+    let work = work_dir(&format!("host-{name}-{}", on_path.is_some()));
+    let world = Arc::new(Script {
+        on_path: on_path.map(str::to_string),
+        ..Default::default()
+    });
+    let host = Host::load(&extension, &work, world.clone()).unwrap();
+    let project = work_dir(&format!("host-{name}-project"));
+    let answer = host.language_server_command(&extension.servers[0].id, &project);
+    (answer, world.take(), host)
+}
+
+fn built_for(name: &str) -> String {
+    match fixture(name).code {
+        extension::Code::Zed { api } => api,
+        other => panic!("{name} has {other:?}"),
+    }
+}
+
+#[test]
+fn an_extension_for_the_first_api_is_asked_by_name_and_language() {
+    // 0.0.1: every function belongs to the world itself, and the server is
+    // described by a record. This one goes straight to GitHub.
+    assert_eq!(built_for("pest"), "0.0.1");
+    let (answer, did, host) = ask("pest", None);
+    assert!(answer.unwrap_err().contains("GitHub is out of reach"));
+    assert_eq!(
+        did,
+        [
+            "pest: CheckingForUpdate",
+            "release pest-parser/pest-ide-tools None pre=false",
+        ]
+    );
+    // It has no settings to give, in a version that could not give any.
+    let project = work_dir("host-pest-options");
+    assert_eq!(host.initialization_options("pest", &project), Ok(None));
+    assert_eq!(host.workspace_configuration("pest", &project), Ok(None));
+}
+
+#[test]
+fn an_extension_for_api_0_0_6_is_asked_by_id() {
+    assert_eq!(built_for("nginx"), "0.0.6");
+    assert_eq!(fixture("nginx").servers[0].languages, ["Nginx"]);
+    let (answer, did, host) = ask("nginx", Some("/usr/local/bin/nginx-language-server"));
+    let command = answer.unwrap();
+    assert_eq!(command.command, "/usr/local/bin/nginx-language-server");
+    assert_eq!(did, ["which nginx-language-server"]);
+    let project = work_dir("host-nginx-options");
+    assert_eq!(host.initialization_options("nginx", &project), Ok(None));
+    assert_eq!(host.workspace_configuration("nginx", &project), Ok(None));
+    // Without the server, it says what to install in its own words.
+    let (answer, _, _) = ask("nginx", None);
+    assert!(answer.unwrap_err().contains("nginx-language-server"));
+}
+
+#[test]
+fn an_extension_for_api_0_1_0_uses_the_path_then_github() {
+    assert_eq!(built_for("terraform"), "0.1.0");
+    let (answer, did, _) = ask("terraform", Some("/opt/bin/terraform-ls"));
+    let command = answer.unwrap();
+    assert_eq!(command.command, "/opt/bin/terraform-ls");
+    assert_eq!(command.args, ["serve"]);
+    assert_eq!(did, ["which terraform-ls"]);
+    let (answer, did, _) = ask("terraform", None);
+    assert!(answer.unwrap_err().contains("GitHub is out of reach"));
+    assert_eq!(
+        did,
+        [
+            "which terraform-ls",
+            "terraform-ls: CheckingForUpdate",
+            "release hashicorp/terraform-ls None pre=false",
+        ]
+    );
+}
+
+#[test]
+fn an_extension_for_api_0_3_0_asks_for_a_pre_release() {
+    assert_eq!(built_for("ledger"), "0.3.0");
+    let (answer, did, _) = ask("ledger", None);
+    assert!(answer.unwrap_err().contains("GitHub is out of reach"));
+    assert_eq!(
+        did,
+        [
+            "ledger-language-server: CheckingForUpdate",
+            "release claytonrcarter/ledger-language-server None pre=true",
+        ]
+    );
 }

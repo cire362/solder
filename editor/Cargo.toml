@@ -59,3 +59,40 @@ opt-level = 2
 
 [profile.ci.package.wasmi_collections]
 opt-level = 2
+
+# So does the compiler in wasmtime, which turns an extension's code and a
+# grammar into machine code when they load: unoptimized, loading one
+# extension took seconds on a CI runner, and the test that starts a language
+# server through one timed out waiting for it.
+[profile.ci.package.cranelift-codegen]
+opt-level = 2
+
+[profile.ci.package.cranelift-frontend]
+opt-level = 2
+
+[profile.ci.package.cranelift-entity]
+opt-level = 2
+
+[profile.ci.package.cranelift-bforest]
+opt-level = 2
+
+[profile.ci.package.cranelift-bitset]
+opt-level = 2
+
+[profile.ci.package.cranelift-control]
+opt-level = 2
+
+[profile.ci.package.regalloc2]
+opt-level = 2
+
+[profile.ci.package.wasmparser]
+opt-level = 2
+
+[profile.ci.package.wasmtime-environ]
+opt-level = 2
+
+[profile.ci.package.wasmtime-internal-cranelift]
+opt-level = 2
+
+[profile.ci.package.wasmtime]
+opt-level = 2

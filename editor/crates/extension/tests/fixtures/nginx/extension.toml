@@ -1,0 +1,29 @@
+id = "nginx"
+name = "Nginx"
+version = "0.0.3"
+schema_version = 1
+description = "Nginx support"
+repository = "https://github.com/d1y/nginx-zed"
+authors = ["d1y <chenhonzhou@gmail.com>"]
+themes = []
+icon_themes = []
+languages = ["languages/nginx"]
+capabilities = []
+
+[lib]
+kind = "Rust"
+version = "0.0.6"
+
+[grammars.nginx]
+repository = "https://gitlab.com/joncoole/tree-sitter-nginx"
+rev = "9413233132d1787aa8d7e8f295ee20b55ba991de"
+
+[language_servers.nginx]
+language = "Nginx"
+languages = []
+
+[language_servers.nginx.language_ids]
+
+[context_servers]
+
+[slash_commands]

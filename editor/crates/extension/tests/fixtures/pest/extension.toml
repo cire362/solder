@@ -1,0 +1,31 @@
+id = "pest"
+name = "Pest"
+version = "0.1.1"
+schema_version = 1
+description = "Pest parser language support for Zed"
+repository = "https://github.com/pest-parser/zed-pest"
+authors = ["Jason Lee <huacnlee@gmail.com>"]
+themes = []
+icon_themes = []
+languages = ["languages/pest"]
+capabilities = []
+
+[lib]
+kind = "Rust"
+version = "0.0.1"
+
+[grammars.pest]
+repository = "https://github.com/pest-parser/tree-sitter-pest"
+rev = "a8a98a824452b1ec4da7f508386a187a2f234b85"
+
+[language_servers.pest]
+language = "Pest"
+languages = []
+
+[language_servers.pest.language_ids]
+
+[context_servers]
+
+[slash_commands]
+
+[indexed_docs_providers]

@@ -2,6 +2,9 @@
 
 Everything the website promises, grouped into phases. Each phase only depends on
 the ones above it. Optimization work (see README) starts after phase 7.
+Phase 8 goes past what the website promises: it is what it takes for an
+extension made for Zed or VS Code to be installed with one button and work
+as it does in the editor it was made for.
 
 Status: `[x]` done, `[~]` partial, `[ ]` not started.
 
@@ -95,7 +98,110 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
       its themes and snippets and points to the Zed one for its language
 - [x] Language servers of Zed extensions: the extension's own code, run in
       wasmtime, gets the server (npm, a GitHub release) and says how to start
-      it. Extensions built for Zed's API 0.6 and 0.7; one server per language
-- [ ] Extensions built for older versions of Zed's API (0.1 to 0.5)
+      it. One server per language
+- [x] Extensions built for every version of Zed's API so far, 0.0.1 to 0.7:
+      each of its nine worlds has its bindings, over one implementation
 - [ ] The plugin registry (needs the hosted service)
 - [ ] Preview environments per branch (needs the hosted service)
+
+## 8. Extensions, in full
+
+Where it stands: extensions install from Zed's catalog and Open VSX. A Zed
+extension brings its languages, snippets, themes and one language server. A
+VS Code extension brings its themes and snippets only.
+
+The two kinds are different work. A Zed extension is data plus a small
+sandboxed program with a fixed interface, so it can be supported completely.
+A VS Code extension is a Node program written against VS Code's own API: it
+runs here only as far as that API is rebuilt here, one area at a time, and
+it runs with the user's rights, not in a sandbox. The items are in the order
+to build them.
+
+### The Extensions tab
+- [ ] Extensions as a tab of the sidebar, next to Files and Git, in place of
+      the window: installed, Zed's catalog and Open VSX in one list, search,
+      one Install button, progress and errors on the row
+- [ ] Before the first install of an extension, what it will do outside a
+      sandbox: the servers it downloads and starts, the commands its manifest
+      declares, and for a VS Code extension that its code runs unconfined
+- [ ] Updates: newer versions are looked for when the tab is opened, never at
+      startup; update one or all; keep a version
+- [ ] Turn an extension off without removing it
+- [ ] For each installed extension, what works and what does not, from what it
+      asked for at run time and did not get, not from its manifest alone
+- [ ] A section on extensions in `editor/README.md` and in the website's docs
+
+### Zed extensions, complete
+- [ ] Every language server an extension lists for a language, not only the
+      first, with their answers merged (completions, diagnostics, actions).
+      Vue needs this, and Dockerfile has two
+- [ ] One extension setting up another's server
+      (`language-server-additional-*`: Vue adds its plugin to the TypeScript
+      server)
+- [ ] The user's settings reach the extension: a server's binary, options and
+      settings from `settings.json`, and the language's tab size
+- [ ] The rest of a language's files: indentation, brackets, the outline,
+      and from `config.toml` the pairs that close themselves, the block
+      comment and the word characters
+- [ ] Completion and symbol labels as the extension paints them
+      (`labels-for-completions`, `labels-for-symbols`)
+- [ ] The languages Zed builds in and so does not list in its catalog (C,
+      C++, Markdown, YAML, shell): grammars and servers of our own for them,
+      installed the same way
+- [ ] Icon themes: file icons in the tree and on tabs
+- [ ] A Node of Solder's own for servers written in JavaScript when the
+      machine has none, downloaded on first need
+- [ ] The commands an extension may run and the hosts it may download from,
+      granted or refused per extension (Zed's capabilities)
+- [ ] A time limit for a grammar's scanner, which today can hold a parse
+- [ ] Debug adapters of extensions, in the debugger
+- [ ] Slash commands and context servers of extensions, in the chat and the
+      agent
+- [ ] Each new version of Zed's API as it is published (0.8 is the next)
+
+### VS Code extensions: what needs no code
+- [ ] TextMate grammars: highlighting for the languages only VS Code has an
+      extension for (needs a regular expression engine with look-behind,
+      which is a dependency to decide on)
+- [ ] Language configuration: brackets, pairs that close themselves, comments,
+      indentation rules, and which files are which language
+- [ ] Themes in the old `.tmTheme` format
+- [ ] Icon themes, through the same file icons as Zed's
+- [ ] The settings an extension declares, with their defaults, in
+      `settings.json`
+- [ ] Debuggers an extension declares with a program to start, in the
+      debugger
+- [ ] The build for this machine when an extension has one per platform, and
+      the extensions it depends on or packs, installed with it
+
+### VS Code extensions: their code
+- [ ] An extension host: a Node process next to the editor that loads
+      extensions when their activation events happen and gives them a
+      `vscode` module of Solder's own. One extension that crashes or hangs
+      does not take the editor or the others with it
+- [ ] The API every extension starts from: commands, messages, pickers and
+      input boxes, status bar items, output channels, configuration, the
+      workspace's folders and files, open documents, their edits and events
+- [ ] Language features: the providers for completion, hover, definition,
+      references, rename, formatting, code actions, symbols, semantic tokens,
+      inlay hints and code lenses, and diagnostic collections. This is what
+      `vscode-languageclient` is built on, so it carries most language
+      extensions (and Prettier and ESLint)
+- [ ] Commands, menus and key bindings an extension contributes, in the
+      palette and the keymap
+- [ ] Debugging: adapters and configurations that extensions register in
+      code, in the debugger
+- [ ] Tasks, terminals and file watching
+- [ ] Source control providers, views in the sidebar (trees), decorations and
+      test controllers
+- [ ] Webviews, custom editors and notebooks. They need a browser view inside
+      the window, which GPUI does not have; decided when the rest is done
+- [ ] A check that runs with each release: the most installed extensions of
+      Open VSX are installed, activated and asked for their main feature, and
+      the result is the list of what works
+
+### What will not run
+Not tasks, but said so nobody waits for them: extensions whose licence or
+own checks tie them to Microsoft's products (Pylance, C# Dev Kit, Remote
+SSH, Live Share), and anything published only on Microsoft's Marketplace,
+which other editors may not use.

@@ -1,0 +1,31 @@
+id = "terraform"
+name = "Terraform"
+version = "0.1.9"
+schema_version = 1
+description = "Terraform support."
+repository = "https://github.com/zed-extensions/terraform"
+authors = ["Caius Durling <dev@caius.name>", "Daniel Banck <dbanck@users.noreply.github.com>"]
+themes = []
+icon_themes = []
+languages = ["languages/hcl", "languages/terraform", "languages/terraform-vars"]
+capabilities = []
+
+[lib]
+kind = "Rust"
+version = "0.1.0"
+
+[grammars.hcl]
+repository = "https://github.com/tree-sitter-grammars/tree-sitter-hcl"
+rev = "fad991865fee927dd1de5e172fb3f08ac674d914"
+
+[language_servers.terraform-ls]
+languages = ["Terraform", "Terraform Vars"]
+code_action_kinds = []
+
+[language_servers.terraform-ls.language_ids]
+"Terraform Vars" = "terraform-vars"
+Terraform = "terraform"
+
+[context_servers]
+
+[slash_commands]

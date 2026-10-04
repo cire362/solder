@@ -18,30 +18,11 @@ use std::{
 
 use wasmtime::{
     Config, Engine, Store, StoreLimits, StoreLimitsBuilder,
-    component::{Component, HasSelf, Linker, Resource, ResourceTable},
+    component::{Component, Resource, ResourceTable},
 };
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::{Code, Extension};
-
-mod bindings {
-    wasmtime::component::bindgen!({
-        path: "wit/since_v0.6.0",
-        world: "extension",
-        with: {
-            "worktree": super::Worktree,
-            "project": super::Project,
-            "key-value-store": super::KeyValueStore,
-            "zed:extension/http-client/http-response-stream": super::ResponseStream,
-        },
-    });
-}
-
-use bindings::zed::extension as api;
-
-/// The versions of Zed's extension API whose world this host implements:
-/// 0.6 and 0.7 share one.
-const API: std::ops::RangeInclusive<(u32, u32)> = (0, 6)..=(0, 7);
 /// An extension's own memory. They are small programs; this is generous.
 const MEMORY: usize = 256 * 1024 * 1024;
 /// What one call may compute before it is stopped. Waiting on the world
@@ -217,54 +198,26 @@ fn declared(commands: &[(String, Vec<String>)], command: &Command) -> bool {
     })
 }
 
-// ------------------------------------------------- what the extension imports
+// ------------------------------------------- what every version asks, once
 
-impl api::common::Host for State {}
-impl api::lsp::Host for State {}
-impl api::slash_command::Host for State {}
-impl api::context_server::Host for State {}
-
-impl api::dap::Host for State {
-    fn resolve_tcp_template(
-        &mut self,
-        _: api::dap::TcpArgumentsTemplate,
-    ) -> Result<api::dap::TcpArguments, String> {
-        Err("Solder does not run the debug adapters of extensions".into())
+/// The user's settings for a language or a server. Solder has none of its
+/// own for either yet, so an extension sees what Zed gives when nothing is
+/// set.
+fn settings(category: &str) -> Result<String, String> {
+    match category {
+        "language" => Ok(r#"{"tab_size":4}"#.into()),
+        "lsp" => Ok(r#"{"binary":null,"initialization_options":null,"settings":null}"#.into()),
+        "context_servers" => Ok(r#"{"command":null,"settings":null}"#.into()),
+        other => Err(format!("Unknown settings category: {other}")),
     }
 }
 
-impl api::platform::Host for State {
-    fn current_platform(&mut self) -> (api::platform::Os, api::platform::Architecture) {
-        use api::platform::{Architecture, Os};
-        (
-            match std::env::consts::OS {
-                "macos" => Os::Mac,
-                "windows" => Os::Windows,
-                _ => Os::Linux,
-            },
-            match std::env::consts::ARCH {
-                "aarch64" => Architecture::Aarch64,
-                "x86" => Architecture::X86,
-                _ => Architecture::X8664,
-            },
-        )
-    }
-}
-
-impl api::nodejs::Host for State {
-    fn node_binary_path(&mut self) -> Result<String, String> {
-        self.world.node()
-    }
-
-    fn npm_package_latest_version(&mut self, package: String) -> Result<String, String> {
-        self.world.npm_latest(&package)
-    }
-
-    fn npm_package_installed_version(&mut self, package: String) -> Result<Option<String>, String> {
+impl State {
+    fn npm_installed(&self, package: &str) -> Result<Option<String>, String> {
         let manifest = self
             .work_dir
             .join("node_modules")
-            .join(&package)
+            .join(package)
             .join("package.json");
         let Ok(text) = std::fs::read_to_string(manifest) else {
             return Ok(None);
@@ -273,88 +226,21 @@ impl api::nodejs::Host for State {
         Ok(manifest["version"].as_str().map(str::to_string))
     }
 
-    fn npm_install_package(&mut self, package: String, version: String) -> Result<(), String> {
-        self.world.npm_install(&self.work_dir, &package, &version)
-    }
-}
-
-impl api::github::Host for State {
-    fn latest_github_release(
-        &mut self,
-        repo: String,
-        options: api::github::GithubReleaseOptions,
-    ) -> Result<api::github::GithubRelease, String> {
-        let release = self.world.release(&repo, None, options.pre_release)?;
-        if options.require_assets && release.assets.is_empty() {
+    fn latest_release(
+        &self,
+        repo: &str,
+        require_assets: bool,
+        pre_release: bool,
+    ) -> Result<Release, String> {
+        let release = self.world.release(repo, None, pre_release)?;
+        if require_assets && release.assets.is_empty() {
             return Err(format!("The latest release of {repo} has no files"));
         }
-        Ok(release.into())
+        Ok(release)
     }
 
-    fn github_release_by_tag_name(
-        &mut self,
-        repo: String,
-        tag: String,
-    ) -> Result<api::github::GithubRelease, String> {
-        Ok(self.world.release(&repo, Some(&tag), true)?.into())
-    }
-}
-
-impl From<Release> for api::github::GithubRelease {
-    fn from(release: Release) -> Self {
-        Self {
-            version: release.version,
-            assets: release
-                .assets
-                .into_iter()
-                .map(|(name, download_url)| api::github::GithubReleaseAsset { name, download_url })
-                .collect(),
-        }
-    }
-}
-
-impl From<api::http_client::HttpRequest> for HttpRequest {
-    fn from(request: api::http_client::HttpRequest) -> Self {
-        use api::http_client::{HttpMethod, RedirectPolicy};
-        Self {
-            method: match request.method {
-                HttpMethod::Get => "GET",
-                HttpMethod::Head => "HEAD",
-                HttpMethod::Post => "POST",
-                HttpMethod::Put => "PUT",
-                HttpMethod::Delete => "DELETE",
-                HttpMethod::Options => "OPTIONS",
-                HttpMethod::Patch => "PATCH",
-            },
-            url: request.url,
-            headers: request.headers,
-            body: request.body,
-            redirects: match request.redirect_policy {
-                RedirectPolicy::NoFollow => Some(0),
-                RedirectPolicy::FollowLimit(limit) => Some(limit),
-                RedirectPolicy::FollowAll => None,
-            },
-        }
-    }
-}
-
-impl api::http_client::Host for State {
-    fn fetch(
-        &mut self,
-        request: api::http_client::HttpRequest,
-    ) -> Result<api::http_client::HttpResponse, String> {
-        let response = self.world.fetch(request.into())?;
-        Ok(api::http_client::HttpResponse {
-            headers: response.headers,
-            body: response.body,
-        })
-    }
-
-    fn fetch_stream(
-        &mut self,
-        request: api::http_client::HttpRequest,
-    ) -> Result<Resource<ResponseStream>, String> {
-        let response = self.world.fetch(request.into())?;
+    fn stream(&mut self, request: HttpRequest) -> Result<Resource<ResponseStream>, String> {
+        let response = self.world.fetch(request)?;
         let chunks = response
             .body
             .chunks(64 * 1024)
@@ -364,142 +250,29 @@ impl api::http_client::Host for State {
             .push(ResponseStream { chunks })
             .map_err(|e| e.to_string())
     }
-}
 
-impl api::http_client::HostHttpResponseStream for State {
-    fn next_chunk(&mut self, stream: Resource<ResponseStream>) -> Result<Option<Vec<u8>>, String> {
+    fn next_piece(&mut self, stream: Resource<ResponseStream>) -> Result<Option<Vec<u8>>, String> {
         let stream = self.table.get_mut(&stream).map_err(|e| e.to_string())?;
         Ok(stream.chunks.pop_front())
     }
 
-    fn drop(&mut self, stream: Resource<ResponseStream>) -> wasmtime::Result<()> {
-        self.table.delete(stream)?;
-        Ok(())
-    }
-}
-
-impl api::process::Host for State {
-    fn run_command(
-        &mut self,
-        command: api::process::Command,
-    ) -> Result<api::process::Output, String> {
-        let command = Command {
-            command: command.command,
-            args: command.args,
-            env: command.env,
-        };
+    fn run_declared(&self, command: Command) -> Result<Output, String> {
         if !declared(&self.commands, &command) {
             return Err(format!(
                 "The extension's manifest does not declare that it runs {}",
                 command.command
             ));
         }
-        let output = self.world.run(&command)?;
-        Ok(api::process::Output {
-            status: output.status,
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
-    }
-}
-
-impl bindings::HostWorktree for State {
-    fn id(&mut self, _: Resource<Worktree>) -> u64 {
-        0
+        self.world.run(&command)
     }
 
-    fn root_path(&mut self, worktree: Resource<Worktree>) -> String {
-        self.table
-            .get(&worktree)
-            .map(|w| w.root.to_string_lossy().into_owned())
-            .unwrap_or_default()
+    fn download(&self, url: &str, path: &str, kind: FileKind) -> Result<(), String> {
+        self.world
+            .download(url, &writable(&self.work_dir, path)?, kind)
     }
 
-    fn read_text_file(
-        &mut self,
-        worktree: Resource<Worktree>,
-        path: String,
-    ) -> Result<String, String> {
-        let root = &self.table.get(&worktree).map_err(|e| e.to_string())?.root;
-        let file = normalize(&root.join(&path));
-        if !file.starts_with(root) {
-            return Err(format!("{path} is outside the project"));
-        }
-        std::fs::read_to_string(file).map_err(|e| format!("{path}: {e}"))
-    }
-
-    fn which(&mut self, _: Resource<Worktree>, binary: String) -> Option<String> {
-        self.world.which(&binary)
-    }
-
-    fn shell_env(&mut self, _: Resource<Worktree>) -> Vec<(String, String)> {
-        self.world.env()
-    }
-
-    fn drop(&mut self, worktree: Resource<Worktree>) -> wasmtime::Result<()> {
-        self.table.delete(worktree)?;
-        Ok(())
-    }
-}
-
-impl bindings::HostProject for State {
-    fn worktree_ids(&mut self, _: Resource<Project>) -> Vec<u64> {
-        vec![0]
-    }
-
-    fn drop(&mut self, project: Resource<Project>) -> wasmtime::Result<()> {
-        self.table.delete(project)?;
-        Ok(())
-    }
-}
-
-impl bindings::HostKeyValueStore for State {
-    fn insert(&mut self, _: Resource<KeyValueStore>, _: String, _: String) -> Result<(), String> {
-        Err("Solder does not index documentation".into())
-    }
-
-    fn drop(&mut self, store: Resource<KeyValueStore>) -> wasmtime::Result<()> {
-        self.table.delete(store)?;
-        Ok(())
-    }
-}
-
-impl bindings::ExtensionImports for State {
-    /// The user's settings for a language or a server. Solder has none of
-    /// its own for either yet, so an extension sees what Zed gives when
-    /// nothing is set.
-    fn get_settings(
-        &mut self,
-        _: Option<bindings::SettingsLocation>,
-        category: String,
-        _key: Option<String>,
-    ) -> Result<String, String> {
-        match category.as_str() {
-            "language" => Ok(r#"{"tab_size":4}"#.into()),
-            "lsp" => Ok(r#"{"binary":null,"initialization_options":null,"settings":null}"#.into()),
-            "context_servers" => Ok(r#"{"command":null,"settings":null}"#.into()),
-            other => Err(format!("Unknown settings category: {other}")),
-        }
-    }
-
-    fn download_file(
-        &mut self,
-        url: String,
-        path: String,
-        kind: bindings::DownloadedFileType,
-    ) -> Result<(), String> {
-        let dest = writable(&self.work_dir, &path)?;
-        let kind = match kind {
-            bindings::DownloadedFileType::Gzip => FileKind::Gzip,
-            bindings::DownloadedFileType::GzipTar => FileKind::GzipTar,
-            bindings::DownloadedFileType::Zip => FileKind::Zip,
-            bindings::DownloadedFileType::Uncompressed => FileKind::Uncompressed,
-        };
-        self.world.download(&url, &dest, kind)
-    }
-
-    fn make_file_executable(&mut self, path: String) -> Result<(), String> {
-        let path = writable(&self.work_dir, &path)?;
+    fn make_executable(&self, path: &str) -> Result<(), String> {
+        let path = writable(&self.work_dir, path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -514,22 +287,529 @@ impl bindings::ExtensionImports for State {
         Ok(())
     }
 
-    fn set_language_server_installation_status(
-        &mut self,
-        server: String,
-        status: bindings::LanguageServerInstallationStatus,
-    ) {
-        use bindings::LanguageServerInstallationStatus as S;
-        self.world.status(
-            &server,
-            match status {
-                S::None => Status::Ready,
-                S::Downloading => Status::Downloading,
-                S::CheckingForUpdate => Status::CheckingForUpdate,
-                S::Failed(why) => Status::Failed(why),
-            },
-        );
+    fn worktree_root(&self, worktree: &Resource<Worktree>) -> String {
+        self.table
+            .get(worktree)
+            .map(|w| w.root.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
+
+    fn worktree_file(&self, worktree: &Resource<Worktree>, path: &str) -> Result<String, String> {
+        let root = &self.table.get(worktree).map_err(|e| e.to_string())?.root;
+        let file = normalize(&root.join(path));
+        if !file.starts_with(root) {
+            return Err(format!("{path} is outside the project"));
+        }
+        std::fs::read_to_string(file).map_err(|e| format!("{path}: {e}"))
+    }
+}
+
+/// What a version of the API exports, in the terms the host works in.
+trait Calls: Send {
+    /// How to start a server. `language` is the first language the manifest
+    /// lists for it: the oldest versions are asked by name and language.
+    fn command(
+        &self,
+        store: &mut Store<State>,
+        server: &str,
+        language: &str,
+        worktree: Resource<Worktree>,
+    ) -> wasmtime::Result<Result<Command, String>>;
+
+    fn initialization_options(
+        &self,
+        store: &mut Store<State>,
+        server: &str,
+        language: &str,
+        worktree: Resource<Worktree>,
+    ) -> wasmtime::Result<Result<Option<String>, String>>;
+
+    fn workspace_configuration(
+        &self,
+        store: &mut Store<State>,
+        server: &str,
+        worktree: Resource<Worktree>,
+    ) -> wasmtime::Result<Result<Option<String>, String>>;
+}
+
+// --------------------------------------------- one world for each version
+//
+// Zed's API grew by a step at a time, and each step is a world of its own:
+// a component built for one imports exactly its functions. The modules in
+// `host/` generate the bindings of each from its WIT files; the macros here
+// write the glue between those bindings and the code above, which is the
+// same for every version that has the interface at all.
+
+/// Where an interface only brings types, there is nothing to implement.
+macro_rules! types_only {
+    ($api:ident: $($interface:ident),+) => {
+        $(impl $api::$interface::Host for State {})+
+    };
+}
+
+macro_rules! platform {
+    ($api:ident) => {{
+        use $api::platform::{Architecture, Os};
+        (
+            match std::env::consts::OS {
+                "macos" => Os::Mac,
+                "windows" => Os::Windows,
+                _ => Os::Linux,
+            },
+            match std::env::consts::ARCH {
+                "aarch64" => Architecture::Aarch64,
+                "x86" => Architecture::X86,
+                _ => Architecture::X8664,
+            },
+        )
+    }};
+}
+
+macro_rules! github_release {
+    ($api:ident, $release:expr) => {{
+        let release: Release = $release;
+        $api::github::GithubRelease {
+            version: release.version,
+            assets: release
+                .assets
+                .into_iter()
+                .map(|(name, download_url)| $api::github::GithubReleaseAsset { name, download_url })
+                .collect(),
+        }
+    }};
+}
+
+macro_rules! file_kind {
+    ($bindings:ident, $kind:expr) => {
+        match $kind {
+            $bindings::DownloadedFileType::Gzip => FileKind::Gzip,
+            $bindings::DownloadedFileType::GzipTar => FileKind::GzipTar,
+            $bindings::DownloadedFileType::Zip => FileKind::Zip,
+            $bindings::DownloadedFileType::Uncompressed => FileKind::Uncompressed,
+        }
+    };
+}
+
+/// The `platform` and `nodejs` interfaces, and `github` with or without
+/// releases by tag.
+macro_rules! tools {
+    ($api:ident) => {
+        tools!(@common $api);
+        impl $api::github::Host for State {
+            tools!(@latest $api);
+        }
+    };
+    ($api:ident, releases_by_tag) => {
+        tools!(@common $api);
+        impl $api::github::Host for State {
+            tools!(@latest $api);
+
+            fn github_release_by_tag_name(
+                &mut self,
+                repo: String,
+                tag: String,
+            ) -> Result<$api::github::GithubRelease, String> {
+                Ok(github_release!(
+                    $api,
+                    self.world.release(&repo, Some(&tag), true)?
+                ))
+            }
+        }
+    };
+    (@latest $api:ident) => {
+        fn latest_github_release(
+            &mut self,
+            repo: String,
+            options: $api::github::GithubReleaseOptions,
+        ) -> Result<$api::github::GithubRelease, String> {
+            Ok(github_release!(
+                $api,
+                self.latest_release(&repo, options.require_assets, options.pre_release)?
+            ))
+        }
+    };
+    (@common $api:ident) => {
+        impl $api::platform::Host for State {
+            fn current_platform(&mut self) -> ($api::platform::Os, $api::platform::Architecture) {
+                platform!($api)
+            }
+        }
+
+        impl $api::nodejs::Host for State {
+            fn node_binary_path(&mut self) -> Result<String, String> {
+                self.world.node()
+            }
+
+            fn npm_package_latest_version(&mut self, package: String) -> Result<String, String> {
+                self.world.npm_latest(&package)
+            }
+
+            fn npm_package_installed_version(
+                &mut self,
+                package: String,
+            ) -> Result<Option<String>, String> {
+                self.npm_installed(&package)
+            }
+
+            fn npm_install_package(&mut self, package: String, version: String) -> Result<(), String> {
+                self.world.npm_install(&self.work_dir, &package, &version)
+            }
+        }
+    };
+}
+
+macro_rules! http {
+    ($api:ident) => {
+        fn request(request: $api::http_client::HttpRequest) -> HttpRequest {
+            use $api::http_client::{HttpMethod, RedirectPolicy};
+            HttpRequest {
+                method: match request.method {
+                    HttpMethod::Get => "GET",
+                    HttpMethod::Head => "HEAD",
+                    HttpMethod::Post => "POST",
+                    HttpMethod::Put => "PUT",
+                    HttpMethod::Delete => "DELETE",
+                    HttpMethod::Options => "OPTIONS",
+                    HttpMethod::Patch => "PATCH",
+                },
+                url: request.url,
+                headers: request.headers,
+                body: request.body,
+                redirects: match request.redirect_policy {
+                    RedirectPolicy::NoFollow => Some(0),
+                    RedirectPolicy::FollowLimit(limit) => Some(limit),
+                    RedirectPolicy::FollowAll => None,
+                },
+            }
+        }
+
+        impl $api::http_client::Host for State {
+            fn fetch(
+                &mut self,
+                asked: $api::http_client::HttpRequest,
+            ) -> Result<$api::http_client::HttpResponse, String> {
+                let response = self.world.fetch(request(asked))?;
+                Ok($api::http_client::HttpResponse {
+                    headers: response.headers,
+                    body: response.body,
+                })
+            }
+
+            fn fetch_stream(
+                &mut self,
+                asked: $api::http_client::HttpRequest,
+            ) -> Result<Resource<ResponseStream>, String> {
+                self.stream(request(asked))
+            }
+        }
+
+        impl $api::http_client::HostHttpResponseStream for State {
+            fn next_chunk(
+                &mut self,
+                stream: Resource<ResponseStream>,
+            ) -> Result<Option<Vec<u8>>, String> {
+                self.next_piece(stream)
+            }
+
+            fn drop(&mut self, stream: Resource<ResponseStream>) -> wasmtime::Result<()> {
+                self.table.delete(stream)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+macro_rules! process {
+    ($api:ident) => {
+        impl $api::process::Host for State {
+            fn run_command(
+                &mut self,
+                command: $api::process::Command,
+            ) -> Result<$api::process::Output, String> {
+                let output = self.run_declared(Command {
+                    command: command.command,
+                    args: command.args,
+                    env: command.env,
+                })?;
+                Ok($api::process::Output {
+                    status: output.status,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                })
+            }
+        }
+    };
+}
+
+/// The project folder. From 0.0.6 it also has an id and says its path.
+macro_rules! worktree {
+    ($bindings:ident $(, $located:ident)?) => {
+        impl $bindings::HostWorktree for State {
+            $(
+                fn id(&mut self, _: Resource<Worktree>) -> u64 {
+                    let $located = 0;
+                    $located
+                }
+
+                fn root_path(&mut self, worktree: Resource<Worktree>) -> String {
+                    self.worktree_root(&worktree)
+                }
+            )?
+
+            fn read_text_file(
+                &mut self,
+                worktree: Resource<Worktree>,
+                path: String,
+            ) -> Result<String, String> {
+                self.worktree_file(&worktree, &path)
+            }
+
+            fn which(&mut self, _: Resource<Worktree>, binary: String) -> Option<String> {
+                self.world.which(&binary)
+            }
+
+            fn shell_env(&mut self, _: Resource<Worktree>) -> Vec<(String, String)> {
+                self.world.env()
+            }
+
+            fn drop(&mut self, worktree: Resource<Worktree>) -> wasmtime::Result<()> {
+                self.table.delete(worktree)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+macro_rules! key_value_store {
+    ($bindings:ident) => {
+        impl $bindings::HostKeyValueStore for State {
+            fn insert(
+                &mut self,
+                _: Resource<KeyValueStore>,
+                _: String,
+                _: String,
+            ) -> Result<(), String> {
+                Err("Solder does not index documentation".into())
+            }
+
+            fn drop(&mut self, store: Resource<KeyValueStore>) -> wasmtime::Result<()> {
+                self.table.delete(store)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+macro_rules! project {
+    ($bindings:ident) => {
+        impl $bindings::HostProject for State {
+            fn worktree_ids(&mut self, _: Resource<Project>) -> Vec<u64> {
+                vec![0]
+            }
+
+            fn drop(&mut self, project: Resource<Project>) -> wasmtime::Result<()> {
+                self.table.delete(project)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+/// The functions of the world itself, as they are from 0.0.6 on.
+macro_rules! world_functions {
+    ($bindings:ident) => {
+        impl $bindings::ExtensionImports for State {
+            fn get_settings(
+                &mut self,
+                _: Option<$bindings::SettingsLocation>,
+                category: String,
+                _key: Option<String>,
+            ) -> Result<String, String> {
+                settings(&category)
+            }
+
+            fn download_file(
+                &mut self,
+                url: String,
+                path: String,
+                kind: $bindings::DownloadedFileType,
+            ) -> Result<(), String> {
+                self.download(&url, &path, file_kind!($bindings, kind))
+            }
+
+            fn make_file_executable(&mut self, path: String) -> Result<(), String> {
+                self.make_executable(&path)
+            }
+
+            fn set_language_server_installation_status(
+                &mut self,
+                server: String,
+                status: $bindings::LanguageServerInstallationStatus,
+            ) {
+                use $bindings::LanguageServerInstallationStatus as S;
+                self.world.status(
+                    &server,
+                    match status {
+                        S::None => Status::Ready,
+                        S::Downloading => Status::Downloading,
+                        S::CheckingForUpdate => Status::CheckingForUpdate,
+                        S::Failed(why) => Status::Failed(why),
+                    },
+                );
+            }
+        }
+    };
+}
+
+/// Links a version's imports, starts the component and wraps its exports.
+/// The oldest versions are asked about a server by its name and language
+/// (`by_config`), the rest by its id.
+macro_rules! start {
+    ($bindings:ident) => {
+        start!(@start $bindings);
+
+        impl Calls for $bindings::Extension {
+            fn command(
+                &self,
+                store: &mut Store<State>,
+                server: &str,
+                _language: &str,
+                worktree: Resource<Worktree>,
+            ) -> wasmtime::Result<Result<Command, String>> {
+                Ok(self
+                    .call_language_server_command(store, server, worktree)?
+                    .map(|command| Command {
+                        command: command.command,
+                        args: command.args,
+                        env: command.env,
+                    }))
+            }
+
+            fn initialization_options(
+                &self,
+                store: &mut Store<State>,
+                server: &str,
+                _language: &str,
+                worktree: Resource<Worktree>,
+            ) -> wasmtime::Result<Result<Option<String>, String>> {
+                self.call_language_server_initialization_options(store, server, worktree)
+            }
+
+            fn workspace_configuration(
+                &self,
+                store: &mut Store<State>,
+                server: &str,
+                worktree: Resource<Worktree>,
+            ) -> wasmtime::Result<Result<Option<String>, String>> {
+                self.call_language_server_workspace_configuration(store, server, worktree)
+            }
+        }
+    };
+    ($bindings:ident, by_config) => {
+        start!(@start $bindings);
+
+        impl Calls for $bindings::Extension {
+            fn command(
+                &self,
+                store: &mut Store<State>,
+                server: &str,
+                language: &str,
+                worktree: Resource<Worktree>,
+            ) -> wasmtime::Result<Result<Command, String>> {
+                let config = $bindings::LanguageServerConfig {
+                    name: server.to_string(),
+                    language_name: language.to_string(),
+                };
+                Ok(self
+                    .call_language_server_command(store, &config, worktree)?
+                    .map(|command| Command {
+                        command: command.command,
+                        args: command.args,
+                        env: command.env,
+                    }))
+            }
+
+            fn initialization_options(
+                &self,
+                store: &mut Store<State>,
+                server: &str,
+                language: &str,
+                worktree: Resource<Worktree>,
+            ) -> wasmtime::Result<Result<Option<String>, String>> {
+                let config = $bindings::LanguageServerConfig {
+                    name: server.to_string(),
+                    language_name: language.to_string(),
+                };
+                self.call_language_server_initialization_options(store, &config, worktree)
+            }
+
+            /// These versions have no settings to give a server.
+            fn workspace_configuration(
+                &self,
+                _: &mut Store<State>,
+                _: &str,
+                _: Resource<Worktree>,
+            ) -> wasmtime::Result<Result<Option<String>, String>> {
+                Ok(Ok(None))
+            }
+        }
+    };
+    (@start $bindings:ident) => {
+        pub(super) fn start(
+            store: &mut Store<State>,
+            component: &wasmtime::component::Component,
+        ) -> wasmtime::Result<Box<dyn Calls>> {
+            let mut linker = wasmtime::component::Linker::new(store.engine());
+            wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
+            $bindings::Extension::add_to_linker::<State, wasmtime::component::HasSelf<State>>(
+                &mut linker,
+                |state| state,
+            )?;
+            let extension = $bindings::Extension::instantiate(&mut *store, component, &linker)?;
+            extension.call_init_extension(&mut *store)?;
+            Ok(Box::new(extension))
+        }
+    };
+}
+
+mod v0_0_1;
+mod v0_0_4;
+mod v0_0_6;
+mod v0_1_0;
+mod v0_2_0;
+mod v0_3_0;
+mod v0_4_0;
+mod v0_5_0;
+mod v0_6_0;
+
+/// Starts a component with the world of the API version it was built for:
+/// the newest one that is not newer than `api`.
+type Start = fn(&mut Store<State>, &Component) -> wasmtime::Result<Box<dyn Calls>>;
+
+/// The first version of each world, oldest first.
+const WORLDS: &[((u32, u32, u32), Start)] = &[
+    ((0, 0, 1), v0_0_1::start),
+    ((0, 0, 4), v0_0_4::start),
+    ((0, 0, 6), v0_0_6::start),
+    ((0, 1, 0), v0_1_0::start),
+    ((0, 2, 0), v0_2_0::start),
+    ((0, 3, 0), v0_3_0::start),
+    ((0, 4, 0), v0_4_0::start),
+    ((0, 5, 0), v0_5_0::start),
+    ((0, 6, 0), v0_6_0::start),
+];
+/// The first version this host does not know. 0.7 added nothing to the
+/// world of 0.6.
+const UNKNOWN: (u32, u32, u32) = (0, 8, 0);
+
+/// The world for `api`, with the version it starts at.
+fn world_for(api: &str) -> Option<&'static ((u32, u32, u32), Start)> {
+    let mut parts = api.split('.').map(|p| p.parse::<u32>().ok());
+    let version = (parts.next()??, parts.next()??, parts.next()??);
+    if version >= UNKNOWN {
+        return None;
+    }
+    WORLDS.iter().rev().find(|(since, _)| version >= *since)
 }
 
 // ------------------------------------------------------------------ the host
@@ -545,21 +825,19 @@ fn engine() -> &'static Engine {
 
 /// Whether this host runs extensions built for `api` (`0.7.0`).
 pub fn runs(api: &str) -> bool {
-    let mut parts = api.split('.').map(|p| p.parse::<u32>().ok());
-    match (parts.next().flatten(), parts.next().flatten()) {
-        (Some(major), Some(minor)) => API.contains(&(major, minor)),
-        _ => false,
-    }
+    world_for(api).is_some()
 }
 
 struct Running {
     store: Store<State>,
-    extension: bindings::Extension,
+    extension: Box<dyn Calls>,
 }
 
 /// One extension's code, loaded and ready to be asked.
 pub struct Host {
     running: Mutex<Running>,
+    /// The first language the manifest lists for each server.
+    languages: Vec<(String, String)>,
 }
 
 impl Host {
@@ -573,11 +851,11 @@ impl Host {
         let Code::Zed { api } = &extension.code else {
             return Err("The extension has no code to run".into());
         };
-        if !runs(api) {
+        let Some((_, start)) = world_for(api) else {
             return Err(format!(
                 "It was built for version {api} of Zed's extension API, which Solder does not run yet"
             ));
-        }
+        };
         std::fs::create_dir_all(work_dir).map_err(|e| e.to_string())?;
         // Paths the extension builds from its folder must be the real ones.
         let work_dir = work_dir.canonicalize().map_err(|e| e.to_string())?;
@@ -585,10 +863,6 @@ impl Host {
             std::fs::read(extension.dir.join("extension.wasm")).map_err(|e| e.to_string())?;
         let problem = |e: wasmtime::Error| format!("{e:#}");
         let component = Component::new(engine(), &bytes).map_err(problem)?;
-        let mut linker = Linker::new(engine());
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(problem)?;
-        bindings::Extension::add_to_linker::<State, HasSelf<State>>(&mut linker, |state| state)
-            .map_err(problem)?;
 
         // The extension's folder is the whole of its file system. It is
         // there twice: as the current folder, and under its real path, which
@@ -613,15 +887,30 @@ impl Host {
         );
         store.limiter(|state| &mut state.limits);
         store.set_fuel(FUEL).map_err(problem)?;
-        let instance =
-            bindings::Extension::instantiate(&mut store, &component, &linker).map_err(problem)?;
-        instance.call_init_extension(&mut store).map_err(problem)?;
+        let running = start(&mut store, &component).map_err(problem)?;
         Ok(Self {
             running: Mutex::new(Running {
                 store,
-                extension: instance,
+                extension: running,
             }),
+            languages: extension
+                .servers
+                .iter()
+                .map(|server| {
+                    (
+                        server.id.clone(),
+                        server.languages.first().cloned().unwrap_or_default(),
+                    )
+                })
+                .collect(),
         })
+    }
+
+    fn language(&self, server: &str) -> &str {
+        self.languages
+            .iter()
+            .find(|(id, _)| id == server)
+            .map_or("", |(_, language)| language)
     }
 
     /// Calls into the extension with a project folder in hand.
@@ -629,7 +918,7 @@ impl Host {
         &self,
         root: &Path,
         call: impl FnOnce(
-            &bindings::Extension,
+            &dyn Calls,
             &mut Store<State>,
             Resource<Worktree>,
         ) -> wasmtime::Result<Result<T, String>>,
@@ -646,7 +935,7 @@ impl Host {
             })
             .map_err(|e| e.to_string())?;
         let rep = worktree.rep();
-        let answer = call(extension, store, worktree);
+        let answer = call(&**extension, store, worktree);
         // The extension only borrowed the folder; the entry is ours to drop.
         let _ = store
             .data_mut()
@@ -658,8 +947,9 @@ impl Host {
     /// How to start the language server `server` for the project in `root`.
     /// The extension may download the server first.
     pub fn language_server_command(&self, server: &str, root: &Path) -> Result<Command, String> {
+        let language = self.language(server);
         let command = self.ask(root, |extension, store, worktree| {
-            extension.call_language_server_command(store, server, worktree)
+            extension.command(store, server, language, worktree)
         })?;
         let running = self.running.lock().unwrap();
         Ok(Command {
@@ -675,8 +965,9 @@ impl Host {
         server: &str,
         root: &Path,
     ) -> Result<Option<String>, String> {
+        let language = self.language(server);
         self.ask(root, |extension, store, worktree| {
-            extension.call_language_server_initialization_options(store, server, worktree)
+            extension.initialization_options(store, server, language, worktree)
         })
     }
 
@@ -687,7 +978,7 @@ impl Host {
         root: &Path,
     ) -> Result<Option<String>, String> {
         self.ask(root, |extension, store, worktree| {
-            extension.call_language_server_workspace_configuration(store, server, worktree)
+            extension.workspace_configuration(store, server, worktree)
         })
     }
 }
@@ -770,12 +1061,26 @@ mod tests {
 
     #[test]
     fn the_api_versions_it_runs() {
-        assert!(runs("0.6.0"));
+        // Every version published so far, each with the newest world that
+        // is not newer than it.
+        let world = |api: &str| world_for(api).map(|(since, _)| *since);
+        assert_eq!(world("0.0.1"), Some((0, 0, 1)));
+        assert_eq!(world("0.0.3"), Some((0, 0, 1)));
+        assert_eq!(world("0.0.4"), Some((0, 0, 4)));
+        assert_eq!(world("0.0.6"), Some((0, 0, 6)));
+        assert_eq!(world("0.0.7"), Some((0, 0, 6)));
+        assert_eq!(world("0.1.0"), Some((0, 1, 0)));
+        assert_eq!(world("0.2.0"), Some((0, 2, 0)));
+        assert_eq!(world("0.3.0"), Some((0, 3, 0)));
+        assert_eq!(world("0.4.0"), Some((0, 4, 0)));
+        assert_eq!(world("0.5.0"), Some((0, 5, 0)));
+        assert_eq!(world("0.6.0"), Some((0, 6, 0)));
+        assert_eq!(world("0.7.3"), Some((0, 6, 0)));
         assert!(runs("0.7.0"));
-        assert!(runs("0.7.3"));
-        assert!(!runs("0.5.0"));
         assert!(!runs("0.8.0"));
         assert!(!runs("1.0.0"));
+        assert!(!runs("0.0.0"));
+        assert!(!runs("0.6"));
         assert!(!runs(""));
     }
 }
