@@ -116,6 +116,19 @@ pub(crate) fn find_program(program: &str, root: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Server names live as long as the program: they key the running servers.
+/// The ones extensions bring are few, so each is kept once and never freed.
+fn intern(name: &str) -> &'static str {
+    static NAMES: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(known) = names.iter().find(|n| **n == name) {
+        return known;
+    }
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    names.push(leaked);
+    leaked
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ServerKey {
     name: &'static str,
@@ -137,6 +150,9 @@ struct DocEntry {
     uri: lt::Uri,
     version: i32,
     opened: bool,
+    /// What the server calls this document's language, when an extension
+    /// says; otherwise the document's own id is used.
+    language_id: Option<String>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -194,6 +210,12 @@ impl LspStore {
         }
     }
 
+    /// Shows `text` where the servers' progress goes; `None` clears it.
+    pub fn set_status(&mut self, text: Option<SharedString>, cx: &mut Context<Self>) {
+        self.status = text;
+        cx.notify();
+    }
+
     pub fn status(&self) -> Option<&SharedString> {
         self.status.as_ref()
     }
@@ -229,6 +251,7 @@ impl LspStore {
                 uri: path_to_uri(Path::new("/")),
                 version: 0,
                 opened: false,
+                language_id: None,
                 _subscriptions: subscriptions,
             },
         );
@@ -248,27 +271,96 @@ impl LspStore {
             entry.key = None;
             return;
         };
-        let Some(spec) = spec_for(language) else {
-            entry.key = None;
-            return;
+        // The servers Solder knows first, then the one an installed
+        // extension brings for the language.
+        let builtin = spec_for(language);
+        let brought = match builtin {
+            Some(_) => None,
+            None => crate::extension_store::ExtensionStore::try_global(cx)
+                .and_then(|store| store.read(cx).server_for(language)),
         };
-        let settings = Settings::get(cx).language_servers.get(spec.name).cloned();
+        let (name, root) = match (&builtin, &brought) {
+            (Some(spec), _) => (spec.name, find_root(path, spec.root_markers)),
+            (None, Some(server)) => (intern(&server.id), find_root(path, &[".git"])),
+            (None, None) => {
+                entry.key = None;
+                return;
+            }
+        };
+        let settings = Settings::get(cx).language_servers.get(name).cloned();
         if settings.as_ref().is_some_and(|s| s.disabled) {
             entry.key = None;
             return;
         }
-        let key = ServerKey {
-            name: spec.name,
-            root: find_root(path, spec.root_markers),
-        };
+        let key = ServerKey { name, root };
         entry.uri = path_to_uri(path);
         entry.key = Some(key.clone());
         entry.opened = false;
+        entry.language_id = brought.as_ref().and_then(|s| s.language_id.clone());
         match self.servers.get(&key) {
             Some(ServerState::Running { .. }) => self.open(id, cx),
             Some(ServerState::Starting | ServerState::Failed) => {}
-            None => self.start(key, spec, cx),
+            None => match (builtin, brought) {
+                (Some(spec), _) => self.start(key, spec, cx),
+                (None, Some(server)) => self.start_from_extension(key, server, cx),
+                (None, None) => {}
+            },
         }
+    }
+
+    /// Starts a server an extension brings. The extension is asked for the
+    /// command first, and may download the server before it answers.
+    fn start_from_extension(
+        &mut self,
+        key: ServerKey,
+        server: crate::extension_store::ExtensionServer,
+        cx: &mut Context<Self>,
+    ) {
+        self.servers.insert(key.clone(), ServerState::Starting);
+        self.status = Some(format!("Getting {} ready...", server.name).into());
+        cx.notify();
+        let store = crate::extension_store::ExtensionStore::global(cx);
+        let resolving = store.update(cx, |store, cx| store.resolve(&server, &key.root, cx));
+        cx.spawn(async move |this, cx| {
+            let result = match resolving.await {
+                Ok(resolved) => {
+                    let command = ServerCommand {
+                        program: PathBuf::from(resolved.command.command),
+                        args: resolved.command.args,
+                        env: resolved.command.env,
+                    };
+                    let (name, root) = (key.name, key.root.clone());
+                    let spawned = cx
+                        .background_executor()
+                        .spawn(async move { LanguageServer::spawn(name, &command, &root) })
+                        .await;
+                    match spawned {
+                        Ok((server, notifications)) => server
+                            .initialize(&key.root, resolved.initialization_options)
+                            .await
+                            .map(|_| {
+                                if let Some(settings) = resolved.configuration {
+                                    server.set_configuration(settings);
+                                }
+                                (server, notifications)
+                            })
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            this.update(cx, |this, cx| match result {
+                Ok((server, notifications)) => this.started(key, server, notifications, cx),
+                Err(error) => {
+                    this.status = Some(format!("{}: {error}", key.name).into());
+                    this.servers.insert(key, ServerState::Failed);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn start(&mut self, key: ServerKey, spec: ServerSpec, cx: &mut Context<Self>) {
@@ -391,7 +483,10 @@ impl LspStore {
         server.notify::<lt::notification::DidOpenTextDocument>(lt::DidOpenTextDocumentParams {
             text_document: lt::TextDocumentItem {
                 uri: entry.uri.clone(),
-                language_id: doc.language_id().into(),
+                language_id: entry
+                    .language_id
+                    .clone()
+                    .unwrap_or_else(|| doc.language_id().into()),
                 version: 0,
                 text: doc.text().rope().to_string(),
             },

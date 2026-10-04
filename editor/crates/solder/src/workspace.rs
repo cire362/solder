@@ -8818,8 +8818,8 @@ mod tests {
         let config = db::testing::dir(&format!("ws-{name}-config"));
         cx.executor().allow_parking();
         let store = cx.update(|cx| {
-            let store = cx.new(|_| {
-                let mut store = ExtensionStore::new(data.join("extensions"), config.clone());
+            let store = cx.new(|cx| {
+                let mut store = ExtensionStore::new(data.join("extensions"), config.clone(), cx);
                 store.zed_url = base.to_string();
                 store.open_vsx_url = base.to_string();
                 store
@@ -8863,6 +8863,18 @@ mod tests {
         tar(&dir)
     }
 
+    /// The languages of extensions are one set per process, and tests run in
+    /// parallel in one process: a test that installs a language holds this
+    /// for as long as it runs, so another does not replace the set under it.
+    fn extension_languages() -> std::sync::MutexGuard<'static, ()> {
+        static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        // Start from what a fresh install has: none, whatever the test
+        // before left installed.
+        syntax::set_extension_languages(Vec::new());
+        guard
+    }
+
     fn click(cx: &mut VisualTestContext, selector: &'static str) {
         let bounds = cx
             .debug_bounds(selector)
@@ -8873,6 +8885,7 @@ mod tests {
 
     #[gpui::test]
     fn a_zed_extension_installs_from_the_catalog_and_works(cx: &mut TestAppContext) {
+        let _languages = extension_languages();
         let catalog = r#"{"data":[{"id":"vue","name":"Vue","version":"0.4.0","description":"Vue support.","download_count":675263,"provides":["languages","grammars","language-servers"]}]}"#;
         let (base, requests) = serve(vec![
             ("/extensions", Served::ok(catalog.as_bytes().to_vec())),
@@ -9035,6 +9048,179 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|r| r == "/extensions?max_schema_version=1&filter=vue")
+        );
+    }
+
+    /// What extensions reach outside their sandbox through, for the test
+    /// below: the server is "on the PATH" as a script that starts the mock
+    /// language server, and nothing else is available.
+    struct ServerOnPath(String);
+
+    impl extension::host::World for ServerOnPath {
+        fn node(&self) -> Result<String, String> {
+            Err("no Node here".into())
+        }
+        fn npm_latest(&self, _: &str) -> Result<String, String> {
+            Err("no npm here".into())
+        }
+        fn npm_install(&self, _: &Path, _: &str, _: &str) -> Result<(), String> {
+            Err("no npm here".into())
+        }
+        fn release(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: bool,
+        ) -> Result<extension::host::Release, String> {
+            Err("no network here".into())
+        }
+        fn download(&self, _: &str, _: &Path, _: extension::host::FileKind) -> Result<(), String> {
+            Err("no network here".into())
+        }
+        fn fetch(
+            &self,
+            _: extension::host::HttpRequest,
+        ) -> Result<extension::host::HttpResponse, String> {
+            Err("no network here".into())
+        }
+        fn run(&self, _: &extension::host::Command) -> Result<extension::host::Output, String> {
+            Err("no commands here".into())
+        }
+        fn which(&self, binary: &str) -> Option<String> {
+            (binary == "vscode-html-language-server").then(|| self.0.clone())
+        }
+        fn env(&self) -> Vec<(String, String)> {
+            Vec::new()
+        }
+        fn status(&self, _: &str, _: extension::host::Status) {}
+    }
+
+    #[gpui::test]
+    fn a_language_server_of_a_zed_extension_starts_for_its_language(cx: &mut TestAppContext) {
+        let _languages = extension_languages();
+        // An extension whose language is the Vue of the fixtures and whose
+        // code is Zed's real HTML extension: asked for its server, it looks
+        // on the PATH first, where the test has put the mock server.
+        let source = db::testing::dir("ws-ext-lsp-source");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        write_file(
+            &source.join("extension.toml"),
+            "id = \"html\"\nname = \"HTML\"\nversion = \"0.3.2\"\nschema_version = 1\n\n[lib]\nkind = \"Rust\"\nversion = \"0.7.0\"\n\n[language_servers.vscode-html-language-server]\nlanguage = \"Vue.js\"\n\n[language_servers.vscode-html-language-server.language_ids]\n\"Vue.js\" = \"html\"\n",
+        );
+        std::fs::copy(
+            fixtures.join("extension/tests/fixtures/html/extension.wasm"),
+            source.join("extension.wasm"),
+        )
+        .unwrap();
+        write_file(
+            &source.join("languages/vue/config.toml"),
+            "name = \"Vue.js\"\ngrammar = \"vue\"\npath_suffixes = [\"vue\"]\n",
+        );
+        for query in ["highlights.scm", "injections.scm"] {
+            std::fs::copy(
+                fixtures.join("syntax/tests/fixtures/vue").join(query),
+                source.join("languages/vue").join(query),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(source.join("grammars")).unwrap();
+        std::fs::copy(
+            fixtures.join("syntax/tests/fixtures/vue/vue.wasm"),
+            source.join("grammars/vue.wasm"),
+        )
+        .unwrap();
+        let catalog = r#"{"data":[{"id":"html","name":"HTML","version":"0.3.2","description":"HTML support.","download_count":1,"provides":["languages","language-servers"]}]}"#;
+        let (base, _) = serve(vec![
+            ("/extensions", Served::ok(catalog.as_bytes().to_vec())),
+            ("/extensions/html/download", Served::ok(tar(&source))),
+        ]);
+
+        // The server "on the PATH": a script that starts the mock server
+        // and tells it where to write down what it is sent.
+        let scratch = db::testing::dir("ws-ext-lsp-server");
+        let log = scratch.join("sent.jsonl");
+        let script = scratch.join("vscode-html-language-server");
+        let mock = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        write_file(
+            &script,
+            &format!(
+                "#!/bin/sh\nMOCK_LSP_LOG='{}' exec python3 '{}'\n",
+                log.display(),
+                mock.display()
+            ),
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-lsp", &base);
+        let world = ServerOnPath(script.to_string_lossy().into_owned());
+        store.update(cx, |store, _| {
+            store.world = Some(std::sync::Arc::new(world))
+        });
+        let lsp = cx.read(|cx| LspStore::global(cx).unwrap());
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+
+        // Installing the extension is all it takes: the open file gets its
+        // language, and the language its server.
+        cx.dispatch_action(ShowExtensions);
+        cx.run_until_parked();
+        click(cx, "extensions-zed");
+        wait_for(cx, "the catalog", &|cx| {
+            !store.read(cx).catalog(Origin::Zed).entries.is_empty()
+        });
+        cx.run_until_parked();
+        click(cx, "extension-act-0");
+        wait_for(cx, "the install", &|cx| {
+            store.read(cx).find(Origin::Zed, "html").is_some()
+        });
+        cx.simulate_keystrokes("escape");
+        wait_for(cx, "the language server", &|cx| {
+            lsp.read(cx)
+                .capabilities(editor.read(cx).document())
+                .is_some()
+        });
+        assert_eq!(cx.read(|cx| lsp.read(cx).status().cloned()), None);
+
+        // The server was started with what the extension said: its
+        // initialization options, and the language under the id the
+        // extension's manifest gives it.
+        let sent = |what: &str| -> Option<serde_json::Value> {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            text.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|entry| entry[0] == what)
+                .map(|entry| entry[1].clone())
+        };
+        wait_for(cx, "the file to be opened in the server", &|_| {
+            sent("open").is_some()
+        });
+        assert_eq!(
+            sent("initialize"),
+            Some(serde_json::json!({ "provideFormatter": true }))
+        );
+        assert_eq!(sent("open"), Some(serde_json::json!("html")));
+
+        // It answers like any other server: completion works in the file.
+        editor.update_in(cx, |e, _, cx| {
+            let end = e.text(cx).len();
+            e.select_range(end..end, cx)
+        });
+        cx.simulate_input("pri");
+        wait_for(cx, "completions from the server", &|cx| {
+            editor
+                .read(cx)
+                .completion
+                .as_ref()
+                .is_some_and(|menu| menu.items.iter().any(|item| item.label == "println"))
+        });
+
+        // The window counts the server among what Solder uses.
+        let installed = cx.read(|cx| store.read(cx).find(Origin::Zed, "html").cloned());
+        assert_eq!(
+            installed.unwrap().provides(),
+            "1 language, 1 language server"
         );
     }
 }

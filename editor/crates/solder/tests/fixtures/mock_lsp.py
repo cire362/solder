@@ -5,6 +5,7 @@ Diagnostics: every "TODO" is a warning, every "boom" an error.
 Positions are UTF-8 byte columns (negotiated via positionEncoding).
 """
 import json
+import os
 import re
 import sys
 
@@ -60,6 +61,14 @@ def publish(uri):
           "params": {"uri": uri, "diagnostics": diags}})
 
 
+def note(what, value):
+    """Appends what the client sent to the file MOCK_LSP_LOG names, if any."""
+    log = os.environ.get("MOCK_LSP_LOG")
+    if log:
+        with open(log, "a") as f:
+            f.write(json.dumps([what, value]) + "\n")
+
+
 def word_at(text, byte):
     data = text.encode()
     start = byte
@@ -79,6 +88,7 @@ while True:
     params = msg.get("params") or {}
     mid = msg.get("id")
     if method == "initialize":
+        note("initialize", params.get("initializationOptions"))
         send({"jsonrpc": "2.0", "id": mid, "result": {"capabilities": {
             "positionEncoding": "utf-8",
             "textDocumentSync": 2,
@@ -92,8 +102,11 @@ while True:
             "executeCommandProvider": {"commands": ["mock.touch"]},
             "signatureHelpProvider": {"triggerCharacters": ["("], "retriggerCharacters": [","]},
         }}})
+    elif method == "workspace/didChangeConfiguration":
+        note("configuration", params.get("settings"))
     elif method == "textDocument/didOpen":
         doc = params["textDocument"]
+        note("open", doc.get("languageId"))
         docs[doc["uri"]] = doc["text"]
         publish(doc["uri"])
     elif method == "textDocument/didChange":

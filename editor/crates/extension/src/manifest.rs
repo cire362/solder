@@ -100,6 +100,11 @@ pub struct Extension {
 }
 
 impl Extension {
+    /// Whether its code runs in Solder's host.
+    pub fn runs_code(&self) -> bool {
+        matches!(&self.code, Code::Zed { api } if crate::host::runs(api))
+    }
+
     /// One line on what Solder takes from it.
     pub fn provides(&self) -> String {
         let count = |n: usize, one: &str, many: &str| match n {
@@ -114,6 +119,15 @@ impl Extension {
             .count();
         let parts: Vec<String> = [
             count(highlighted, "language", "languages"),
+            count(
+                if self.runs_code() {
+                    self.servers.len()
+                } else {
+                    0
+                },
+                "language server",
+                "language servers",
+            ),
             count(self.themes.len(), "theme", "themes"),
             count(self.snippets.len(), "snippet file", "snippet files"),
         ]

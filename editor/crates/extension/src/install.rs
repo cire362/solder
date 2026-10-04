@@ -57,6 +57,11 @@ pub fn dir_for(root: &Path, origin: Origin, id: &str) -> PathBuf {
     root.join(origin.folder()).join(id)
 }
 
+/// The folder a Zed extension's code keeps what it downloads in.
+pub fn work_dir(root: &Path, id: &str) -> PathBuf {
+    root.join("work").join(id)
+}
+
 /// Every extension under `root`, by name; blocking. A folder that cannot be
 /// read is reported and left out.
 pub fn installed(root: &Path) -> Vec<Extension> {
@@ -81,6 +86,8 @@ pub fn remove(root: &Path, origin: Origin, id: &str) -> Result<(), String> {
     if !valid_id(id) {
         return Err(format!("{id} is not an extension id"));
     }
+    // The language servers its code downloaded go with it.
+    let _ = std::fs::remove_dir_all(work_dir(root, id));
     match std::fs::remove_dir_all(dir_for(root, origin, id)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
         _ => Ok(()),
@@ -379,11 +386,13 @@ mod tests {
         );
         assert_eq!(
             installed.provides(),
-            "1 language, 2 themes, 2 snippet files"
+            "1 language, 1 language server, 2 themes, 2 snippet files"
         );
 
         assert_eq!(super::installed(&root), vec![installed]);
+        write(&work_dir(&root, "demo").join("server/bin/ls"), "");
         remove(&root, Origin::Zed, "demo").unwrap();
+        assert!(!work_dir(&root, "demo").exists());
         assert!(super::installed(&root).is_empty());
         remove(&root, Origin::Zed, "demo").unwrap();
         assert!(remove(&root, Origin::Zed, "../x").is_err());

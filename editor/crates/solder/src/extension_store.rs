@@ -7,15 +7,23 @@
 //! language is opened, and the network is used only when the Extensions
 //! window searches or installs.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use extension::{
     Entry, Extension, Origin, Snippet, catalog,
+    host::{Host, Status, World},
     install::{self, Progress},
+    world::System,
 };
-use gpui::{App, AppContext, Context, Entity, Global, WeakEntity};
+use futures::{StreamExt, channel::mpsc};
+use gpui::{App, AppContext, Context, Entity, Global, SharedString, Task, WeakEntity};
 
-use crate::{document::Document, import_settings};
+use crate::{document::Document, import_settings, lsp_store::LspStore};
 
 /// An extension by where it is from and its id in lowercase: the two
 /// catalogs do not agree with the manifests on the case of ids.
@@ -37,6 +45,29 @@ pub struct Catalog {
     pub searched: bool,
     generation: usize,
 }
+
+/// A language server an installed extension knows how to get and start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionServer {
+    /// The extension's id.
+    pub extension: String,
+    pub id: String,
+    pub name: String,
+    /// What the server calls the language, where the extension says.
+    pub language_id: Option<String>,
+}
+
+/// What an extension answered about its server.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Resolved {
+    pub command: extension::host::Command,
+    pub initialization_options: Option<serde_json::Value>,
+    pub configuration: Option<serde_json::Value>,
+}
+
+/// An extension's code, loaded when a server of it is first needed. The
+/// lock is held while it loads, so two projects asking at once load it once.
+type Slot = Arc<Mutex<Option<Arc<Host>>>>;
 
 /// The snippets of one file and the languages they are for.
 struct SnippetSet {
@@ -67,6 +98,14 @@ pub struct ExtensionStore {
     pub theme_status: Option<Result<String, String>>,
     documents: Vec<WeakEntity<Document>>,
     scans: usize,
+    /// The loaded code of extensions, by extension id.
+    hosts: HashMap<String, Slot>,
+    /// What extensions reach outside their sandbox through. `None` is the
+    /// real thing; tests script it.
+    pub world: Option<Arc<dyn World>>,
+    /// Where extensions report on the servers they are getting ready.
+    statuses: mpsc::UnboundedSender<(String, Status)>,
+    _pump: Task<()>,
 }
 
 struct GlobalExtensionStore(Entity<ExtensionStore>);
@@ -74,7 +113,30 @@ struct GlobalExtensionStore(Entity<ExtensionStore>);
 impl Global for GlobalExtensionStore {}
 
 impl ExtensionStore {
-    pub fn new(root: PathBuf, config: PathBuf) -> Self {
+    pub fn new(root: PathBuf, config: PathBuf, cx: &mut Context<Self>) -> Self {
+        // An extension speaks from its own thread; what it says about a
+        // server goes to the status bar, next to the language servers' own.
+        let (statuses, mut said) = mpsc::unbounded::<(String, Status)>();
+        let pump = cx.spawn(async move |_, cx| {
+            while let Some((server, status)) = said.next().await {
+                let text: Option<SharedString> = match status {
+                    Status::Ready => None,
+                    Status::CheckingForUpdate => {
+                        Some(format!("Checking {server} for updates...").into())
+                    }
+                    Status::Downloading => Some(format!("Downloading {server}...").into()),
+                    Status::Failed(why) => Some(format!("{server}: {why}").into()),
+                };
+                let shown = cx.update(|cx| {
+                    if let Some(lsp) = LspStore::global(cx) {
+                        lsp.update(cx, |lsp, cx| lsp.set_status(text, cx));
+                    }
+                });
+                if shown.is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             root,
             config,
@@ -91,6 +153,10 @@ impl ExtensionStore {
             theme_status: None,
             documents: Vec::new(),
             scans: 0,
+            hosts: HashMap::new(),
+            world: None,
+            statuses,
+            _pump: pump,
         }
     }
 
@@ -113,7 +179,7 @@ impl ExtensionStore {
                 .join("Solder/extensions"),
             crate::settings::config_dir(),
         );
-        let store = cx.new(|_| ExtensionStore::new(root, config));
+        let store = cx.new(|cx| ExtensionStore::new(root, config, cx));
         cx.set_global(GlobalExtensionStore(store.clone()));
         store.update(cx, |s, cx| s.scan(cx));
         store
@@ -188,6 +254,12 @@ impl ExtensionStore {
                 if this.scans != scan {
                     return;
                 }
+                // An extension that changed or went away takes its loaded
+                // code with it; the next request loads what is there now.
+                this.hosts.retain(|id, _| {
+                    let before = this.installed.iter().find(|e| e.id == *id);
+                    before.is_some() && before == installed.iter().find(|e| e.id == *id)
+                });
                 this.installed = installed;
                 this.snippets = snippets;
                 this.loaded = true;
@@ -242,6 +314,92 @@ impl ExtensionStore {
             .flat_map(|set| &set.snippets)
             .filter(|snippet| applies(&snippet.scopes))
             .collect()
+    }
+
+    /// The server an installed extension brings for `language`, if its code
+    /// is one Solder runs.
+    pub fn server_for(&self, language: &str) -> Option<ExtensionServer> {
+        self.installed
+            .iter()
+            .filter(|extension| extension.runs_code())
+            .find_map(|extension| {
+                let server = extension
+                    .servers
+                    .iter()
+                    .find(|server| server.languages.iter().any(|l| l == language))?;
+                Some(ExtensionServer {
+                    extension: extension.id.clone(),
+                    id: server.id.clone(),
+                    name: server.name.clone(),
+                    language_id: server
+                        .language_ids
+                        .iter()
+                        .find(|(name, _)| name == language)
+                        .map(|(_, id)| id.clone()),
+                })
+            })
+    }
+
+    /// Asks the extension how to start `server` for the project in `root`.
+    /// The extension may first download the server, so this can take as
+    /// long as that does. It runs on a thread of its own.
+    pub fn resolve(
+        &mut self,
+        server: &ExtensionServer,
+        root: &Path,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Resolved, String>> {
+        let Some(extension) = self.find(Origin::Zed, &server.extension).cloned() else {
+            return Task::ready(Err(format!("{} is not installed", server.extension)));
+        };
+        let slot = self.hosts.entry(extension.id.clone()).or_default().clone();
+        let work_dir = install::work_dir(&self.root, &extension.id);
+        let world = self.world.clone();
+        let statuses = self.statuses.clone();
+        let (id, root) = (server.id.clone(), root.to_path_buf());
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("solder-extension".into())
+            .spawn(move || {
+                let answer = (|| {
+                    let host = {
+                        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+                        match &*slot {
+                            Some(host) => host.clone(),
+                            None => {
+                                let world = world.unwrap_or_else(|| {
+                                    Arc::new(System::new(
+                                        extension::world::user_env(),
+                                        move |server, status| {
+                                            let _ = statuses
+                                                .unbounded_send((server.to_string(), status));
+                                        },
+                                    ))
+                                });
+                                let host = Arc::new(Host::load(&extension, &work_dir, world)?);
+                                *slot = Some(host.clone());
+                                host
+                            }
+                        }
+                    };
+                    let json = |text: Option<String>| {
+                        text.and_then(|text| serde_json::from_str(&text).ok())
+                    };
+                    Ok(Resolved {
+                        command: host.language_server_command(&id, &root)?,
+                        initialization_options: json(host.initialization_options(&id, &root)?),
+                        configuration: json(host.workspace_configuration(&id, &root)?),
+                    })
+                })();
+                let _ = tx.send(answer);
+            });
+        if let Err(error) = spawned {
+            return Task::ready(Err(error.to_string()));
+        }
+        cx.background_executor().spawn(async move {
+            rx.await
+                .unwrap_or_else(|_| Err("The extension stopped without an answer".into()))
+        })
     }
 
     /// Asks a catalog for `query`. An answer to an older question is dropped.

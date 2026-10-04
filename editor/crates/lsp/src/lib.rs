@@ -79,6 +79,8 @@ pub struct LanguageServer {
     pending: Pending,
     capabilities: Mutex<ServerCapabilities>,
     encoding: Mutex<Encoding>,
+    /// What `workspace/configuration` is answered from.
+    configuration: Arc<Mutex<Value>>,
     child: Mutex<Child>,
 }
 
@@ -110,6 +112,7 @@ impl LanguageServer {
         let (out_tx, out_rx) = std_mpsc::channel::<Vec<u8>>();
         let (note_tx, note_rx) = mpsc::unbounded();
         let pending: Pending = Arc::default();
+        let configuration = Arc::new(Mutex::new(Value::Null));
 
         std::thread::Builder::new()
             .name("lsp-writer".into())
@@ -118,9 +121,10 @@ impl LanguageServer {
         {
             let pending = pending.clone();
             let out_tx = out_tx.clone();
+            let configuration = configuration.clone();
             std::thread::Builder::new()
                 .name("lsp-reader".into())
-                .spawn(move || read_loop(stdout, pending, note_tx, out_tx))
+                .spawn(move || read_loop(stdout, pending, note_tx, out_tx, configuration))
                 .map_err(|e| Error::Io(e.to_string()))?;
         }
 
@@ -131,6 +135,7 @@ impl LanguageServer {
             pending,
             capabilities: Mutex::new(ServerCapabilities::default()),
             encoding: Mutex::new(Encoding::Utf16),
+            configuration,
             child: Mutex::new(child),
         });
         Ok((server, note_rx))
@@ -146,6 +151,15 @@ impl LanguageServer {
 
     pub fn encoding(&self) -> Encoding {
         *self.encoding.lock()
+    }
+
+    /// The settings of this server: told to it now, and what its
+    /// `workspace/configuration` requests are answered from afterwards.
+    pub fn set_configuration(&self, settings: Value) {
+        *self.configuration.lock() = settings.clone();
+        self.notify::<lsp_types::notification::DidChangeConfiguration>(
+            lsp_types::DidChangeConfigurationParams { settings },
+        );
     }
 
     /// The `initialize` handshake. Offers UTF-8 positions first.
@@ -259,6 +273,7 @@ fn read_loop(
     pending: Pending,
     notifications: mpsc::UnboundedSender<Notification>,
     outgoing: std_mpsc::Sender<Vec<u8>>,
+    configuration: Arc<Mutex<Value>>,
 ) {
     let mut reader = BufReader::new(stdout);
     while let Some(message) = read_message(&mut reader) {
@@ -303,11 +318,16 @@ fn read_loop(
             (Some(id), Some(method)) => {
                 let result = match method.as_str() {
                     "workspace/configuration" => {
-                        let items = value
-                            .pointer("/params/items")
-                            .and_then(Value::as_array)
-                            .map_or(0, Vec::len);
-                        Value::Array(vec![Value::Null; items])
+                        let settings = configuration.lock();
+                        Value::Array(
+                            value
+                                .pointer("/params/items")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .map(|item| section(&settings, item["section"].as_str()))
+                                .collect(),
+                        )
                     }
                     _ => Value::Null,
                 };
@@ -340,6 +360,21 @@ fn read_loop(
 }
 
 /// Reads one `Content-Length`-framed message.
+/// The part of `settings` a server asks for: all of it, the value under
+/// the section's name, or the value its dotted path leads to.
+fn section(settings: &Value, name: Option<&str>) -> Value {
+    let Some(name) = name.filter(|n| !n.is_empty()) else {
+        return settings.clone();
+    };
+    if let Some(found) = settings.get(name) {
+        return found.clone();
+    }
+    name.split('.')
+        .try_fold(settings, |value, key| value.get(key))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
 fn read_message(reader: &mut impl BufRead) -> Option<Vec<u8>> {
     let mut length = None;
     loop {
@@ -422,6 +457,28 @@ pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn a_section_of_the_settings() {
+        let settings = json!({
+            "css": { "lint": { "level": 2 } },
+            "vue.inlayHints.missingProps": true
+        });
+        assert_eq!(section(&settings, None), settings);
+        assert_eq!(section(&settings, Some("")), settings);
+        assert_eq!(
+            section(&settings, Some("css")),
+            json!({ "lint": { "level": 2 } })
+        );
+        assert_eq!(section(&settings, Some("css.lint.level")), json!(2));
+        // A key that itself has dots wins over a path.
+        assert_eq!(
+            section(&settings, Some("vue.inlayHints.missingProps")),
+            json!(true)
+        );
+        assert_eq!(section(&settings, Some("less")), Value::Null);
+        assert_eq!(section(&Value::Null, Some("css")), Value::Null);
+    }
 
     #[test]
     fn frames_round_trip() {

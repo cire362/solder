@@ -90,6 +90,59 @@ impl System {
     }
 }
 
+/// The environment the user's own tools start with. An app started from the
+/// Dock gets a bare PATH, without Node from a version manager or anything
+/// else set up in the shell's files, so the shell is asked once: it prints
+/// its environment after reading them. If it cannot be asked within a few
+/// seconds, the app's own environment is used. Blocking; the answer is kept.
+pub fn user_env() -> Vec<(String, String)> {
+    static ENV: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    ENV.get_or_init(|| {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        shell_env(&shell, Duration::from_secs(5)).unwrap_or_else(|| std::env::vars().collect())
+    })
+    .clone()
+}
+
+/// What `shell` has in its environment as a login, interactive shell.
+fn shell_env(shell: &str, patience: Duration) -> Option<Vec<(String, String)>> {
+    // The marker separates the environment from whatever the shell's files
+    // print on the way.
+    const MARKER: &str = "__SOLDER_ENV__";
+    let mut child = Process::new(shell)
+        .args(["-l", "-i", "-c"])
+        .arg(format!("printf '%s' {MARKER}; /usr/bin/env -0"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut out);
+        let _ = tx.send(out);
+    });
+    let out = match rx.recv_timeout(patience) {
+        Ok(out) => out,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+    let _ = child.wait();
+    let out = String::from_utf8_lossy(&out);
+    let (_, env) = out.split_once(MARKER)?;
+    let env: Vec<(String, String)> = env
+        .split('\0')
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    env.iter().any(|(name, _)| name == "PATH").then_some(env)
+}
+
 fn is_program(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -410,6 +463,35 @@ mod tests {
                 .unwrap_err()
                 .starts_with("Node.js was not found")
         );
+    }
+
+    #[test]
+    fn the_shell_is_asked_for_the_users_environment() {
+        let dir = scratch("world-env");
+        // A shell whose files print a greeting and set up a PATH, as a
+        // version manager does.
+        executable(
+            &dir.join("shell"),
+            "#!/bin/sh\necho 'Welcome back'\nexport PATH=\"/opt/tools/bin:$PATH\"\nexport MULTI='a=b'\nshift 2\nexec /bin/sh \"$@\"\n",
+        );
+        let env = shell_env(dir.join("shell").to_str().unwrap(), Duration::from_secs(20)).unwrap();
+        let get = |name: &str| env.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
+        assert!(get("PATH").unwrap().starts_with("/opt/tools/bin:"));
+        assert_eq!(get("MULTI"), Some("a=b"));
+        // One that never answers is given up on.
+        executable(&dir.join("stuck"), "#!/bin/sh\nsleep 30\n");
+        let started = std::time::Instant::now();
+        assert!(
+            shell_env(
+                dir.join("stuck").to_str().unwrap(),
+                Duration::from_millis(300)
+            )
+            .is_none()
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(shell_env("/no/such/shell", Duration::from_secs(1)).is_none());
+        // The real one, whatever it is, has a PATH.
+        assert!(user_env().iter().any(|(name, _)| name == "PATH"));
     }
 
     #[test]

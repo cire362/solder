@@ -186,6 +186,17 @@ fn writable(work_dir: &Path, path: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// The program an extension named, as a path the system can start. A path
+/// relative to the extension's folder (a server it downloaded there) is
+/// made whole; a bare name is left for the PATH, and a full path as it is.
+fn program(work_dir: &Path, command: &str) -> String {
+    let path = Path::new(command);
+    if path.is_absolute() || (path.components().count() < 2 && !work_dir.join(path).is_file()) {
+        return command.to_string();
+    }
+    work_dir.join(path).to_string_lossy().into_owned()
+}
+
 /// Whether one of the declared `commands` covers `command`.
 fn declared(commands: &[(String, Vec<String>)], command: &Command) -> bool {
     commands.iter().any(|(program, args)| {
@@ -647,11 +658,12 @@ impl Host {
     /// How to start the language server `server` for the project in `root`.
     /// The extension may download the server first.
     pub fn language_server_command(&self, server: &str, root: &Path) -> Result<Command, String> {
-        self.ask(root, |extension, store, worktree| {
+        let command = self.ask(root, |extension, store, worktree| {
             extension.call_language_server_command(store, server, worktree)
-        })
-        .map(|command| Command {
-            command: command.command,
+        })?;
+        let running = self.running.lock().unwrap();
+        Ok(Command {
+            command: program(&running.store.data().work_dir, &command.command),
             args: command.args,
             env: command.env,
         })
@@ -698,6 +710,27 @@ mod tests {
         assert!(writable(dir, "/etc/passwd").is_err());
         // A neighbour whose name starts the same is not inside.
         assert!(writable(dir, "/data/work/html-evil/x").is_err());
+    }
+
+    #[test]
+    fn a_program_in_the_extensions_folder_gets_its_full_path() {
+        let dir = crate::testing::scratch("host-program");
+        crate::testing::write(&dir.join("server-v1/bin/server"), "");
+        crate::testing::write(&dir.join("taplo"), "");
+        let full = |relative: &str| dir.join(relative).to_string_lossy().into_owned();
+        // What an extension answers after downloading a server.
+        assert_eq!(
+            program(&dir, "server-v1/bin/server"),
+            full("server-v1/bin/server")
+        );
+        assert_eq!(
+            program(&dir, "./server-v1/bin/server"),
+            full("./server-v1/bin/server")
+        );
+        // A file directly in the folder, against a name meant for the PATH.
+        assert_eq!(program(&dir, "taplo"), full("taplo"));
+        assert_eq!(program(&dir, "gopls"), "gopls");
+        assert_eq!(program(&dir, "/usr/bin/node"), "/usr/bin/node");
     }
 
     #[test]
