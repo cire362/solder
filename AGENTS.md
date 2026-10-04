@@ -78,6 +78,12 @@ Never guess a signature.
 - `Workspace` owns panes, tabs, the sidebar, modals, the terminal dock and
   the find bar. Global state lives in `Settings`, `Theme`, `Perf` and
   `LspStore` (see `main.rs` for init order).
+- A document belongs to several language servers (`LspStore`): the one
+  Solder knows for its language, then every one an installed extension
+  brings. Answers that add up (completions, code actions, diagnostics) come
+  from all of them, each in its server's own position encoding: convert
+  before mixing. A request with one answer goes to the first server that
+  advertises it (`LspStore::request`).
 - Language-server requests triggered by typing must run after the current
   effect cycle (`cx.defer`), so the `didChange` for what was just typed
   reaches the server first. See `Editor::after_typing`.

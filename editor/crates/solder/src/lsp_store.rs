@@ -18,6 +18,7 @@ use text::{Buffer, Point};
 
 use crate::{
     document::{Diagnostic, Document, DocumentEvent, Severity},
+    extension_store::ExtensionServer,
     settings::Settings,
 };
 
@@ -146,14 +147,74 @@ enum ServerState {
 
 struct DocEntry {
     document: WeakEntity<Document>,
-    key: Option<ServerKey>,
+    /// The servers the document belongs to: the one Solder knows for its
+    /// language, then every one an extension brings for it.
+    servers: Vec<Attached>,
     uri: lt::Uri,
     version: i32,
+    _subscriptions: [Subscription; 2],
+}
+
+/// A document's place in one server.
+struct Attached {
+    key: ServerKey,
+    /// The server runs and was told the document is open.
     opened: bool,
     /// What the server calls this document's language, when an extension
     /// says; otherwise the document's own id is used.
     language_id: Option<String>,
-    _subscriptions: [Subscription; 2],
+}
+
+/// A code action with the server it came from: its edits are in that
+/// server's encoding, and resolving or running it goes back there.
+#[derive(Clone, Debug)]
+pub struct ServerAction {
+    pub action: lt::CodeActionOrCommand,
+    pub encoding: Encoding,
+    pub server: &'static str,
+}
+
+/// A request on its way to one server: the server's name, its encoding and
+/// the answer to wait for.
+pub type Asked<R> = (
+    &'static str,
+    Encoding,
+    BoxFuture<'static, lsp::Result<<R as lt::request::Request>::Result>>,
+);
+
+/// Whether a server said it answers `method`. One that did not say either
+/// way is asked.
+fn supports(caps: &lt::ServerCapabilities, method: &str) -> bool {
+    fn yes<T>(provider: &Option<lt::OneOf<bool, T>>) -> bool {
+        !matches!(provider, None | Some(lt::OneOf::Left(false)))
+    }
+    match method {
+        "textDocument/completion" => caps.completion_provider.is_some(),
+        "textDocument/hover" => !matches!(
+            caps.hover_provider,
+            None | Some(lt::HoverProviderCapability::Simple(false))
+        ),
+        "textDocument/signatureHelp" => caps.signature_help_provider.is_some(),
+        "textDocument/definition" => yes(&caps.definition_provider),
+        "textDocument/references" => yes(&caps.references_provider),
+        "textDocument/rename" => yes(&caps.rename_provider),
+        "textDocument/formatting" => yes(&caps.document_formatting_provider),
+        "textDocument/codeAction" => !matches!(
+            caps.code_action_provider,
+            None | Some(lt::CodeActionProviderCapability::Simple(false))
+        ),
+        _ => true,
+    }
+}
+
+impl Attached {
+    fn new(key: ServerKey, language_id: Option<String>) -> Self {
+        Self {
+            key,
+            opened: false,
+            language_id,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -247,18 +308,18 @@ impl LspStore {
             id,
             DocEntry {
                 document: document.downgrade(),
-                key: None,
                 uri: path_to_uri(Path::new("/")),
                 version: 0,
-                opened: false,
-                language_id: None,
+                servers: Vec::new(),
                 _subscriptions: subscriptions,
             },
         );
         self.attach(id, cx);
     }
 
-    /// Works out which server a document belongs to and gets it opened there.
+    /// Works out which servers a document belongs to and gets it opened in
+    /// each: the one Solder knows for its language, and every one an
+    /// installed extension brings for it.
     fn attach(&mut self, id: EntityId, cx: &mut Context<Self>) {
         let Some(entry) = self.docs.get_mut(&id) else {
             return;
@@ -267,44 +328,98 @@ impl LspStore {
             return;
         };
         let doc = document.read(cx);
-        let (Some(path), Some(language)) = (doc.path(), doc.language_name()) else {
-            entry.key = None;
-            return;
-        };
-        // The servers Solder knows first, then the one an installed
-        // extension brings for the language.
-        let builtin = spec_for(language);
-        let brought = match builtin {
-            Some(_) => None,
-            None => crate::extension_store::ExtensionStore::try_global(cx)
-                .and_then(|store| store.read(cx).server_for(language)),
-        };
-        let (name, root) = match (&builtin, &brought) {
-            (Some(spec), _) => (spec.name, find_root(path, spec.root_markers)),
-            (None, Some(server)) => (intern(&server.id), find_root(path, &[".git"])),
-            (None, None) => {
-                entry.key = None;
-                return;
+        let mut wanted: Vec<(Attached, Option<ServerSpec>, Option<ExtensionServer>)> = Vec::new();
+        if let (Some(path), Some(language)) = (doc.path(), doc.language_name()) {
+            entry.uri = path_to_uri(path);
+            if let Some(spec) = spec_for(language) {
+                let key = ServerKey {
+                    name: spec.name,
+                    root: find_root(path, spec.root_markers),
+                };
+                wanted.push((Attached::new(key, None), Some(spec), None));
             }
-        };
-        let settings = Settings::get(cx).language_servers.get(name).cloned();
-        if settings.as_ref().is_some_and(|s| s.disabled) {
-            entry.key = None;
-            return;
+            let brought = crate::extension_store::ExtensionStore::try_global(cx)
+                .map(|store| store.read(cx).servers_for(language))
+                .unwrap_or_default();
+            for server in brought {
+                let key = ServerKey {
+                    name: intern(&server.id),
+                    root: find_root(path, &[".git"]),
+                };
+                // Two extensions that bring the same server start it once.
+                if wanted.iter().all(|(attached, ..)| attached.key != key) {
+                    let attached = Attached::new(key, server.language_id.clone());
+                    wanted.push((attached, None, Some(server)));
+                }
+            }
+            let settings = Settings::get(cx);
+            wanted.retain(|(attached, ..)| {
+                !settings
+                    .language_servers
+                    .get(attached.key.name)
+                    .is_some_and(|s| s.disabled)
+            });
         }
-        let key = ServerKey { name, root };
-        entry.uri = path_to_uri(path);
-        entry.key = Some(key.clone());
-        entry.opened = false;
-        entry.language_id = brought.as_ref().and_then(|s| s.language_id.clone());
-        match self.servers.get(&key) {
-            Some(ServerState::Running { .. }) => self.open(id, cx),
-            Some(ServerState::Starting | ServerState::Failed) => {}
-            None => match (builtin, brought) {
-                (Some(spec), _) => self.start(key, spec, cx),
-                (None, Some(server)) => self.start_from_extension(key, server, cx),
-                (None, None) => {}
-            },
+        // A server the document stays in keeps it open; one it leaves is
+        // told it closed.
+        let before = std::mem::take(&mut entry.servers);
+        let mut starting = Vec::new();
+        for (mut attached, spec, server) in wanted {
+            attached.opened = before
+                .iter()
+                .any(|was| was.key == attached.key && was.opened);
+            starting.push((attached.key.clone(), attached.opened, spec, server));
+            entry.servers.push(attached);
+        }
+        let uri = entry.uri.clone();
+        let left: Vec<ServerKey> = before
+            .into_iter()
+            .filter(|was| was.opened && starting.iter().all(|(key, ..)| *key != was.key))
+            .map(|was| was.key)
+            .collect();
+        for key in &left {
+            if let Some(server) = self.server(key) {
+                server.notify::<lt::notification::DidCloseTextDocument>(
+                    lt::DidCloseTextDocumentParams {
+                        text_document: lt::TextDocumentIdentifier { uri: uri.clone() },
+                    },
+                );
+            }
+        }
+        // What a server it no longer belongs to reported goes with it.
+        let doc = document.read(cx);
+        let names: Vec<&'static str> = starting.iter().map(|(key, ..)| key.name).collect();
+        let stale = doc.diagnostics().iter().any(|d| !names.contains(&d.server));
+        if stale {
+            document.update(cx, |doc, cx| {
+                let kept = doc
+                    .diagnostics()
+                    .iter()
+                    .filter(|d| names.contains(&d.server))
+                    .cloned()
+                    .collect();
+                doc.set_diagnostics(kept, cx);
+            });
+        }
+        for (key, opened, spec, server) in starting {
+            match (self.servers.get(&key), spec, server) {
+                (Some(ServerState::Running { .. }), ..) if opened => {}
+                (Some(ServerState::Running { .. }), ..) => self.open(id, &key, cx),
+                (Some(ServerState::Starting | ServerState::Failed), ..) => {}
+                (None, Some(spec), _) => self.start(key, spec, cx),
+                (None, None, Some(server)) => self.start_from_extension(key, server, cx),
+                (None, None, None) => {}
+            }
+        }
+    }
+
+    /// The extensions that are installed and on changed: every document
+    /// joins the servers they now bring for its language and leaves the
+    /// ones they no longer do. A document whose servers are the same is not
+    /// touched.
+    pub fn extension_servers_changed(&mut self, cx: &mut Context<Self>) {
+        for id in self.docs.keys().copied().collect::<Vec<_>>() {
+            self.attach(id, cx);
         }
     }
 
@@ -313,7 +428,7 @@ impl LspStore {
     fn start_from_extension(
         &mut self,
         key: ServerKey,
-        server: crate::extension_store::ExtensionServer,
+        server: ExtensionServer,
         cx: &mut Context<Self>,
     ) {
         self.servers.insert(key.clone(), ServerState::Starting);
@@ -453,11 +568,11 @@ impl LspStore {
         let waiting: Vec<EntityId> = self
             .docs
             .iter()
-            .filter(|(_, e)| e.key.as_ref() == Some(&key) && !e.opened)
+            .filter(|(_, e)| e.servers.iter().any(|a| a.key == key && !a.opened))
             .map(|(id, _)| *id)
             .collect();
         for id in waiting {
-            self.open(id, cx);
+            self.open(id, &key, cx);
         }
         cx.notify();
     }
@@ -469,31 +584,52 @@ impl LspStore {
         }
     }
 
-    fn open(&mut self, id: EntityId, cx: &mut Context<Self>) {
+    /// The running servers a document is open in, in the order it got them.
+    fn opened<'a>(
+        &'a self,
+        entry: &'a DocEntry,
+    ) -> impl Iterator<Item = (&'static str, &'a Arc<LanguageServer>)> + 'a {
+        entry
+            .servers
+            .iter()
+            .filter(|attached| attached.opened)
+            .filter_map(|attached| Some((attached.key.name, self.server(&attached.key)?)))
+    }
+
+    /// Tells the server under `key` that the document is open.
+    fn open(&mut self, id: EntityId, key: &ServerKey, cx: &mut Context<Self>) {
         let Some(entry) = self.docs.get(&id) else {
             return;
         };
-        let (Some(key), Some(document)) = (entry.key.clone(), entry.document.upgrade()) else {
+        let (Some(attached), Some(document)) = (
+            entry.servers.iter().find(|a| a.key == *key),
+            entry.document.upgrade(),
+        ) else {
             return;
         };
-        let Some(server) = self.server(&key).cloned() else {
+        let Some(server) = self.server(key).cloned() else {
             return;
         };
         let doc = document.read(cx);
         server.notify::<lt::notification::DidOpenTextDocument>(lt::DidOpenTextDocumentParams {
             text_document: lt::TextDocumentItem {
                 uri: entry.uri.clone(),
-                language_id: entry
+                language_id: attached
                     .language_id
                     .clone()
                     .unwrap_or_else(|| doc.language_id().into()),
-                version: 0,
+                // The version the other servers of the document are at: the
+                // changes that follow carry the next ones.
+                version: entry.version,
                 text: doc.text().rope().to_string(),
             },
         });
-        if let Some(entry) = self.docs.get_mut(&id) {
-            entry.opened = true;
-            entry.version = 0;
+        if let Some(attached) = self
+            .docs
+            .get_mut(&id)
+            .and_then(|entry| entry.servers.iter_mut().find(|a| a.key == *key))
+        {
+            attached.opened = true;
         }
     }
 
@@ -501,65 +637,70 @@ impl LspStore {
         let Some(entry) = self.docs.get_mut(&id) else {
             return;
         };
-        if !entry.opened {
-            return;
-        }
-        let Some(key) = entry.key.clone() else { return };
-        let Some(server) = (match self.servers.get(&key) {
-            Some(ServerState::Running { server, .. }) => Some(server.clone()),
-            _ => None,
-        }) else {
-            return;
-        };
-        let sync = sync_kind(&server.capabilities());
-        if sync == lt::TextDocumentSyncKind::NONE {
+        if !entry.servers.iter().any(|a| a.opened) {
             return;
         }
         entry.version += 1;
-        let changes = if sync == lt::TextDocumentSyncKind::INCREMENTAL {
-            let utf8 = server.encoding() == Encoding::Utf8;
-            edits
-                .iter()
-                .map(|e| {
-                    let (start, end) = if utf8 {
-                        (e.start_point, e.old_end_point)
-                    } else {
-                        (e.start_utf16, e.old_end_utf16)
-                    };
-                    lt::TextDocumentContentChangeEvent {
-                        range: Some(lt::Range::new(position(start), position(end))),
-                        range_length: None,
-                        text: e.new_text.to_string(),
-                    }
-                })
-                .collect()
-        } else {
-            let Some(document) = entry.document.upgrade() else {
-                return;
-            };
-            vec![lt::TextDocumentContentChangeEvent {
-                range: None,
-                range_length: None,
-                text: document.read(cx).text().rope().to_string(),
-            }]
+        let Some(entry) = self.docs.get(&id) else {
+            return;
         };
-        server.notify::<lt::notification::DidChangeTextDocument>(lt::DidChangeTextDocumentParams {
-            text_document: lt::VersionedTextDocumentIdentifier {
-                uri: entry.uri.clone(),
-                version: entry.version,
-            },
-            content_changes: changes,
-        });
+        let whole = std::cell::OnceCell::new();
+        for (_, server) in self.opened(entry) {
+            let sync = sync_kind(&server.capabilities());
+            if sync == lt::TextDocumentSyncKind::NONE {
+                continue;
+            }
+            let changes = if sync == lt::TextDocumentSyncKind::INCREMENTAL {
+                let utf8 = server.encoding() == Encoding::Utf8;
+                edits
+                    .iter()
+                    .map(|e| {
+                        let (start, end) = if utf8 {
+                            (e.start_point, e.old_end_point)
+                        } else {
+                            (e.start_utf16, e.old_end_utf16)
+                        };
+                        lt::TextDocumentContentChangeEvent {
+                            range: Some(lt::Range::new(position(start), position(end))),
+                            range_length: None,
+                            text: e.new_text.to_string(),
+                        }
+                    })
+                    .collect()
+            } else {
+                // The whole text, made once for the servers that want it.
+                let Some(text) = whole
+                    .get_or_init(|| {
+                        let document = entry.document.upgrade()?;
+                        Some(document.read(cx).text().rope().to_string())
+                    })
+                    .clone()
+                else {
+                    continue;
+                };
+                vec![lt::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text,
+                }]
+            };
+            server.notify::<lt::notification::DidChangeTextDocument>(
+                lt::DidChangeTextDocumentParams {
+                    text_document: lt::VersionedTextDocumentIdentifier {
+                        uri: entry.uri.clone(),
+                        version: entry.version,
+                    },
+                    content_changes: changes,
+                },
+            );
+        }
     }
 
     fn did_save(&mut self, id: EntityId) {
         let Some(entry) = self.docs.get(&id) else {
             return;
         };
-        let (true, Some(key)) = (entry.opened, entry.key.as_ref()) else {
-            return;
-        };
-        if let Some(server) = self.server(key) {
+        for (_, server) in self.opened(entry) {
             server.notify::<lt::notification::DidSaveTextDocument>(lt::DidSaveTextDocumentParams {
                 text_document: lt::TextDocumentIdentifier {
                     uri: entry.uri.clone(),
@@ -570,17 +711,10 @@ impl LspStore {
     }
 
     fn close(&mut self, id: EntityId) {
-        let Some(entry) = self.docs.get_mut(&id) else {
+        let Some(entry) = self.docs.get(&id) else {
             return;
         };
-        if !entry.opened {
-            return;
-        }
-        entry.opened = false;
-        if let Some(server) = entry.key.as_ref().and_then(|k| match self.servers.get(k) {
-            Some(ServerState::Running { server, .. }) => Some(server),
-            _ => None,
-        }) {
+        for (_, server) in self.opened(entry) {
             server.notify::<lt::notification::DidCloseTextDocument>(
                 lt::DidCloseTextDocumentParams {
                     text_document: lt::TextDocumentIdentifier {
@@ -588,6 +722,11 @@ impl LspStore {
                     },
                 },
             );
+        }
+        if let Some(entry) = self.docs.get_mut(&id) {
+            for attached in &mut entry.servers {
+                attached.opened = false;
+            }
         }
     }
 
@@ -602,8 +741,9 @@ impl LspStore {
                     return;
                 };
                 let encoding = server.encoding();
+                let name = key.name;
                 for entry in self.docs.values() {
-                    if entry.key.as_ref() != Some(key) || entry.uri != params.uri {
+                    if entry.uri != params.uri || entry.servers.iter().all(|a| a.key != *key) {
                         continue;
                     }
                     let Some(document) = entry.document.upgrade() else {
@@ -611,21 +751,28 @@ impl LspStore {
                     };
                     let diagnostics = params.diagnostics.clone();
                     document.update(cx, |doc, cx| {
-                        let converted = diagnostics
+                        // This server's replace its own; what the document's
+                        // other servers reported stays.
+                        let others = doc
+                            .diagnostics()
                             .iter()
-                            .map(|d| Diagnostic {
-                                range: from_range(doc.text(), d.range, encoding),
-                                severity: match d.severity {
-                                    Some(lt::DiagnosticSeverity::ERROR) => Severity::Error,
-                                    Some(lt::DiagnosticSeverity::WARNING) => Severity::Warning,
-                                    Some(lt::DiagnosticSeverity::HINT) => Severity::Hint,
-                                    _ => Severity::Info,
-                                },
-                                message: d.message.clone(),
-                                source: d.source.clone(),
-                            })
-                            .collect();
-                        doc.set_diagnostics(converted, cx);
+                            .filter(|d| d.server != name)
+                            .cloned();
+                        let fresh = diagnostics.iter().map(|d| Diagnostic {
+                            range: from_range(doc.text(), d.range, encoding),
+                            severity: match d.severity {
+                                Some(lt::DiagnosticSeverity::ERROR) => Severity::Error,
+                                Some(lt::DiagnosticSeverity::WARNING) => Severity::Warning,
+                                Some(lt::DiagnosticSeverity::HINT) => Severity::Hint,
+                                _ => Severity::Info,
+                            },
+                            message: d.message.clone(),
+                            source: d.source.clone(),
+                            server: name,
+                        });
+                        let mut merged: Vec<Diagnostic> = others.chain(fresh).collect();
+                        merged.sort_by_key(|d| (d.range.start, d.range.end));
+                        doc.set_diagnostics(merged, cx);
                     });
                 }
             }
@@ -682,8 +829,9 @@ impl LspStore {
         }
     }
 
-    /// Sends a request about `document` to its server. `None` when the
-    /// document has no running server.
+    /// Sends a request about `document` to one server: the first of its
+    /// servers that said it answers this kind, or the first of all if none
+    /// said. `None` when the document has no running server.
     pub fn request<R: lt::request::Request>(
         &self,
         document: &Entity<Document>,
@@ -691,10 +839,11 @@ impl LspStore {
         params: impl FnOnce(lt::TextDocumentIdentifier, Encoding, &Buffer) -> R::Params,
     ) -> Option<(Encoding, BoxFuture<'static, lsp::Result<R::Result>>)> {
         let entry = self.docs.get(&document.entity_id())?;
-        if !entry.opened {
-            return None;
-        }
-        let server = self.server(entry.key.as_ref()?)?;
+        let server = self
+            .opened(entry)
+            .map(|(_, server)| server)
+            .find(|server| supports(&server.capabilities(), R::METHOD))
+            .or_else(|| self.opened(entry).map(|(_, server)| server).next())?;
         let encoding = server.encoding();
         let id = lt::TextDocumentIdentifier {
             uri: entry.uri.clone(),
@@ -703,21 +852,54 @@ impl LspStore {
         Some((encoding, server.request::<R>(params).boxed()))
     }
 
-    /// Sends a request to the document's server that is not about a position
-    /// in the document (code action resolve, execute command).
+    /// Sends a request about `document` to every one of its servers that
+    /// answers this kind, for answers that add up: completions, actions.
+    /// Each comes with the server's name and its encoding.
+    pub fn request_all<R: lt::request::Request>(
+        &self,
+        document: &Entity<Document>,
+        cx: &App,
+        params: impl Fn(lt::TextDocumentIdentifier, Encoding, &Buffer) -> R::Params,
+    ) -> Vec<Asked<R>> {
+        let Some(entry) = self.docs.get(&document.entity_id()) else {
+            return Vec::new();
+        };
+        let buffer = document.read(cx).text();
+        self.opened(entry)
+            .filter(|(_, server)| supports(&server.capabilities(), R::METHOD))
+            .map(|(name, server)| {
+                let encoding = server.encoding();
+                let id = lt::TextDocumentIdentifier {
+                    uri: entry.uri.clone(),
+                };
+                let request = server.request::<R>(params(id, encoding, buffer)).boxed();
+                (name, encoding, request)
+            })
+            .collect()
+    }
+
+    /// Sends a request to one of the document's servers by name, one that is
+    /// not about a position in the document (code action resolve, execute
+    /// command): it goes back to the server the action came from.
     pub fn server_request<R: lt::request::Request>(
         &self,
         document: &Entity<Document>,
+        server: &'static str,
         params: R::Params,
     ) -> Option<BoxFuture<'static, lsp::Result<R::Result>>> {
         let entry = self.docs.get(&document.entity_id())?;
-        let server = self.server(entry.key.as_ref()?)?;
+        let (_, server) = self.opened(entry).find(|(name, _)| *name == server)?;
         Some(server.request::<R>(params).boxed())
     }
 
-    pub fn capabilities(&self, document: &Entity<Document>) -> Option<lt::ServerCapabilities> {
-        let entry = self.docs.get(&document.entity_id())?;
-        Some(self.server(entry.key.as_ref()?)?.capabilities())
+    /// What each of the document's running servers can do.
+    pub fn all_capabilities(&self, document: &Entity<Document>) -> Vec<lt::ServerCapabilities> {
+        let Some(entry) = self.docs.get(&document.entity_id()) else {
+            return Vec::new();
+        };
+        self.opened(entry)
+            .map(|(_, server)| server.capabilities())
+            .collect()
     }
 
     /// Stops every server. Called when the app quits.

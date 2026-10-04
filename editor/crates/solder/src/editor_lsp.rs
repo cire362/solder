@@ -19,7 +19,7 @@ use crate::{
         HideCompletions, NextDiagnostic, PrevDiagnostic, RenameSymbol, SelectNextCompletion,
         SelectPrevCompletion, ShowCompletions, ShowHover,
     },
-    lsp_store::{LspStore, from_range, to_position},
+    lsp_store::{LspStore, ServerAction, from_range, to_position},
     picker::highlighted_text,
     settings::Settings,
     theme::{ActiveTheme, UI_FONT_SIZE},
@@ -190,11 +190,14 @@ impl Editor {
         self.schedule_ghost(cx);
         let Some(c) = text.chars().last() else { return };
         self.maybe_signature_help(c, cx);
+        // A character that any of the file's servers completes on.
         let triggers: Vec<String> = LspStore::global(cx)
-            .and_then(|s| s.read(cx).capabilities(&self.document))
-            .and_then(|c| c.completion_provider)
-            .and_then(|p| p.trigger_characters)
-            .unwrap_or_default();
+            .map(|s| s.read(cx).all_capabilities(&self.document))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|c| c.completion_provider?.trigger_characters)
+            .flatten()
+            .collect();
         let is_trigger =
             triggers.iter().any(|t| t.ends_with(c)) || (c == '.' && self.schema_source.is_some());
         if is_trigger {
@@ -253,21 +256,30 @@ impl Editor {
         } else {
             Vec::new()
         };
-        let Some((encoding, request)) =
-            self.lsp_request::<lt::request::Completion>(cx, |id, enc, buf| lt::CompletionParams {
-                text_document_position: Self::position_params(id, enc, buf, head),
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
-                context: Some(lt::CompletionContext {
-                    trigger_kind: if trigger.is_some() {
-                        lt::CompletionTriggerKind::TRIGGER_CHARACTER
-                    } else {
-                        lt::CompletionTriggerKind::INVOKED
+        // Every server of the file that completes is asked; their answers
+        // make one menu.
+        let requests = LspStore::global(cx)
+            .map(|store| {
+                store.read(cx).request_all::<lt::request::Completion>(
+                    &self.document,
+                    cx,
+                    |id, enc, buf| lt::CompletionParams {
+                        text_document_position: Self::position_params(id, enc, buf, head),
+                        work_done_progress_params: Default::default(),
+                        partial_result_params: Default::default(),
+                        context: Some(lt::CompletionContext {
+                            trigger_kind: if trigger.is_some() {
+                                lt::CompletionTriggerKind::TRIGGER_CHARACTER
+                            } else {
+                                lt::CompletionTriggerKind::INVOKED
+                            },
+                            trigger_character: trigger.map(|c| c.to_string()),
+                        }),
                     },
-                    trigger_character: trigger.map(|c| c.to_string()),
-                }),
+                )
             })
-        else {
+            .unwrap_or_default();
+        if requests.is_empty() {
             // No language server for this file: the snippets are the menu.
             if !snippets.is_empty() {
                 let mut menu = CompletionMenu::new(snippets, lsp::Encoding::Utf8, start);
@@ -276,15 +288,34 @@ impl Editor {
                 cx.notify();
             }
             return;
-        };
+        }
+        // The menu keeps one encoding for its items' ranges: the first
+        // server's. Items of a server that counts differently are rewritten
+        // to it when they arrive.
+        let encoding = requests[0].1;
         self.completion_task = Some(cx.spawn(async move |this, cx| {
-            let response = request.await;
+            let responses = futures::future::join_all(
+                requests
+                    .into_iter()
+                    .map(|(_, encoding, request)| async move { (encoding, request.await) }),
+            )
+            .await;
             this.update(cx, |this, cx| {
-                let mut items = match response {
-                    Ok(Some(lt::CompletionResponse::Array(items))) => items,
-                    Ok(Some(lt::CompletionResponse::List(list))) => list.items,
-                    _ => Vec::new(),
-                };
+                let buffer = this.document.read(cx).text();
+                let mut items = Vec::new();
+                for (from, response) in responses {
+                    let mut answered = match response {
+                        Ok(Some(lt::CompletionResponse::Array(items))) => items,
+                        Ok(Some(lt::CompletionResponse::List(list))) => list.items,
+                        _ => Vec::new(),
+                    };
+                    if from != encoding {
+                        for item in &mut answered {
+                            recode_item(item, buffer, from, encoding);
+                        }
+                    }
+                    items.extend(answered);
+                }
                 items.extend(snippets);
                 // The cursor may have moved while we waited.
                 let head_now = this.newest_range().end;
@@ -1062,9 +1093,13 @@ impl Editor {
     // ------------------------------------------------------------ signature help
 
     pub(crate) fn maybe_signature_help(&mut self, typed: char, cx: &mut Context<Self>) {
+        // The first of the file's servers that gives signature help: the
+        // request goes to the same one.
         let caps = LspStore::global(cx)
-            .and_then(|s| s.read(cx).capabilities(&self.document))
-            .and_then(|c| c.signature_help_provider);
+            .map(|s| s.read(cx).all_capabilities(&self.document))
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|c| c.signature_help_provider);
         let Some(caps) = caps else { return };
         let triggers = caps.trigger_characters.unwrap_or_default();
         let retriggers = caps.retrigger_characters.unwrap_or_default();
@@ -1182,43 +1217,80 @@ impl Editor {
             .filter(|d| d.range.start <= range.end && d.range.end >= range.start)
             .map(|d| (d.range.clone(), d.severity, d.message.clone()))
             .collect();
-        let Some((encoding, request)) =
-            self.lsp_request::<lt::request::CodeActionRequest>(cx, |id, enc, buf| {
-                let to_range = |r: Range<usize>| {
-                    lt::Range::new(to_position(buf, r.start, enc), to_position(buf, r.end, enc))
-                };
-                lt::CodeActionParams {
-                    text_document: id,
-                    range: to_range(range.clone()),
-                    context: lt::CodeActionContext {
-                        diagnostics: diagnostics
-                            .into_iter()
-                            .map(|(r, severity, message)| lt::Diagnostic {
-                                range: to_range(r),
-                                severity: Some(match severity {
-                                    Severity::Error => lt::DiagnosticSeverity::ERROR,
-                                    Severity::Warning => lt::DiagnosticSeverity::WARNING,
-                                    Severity::Info => lt::DiagnosticSeverity::INFORMATION,
-                                    Severity::Hint => lt::DiagnosticSeverity::HINT,
-                                }),
-                                message,
-                                ..Default::default()
-                            })
-                            .collect(),
-                        only: None,
-                        trigger_kind: Some(lt::CodeActionTriggerKind::INVOKED),
-                    },
-                    work_done_progress_params: Default::default(),
-                    partial_result_params: Default::default(),
-                }
+        // Every server of the file that has actions is asked; the picker
+        // lists them together, each remembering where it came from.
+        let requests = LspStore::global(cx)
+            .map(|store| {
+                store
+                    .read(cx)
+                    .request_all::<lt::request::CodeActionRequest>(
+                        &self.document,
+                        cx,
+                        |id, enc, buf| {
+                            let to_range = |r: Range<usize>| {
+                                lt::Range::new(
+                                    to_position(buf, r.start, enc),
+                                    to_position(buf, r.end, enc),
+                                )
+                            };
+                            lt::CodeActionParams {
+                                text_document: id,
+                                range: to_range(range.clone()),
+                                context: lt::CodeActionContext {
+                                    diagnostics: diagnostics
+                                        .iter()
+                                        .cloned()
+                                        .map(|(r, severity, message)| lt::Diagnostic {
+                                            range: to_range(r),
+                                            severity: Some(match severity {
+                                                Severity::Error => lt::DiagnosticSeverity::ERROR,
+                                                Severity::Warning => {
+                                                    lt::DiagnosticSeverity::WARNING
+                                                }
+                                                Severity::Info => {
+                                                    lt::DiagnosticSeverity::INFORMATION
+                                                }
+                                                Severity::Hint => lt::DiagnosticSeverity::HINT,
+                                            }),
+                                            message,
+                                            ..Default::default()
+                                        })
+                                        .collect(),
+                                    only: None,
+                                    trigger_kind: Some(lt::CodeActionTriggerKind::INVOKED),
+                                },
+                                work_done_progress_params: Default::default(),
+                                partial_result_params: Default::default(),
+                            }
+                        },
+                    )
             })
-        else {
+            .unwrap_or_default();
+        if requests.is_empty() {
             return;
-        };
+        }
         cx.spawn(async move |this, cx| {
-            let actions = request.await.ok().flatten().unwrap_or_default();
+            let answers = futures::future::join_all(requests.into_iter().map(
+                |(server, encoding, request)| async move { (server, encoding, request.await) },
+            ))
+            .await;
+            let actions: Vec<ServerAction> = answers
+                .into_iter()
+                .flat_map(|(server, encoding, answer)| {
+                    answer
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(move |action| ServerAction {
+                            action,
+                            encoding,
+                            server,
+                        })
+                })
+                .collect();
             this.update(cx, |_, cx| {
-                cx.emit(EditorEvent::ShowCodeActions { actions, encoding })
+                cx.emit(EditorEvent::ShowCodeActions { actions })
             })
             .ok();
         })
@@ -1226,23 +1298,21 @@ impl Editor {
     }
 
     /// Runs a chosen code action: its edit, resolved first if the server
-    /// sent it without one, then its command.
-    pub fn apply_code_action(
-        &mut self,
-        action: lt::CodeActionOrCommand,
-        encoding: Encoding,
-        cx: &mut Context<Self>,
-    ) {
+    /// sent it without one, then its command. Both go to the server the
+    /// action came from.
+    pub fn apply_code_action(&mut self, chosen: ServerAction, cx: &mut Context<Self>) {
         let Some(store) = LspStore::global(cx) else {
             return;
         };
         let document = self.document.clone();
-        match action {
+        let (encoding, server) = (chosen.encoding, chosen.server);
+        match chosen.action {
             lt::CodeActionOrCommand::Command(command) => {
                 let request = store
                     .read(cx)
                     .server_request::<lt::request::ExecuteCommand>(
                         &document,
+                        server,
                         lt::ExecuteCommandParams {
                             command: command.command,
                             arguments: command.arguments.unwrap_or_default(),
@@ -1264,6 +1334,7 @@ impl Editor {
                             .read(cx)
                             .server_request::<lt::request::CodeActionResolveRequest>(
                                 &document,
+                                server,
                                 action.clone(),
                             )
                     })
@@ -1279,8 +1350,11 @@ impl Editor {
                         }
                         if let Some(command) = action.command {
                             this.apply_code_action(
-                                lt::CodeActionOrCommand::Command(command),
-                                encoding,
+                                ServerAction {
+                                    action: lt::CodeActionOrCommand::Command(command),
+                                    encoding,
+                                    server,
+                                },
                                 cx,
                             );
                         }
@@ -1290,6 +1364,30 @@ impl Editor {
                 .detach();
             }
         }
+    }
+}
+
+/// Rewrites the ranges of a completion item from one server's way of
+/// counting columns to another's, so a menu made of several servers'
+/// items has one.
+fn recode_item(item: &mut lt::CompletionItem, buffer: &Buffer, from: Encoding, to: Encoding) {
+    let recode = |range: &mut lt::Range| {
+        let bytes = from_range(buffer, *range, from);
+        *range = lt::Range::new(
+            to_position(buffer, bytes.start, to),
+            to_position(buffer, bytes.end, to),
+        );
+    };
+    match &mut item.text_edit {
+        Some(lt::CompletionTextEdit::Edit(edit)) => recode(&mut edit.range),
+        Some(lt::CompletionTextEdit::InsertAndReplace(edit)) => {
+            recode(&mut edit.insert);
+            recode(&mut edit.replace);
+        }
+        None => {}
+    }
+    for edit in item.additional_text_edits.iter_mut().flatten() {
+        recode(&mut edit.range);
     }
 }
 
