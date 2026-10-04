@@ -9528,4 +9528,241 @@ mod tests {
                     .all(|(_, server)| *server == "rust-analyzer")
         });
     }
+
+    /// The world of the Vue test: Node is a script that starts the mock
+    /// server in Vue's role, and npm "installs" by making the files the
+    /// extension then looks for.
+    struct VueWorld {
+        node: String,
+    }
+
+    impl extension::host::World for VueWorld {
+        fn node(&self) -> Result<String, String> {
+            Ok(self.node.clone())
+        }
+        fn npm_latest(&self, _: &str) -> Result<String, String> {
+            Ok("3.0.0".into())
+        }
+        fn npm_install(&self, dir: &Path, package: &str, version: &str) -> Result<(), String> {
+            let package = dir.join("node_modules").join(package);
+            write_file(
+                &package.join("package.json"),
+                &format!(r#"{{"version": "{version}"}}"#),
+            );
+            write_file(&package.join("bin/vue-language-server.js"), "");
+            Ok(())
+        }
+        fn release(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: bool,
+        ) -> Result<extension::host::Release, String> {
+            Err("no network here".into())
+        }
+        fn download(&self, _: &str, _: &Path, _: extension::host::FileKind) -> Result<(), String> {
+            Err("no network here".into())
+        }
+        fn fetch(
+            &self,
+            _: extension::host::HttpRequest,
+        ) -> Result<extension::host::HttpResponse, String> {
+            Err("no network here".into())
+        }
+        fn run(&self, _: &extension::host::Command) -> Result<extension::host::Output, String> {
+            Err("no commands here".into())
+        }
+        fn which(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn env(&self) -> Vec<(String, String)> {
+            Vec::new()
+        }
+        fn status(&self, _: &str, _: extension::host::Status) {}
+    }
+
+    /// What a mock server wrote down under `what`, in order.
+    fn noted(log: &Path, what: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|entry| entry[0] == what)
+            .map(|entry| entry[1].clone())
+            .collect()
+    }
+
+    fn executable(path: &Path, text: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        write_file(path, text);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[gpui::test]
+    fn vue_sets_up_the_typescript_server_and_talks_to_it(cx: &mut TestAppContext) {
+        let _languages = extension_languages();
+        // A project with a TypeScript file and a Vue component, and Zed's
+        // real Vue extension installed. Both servers are the mock: the
+        // TypeScript one through the user's settings, Vue's as the "Node"
+        // the extension is given.
+        let root = db::testing::dir("ws-vue").canonicalize().unwrap();
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let script = root.join("src/util.ts");
+        let component = root.join("src/App.vue");
+        std::fs::write(&script, "export const one = 1\n").unwrap();
+        std::fs::write(
+            &component,
+            "<template>\n  <p>{{ msg }}</p>\n</template>\n<script setup lang=\"ts\">\nconst msg = 'hi'\n</script>\n",
+        )
+        .unwrap();
+        let mock = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        let scratch = db::testing::dir("ws-vue-servers");
+        let (ts_log, vue_log) = (scratch.join("ts.jsonl"), scratch.join("vue.jsonl"));
+        let typescript = scratch.join("typescript-language-server");
+        executable(
+            &typescript,
+            &format!(
+                "#!/bin/sh\nMOCK_LSP_LOG='{}' exec python3 '{}'\n",
+                ts_log.display(),
+                mock.display()
+            ),
+        );
+        let node = scratch.join("node");
+        executable(
+            &node,
+            &format!(
+                "#!/bin/sh\nMOCK_LSP_TAG=vue MOCK_LSP_ASKS_TSSERVER=1 MOCK_LSP_LOG='{}' exec python3 '{}'\n",
+                vue_log.display(),
+                mock.display()
+            ),
+        );
+        let data = db::testing::dir("ws-vue-data");
+        let installed = data.join("extensions/zed/vue");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        std::fs::create_dir_all(installed.join("grammars")).unwrap();
+        for file in ["extension.toml", "extension.wasm"] {
+            std::fs::copy(
+                fixtures.join("extension/tests/fixtures/vue").join(file),
+                installed.join(file),
+            )
+            .unwrap();
+        }
+        write_file(
+            &installed.join("languages/vue/config.toml"),
+            "name = \"Vue.js\"\ngrammar = \"vue\"\npath_suffixes = [\"vue\"]\n",
+        );
+        for query in ["highlights.scm", "injections.scm"] {
+            std::fs::copy(
+                fixtures.join("syntax/tests/fixtures/vue").join(query),
+                installed.join("languages/vue").join(query),
+            )
+            .unwrap();
+        }
+        std::fs::copy(
+            fixtures.join("syntax/tests/fixtures/vue/vue.wasm"),
+            installed.join("grammars/vue.wasm"),
+        )
+        .unwrap();
+        cx.executor().allow_parking();
+        let store = cx.update(|cx| {
+            let store = cx.new(|cx| {
+                let mut store =
+                    ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
+                store.world = Some(std::sync::Arc::new(VueWorld {
+                    node: node.to_string_lossy().into_owned(),
+                }));
+                store
+            });
+            ExtensionStore::set_global(store.clone(), cx);
+            store.update(cx, |s, cx| s.scan(cx));
+            store
+        });
+        let (ws, cx) = setup(cx, root.clone());
+        cx.update(|_, cx| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "typescript-language-server".into(),
+                settings::ServerOverride {
+                    command: Some(typescript.display().to_string()),
+                    args: Some(Vec::new()),
+                    ..Default::default()
+                },
+            );
+            cx.set_global(settings);
+        });
+        wait_for(cx, "the extensions folder", &|cx| store.read(cx).loaded);
+        let lsp = cx.read(|cx| LspStore::global(cx).unwrap());
+
+        // The TypeScript file first: its server starts as it always did,
+        // with nothing added.
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(script.clone(), None, window, cx)
+        });
+        wait_for(cx, "the TypeScript server", &|_| {
+            noted(&ts_log, "open").len() == 1
+        });
+        assert_eq!(noted(&ts_log, "initialize"), [serde_json::Value::Null]);
+
+        // Then the component. Vue's extension is asked what it adds to the
+        // TypeScript server; it adds its plugin, so that server is started
+        // again with it, and both files are opened in the new one: the
+        // component under the name the plugin was told to expect.
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(component.clone(), None, window, cx)
+        });
+        wait_for(cx, "the TypeScript server to start again", &|_| {
+            noted(&ts_log, "initialize").len() == 2 && noted(&ts_log, "open").len() == 4
+        });
+        let options = noted(&ts_log, "initialize")[1].clone();
+        assert_eq!(options["plugins"][0]["name"], "@vue/typescript-plugin");
+        let work = data.join("extensions/work/vue").canonicalize().unwrap();
+        assert_eq!(options["plugins"][0]["location"], work.to_str().unwrap());
+        // The server that ran got the component as soon as it was opened;
+        // the one started in its place gets both files again.
+        let opened = noted(&ts_log, "open");
+        assert_eq!(opened[..2], ["typescript", "vue.js"]);
+        let mut again = opened[2..].to_vec();
+        again.sort_by_key(|id| id.to_string());
+        assert_eq!(again, ["typescript", "vue.js"]);
+
+        // The component has two servers: Vue's own, which hears it as
+        // `vue`, and the TypeScript one.
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        wait_for(cx, "both servers of the component", &|cx| {
+            lsp.read(cx)
+                .all_capabilities(editor.read(cx).document())
+                .len()
+                == 2
+        });
+        assert_eq!(noted(&vue_log, "open"), ["vue"]);
+
+        // Vue's server has the TypeScript server asked something through
+        // the editor each time the file changes; the answer goes back.
+        editor.update_in(cx, |e, _, cx| {
+            let end = e.text(cx).len();
+            e.select_range(end..end, cx)
+        });
+        cx.update(|window, cx| window.focus(&editor.focus_handle(cx)));
+        cx.simulate_input("pri");
+        wait_for(cx, "the TypeScript server's answer to reach Vue's", &|_| {
+            noted(&vue_log, "tsserver")
+                .iter()
+                .any(|answer| answer[0][1]["asked"] == "_vue:projectInfo")
+        });
+        let answers = noted(&vue_log, "tsserver");
+        let answered = answers
+            .iter()
+            .find(|answer| !answer[0][1].is_null())
+            .unwrap();
+        assert_eq!(answered[0][0], 7);
+
+        // And completions in the component come from both.
+        wait_for(cx, "completions of both", &|cx| {
+            editor.read(cx).completion.as_ref().is_some_and(|menu| {
+                let has = |label: &str| menu.items.iter().any(|item| item.label == label);
+                has("println") && has("vue_println")
+            })
+        });
+    }
 }

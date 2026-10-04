@@ -65,6 +65,13 @@ pub struct Resolved {
     pub configuration: Option<serde_json::Value>,
 }
 
+/// What installed extensions add to a language server that is not theirs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Additions {
+    pub initialization_options: Option<serde_json::Value>,
+    pub configuration: Option<serde_json::Value>,
+}
+
 /// An extension's code, loaded when a server of it is first needed. The
 /// lock is held while it loads, so two projects asking at once load it once.
 type Slot = Arc<Mutex<Option<Arc<Host>>>>;
@@ -109,12 +116,42 @@ pub struct ExtensionStore {
     scans: usize,
     /// The loaded code of extensions, by extension id.
     hosts: HashMap<String, Slot>,
+    /// The extension servers that were asked for their command already, by
+    /// extension and server id: that is when an extension installs what it
+    /// needs, and it comes before anything else is asked of it.
+    resolved: Arc<Mutex<Vec<(String, String)>>>,
     /// What extensions reach outside their sandbox through. `None` is the
     /// real thing; tests script it.
     pub world: Option<Arc<dyn World>>,
     /// Where extensions report on the servers they are getting ready.
     statuses: mpsc::UnboundedSender<(String, Status)>,
     _pump: Task<()>,
+}
+
+/// The loaded code of an extension: what its slot holds, or loaded now.
+/// Blocking, and slow the first time.
+fn host_in(
+    slot: &Slot,
+    extension: &Extension,
+    work_dir: &Path,
+    world: Option<Arc<dyn World>>,
+    statuses: mpsc::UnboundedSender<(String, Status)>,
+) -> Result<Arc<Host>, String> {
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(host) = &*slot {
+        return Ok(host.clone());
+    }
+    let world = world.unwrap_or_else(|| {
+        Arc::new(System::new(
+            extension::world::user_env(),
+            move |server, status| {
+                let _ = statuses.unbounded_send((server.to_string(), status));
+            },
+        ))
+    });
+    let host = Arc::new(Host::load(extension, work_dir, world)?);
+    *slot = Some(host.clone());
+    Ok(host)
 }
 
 struct GlobalExtensionStore(Entity<ExtensionStore>);
@@ -166,6 +203,7 @@ impl ExtensionStore {
             documents: Vec::new(),
             scans: 0,
             hosts: HashMap::new(),
+            resolved: Arc::default(),
             world: None,
             statuses,
             _pump: pump,
@@ -283,6 +321,11 @@ impl ExtensionStore {
                     let before = this.installed.iter().find(|e| e.id == *id);
                     before.is_some() && before == installed.iter().find(|e| e.id == *id)
                 });
+                let loaded: Vec<&String> = this.hosts.keys().collect();
+                this.resolved
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|(extension, _)| loaded.contains(&extension));
                 if let (Some(state), false) = (state, this.loaded) {
                     this.state = state;
                 }
@@ -405,37 +448,24 @@ impl ExtensionStore {
         let work_dir = install::work_dir(&self.root, &extension.id);
         let world = self.world.clone();
         let statuses = self.statuses.clone();
+        let resolved = self.resolved.clone();
         let (id, root) = (server.id.clone(), root.to_path_buf());
         let (tx, rx) = futures::channel::oneshot::channel();
         let spawned = std::thread::Builder::new()
             .name("solder-extension".into())
             .spawn(move || {
                 let answer = (|| {
-                    let host = {
-                        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-                        match &*slot {
-                            Some(host) => host.clone(),
-                            None => {
-                                let world = world.unwrap_or_else(|| {
-                                    Arc::new(System::new(
-                                        extension::world::user_env(),
-                                        move |server, status| {
-                                            let _ = statuses
-                                                .unbounded_send((server.to_string(), status));
-                                        },
-                                    ))
-                                });
-                                let host = Arc::new(Host::load(&extension, &work_dir, world)?);
-                                *slot = Some(host.clone());
-                                host
-                            }
-                        }
-                    };
+                    let host = host_in(&slot, &extension, &work_dir, world, statuses)?;
                     let json = |text: Option<String>| {
                         text.and_then(|text| serde_json::from_str(&text).ok())
                     };
+                    let command = host.language_server_command(&id, &root)?;
+                    resolved
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((extension.id.clone(), id.clone()));
                     Ok(Resolved {
-                        command: host.language_server_command(&id, &root)?,
+                        command,
                         initialization_options: json(host.initialization_options(&id, &root)?),
                         configuration: json(host.workspace_configuration(&id, &root)?),
                     })
@@ -449,6 +479,88 @@ impl ExtensionStore {
             rx.await
                 .unwrap_or_else(|_| Err("The extension stopped without an answer".into()))
         })
+    }
+
+    /// What the extensions behind `servers` add to the options and settings
+    /// of `target`, a server that is not theirs. Each is asked for its own
+    /// server's command first if it was not yet: that is when it installs
+    /// what the addition points to. Runs on a thread of its own, and an
+    /// extension that fails adds nothing.
+    pub fn additions(
+        &mut self,
+        target: &str,
+        servers: Vec<ExtensionServer>,
+        root: &Path,
+        cx: &mut Context<Self>,
+    ) -> Task<Additions> {
+        let mut asked = Vec::new();
+        for server in servers {
+            let Some(extension) = self.find(Origin::Zed, &server.extension).cloned() else {
+                continue;
+            };
+            let slot = self.hosts.entry(extension.id.clone()).or_default().clone();
+            let work_dir = install::work_dir(&self.root, &extension.id);
+            asked.push((server.id, extension, slot, work_dir));
+        }
+        let world = self.world.clone();
+        let statuses = self.statuses.clone();
+        let resolved = self.resolved.clone();
+        let (target, root) = (target.to_string(), root.to_path_buf());
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("solder-extension".into())
+            .spawn(move || {
+                let mut additions = Additions::default();
+                let add = |into: &mut Option<serde_json::Value>, text: Option<String>| {
+                    let Some(more) = text.and_then(|t| serde_json::from_str(&t).ok()) else {
+                        return;
+                    };
+                    match into {
+                        Some(into) => extension::host::merge_json(into, more),
+                        None => *into = Some(more),
+                    }
+                };
+                for (id, extension, slot, work_dir) in asked {
+                    let Ok(host) = host_in(
+                        &slot,
+                        &extension,
+                        &work_dir,
+                        world.clone(),
+                        statuses.clone(),
+                    ) else {
+                        continue;
+                    };
+                    let seen = (extension.id.clone(), id.clone());
+                    let known = resolved
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains(&seen);
+                    if !known {
+                        if host.language_server_command(&id, &root).is_err() {
+                            continue;
+                        }
+                        resolved
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(seen);
+                    }
+                    if let Ok(options) = host.additional_initialization_options(&id, &target, &root)
+                    {
+                        add(&mut additions.initialization_options, options);
+                    }
+                    if let Ok(settings) =
+                        host.additional_workspace_configuration(&id, &target, &root)
+                    {
+                        add(&mut additions.configuration, settings);
+                    }
+                }
+                let _ = tx.send(additions);
+            });
+        if spawned.is_err() {
+            return Task::ready(Additions::default());
+        }
+        cx.background_executor()
+            .spawn(async move { rx.await.unwrap_or_default() })
     }
 
     /// Asks a catalog for `query`. An answer to an older question is dropped.

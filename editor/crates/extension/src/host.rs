@@ -105,6 +105,27 @@ pub trait World: Send + Sync + 'static {
     fn status(&self, server: &str, status: Status);
 }
 
+/// Adds `more` to `into`, the way one extension's options are added to a
+/// server's own: objects merge key by key, lists grow, and anything else is
+/// replaced.
+pub fn merge_json(into: &mut serde_json::Value, more: serde_json::Value) {
+    use serde_json::Value;
+    match (into, more) {
+        (Value::Object(into), Value::Object(more)) => {
+            for (key, value) in more {
+                match into.get_mut(&key) {
+                    Some(existing) => merge_json(existing, value),
+                    None => {
+                        into.insert(key, value);
+                    }
+                }
+            }
+        }
+        (Value::Array(into), Value::Array(more)) => into.extend(more),
+        (into, more) => *into = more,
+    }
+}
+
 /// A project folder as an extension sees it.
 pub struct Worktree {
     root: PathBuf,
@@ -1106,6 +1127,37 @@ mod tests {
         assert_eq!(program(&dir, "taplo"), full("taplo"));
         assert_eq!(program(&dir, "gopls"), "gopls");
         assert_eq!(program(&dir, "/usr/bin/node"), "/usr/bin/node");
+    }
+
+    #[test]
+    fn options_of_two_sources_merge() {
+        use serde_json::json;
+        let mut options = json!({
+            "hostInfo": "solder",
+            "plugins": [{ "name": "mine" }],
+            "preferences": { "quotes": "single", "semi": true }
+        });
+        merge_json(
+            &mut options,
+            json!({
+                "plugins": [{ "name": "@vue/typescript-plugin" }],
+                "preferences": { "semi": false },
+                "tsserver": { "logVerbosity": "off" }
+            }),
+        );
+        assert_eq!(
+            options,
+            json!({
+                "hostInfo": "solder",
+                "plugins": [{ "name": "mine" }, { "name": "@vue/typescript-plugin" }],
+                "preferences": { "quotes": "single", "semi": false },
+                "tsserver": { "logVerbosity": "off" }
+            })
+        );
+        // Nothing there yet: what is added is all there is.
+        let mut empty = serde_json::Value::Null;
+        merge_json(&mut empty, json!({ "a": 1 }));
+        assert_eq!(empty, json!({ "a": 1 }));
     }
 
     #[test]

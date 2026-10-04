@@ -701,6 +701,13 @@ together, their completions make one menu and their code actions one list;
 a request with one answer (hover, definition, rename, formatting) goes to
 the first server that says it gives it.
 
+An extension can also set up a server it does not bring. Vue's own server
+leaves the script of a component to the TypeScript server and needs it to
+load Vue's plugin. So with the Vue extension installed, a `.vue` file is the
+TypeScript server's too, that server is started with the plugin (started
+again, if it ran without), and the questions Vue's server has for it pass
+through the editor.
+
 That is why such an extension **asks first**. It is downloaded and read, and
 then waits: the tab shows what installing it allows (the servers it gets, the
 commands its manifest declares), and nothing is in place until you press
