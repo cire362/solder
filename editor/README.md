@@ -679,7 +679,7 @@ here.
 
 | From | Solder uses | Does not run here |
 |---|---|---|
-| A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, its language servers | Icon themes, slash commands, context servers, debug adapters |
+| A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, icon themes, its language servers | Slash commands, context servers, debug adapters |
 | A VS Code extension | Themes (JSON), snippets | Its code, TextMate grammars, everything the code would add |
 
 A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
@@ -710,6 +710,12 @@ program to start. That code runs in a sandbox with a memory limit and a
 budget for each call; its files are one folder
 (`extensions/work/<id>` in the app's data folder). The server itself is a
 program Solder starts with your rights, as Zed does.
+
+An icon theme puts a picture next to each file in the tree and on tabs, by
+the file's name and ending. Press **Use** on it in the Extensions tab, or
+name it in `settings.json` (`"icon_theme": "Catppuccin Mocha"`); with none
+named, the tree has no pictures. The pictures are the extension's own SVG
+files, read from its folder.
 
 An extension may also paint the completions of its server: Vue's shows a
 property as a tag followed by its detail. Its answer is colored as code in

@@ -161,7 +161,8 @@ to build them.
 - [ ] The languages Zed builds in and so does not list in its catalog (C,
       C++, Markdown, YAML, shell): grammars and servers of our own for them,
       installed the same way
-- [ ] Icon themes: file icons in the tree and on tabs
+- [x] Icon themes: file icons in the tree and on tabs, chosen in the
+      Extensions tab or by `icon_theme` in `settings.json`
 - [ ] A Node of Solder's own for servers written in JavaScript when the
       machine has none, downloaded on first need
 - [ ] The commands an extension may run and the hosts it may download from,
@@ -225,7 +226,8 @@ Where it stands: keys are the user's (`keymap.json`), and so are the colors
 (a theme file, 34 tokens). The rest is fixed in code: the sidebar is on the
 left and 390 px wide, the chat on the right, the terminal at the bottom, the
 sidebar's tabs and the status bar's items in one order, the interface font
-and its size, and there are no icons, only words.
+and its size, and the only icons are those of files, from an extension's
+icon theme; buttons and panels are words.
 
 How it is built: `layout.json`, next to `settings.json`, is the truth and is
 read again when it is saved. Whatever is done by hand in the window (a border
@@ -277,5 +279,6 @@ file, so the two never disagree. It starts after the Zed items of phase 8.
 - [ ] A set of icons of Solder's own for buttons, panels and the bars
       (Phosphor, MIT, drawn from files kept in the app, so nothing is
       downloaded)
-- [ ] File icons in the tree and on tabs from the icon themes of Zed and
-      VS Code extensions (the items of phase 8), chosen in `settings.json`
+- [~] File icons in the tree and on tabs from the icon themes of Zed and
+      VS Code extensions (the items of phase 8), chosen in `settings.json`.
+      Zed's are in; VS Code's are not yet

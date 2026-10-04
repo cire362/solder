@@ -448,7 +448,18 @@ mod tests {
                 ("extra/all.json", vec!["all".to_string()]),
             ]
         );
-        assert_eq!(installed.missing, ["Icon themes"]);
+        // Its icon theme is read, pictures and all, so nothing is left
+        // that does not run here.
+        assert!(installed.missing.is_empty(), "{:?}", installed.missing);
+        assert_eq!(installed.icon_themes.len(), 1);
+        let icons = &installed.icon_themes[0];
+        assert_eq!(icons.name, "Demo Icons");
+        let rust = home.join("icons/rust.svg");
+        assert_eq!(icons.file("main.rs").map(|p| &**p), Some(&*rust));
+        let file = home.join("icons/file.svg");
+        assert_eq!(icons.file("notes.txt").map(|p| &**p), Some(&*file));
+        let open = home.join("icons/folder-open.svg");
+        assert_eq!(icons.folder("src", true).map(|p| &**p), Some(&*open));
         assert_eq!(
             installed.commands,
             [("demo-ls".to_string(), vec!["--version".to_string()])]
@@ -462,7 +473,7 @@ mod tests {
         );
         assert_eq!(
             installed.provides(),
-            "1 language, 1 language server, 2 themes, 2 snippet files"
+            "1 language, 1 language server, 2 themes, 1 icon theme, 2 snippet files"
         );
 
         assert_eq!(super::installed(&root), vec![installed]);

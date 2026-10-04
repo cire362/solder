@@ -27,6 +27,7 @@ mod extension_store;
 mod extensions_panel;
 mod file_diff;
 mod file_finder;
+mod file_icons;
 mod fuzzy;
 mod git;
 mod git_panel;

@@ -25,6 +25,7 @@ use gpui::{App, AppContext, Context, Entity, Global, SharedString, Task, WeakEnt
 
 use crate::{
     document::Document,
+    file_icons::FileIcons,
     import_settings,
     lsp_store::LspStore,
     settings::{ServerOverride, Settings},
@@ -117,6 +118,8 @@ pub struct ExtensionStore {
     pub errors: HashMap<Key, String>,
     /// What "Use" last did with a theme.
     pub theme_status: Option<Result<String, String>>,
+    /// The same for the last icon theme chosen.
+    pub icon_status: Option<Result<String, String>>,
     documents: Vec<WeakEntity<Document>>,
     scans: usize,
     /// The loaded code of extensions, by extension id.
@@ -210,7 +213,10 @@ impl ExtensionStore {
         };
         copy(&asked, cx);
         let watched = asked.clone();
-        let watching = cx.observe_global::<Settings>(move |_, cx| copy(&watched, cx));
+        let watching = cx.observe_global::<Settings>(move |this, cx| {
+            copy(&watched, cx);
+            this.sync_icons(cx);
+        });
         Self {
             root,
             config,
@@ -228,6 +234,7 @@ impl ExtensionStore {
             state: extension::State::default(),
             errors: HashMap::new(),
             theme_status: None,
+            icon_status: None,
             documents: Vec::new(),
             scans: 0,
             hosts: HashMap::new(),
@@ -405,7 +412,62 @@ impl ExtensionStore {
         .detach();
     }
 
+    /// Puts the icon theme the settings name in use, if an extension that
+    /// is installed and on has it.
+    fn sync_icons(&mut self, cx: &mut Context<Self>) {
+        let wanted = cx
+            .try_global::<Settings>()
+            .and_then(|settings| settings.icon_theme.clone());
+        let theme = wanted.and_then(|name| {
+            self.installed
+                .iter()
+                .filter(|extension| !self.is_off(extension.origin, &extension.id))
+                .flat_map(|extension| &extension.icon_themes)
+                .find(|theme| theme.name == name)
+                .cloned()
+        });
+        let now = cx
+            .try_global::<FileIcons>()
+            .and_then(|icons| icons.0.as_deref());
+        if now != theme.as_ref() {
+            cx.set_global(FileIcons(theme.map(Arc::new)));
+            cx.refresh_windows();
+        }
+    }
+
+    /// Makes `name` the icon theme, in `settings.json`.
+    pub fn use_icon_theme(&mut self, name: String, cx: &mut Context<Self>) {
+        let config = self.config.clone();
+        cx.spawn(async move |this, cx| {
+            let dir = config.clone();
+            let chosen = name.clone();
+            let applied = cx
+                .background_executor()
+                .spawn(async move {
+                    let choice = import_settings::Choice {
+                        settings: vec![import::Setting {
+                            key: "icon_theme",
+                            label: "Icon theme",
+                            value: chosen.into(),
+                        }],
+                        ..Default::default()
+                    };
+                    import_settings::apply(&dir, &choice)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.icon_status = Some(applied.map(|_| name));
+                // As with a theme: at once, not when the watcher notices.
+                crate::settings::reload_from(&config, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn sync_languages(&mut self, cx: &mut Context<Self>) {
+        self.sync_icons(cx);
         let specs: Vec<syntax::LanguageSpec> = self
             .installed
             .iter()

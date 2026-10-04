@@ -734,6 +734,14 @@ impl Render for ProjectPanel {
                                 } else {
                                     ""
                                 };
+                                // The picture of the icon theme in use.
+                                let icon = path.as_deref().and_then(|path| {
+                                    if is_dir {
+                                        crate::file_icons::folder(path, expanded, cx)
+                                    } else {
+                                        crate::file_icons::file(path, cx)
+                                    }
+                                });
                                 let label = match editing {
                                     Some(edit) => div()
                                         .flex_1()
@@ -793,6 +801,16 @@ impl Render for ProjectPanel {
                                             .text_color(theme.fg_subtle)
                                             .child(caret),
                                     )
+                                    .when_some(icon, |d, icon| {
+                                        d.child(
+                                            div()
+                                                .flex_none()
+                                                .debug_selector(move || {
+                                                    format!("file-icon-{row_ix}")
+                                                })
+                                                .child(icon),
+                                        )
+                                    })
                                     .child(label)
                                     .when_some(row, |d, ix| {
                                         d.on_mouse_down(

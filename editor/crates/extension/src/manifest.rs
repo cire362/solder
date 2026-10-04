@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use import::{ThemeFile, jsonc, theme};
+
+use crate::icons::{self, IconTheme};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -119,6 +121,8 @@ pub struct Extension {
     pub description: String,
     pub dir: PathBuf,
     pub themes: Vec<ThemeFile>,
+    /// Which picture goes with which file, in the tree and on tabs.
+    pub icon_themes: Vec<IconTheme>,
     pub snippets: Vec<SnippetFile>,
     pub languages: Vec<Language>,
     pub servers: Vec<Server>,
@@ -182,6 +186,7 @@ impl Extension {
                 "language servers",
             ),
             count(self.themes.len(), "theme", "themes"),
+            count(self.icon_themes.len(), "icon theme", "icon themes"),
             count(self.snippets.len(), "snippet file", "snippet files"),
         ]
         .into_iter()
@@ -270,6 +275,21 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
     let themes = files(&dir.join("themes"), "json")
         .iter()
         .flat_map(|path| theme::all_zed(path))
+        .collect();
+
+    // Icon themes: the files the manifest names, and those in the folder
+    // they are kept in.
+    let mut icon_paths = files(&dir.join("icon_themes"), "json");
+    for named in strings(&manifest["icon_themes"]) {
+        if let Some(path) = inside(dir, &named).filter(|p| p.is_file())
+            && !icon_paths.contains(&path)
+        {
+            icon_paths.push(path);
+        }
+    }
+    let icon_themes = icon_paths
+        .iter()
+        .flat_map(|path| icons::read(dir, path))
         .collect();
 
     // Snippets: the file the manifest names, or one per language in
@@ -443,7 +463,6 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         _ => false,
     };
     for (key, what) in [
-        ("icon_themes", "Icon themes"),
         ("context_servers", "Context servers"),
         ("slash_commands", "Slash commands"),
         ("debug_adapters", "Debug adapters"),
@@ -465,6 +484,7 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         description: text(&manifest["description"]),
         dir: dir.to_path_buf(),
         themes,
+        icon_themes,
         snippets,
         languages,
         servers,
@@ -594,6 +614,7 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         description: label(&text(&manifest["description"])),
         dir: dir.to_path_buf(),
         themes,
+        icon_themes: Vec::new(),
         snippets,
         languages,
         servers: Vec::new(),

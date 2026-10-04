@@ -579,6 +579,42 @@ impl ExtensionsPanel {
                         None => {}
                     }
                 }
+                if !installed.icon_themes.is_empty() {
+                    details = details.child(heading("ICON THEMES"));
+                    let view = cx.entity();
+                    details = details.child(div().flex().flex_wrap().gap_1().children(
+                        installed.icon_themes.iter().enumerate().map(|(i, icons)| {
+                            let (view, name) = (view.clone(), icons.name.clone());
+                            ui::button(
+                                ("extension-icons", i),
+                                format!("Use {name}"),
+                                false,
+                                theme,
+                                move |_, _, cx| {
+                                    let name = name.clone();
+                                    view.update(cx, |this, cx| {
+                                        this.store
+                                            .update(cx, |store, cx| store.use_icon_theme(name, cx))
+                                    })
+                                },
+                            )
+                            .debug_selector(move || format!("extension-icons-{i}"))
+                            .h(px(22.))
+                        }),
+                    ));
+                    match &store.icon_status {
+                        Some(Ok(name)) => {
+                            details = details.child(line(
+                                format!("File icons are now {name}").into(),
+                                theme.fg_subtle,
+                            ))
+                        }
+                        Some(Err(error)) => {
+                            details = details.child(line(error.clone().into(), theme.error))
+                        }
+                        None => {}
+                    }
+                }
             }
             None => {
                 if let Some(entry) = &row.entry

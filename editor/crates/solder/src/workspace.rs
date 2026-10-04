@@ -3221,6 +3221,9 @@ impl Workspace {
                 let editor = tab.editor.clone();
                 let doc = tab.editor.read(cx).doc(cx);
                 let name: SharedString = doc.title().into();
+                let icon = doc
+                    .path()
+                    .and_then(|path| crate::file_icons::file(path, cx));
                 let dirty = doc.is_dirty();
                 let active = pane.active == Some(ix);
                 let close_editor = editor.clone();
@@ -3257,6 +3260,14 @@ impl Workspace {
                             this.close(&middle_editor, window, cx)
                         }),
                     )
+                    .when_some(icon, |d, icon| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .debug_selector(move || format!("tab-icon-{ix}"))
+                                .child(icon),
+                        )
+                    })
                     .child(name)
                     .child(
                         // Unsaved state doubles as the close target, like most editors.
@@ -8908,6 +8919,16 @@ brackets = [
         std::fs::copy(fixtures.join("vue.wasm"), dir.join("grammars/vue.wasm")).unwrap();
         write_file(&dir.join("themes/demo.json"), extension::testing::ZED_THEME);
         write_file(
+            &dir.join("icon_themes/demo.json"),
+            extension::testing::ZED_ICON_THEME,
+        );
+        for icon in ["file", "rust", "folder", "folder-open"] {
+            write_file(
+                &dir.join(format!("icons/{icon}.svg")),
+                &extension::testing::svg(icon),
+            );
+        }
+        write_file(
             &dir.join("snippets/vue.json"),
             r#"{"Base": {"prefix": "vbase", "body": ["<section>", "\t${1:$TM_FILENAME_BASE}", "</section>"], "description": "A section"}}"#,
         );
@@ -9038,6 +9059,25 @@ brackets = [
         );
         assert!(config.join("themes/demo-dark.json").is_file());
 
+        // And its icon theme gives files their pictures: the open file's
+        // tab has one. The choice is a line in the settings.
+        let icons = |cx: &App| {
+            cx.try_global::<crate::file_icons::FileIcons>()
+                .and_then(|icons| icons.0.as_ref().map(|theme| theme.name.clone()))
+        };
+        assert_eq!(cx.read(|cx| icons(cx)), None);
+        click(cx, "extension-icons-0");
+        wait_for(cx, "the icon theme", &|cx| {
+            icons(cx).as_deref() == Some("Demo Icons")
+        });
+        assert_eq!(
+            cx.read(|cx| cx.global::<Settings>().icon_theme.clone()),
+            Some("Demo Icons".into())
+        );
+        bounds_soon(cx, "tab-icon-0");
+        let rust = cx.read(|cx| crate::file_icons::file(Path::new("src/main.rs"), cx).is_some());
+        assert!(rust);
+
         // Opening the tab asked the catalog about what is installed, and it
         // has a newer version: the row offers it, and so does Update all.
         let has_update = |cx: &App| {
@@ -9067,6 +9107,7 @@ brackets = [
         // on, the language is back. The decision is written down.
         click(cx, "extension-off");
         wait_for(cx, "the language to go", &|cx| language(cx).is_none());
+        assert_eq!(cx.read(|cx| icons(cx)), None);
         assert!(cx.read(|cx| store.read(cx).find(Origin::Zed, "vue").is_some()));
         wait_for(cx, "the decision on disk", &|_| {
             std::fs::read_to_string(folder.join("state.json"))
@@ -9076,6 +9117,7 @@ brackets = [
         wait_for(cx, "the language to return", &|cx| {
             language(cx) == Some("Vue.js")
         });
+        assert_eq!(cx.read(|cx| icons(cx)).as_deref(), Some("Demo Icons"));
 
         // Update all downloads it again.
         let downloads = |requests: &std::sync::Mutex<Vec<String>>| {
