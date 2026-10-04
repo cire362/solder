@@ -293,6 +293,19 @@ fn build_map(
                     | "go"
                     | "py"
                     | "pyi"
+                    | "c"
+                    | "h"
+                    | "cc"
+                    | "cpp"
+                    | "cxx"
+                    | "hh"
+                    | "hpp"
+                    | "hxx"
+                    | "sh"
+                    | "bash"
+                    | "zsh"
+                    | "md"
+                    | "markdown"
             )
         ) || syntax::language_for_path(&path).is_some_and(|l| l.has_outline());
         if outlined && let Some(source) = read_source(&path, &mut budget) {

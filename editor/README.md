@@ -8,7 +8,8 @@ crates/
   extension/ extensions of Zed and VS Code: manifests, the two catalogs, installing,
             and the sandbox that runs a Zed extension's code to get its language server
   syntax/   tree-sitter parsing and highlighting for Rust, TS/TSX, JS, JSON, CSS, Go, Python,
-            and for the languages of extensions (grammars in WebAssembly)
+            C, C++, Markdown, YAML and shell, and for the languages of extensions
+            (grammars in WebAssembly)
   db/       database connections: detection, drivers, statement splitting (no UI)
   rest/     HTTP: .http files, route detection, OpenAPI import, sending (no UI)
   ai/       local models: hardware, catalog, downloads, llama-server, benchmark (no UI)
@@ -391,7 +392,9 @@ text. Files outside the project, symbolic links, Git-ignored files and build
 folders are also excluded.
 
 **Project map** is off by default. Turn it on to attach relative paths and
-declaration names with line numbers for Rust, TS/TSX, JS, Go and Python. It does
+declaration names with line numbers for Rust, TS/TSX, JS, Go, Python, C, C++ and
+shell, the headings of Markdown, and extension languages that say what they
+declare. It does
 not attach their bodies or let the model read other files. The map is built on
 request in the background, preferring paths mentioned in the question and files
 near the current file. Each request includes a fresh map, not copies of old maps.

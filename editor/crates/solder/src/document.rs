@@ -446,6 +446,11 @@ impl Document {
             Some("CSS") => "css",
             Some("Go") => "go",
             Some("Python") => "python",
+            Some("C") => "c",
+            Some("C++") => "cpp",
+            Some("Markdown") => "markdown",
+            Some("YAML") => "yaml",
+            Some("Shell Script") => "shellscript",
             _ => "plaintext",
         }
     }

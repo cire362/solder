@@ -160,9 +160,11 @@ to build them.
       with the typed word matched against the part that is the name
 - [ ] Symbol labels (`labels-for-symbols`). The editor has no list of a
       file's or a project's symbols to paint them in; it comes with one
-- [ ] The languages Zed builds in and so does not list in its catalog (C,
-      C++, Markdown, YAML, shell): grammars and servers of our own for them,
-      installed the same way
+- [x] The languages Zed builds in and so does not list in its catalog (C,
+      C++, Markdown, YAML, shell): built in here too, as grammars in the
+      binary, with the servers Zed has for them (clangd, yaml-language-server)
+      taken from the PATH. Markdown is two grammars and the languages of its
+      code blocks; a paragraph that did not change is not parsed again
 - [x] Icon themes: file icons in the tree and on tabs, chosen in the
       Extensions tab or by `icon_theme` in `settings.json`
 - [x] A Node of Solder's own for servers written in JavaScript when the

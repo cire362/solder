@@ -1251,7 +1251,8 @@ impl Editor {
             return;
         }
         let unit = self.doc(cx).indent_unit();
-        let python = self.doc(cx).language_name() == Some("Python");
+        // Languages where a line that ends in a colon opens a block.
+        let python = matches!(self.doc(cx).language_name(), Some("Python" | "YAML"));
         // A language from an extension says which pairs take a line of
         // their own between them, and how deep the line after a break goes.
         let pairs = self.pairs_with(|pair| pair.newline, cx);

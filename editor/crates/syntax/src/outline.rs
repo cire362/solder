@@ -87,15 +87,11 @@ pub fn outline(
         }
         let node = cursor.node();
         if let Some(kind) = declaration_kind(node)
-            && let Some(name) = node.child_by_field_name("name")
-            && matches!(
-                name.kind(),
-                "identifier" | "type_identifier" | "property_identifier" | "field_identifier"
-            )
+            && let Some(name) = name_of(node)
             && let Ok(name_text) = name.utf8_text(source.as_bytes())
         {
             symbols.push(Symbol {
-                name: name_text.chars().take(120).collect(),
+                name: name_text.trim().chars().take(120).collect(),
                 kind: Cow::Borrowed(kind),
                 line: node.start_position().row + 1,
             });
@@ -113,6 +109,41 @@ pub fn outline(
         }
     }
     symbols
+}
+
+/// The node that holds what a declaration is called.
+fn name_of(node: Node<'_>) -> Option<Node<'_>> {
+    if let Some(name) = node.child_by_field_name("name") {
+        return matches!(
+            name.kind(),
+            "identifier"
+                | "type_identifier"
+                | "property_identifier"
+                | "field_identifier"
+                // A shell function.
+                | "word"
+        )
+        .then_some(name);
+    }
+    // A heading of a Markdown file is called what it says.
+    if let Some(heading) = node.child_by_field_name("heading_content") {
+        return Some(heading);
+    }
+    // C and C++ put the name inside what declares it: `int *run(void)` is
+    // a pointer declarator around a function declarator around `run`.
+    let mut inner = node.child_by_field_name("declarator")?;
+    for _ in 0..8 {
+        match inner.kind() {
+            "identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "qualified_identifier"
+            | "operator_name"
+            | "destructor_name" => return Some(inner),
+            _ => inner = inner.child_by_field_name("declarator")?,
+        }
+    }
+    None
 }
 
 fn declaration_kind(node: Node<'_>) -> Option<&'static str> {
@@ -133,6 +164,15 @@ fn declaration_kind(node: Node<'_>) -> Option<&'static str> {
         | "interface_declaration"
         | "type_alias_declaration"
         | "enum_declaration" => Some("type"),
+        // C and C++: only where the type is given its body, not where it
+        // is merely used.
+        "struct_specifier" | "class_specifier" | "enum_specifier" | "union_specifier"
+            if node.child_by_field_name("body").is_some() =>
+        {
+            Some("type")
+        }
+        "type_definition" => Some("type"),
+        "atx_heading" => Some("#"),
         "const_item" | "static_item" => Some("const"),
         "variable_declarator"
             if node.child_by_field_name("value").is_some_and(|value| {
@@ -181,6 +221,26 @@ mod tests {
                 "app.py",
                 "class App:\n    pass\ndef run():\n    return 'PRIVATE'",
                 vec!["App", "run"],
+            ),
+            (
+                "app.c",
+                "struct App { int a; };\nstruct App *run(void) { puts(\"PRIVATE\"); return 0; }\nstruct App other;",
+                vec!["App", "run"],
+            ),
+            (
+                "app.cpp",
+                "class App { public: int run(); };\nint App::run() { return 1; }\ntypedef int Id;",
+                vec!["App", "App::run", "Id"],
+            ),
+            (
+                "app.sh",
+                "run() { echo PRIVATE; }\nfunction stop { :; }\n",
+                vec!["run", "stop"],
+            ),
+            (
+                "app.md",
+                "# App\n\nPRIVATE words.\n\n## How to run\n",
+                vec!["App", "How to run"],
             ),
         ];
         for (path, source, names) in cases {

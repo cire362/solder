@@ -7,6 +7,7 @@
 //!   in a 50k-line file costs the same as one in a 50-line file.
 
 use std::{
+    collections::{HashMap, VecDeque},
     ops::{ControlFlow, Range},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, RwLock},
@@ -61,6 +62,16 @@ impl HighlightKind {
             "selector" => Tag,
             "charset" | "import" | "keyframes" | "media" | "namespace" | "supports" => Keyword,
             "escape" | "label" => Constant,
+            // Markdown has no code to color: a heading stands out like a
+            // keyword, what is quoted like a string, and a link's text and
+            // the two kinds of emphasis each get a color of their own,
+            // since there is no bold or slanted text to give them.
+            "text.title" => Keyword,
+            "text.literal" | "text.uri" => String,
+            "text.reference" => Property,
+            "text.strong" => Constant,
+            "text.emphasis" => Attribute,
+            "delimiter" => Punctuation,
             _ => match name.split('.').next()? {
                 "keyword" => Keyword,
                 "string" => String,
@@ -103,6 +114,9 @@ enum Source {
     Native {
         grammar: tree_sitter::Language,
         query: fn() -> String,
+        /// The query that finds other languages inside it, for the few
+        /// built-in ones that hold any: the code blocks of Markdown.
+        injections: Option<&'static str>,
     },
     Wasm(Box<LanguageSpec>),
 }
@@ -121,6 +135,10 @@ pub struct Language {
 struct Highlighter {
     query: Query,
     kinds: Vec<Option<HighlightKind>>,
+    /// The capture that takes color away again (`@none`): the inside of a
+    /// code block, which the block around it paints as quoted text and the
+    /// block's own language then colors.
+    none: Option<u32>,
 }
 
 /// The query that finds other languages inside this one, such as the script
@@ -137,7 +155,6 @@ struct Injection {
     language: Option<String>,
     /// All matches of the pattern form one document.
     combined: bool,
-    include_children: bool,
 }
 
 impl Language {
@@ -179,7 +196,8 @@ impl Language {
                     .iter()
                     .map(|n| HighlightKind::from_capture(n))
                     .collect();
-                Some(Highlighter { query, kinds })
+                let none = query.capture_index_for_name("none");
+                Some(Highlighter { query, kinds, none })
             })
             .as_ref()
     }
@@ -187,10 +205,12 @@ impl Language {
     fn injector(&self) -> Option<&Injector> {
         self.injector
             .get_or_init(|| {
-                let Source::Wasm(spec) = &self.source else {
-                    return None;
+                let source = match &self.source {
+                    Source::Native { injections, .. } => (*injections)?.to_string(),
+                    Source::Wasm(spec) => {
+                        std::fs::read_to_string(spec.injections.as_ref()?).ok()?
+                    }
                 };
-                let source = std::fs::read_to_string(spec.injections.as_ref()?).ok()?;
                 let query = self.query(&source, "injection")?;
                 // Both spellings are in use: `injection.content` in current
                 // grammars, plain `content` in older ones.
@@ -206,7 +226,6 @@ impl Language {
                                         property.value.as_deref().map(str::to_lowercase)
                                 }
                                 "injection.combined" | "combined" => injection.combined = true,
-                                "injection.include-children" => injection.include_children = true,
                                 _ => {}
                             }
                         }
@@ -252,6 +271,9 @@ impl Language {
                     "TSX" => &["typescriptreact"][..],
                     "JavaScript" => &["javascriptreact", "jsx"][..],
                     "JSON" => &["jsonc"][..],
+                    "C++" => &["cpp"][..],
+                    "YAML" => &["yml"][..],
+                    "Shell Script" => &["shellscript", "sh", "bash", "zsh"][..],
                     _ => &[][..],
                 }
                 .iter()
@@ -294,6 +316,13 @@ fn builtin_alias(name: &str) -> Option<&'static str> {
         "py" => "Python",
         "golang" => "Go",
         "jsonc" => "JSON",
+        "h" => "C",
+        "cpp" | "cc" | "cxx" | "hpp" => "C++",
+        "md" => "Markdown",
+        // What Markdown calls the grammar of the text inside its blocks.
+        "markdown_inline" | "markdown-inline" => "Markdown Inline",
+        "yml" => "YAML",
+        "sh" | "bash" | "zsh" | "shell" | "shellscript" | "console" => "Shell Script",
         _ => return None,
     })
 }
@@ -314,12 +343,16 @@ fn intern(name: &str) -> &'static str {
 
 macro_rules! lang {
     ($name:literal, $comment:literal, $grammar:expr, $($query:expr),+) => {
+        lang!($name, $comment, $grammar, inject: None, $($query),+)
+    };
+    ($name:literal, $comment:literal, $grammar:expr, inject: $injections:expr, $($query:expr),+) => {
         Arc::new(Language {
             name: $name,
             line_comment: (!$comment.is_empty()).then_some($comment),
             source: Source::Native {
                 grammar: $grammar.into(),
                 query: || [$($query),+].join("\n"),
+                injections: $injections,
             },
             grammar: OnceLock::new(),
             highlighter: OnceLock::new(),
@@ -411,6 +444,68 @@ fn registry() -> &'static [(&'static [&'static str], Arc<Language>)] {
                     tree_sitter_python::HIGHLIGHTS_QUERY
                 ),
             ),
+            // The languages Zed has built in, and so are in no extension
+            // of its catalog.
+            (
+                &["c", "h"][..],
+                lang!(
+                    "C",
+                    "//",
+                    tree_sitter_c::LANGUAGE,
+                    tree_sitter_c::HIGHLIGHT_QUERY
+                ),
+            ),
+            // C++'s query adds to C's, so it goes last.
+            (
+                &["cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++", "ino"][..],
+                lang!(
+                    "C++",
+                    "//",
+                    tree_sitter_cpp::LANGUAGE,
+                    tree_sitter_c::HIGHLIGHT_QUERY,
+                    tree_sitter_cpp::HIGHLIGHT_QUERY
+                ),
+            ),
+            (
+                &["md", "markdown"][..],
+                lang!(
+                    "Markdown",
+                    "",
+                    tree_sitter_md::LANGUAGE,
+                    inject: Some(tree_sitter_md::INJECTION_QUERY_BLOCK),
+                    tree_sitter_md::HIGHLIGHT_QUERY_BLOCK
+                ),
+            ),
+            // Not a kind of file: what Markdown's paragraphs and headings
+            // are written in, found inside it by the query above.
+            (
+                &[][..],
+                lang!(
+                    "Markdown Inline",
+                    "",
+                    tree_sitter_md::INLINE_LANGUAGE,
+                    inject: Some(tree_sitter_md::INJECTION_QUERY_INLINE),
+                    tree_sitter_md::HIGHLIGHT_QUERY_INLINE
+                ),
+            ),
+            (
+                &["yml", "yaml"][..],
+                lang!(
+                    "YAML",
+                    "#",
+                    tree_sitter_yaml::LANGUAGE,
+                    tree_sitter_yaml::HIGHLIGHTS_QUERY
+                ),
+            ),
+            (
+                &["sh", "bash", "zsh"][..],
+                lang!(
+                    "Shell Script",
+                    "#",
+                    tree_sitter_bash::LANGUAGE,
+                    tree_sitter_bash::HIGHLIGHT_QUERY
+                ),
+            ),
         ]
     })
 }
@@ -454,9 +549,31 @@ pub fn language_for_path(path: &Path) -> Option<Arc<Language>> {
     {
         return Some(language.clone());
     }
+    let name = path.file_name()?.to_str()?;
+    // Files a shell reads that have no ending to go by.
+    if matches!(
+        name,
+        ".bashrc"
+            | ".bash_profile"
+            | ".bash_login"
+            | ".bash_logout"
+            | ".profile"
+            | ".zshrc"
+            | ".zshenv"
+            | ".zprofile"
+            | ".zlogin"
+            | ".zlogout"
+            | "PKGBUILD"
+            | "APKBUILD"
+    ) {
+        return registry()
+            .iter()
+            .map(|(_, language)| language)
+            .find(|language| language.name == "Shell Script")
+            .cloned();
+    }
     // An extension's suffix is the whole file name (`Dockerfile`) or what
     // follows a dot (`vue`, `blade.php`).
-    let name = path.file_name()?.to_str()?;
     extensions()
         .read()
         .unwrap()
@@ -515,6 +632,10 @@ pub struct SyntaxTree {
     layers: Vec<Layer>,
     /// True when edits were applied to `tree` but it has not been reparsed yet.
     stale: bool,
+    /// The stretch of the text that changed since the trees were parsed.
+    /// A layer whose text lies outside it is not parsed again: a Markdown
+    /// file has one for every paragraph.
+    dirty: Option<Range<usize>>,
 }
 
 #[derive(Clone)]
@@ -537,12 +658,13 @@ impl SyntaxTree {
             language.highlighter();
             language.rules();
         }
-        let layers = parse_layers(&language, &tree, rope, &[], None)?;
+        let layers = parse_layers(&language, &tree, rope, &[], None, None)?;
         Some(Self {
             language,
             tree,
             layers,
             stale: false,
+            dirty: None,
         })
     }
 
@@ -594,6 +716,19 @@ impl SyntaxTree {
             layer.tree.edit(&edit);
         }
         self.stale = true;
+        // What changed before follows the text; then it grows by this edit.
+        let (start, old_end, new_end) = (edit.start_byte, edit.old_end_byte, edit.new_end_byte);
+        let moved = |at: usize| {
+            if at >= old_end {
+                at + new_end - old_end
+            } else {
+                at.min(new_end)
+            }
+        };
+        self.dirty = Some(match self.dirty.take() {
+            Some(dirty) => moved(dirty.start).min(start)..moved(dirty.end).max(new_end),
+            None => start..new_end,
+        });
     }
 
     /// Incremental reparse that gives up after `budget`. Returns false when it
@@ -620,12 +755,20 @@ impl SyntaxTree {
         let mut parser = new_parser(&self.language)?;
         let tree = parse_rope(&mut parser, rope, Some(&self.tree), deadline)?;
         drop(parser);
-        let layers = parse_layers(&self.language, &tree, rope, &self.layers, deadline)?;
+        let layers = parse_layers(
+            &self.language,
+            &tree,
+            rope,
+            &self.layers,
+            self.dirty.clone(),
+            deadline,
+        )?;
         Some(SyntaxTree {
             language: self.language.clone(),
             tree,
             layers,
             stale: false,
+            dirty: None,
         })
     }
 
@@ -685,8 +828,10 @@ fn paint(language: &Language, tree: &Tree, rope: &Rope, range: &Range<usize>, sl
     let mut captures = cursor.captures(&hl.query, tree.root_node(), RopeProvider(rope));
     while let Some((m, index)) = captures.next() {
         let capture = m.captures[*index];
-        let Some(kind) = hl.kinds[capture.index as usize] else {
-            continue;
+        let color = match hl.kinds[capture.index as usize] {
+            Some(kind) => kind as u8,
+            None if Some(capture.index) == hl.none => NONE,
+            None => continue,
         };
         // Captures come in document order, and for one node in the order
         // of their patterns, so writing each over the last gives the rule.
@@ -694,8 +839,88 @@ fn paint(language: &Language, tree: &Tree, rope: &Rope, range: &Range<usize>, sl
         let start = node.start.max(range.start) - range.start;
         let end = node.end.min(range.end).saturating_sub(range.start);
         if start < end {
-            slots[start..end].fill(kind as u8);
+            slots[start..end].fill(color);
         }
+    }
+}
+
+/// The layers a tree had before it was edited, for the new ones to take
+/// their trees from.
+struct Old<'a> {
+    layers: &'a [Layer],
+    taken: Vec<bool>,
+    /// The layer of a language that covers exactly a stretch of the text,
+    /// by where the stretch starts and ends now that the edits moved it.
+    places: HashMap<(*const Language, usize, usize), usize>,
+    /// For each language, its layers in order, for a piece of text that
+    /// changed its length and so has no place to be found by: layers keep
+    /// their order while typing, and the first one left is the same piece.
+    left: HashMap<*const Language, VecDeque<usize>>,
+    /// What changed in the text since they were parsed, if that is known.
+    dirty: Option<Range<usize>>,
+}
+
+impl<'a> Old<'a> {
+    fn new(layers: &'a [Layer], dirty: Option<Range<usize>>) -> Self {
+        let mut places = HashMap::new();
+        let mut left: HashMap<*const Language, VecDeque<usize>> = HashMap::new();
+        for (index, layer) in layers.iter().enumerate() {
+            let language = Arc::as_ptr(&layer.language);
+            let ranges = layer.tree.included_ranges();
+            if let (Some(first), Some(last)) = (ranges.first(), ranges.last()) {
+                places
+                    .entry((language, first.start_byte, last.end_byte))
+                    .or_insert(index);
+            }
+            left.entry(language).or_default().push_back(index);
+        }
+        Self {
+            layers,
+            taken: vec![false; layers.len()],
+            places,
+            left,
+            dirty,
+        }
+    }
+
+    /// The old layer for the text of `language` at `ranges`.
+    fn take(
+        &mut self,
+        language: &Arc<Language>,
+        ranges: &[tree_sitter::Range],
+    ) -> Option<&'a Layer> {
+        let language = Arc::as_ptr(language);
+        let place = (
+            language,
+            ranges.first()?.start_byte,
+            ranges.last()?.end_byte,
+        );
+        let index = match self.places.get(&place) {
+            Some(index) if !self.taken[*index] => *index,
+            _ => {
+                let left = self.left.get_mut(&language)?;
+                loop {
+                    let index = left.pop_front()?;
+                    if !self.taken[index] {
+                        break index;
+                    }
+                }
+            }
+        };
+        self.taken[index] = true;
+        Some(&self.layers[index])
+    }
+
+    /// Whether `layer` covers exactly `ranges` and nothing in or next to
+    /// them changed: its tree is then right as it stands.
+    fn untouched(&self, layer: &Layer, ranges: &[tree_sitter::Range]) -> bool {
+        let Some(dirty) = &self.dirty else {
+            return false;
+        };
+        layer.tree.included_ranges() == ranges
+            && ranges
+                .iter()
+                .all(|r| r.end_byte < dirty.start || r.start_byte > dirty.end)
     }
 }
 
@@ -707,32 +932,22 @@ fn parse_layers(
     tree: &Tree,
     rope: &Rope,
     old: &[Layer],
+    dirty: Option<Range<usize>>,
     deadline: Option<Instant>,
 ) -> Option<Vec<Layer>> {
     let mut layers = Vec::new();
     if language.injector().is_some() {
-        let mut used = vec![false; old.len()];
-        inject(
-            language,
-            tree,
-            rope,
-            old,
-            &mut used,
-            deadline,
-            1,
-            &mut layers,
-        )?;
+        let mut old = Old::new(old, dirty);
+        inject(language, tree, rope, &mut old, deadline, 1, &mut layers)?;
     }
     Some(layers)
 }
 
-#[allow(clippy::too_many_arguments)] // one recursive walk; a struct would only rename them
 fn inject(
     language: &Arc<Language>,
     tree: &Tree,
     rope: &Rope,
-    old: &[Layer],
-    used: &mut [bool],
+    old: &mut Old,
     deadline: Option<Instant>,
     depth: usize,
     layers: &mut Vec<Layer>,
@@ -760,7 +975,13 @@ fn inject(
         };
         let mut ranges = Vec::new();
         for node in m.nodes_for_capture_index(content) {
-            content_ranges(node, pattern.include_children, &mut ranges);
+            // The whole node, children and all, which is how Zed reads
+            // these queries. Leaving the children out, as tree-sitter's
+            // own highlighter does, cuts Markdown's text at every
+            // punctuation mark: its block grammar makes a node of each.
+            if node.start_byte() < node.end_byte() {
+                ranges.push(node.range());
+            }
         }
         if ranges.is_empty() {
             continue;
@@ -789,24 +1010,19 @@ fn inject(
     found.sort_by_key(|(_, ranges)| ranges[0].start_byte);
 
     for (target, ranges) in found {
-        let Some(mut parser) = new_parser(&target) else {
-            continue;
+        let before = old.take(&target, &ranges);
+        let parsed = match before {
+            Some(layer) if old.untouched(layer, &ranges) => layer.tree.clone(),
+            _ => {
+                let Some(mut parser) = new_parser(&target) else {
+                    continue;
+                };
+                if parser.set_included_ranges(&ranges).is_err() {
+                    continue;
+                }
+                parse_rope(&mut parser, rope, before.map(|layer| &layer.tree), deadline)?
+            }
         };
-        if parser.set_included_ranges(&ranges).is_err() {
-            continue;
-        }
-        // The first unused old tree of the same language: layers keep their
-        // order while typing, so this is the same piece of text.
-        let reuse = old
-            .iter()
-            .enumerate()
-            .find(|(i, layer)| !used[*i] && Arc::ptr_eq(&layer.language, &target))
-            .map(|(i, layer)| {
-                used[i] = true;
-                &layer.tree
-            });
-        let parsed = parse_rope(&mut parser, rope, reuse, deadline)?;
-        drop(parser);
         // Compiled here for the same reason as in `SyntaxTree::parse`.
         target.highlighter();
         target.rules();
@@ -823,7 +1039,6 @@ fn inject(
                 &layer.tree,
                 rope,
                 old,
-                used,
                 deadline,
                 depth + 1,
                 layers,
@@ -831,37 +1046,6 @@ fn inject(
         }
     }
     Some(())
-}
-
-/// The ranges of `node` an injected language reads: all of it, or what is
-/// left between its children.
-fn content_ranges(node: Node, include_children: bool, out: &mut Vec<tree_sitter::Range>) {
-    let mut push = |start_byte, start_point, end_byte, end_point| {
-        if start_byte < end_byte {
-            out.push(tree_sitter::Range {
-                start_byte,
-                end_byte,
-                start_point,
-                end_point,
-            });
-        }
-    };
-    if include_children || node.child_count() == 0 {
-        push(
-            node.start_byte(),
-            node.start_position(),
-            node.end_byte(),
-            node.end_position(),
-        );
-        return;
-    }
-    let (mut byte, mut point) = (node.start_byte(), node.start_position());
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        push(byte, point, child.start_byte(), child.start_position());
-        (byte, point) = (child.end_byte(), child.end_position());
-    }
-    push(byte, point, node.end_byte(), node.end_position());
 }
 
 /// A parser set up for one language. One that runs a WebAssembly grammar
@@ -908,12 +1092,20 @@ fn new_parser(language: &Language) -> Option<LanguageParser> {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many parses this thread ran, for the tests that count them.
+    static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn parse_rope(
     parser: &mut Parser,
     rope: &Rope,
     old: Option<&Tree>,
     deadline: Option<Instant>,
 ) -> Option<Tree> {
+    #[cfg(test)]
+    PARSES.with(|parses| parses.set(parses.get() + 1));
     let len = rope.len_bytes();
     let mut read = |byte: usize, _| -> &[u8] {
         if byte >= len {
@@ -1415,6 +1607,175 @@ mod tests {
                 .unwrap()
                 .has_outline()
         );
+    }
+
+    /// What `path` is called and how `src` is colored as that language.
+    fn painted(path: &str, src: &str) -> (&'static str, Vec<(String, HighlightKind)>) {
+        let language = language_for_path(Path::new(path)).unwrap();
+        let rope = Rope::from_str(src);
+        let tree = SyntaxTree::parse(language.clone(), &rope).unwrap();
+        (language.name, kinds(&tree, &rope, src))
+    }
+
+    #[test]
+    fn the_languages_zed_has_built_in_are_built_in_here() {
+        use HighlightKind::*;
+        let has = |spans: &[(std::string::String, HighlightKind)], text: &str, kind| {
+            assert!(
+                spans.contains(&(text.to_string(), kind)),
+                "{text}: {spans:?}"
+            );
+        };
+        let (name, spans) = painted(
+            "main.c",
+            "#include <stdio.h>\nint main(void) { return puts(\"hi\"); }\n",
+        );
+        assert_eq!(name, "C");
+        has(&spans, "return", Keyword);
+        has(&spans, "\"hi\"", String);
+        has(&spans, "puts", Function);
+        assert_eq!(painted("util.h", "int a;").0, "C");
+
+        // C++ is C's colors with its own on top.
+        let (name, spans) = painted(
+            "shape.cpp",
+            "namespace geo { class Shape { public: virtual int area() const { return 1; } }; }\n",
+        );
+        assert_eq!(name, "C++");
+        has(&spans, "namespace", Keyword);
+        has(&spans, "class", Keyword);
+        has(&spans, "return", Keyword);
+        has(&spans, "1", Number);
+        assert_eq!(painted("shape.hpp", "class A {};").0, "C++");
+
+        let (name, spans) = painted("ci.yml", "name: build # all of it\nsteps:\n  - run: true\n");
+        assert_eq!(name, "YAML");
+        has(&spans, "name", Property);
+        has(&spans, "# all of it", Comment);
+        has(&spans, "true", Constant);
+        assert_eq!(painted("a.yaml", "a: 1").0, "YAML");
+
+        let (name, spans) = painted(
+            "build.sh",
+            "#!/bin/sh\nfor f in *.rs; do echo \"$f\"; done # all\n",
+        );
+        assert_eq!(name, "Shell Script");
+        has(&spans, "for", Keyword);
+        has(&spans, "echo", Function);
+        has(&spans, "# all", Comment);
+        // The files a shell reads have no ending to go by.
+        assert_eq!(painted("home/.zshrc", "export A=1").0, "Shell Script");
+        assert_eq!(painted(".bash_profile", "export A=1").0, "Shell Script");
+        assert!(language_for_path(Path::new("zshrc")).is_none());
+        // Comments are what the editor's own comment key writes.
+        let comment = |path: &str| language_for_path(Path::new(path)).unwrap().line_comment;
+        assert_eq!(comment("a.c"), Some("//"));
+        assert_eq!(comment("a.cc"), Some("//"));
+        assert_eq!(comment("a.yml"), Some("#"));
+        assert_eq!(comment("a.sh"), Some("#"));
+        assert_eq!(comment("a.md"), None);
+    }
+
+    const NOTES: &str = "# Notes on `run`\n\nSome *slanted* and **strong** text with a [link](https://example.com).\n\n```rust\nfn main() { let x = \"hi\"; }\n```\n\n```nothing-known\nplain words\n```\n\n- an item\n";
+
+    #[test]
+    fn markdown_is_two_grammars_and_the_languages_in_its_blocks() {
+        use HighlightKind::*;
+        let (name, spans) = painted("README.md", NOTES);
+        assert_eq!(name, "Markdown");
+        let has = |text: &str, kind| {
+            assert!(
+                spans.contains(&(text.to_string(), kind)),
+                "{text}: {spans:?}"
+            );
+        };
+        // The block grammar: the heading, its marker, the list's marker.
+        has("#", Punctuation);
+        has("Notes on ", Keyword);
+        has("- ", Punctuation);
+        // The inline grammar, inside the paragraph and inside the heading.
+        has("run", String);
+        has("slanted", Attribute);
+        has("strong", Constant);
+        has("link", Property);
+        has("https://example.com", String);
+        // A block of code is colored by its own language, and what that
+        // language leaves alone is not painted as quoted text.
+        has("fn", Keyword);
+        has("\"hi\"", String);
+        has("main", Function);
+        assert!(
+            !spans
+                .iter()
+                .any(|(text, kind)| *kind == String && text.contains("x =")),
+            "{spans:?}"
+        );
+        // A block in a language nobody knows is plain.
+        assert!(
+            !spans.iter().any(|(text, _)| text.contains("plain words")),
+            "{spans:?}"
+        );
+
+        let rope = Rope::from_str(NOTES);
+        let tree = SyntaxTree::parse(language_for_path(Path::new("a.md")).unwrap(), &rope).unwrap();
+        let at = |what: &str| NOTES.find(what).unwrap();
+        assert_eq!(tree.language_at(at("fn main")).name, "Rust");
+        assert_eq!(tree.language_at(at("slanted")).name, "Markdown Inline");
+        assert_eq!(tree.language_at(at("```rust")).name, "Markdown");
+        // The inline grammar is not a kind of file.
+        assert!(language_for_path(Path::new("a.markdown_inline")).is_none());
+    }
+
+    #[test]
+    fn a_paragraph_that_did_not_change_is_not_parsed_again() {
+        // Many paragraphs, each a piece of the inline grammar of its own.
+        let src: String = (0..40)
+            .map(|i| format!("Paragraph *{i}* here.\n\n"))
+            .collect();
+        let mut buffer = Buffer::new(&src);
+        let language = language_for_path(Path::new("a.md")).unwrap();
+        let mut tree = SyntaxTree::parse(language, buffer.rope()).unwrap();
+        assert_eq!(tree.layers.len(), 40);
+        let parses = || PARSES.with(|parses| parses.replace(0));
+        // The file's own tree and one for each paragraph.
+        assert_eq!(parses(), 41);
+
+        // A word typed into the twentieth.
+        let at = src.find("*20*").unwrap();
+        for e in buffer.edit([(at..at, "new ")], &[], Instant::now()) {
+            tree.edit(&e);
+        }
+        assert!(tree.is_stale());
+        assert!(tree.reparse_within(buffer.rope(), Duration::from_secs(5)));
+        assert_eq!(tree.layers.len(), 40);
+        // The file and that one paragraph: every other kept its tree as it
+        // was, before the edit and after it, where the text only moved.
+        assert_eq!(parses(), 2);
+        // And all of them are colored where the text now is.
+        let text = buffer.rope().to_string();
+        let spans = kinds(&tree, buffer.rope(), &text);
+        let slanted = spans
+            .iter()
+            .filter(|(_, kind)| *kind == HighlightKind::Attribute)
+            .count();
+        assert_eq!(slanted, 40, "{spans:?}");
+        assert!(spans.contains(&("39".into(), HighlightKind::Attribute)));
+
+        // A paragraph taken out: those after it are the same text further
+        // up, and one layer fewer.
+        let gone = text.find("Paragraph *5*").unwrap()..text.find("Paragraph *6*").unwrap();
+        for e in buffer.edit([(gone, "")], &[], Instant::now()) {
+            tree.edit(&e);
+        }
+        assert!(tree.reparse_within(buffer.rope(), Duration::from_secs(5)));
+        assert_eq!(tree.layers.len(), 39);
+        // The file again, and the paragraph that now starts where the one
+        // that went did. The rest are found by where they are and kept.
+        assert_eq!(parses(), 2);
+        let text = buffer.rope().to_string();
+        let spans = kinds(&tree, buffer.rope(), &text);
+        assert!(spans.contains(&("39".into(), HighlightKind::Attribute)));
+        assert!(!spans.contains(&("5".into(), HighlightKind::Attribute)));
     }
 
     #[test]
