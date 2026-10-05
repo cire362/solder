@@ -682,7 +682,7 @@ here.
 
 | From | Solder uses | Does not run here |
 |---|---|---|
-| A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, icon themes, its language servers | Slash commands, context servers, debug adapters |
+| A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, icon themes, its language servers, its debug adapters | Context servers (they need an MCP client, which is planned) |
 | A VS Code extension | Themes (JSON), snippets | Its code, TextMate grammars, everything the code would add |
 
 A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
@@ -720,6 +720,15 @@ long-term release from nodejs.org the first time a server needs it, checks
 it against the published hash and keeps it in `extensions/node` in the app's
 data folder, for every extension; the status bar says so while it downloads.
 It is not updated on its own: delete that folder to get a newer one.
+
+A debug adapter comes from the extension's code too. When the open file is in
+a language whose extension names a debugger (Ruby names `rdbg`), the debug
+panel lists it next to the JavaScript choices, as `rdbg app.rb`. Started, the
+extension is asked how to run the adapter for that file; it may install the
+adapter first, with the commands its manifest declares. The adapter then
+listens on a port Solder picks for it, or talks on its own input and output,
+and the session is the same as any other: breakpoints, stepping, variables,
+the console.
 
 An icon theme puts a picture next to each file in the tree and on tabs, by
 the file's name and ending. Press **Use** on it in the Extensions tab, or

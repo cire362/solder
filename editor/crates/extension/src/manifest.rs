@@ -79,6 +79,8 @@ pub struct Language {
     /// deeper one, a line that matches the second goes one level back.
     pub increase_indent: Option<String>,
     pub decrease_indent: Option<String>,
+    /// The debug adapters that debug it, by name.
+    pub debuggers: Vec<String>,
     /// Missing for a VS Code language: its TextMate grammar is not read.
     pub grammar: Option<Grammar>,
 }
@@ -126,6 +128,8 @@ pub struct Extension {
     pub snippets: Vec<SnippetFile>,
     pub languages: Vec<Language>,
     pub servers: Vec<Server>,
+    /// The debug adapters its code knows how to get and start, by name.
+    pub debug_adapters: Vec<String>,
     pub code: Code,
     /// The commands its manifest declares its code runs: a program and the
     /// arguments it may be given (`*` for any one, `**` for any that remain).
@@ -151,7 +155,12 @@ impl Extension {
         let servers = self
             .servers
             .iter()
-            .map(|server| format!("Download and start the language server {}", server.name));
+            .map(|server| format!("Download and start the language server {}", server.name))
+            .chain(
+                self.debug_adapters
+                    .iter()
+                    .map(|adapter| format!("Get and start the debug adapter {adapter}")),
+            );
         let commands = self.commands.iter().map(|(program, args)| {
             if args.is_empty() {
                 format!("Run {program}")
@@ -184,6 +193,15 @@ impl Extension {
                 },
                 "language server",
                 "language servers",
+            ),
+            count(
+                if self.runs_code() {
+                    self.debug_adapters.len()
+                } else {
+                    0
+                },
+                "debug adapter",
+                "debug adapters",
             ),
             count(self.themes.len(), "theme", "themes"),
             count(self.icon_themes.len(), "icon theme", "icon themes"),
@@ -409,6 +427,7 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
             autoclose_before: config["autoclose_before"].as_str().map(str::to_string),
             word_characters: strings(&config["word_characters"]).concat(),
             completion_characters: strings(&config["completion_query_characters"]).concat(),
+            debuggers: strings(&config["debuggers"]),
             increase_indent: pattern("increase_indent_pattern", "increase_indent_patterns"),
             decrease_indent: pattern("decrease_indent_pattern", "decrease_indent_patterns"),
             grammar,
@@ -465,7 +484,6 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
     for (key, what) in [
         ("context_servers", "Context servers"),
         ("slash_commands", "Slash commands"),
-        ("debug_adapters", "Debug adapters"),
         ("agent_servers", "Agent servers"),
         ("indexed_docs_providers", "Documentation indexing"),
     ] {
@@ -488,6 +506,12 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         snippets,
         languages,
         servers,
+        debug_adapters: manifest["debug_adapters"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(name, _)| name.clone())
+            .collect(),
         code,
         commands,
         missing,
@@ -618,6 +642,7 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         snippets,
         languages,
         servers: Vec::new(),
+        debug_adapters: Vec::new(),
         code,
         commands: Vec::new(),
         missing,

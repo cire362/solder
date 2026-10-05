@@ -181,7 +181,13 @@ to build them.
       parse such grammars off the UI thread and give up on one that hangs,
       or to change tree-sitter. Decided on 2026-10-05: left open until
       tree-sitter has a way of its own, as Zed has no such limit either
-- [ ] Debug adapters of extensions, in the debugger
+- [x] Debug adapters of extensions, in the debugger: the open file with
+      each adapter its language names, started as the extension says, over
+      a port or the adapter's own input and output
+- [ ] Which of a language's servers start. Every server an extension lists
+      for a language is started today, and Ruby's lists eight: the user's
+      choice per language (`language_servers`, with `!name` to leave one
+      out), and Zed's defaults for the languages that need them
 - [ ] Context servers of extensions, in the agent. They are MCP servers
       (context7, GitHub and Postgres are the most installed), and the agent
       has no MCP client yet: the client and these servers are one update of

@@ -8300,6 +8300,7 @@ mod tests {
                 "env": {},
             }),
             browser: Some("http://localhost:4123".into()),
+            adapter: None,
         };
         store.update(cx, |s, cx| s.start(config, root.clone(), cx));
         // The server says where it listens; the page opens in a browser
@@ -9392,7 +9393,7 @@ brackets = [
     /// What extensions reach outside their sandbox through, for the test
     /// below: the server is "on the PATH" as a script that starts the mock
     /// language server, and nothing else is available.
-    struct ServerOnPath(String);
+    struct ServerOnPath(&'static str, String);
 
     impl extension::host::World for ServerOnPath {
         fn node(&self) -> Result<String, String> {
@@ -9425,7 +9426,7 @@ brackets = [
             Err("no commands here".into())
         }
         fn which(&self, binary: &str) -> Option<String> {
-            (binary == "vscode-html-language-server").then(|| self.0.clone())
+            (binary == self.0).then(|| self.1.clone())
         }
         fn env(&self) -> Vec<(String, String)> {
             Vec::new()
@@ -9512,7 +9513,10 @@ brackets = [
             );
             cx.set_global(settings);
         });
-        let world = ServerOnPath(script.to_string_lossy().into_owned());
+        let world = ServerOnPath(
+            "vscode-html-language-server",
+            script.to_string_lossy().into_owned(),
+        );
         store.update(cx, |store, _| {
             store.world = Some(std::sync::Arc::new(world))
         });
@@ -9664,7 +9668,10 @@ brackets = [
             let store = cx.new(|cx| {
                 let mut store =
                     ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
-                let world = ServerOnPath(script.to_string_lossy().into_owned());
+                let world = ServerOnPath(
+                    "vscode-html-language-server",
+                    script.to_string_lossy().into_owned(),
+                );
                 store.world = Some(std::sync::Arc::new(world));
                 store
             });
@@ -10170,5 +10177,122 @@ brackets = [
             std::fs::read_to_string(data.join("extensions/state.json"))
                 .is_ok_and(|text| !text.contains("refused"))
         });
+    }
+
+    #[gpui::test]
+    fn a_debug_adapter_of_an_extension_debugs_a_file_of_its_language(cx: &mut TestAppContext) {
+        let _languages = extension_languages();
+        // Zed's real Ruby extension, installed, with a Ruby language that
+        // names `rdbg` as its debugger. (Its grammar here is Vue's: the test
+        // needs a language, not its colors.) `rdbg` is "on the PATH" as a
+        // script that starts the stand-in adapter on the port it is given.
+        let root = db::testing::dir("ws-rdbg").canonicalize().unwrap();
+        let app = root.join("app.rb");
+        std::fs::write(
+            &app,
+            "def add(a, b)\n  sum = a + b\n  sum\nend\nputs add(2, 3)\n",
+        )
+        .unwrap();
+        let data = db::testing::dir("ws-rdbg-data");
+        let installed = data.join("extensions/zed/ruby");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        std::fs::create_dir_all(installed.join("grammars")).unwrap();
+        for file in ["extension.toml", "extension.wasm"] {
+            std::fs::copy(
+                fixtures.join("extension/tests/fixtures/ruby").join(file),
+                installed.join(file),
+            )
+            .unwrap();
+        }
+        std::fs::copy(
+            fixtures.join("syntax/tests/fixtures/vue/vue.wasm"),
+            installed.join("grammars/vue.wasm"),
+        )
+        .unwrap();
+        write_file(
+            &installed.join("languages/ruby/config.toml"),
+            "name = \"Ruby\"\ngrammar = \"vue\"\npath_suffixes = [\"rb\"]\ndebuggers = [\"rdbg\"]\n",
+        );
+        let scratch = db::testing::dir("ws-rdbg-bin");
+        let rdbg = scratch.join("rdbg");
+        let mock = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_dap.py");
+        executable(
+            &rdbg,
+            &format!(
+                "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --port=*) port=\"${{a#--port=}}\";; esac; done\nexec python3 '{}' \"$port\" 127.0.0.1\n",
+                mock.display()
+            ),
+        );
+        cx.executor().allow_parking();
+        let (extensions, debug) = cx.update(|cx| {
+            let extensions = cx.new(|cx| {
+                let mut store =
+                    ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
+                store.world = Some(std::sync::Arc::new(ServerOnPath(
+                    "rdbg",
+                    rdbg.to_string_lossy().into_owned(),
+                )));
+                store
+            });
+            ExtensionStore::set_global(extensions.clone(), cx);
+            extensions.update(cx, |s, cx| s.scan(cx));
+            let debug = cx.new(|_| {
+                crate::debug::DebugStore::new(
+                    data.join("debug"),
+                    crate::debug::AdapterSpec::JsDebug,
+                )
+            });
+            crate::debug::DebugStore::set_global(debug.clone(), cx);
+            (extensions, debug)
+        });
+        let (ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "the extensions folder", &|cx| {
+            extensions.read(cx).loaded
+        });
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(app.clone(), None, window, cx)
+        });
+        wait_for(cx, "the language", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|e| e.read(cx).doc(cx).language_name() == Some("Ruby"))
+        });
+
+        // The extension says it brings the adapter, and the file of its
+        // language can be debugged with it; a file of another cannot.
+        assert_eq!(
+            cx.read(|cx| extensions
+                .read(cx)
+                .find(Origin::Zed, "ruby")
+                .unwrap()
+                .provides()),
+            "1 language, 8 language servers, 1 debug adapter"
+        );
+        let configs = cx.read(|cx| crate::debug_launch::from_extensions(&root, &app, cx));
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "rdbg app.rb");
+        let none =
+            cx.read(|cx| crate::debug_launch::from_extensions(&root, &root.join("a.js"), cx));
+        assert!(none.is_empty());
+
+        // Started, the extension is asked how; the adapter it names is
+        // started as it says and listens where the editor told it to. The
+        // run stops on the breakpoint in the file.
+        debug.update(cx, |s, cx| {
+            s.toggle(&app, 2, cx);
+            s.start(configs[0].clone(), root.clone(), cx)
+        });
+        wait_for(cx, "the pause in app.rb", &|cx| {
+            paused_line(&debug, cx) == Some(2)
+        });
+        assert!(cx.read(|cx| debug.read(cx).state.active()));
+        debug.update(cx, |s, cx| s.stop(cx));
+        cx.run_until_parked();
+        assert!(cx.read(|cx| !debug.read(cx).state.active()));
+
+        // Turned off, the extension debugs nothing.
+        extensions.update(cx, |s, cx| s.set_off(Origin::Zed, "ruby", true, cx));
+        let none = cx.read(|cx| extensions.read(cx).debuggers_for("Ruby"));
+        assert!(none.is_empty());
     }
 }

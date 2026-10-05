@@ -165,7 +165,10 @@ class Session:
     def start_child(self):
         target = "t%d" % id(self)
         with lock:
-            targets[target] = (self.config.get("program"), self)
+            # What is debugged, under the name js-debug has for it or the
+            # one Ruby's adapter does.
+            program = self.config.get("program") or self.config.get("script_or_command")
+            targets[target] = (program, self)
         timeline = (self.config.get("env") or {}).get("SOLDER_TIMELINE")
         if timeline:
             with open(timeline, "a") as f:
@@ -180,7 +183,9 @@ class Session:
             "arguments": {
                 "request": "launch",
                 "configuration": {
-                    "type": self.config.get("type"),
+                    # A program that is not a browser's page runs as Node's
+                    # does, whatever the adapter calls itself.
+                    "type": self.config.get("type") or "pwa-node",
                     "name": name,
                     "__pendingTargetId": target,
                 },

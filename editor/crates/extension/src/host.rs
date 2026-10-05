@@ -75,6 +75,38 @@ pub enum LabelSpan {
     },
 }
 
+/// A program to debug, as the editor knows it before any adapter does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DebugLaunch {
+    pub label: String,
+    /// The debug adapter's name in its extension's manifest.
+    pub adapter: String,
+    pub program: String,
+    pub cwd: Option<String>,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// How to start a debug adapter and what to ask it for, as an extension
+/// worked it out from a [`DebugLaunch`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugAdapter {
+    /// The adapter's program. `None` for one that is not a process to
+    /// start: it is only connected to.
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub cwd: Option<String>,
+    /// Where the adapter listens: an address, a port, and how long to wait
+    /// for it in milliseconds. `None` means it talks on its own input and
+    /// output.
+    pub connection: Option<(std::net::Ipv4Addr, u16, Option<u64>)>,
+    /// `false` to launch the program, `true` to attach to one that runs.
+    pub attach: bool,
+    /// The arguments of that request, as JSON.
+    pub configuration: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Output {
     pub status: Option<i32>,
@@ -428,6 +460,19 @@ trait Calls: Send {
         _worktree: Resource<Worktree>,
     ) -> wasmtime::Result<Result<Option<String>, String>> {
         Ok(Ok(None))
+    }
+
+    /// How to start the adapter that debugs `launch`. Versions before 0.6
+    /// know no debug adapters.
+    fn debug_adapter(
+        &self,
+        _store: &mut Store<State>,
+        _launch: &DebugLaunch,
+        _worktree: Resource<Worktree>,
+    ) -> wasmtime::Result<Result<DebugAdapter, String>> {
+        Ok(Err(
+            "It was built for a version of Zed's API that has no debug adapters".into(),
+        ))
     }
 
     /// How to show each of a server's completions; `None` leaves one as
@@ -799,6 +844,11 @@ macro_rules! start {
     // From 0.4, an extension may add to the options and settings of a
     // server that is not its own.
     ($bindings:ident, sets_up_others) => {
+        start!($bindings, sets_up_others, {});
+    };
+    // From 0.6, what a version adds of its own is written where its
+    // bindings are.
+    ($bindings:ident, sets_up_others, { $($extra:tt)* }) => {
         start!(@start $bindings);
         start!(@by_id $bindings {
             start!(@labels $bindings, |c| Some(
@@ -832,6 +882,8 @@ macro_rules! start {
                     store, server, target, worktree,
                 )
             }
+
+            $($extra)*
         });
     };
     (@labels $bindings:ident $(, |$c:ident| $details:expr)?) => {
@@ -1093,6 +1145,8 @@ pub struct Host {
     running: Mutex<Running>,
     /// The first language the manifest lists for each server.
     languages: Vec<(String, String)>,
+    /// The debug adapters the manifest declares.
+    debug_adapters: Vec<String>,
 }
 
 impl Host {
@@ -1158,6 +1212,7 @@ impl Host {
                     )
                 })
                 .collect(),
+            debug_adapters: extension.debug_adapters.clone(),
         })
     }
 
@@ -1238,6 +1293,27 @@ impl Host {
             labels.resize(completions.len(), None);
             labels
         }))
+    }
+
+    /// How to start the debug adapter for `launch` in the project at
+    /// `root`. The extension may install the adapter first.
+    pub fn debug_adapter(&self, launch: &DebugLaunch, root: &Path) -> Result<DebugAdapter, String> {
+        // Asked about an adapter that is not its own, an extension may
+        // answer all the same, with its own.
+        if !self.debug_adapters.contains(&launch.adapter) {
+            return Err(format!(
+                "The extension has no debug adapter called {}",
+                launch.adapter
+            ));
+        }
+        let mut adapter = self.ask(root, |extension, store, worktree| {
+            extension.debug_adapter(store, launch, worktree)
+        })?;
+        let running = self.running.lock().unwrap();
+        adapter.command = adapter
+            .command
+            .map(|command| program(&running.store.data().work_dir, &command));
+        Ok(adapter)
     }
 
     /// The JSON to send the server as `initializationOptions`, if any.

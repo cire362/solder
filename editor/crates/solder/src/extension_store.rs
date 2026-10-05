@@ -17,7 +17,7 @@ use std::{
 use extension::{
     Entry, Event, Extension, Origin, Refusals, Snippet, catalog,
     gate::{Did, Gate},
-    host::{CodeLabel, Completion, Host, Status, World},
+    host::{CodeLabel, Completion, DebugAdapter, DebugLaunch, Host, Status, World},
     install::{self, Progress, Staged},
     world::{SettingsFor, System},
 };
@@ -593,6 +593,73 @@ impl ExtensionStore {
                     })
             })
             .collect()
+    }
+
+    /// The debug adapters installed extensions bring for `language`: the
+    /// extension's id and the adapter's name. The language says which
+    /// adapters debug it; an extension that has one of them is asked.
+    pub fn debuggers_for(&self, language: &str) -> Vec<(String, String)> {
+        let on = |extension: &&Extension| {
+            extension.runs_code() && !self.is_off(extension.origin, &extension.id)
+        };
+        let wanted: Vec<&String> = self
+            .installed
+            .iter()
+            .filter(on)
+            .flat_map(|extension| &extension.languages)
+            .filter(|known| known.name == language)
+            .flat_map(|known| &known.debuggers)
+            .collect();
+        self.installed
+            .iter()
+            .filter(on)
+            .flat_map(|extension| {
+                extension
+                    .debug_adapters
+                    .iter()
+                    .filter(|adapter| wanted.contains(adapter))
+                    .map(|adapter| (extension.id.clone(), adapter.clone()))
+            })
+            .collect()
+    }
+
+    /// Asks the extension how to start its debug adapter for `launch`. It
+    /// may install the adapter first, so this runs on a thread of its own,
+    /// like [`ExtensionStore::resolve`].
+    pub fn debug_adapter(
+        &mut self,
+        extension: &str,
+        launch: DebugLaunch,
+        root: &Path,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<DebugAdapter, String>> {
+        let Some(extension) = self.find(Origin::Zed, extension).cloned() else {
+            return Task::ready(Err(format!("{extension} is not installed")));
+        };
+        let slot = self.hosts.entry(extension.id.clone()).or_default().clone();
+        let work_dir = install::work_dir(&self.root, &extension.id);
+        let world = self.world.clone();
+        let statuses = self.statuses.clone();
+        let settings = self.settings_for();
+        let gated = self.gated(&extension.id);
+        let root = root.to_path_buf();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("solder-extension".into())
+            .spawn(move || {
+                let answer = host_in(
+                    &slot, &extension, &work_dir, world, statuses, settings, gated,
+                )
+                .and_then(|host| host.debug_adapter(&launch, &root));
+                let _ = tx.send(answer);
+            });
+        if let Err(error) = spawned {
+            return Task::ready(Err(error.to_string()));
+        }
+        cx.background_executor().spawn(async move {
+            rx.await
+                .unwrap_or_else(|_| Err("The extension stopped without an answer".into()))
+        })
     }
 
     /// How the extension that brought `server` wants these completions of

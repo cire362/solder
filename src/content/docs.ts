@@ -154,7 +154,7 @@ export const DOC_GROUPS: DocGroup[] = [
           { p: "Open the **Extensions** tab of the sidebar. It lists what is installed, then the answers of Zed's catalog and Open VSX in one list. Type to search both, and press **Install** on a row." },
           { note: "Solder has no extension service of its own. The two catalogs are asked when the tab is opened and when you search, never at startup." },
           { h: "What an extension brings", id: "what-works" },
-          { p: "A Zed extension brings its languages with highlighting and with the way they are typed (indentation, brackets, pairs that close themselves, comments), its snippets, its themes, its icon themes and its language servers. A VS Code extension brings its themes and snippets. Its code is written for VS Code and does not run in Solder, so for a language the tab points to the Zed extension instead." },
+          { p: "A Zed extension brings its languages with highlighting and with the way they are typed (indentation, brackets, pairs that close themselves, comments), its snippets, its themes, its icon themes, its language servers and its debug adapters. A VS Code extension brings its themes and snippets. Its code is written for VS Code and does not run in Solder, so for a language the tab points to the Zed extension instead." },
           { p: "Select a row to see both lists for that extension: what Solder uses, and what does not run here." },
           { h: "What asks first", id: "asks-first" },
           { p: "An extension's own code runs in a sandbox: it can compute, and it can write to one folder of its own. A language server is different. It is a program the extension downloads and Solder starts with your rights." },
