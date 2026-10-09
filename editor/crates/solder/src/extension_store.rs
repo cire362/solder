@@ -108,6 +108,9 @@ pub struct ExtensionStore {
     pub zed_url: String,
     pub open_vsx_url: String,
     pub installing: HashMap<Key, Arc<Progress>>,
+    /// What other extensions needed that was already looked for, by id
+    /// in small letters.
+    sought: std::collections::HashSet<String>,
     /// Downloaded and read, waiting for the user to allow what they would
     /// do outside a sandbox.
     pub pending: HashMap<Key, Staged>,
@@ -253,6 +256,7 @@ impl ExtensionStore {
             zed_url: catalog::ZED.into(),
             open_vsx_url: catalog::OPEN_VSX.into(),
             installing: HashMap::new(),
+            sought: Default::default(),
             pending: HashMap::new(),
             updates: HashMap::new(),
             state: extension::State::default(),
@@ -1048,14 +1052,55 @@ impl ExtensionStore {
                 .await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(_) => {
+                    Ok(extension) => {
                         this.updates.remove(&key);
+                        this.install_needed(&extension, cx);
                     }
                     Err(error) => {
                         this.errors.insert(key, error);
                     }
                 }
                 this.scan(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Installs what an extension that was just installed does not work
+    /// without, and what it is a pack of. Each is looked up once: one the
+    /// catalog does not have, such as a part of VS Code itself, is left
+    /// out, and two that need each other end where they began.
+    fn install_needed(&mut self, extension: &Extension, cx: &mut Context<Self>) {
+        let wanted: Vec<String> = extension
+            .needs
+            .iter()
+            .filter(|id| !id.to_lowercase().starts_with("vscode."))
+            .filter(|id| {
+                !self.installed.iter().any(|known| {
+                    known.origin == extension.origin && known.id.eq_ignore_ascii_case(id)
+                })
+            })
+            .filter(|id| self.sought.insert(id.to_lowercase()))
+            .cloned()
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        let origin = extension.origin;
+        let base = match origin {
+            Origin::Zed => self.zed_url.clone(),
+            Origin::VsCode => self.open_vsx_url.clone(),
+        };
+        let asking = catalog::latest(origin, &base, wanted);
+        cx.spawn(async move |this, cx| {
+            let Ok(entries) = asking.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                for entry in entries {
+                    this.install(entry, cx);
+                }
             })
             .ok();
         })

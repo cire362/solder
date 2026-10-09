@@ -823,6 +823,11 @@ some files differently on a light background, there is a second theme for
 that, with ` Light` after the name. A theme drawn with the letters of a font
 and not with pictures is listed among what does not run here.
 
+A VS Code extension that has a build for each platform is installed in the
+one for this machine. What it does not work without, and what it is a pack
+of, are installed with it; a part of VS Code itself that it names is left
+out, since no catalog has it.
+
 An extension may also paint the completions of its server: Vue's shows a
 property as a tag followed by its detail. Its answer is colored as code in
 the file's language, and what you type is matched against the name in it.

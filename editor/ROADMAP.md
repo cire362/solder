@@ -223,8 +223,9 @@ to build them.
       `settings.json`
 - [ ] Debuggers an extension declares with a program to start, in the
       debugger
-- [ ] The build for this machine when an extension has one per platform, and
-      the extensions it depends on or packs, installed with it
+- [x] The build for this machine when an extension has one per platform, and
+      the extensions it depends on or packs, installed with it. The catalog
+      is asked for this platform first; parts of VS Code itself are left out
 
 ### VS Code extensions: their code
 - [ ] An extension host: a Node process next to the editor that loads

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use import::{ThemeFile, jsonc, theme};
 
+use crate::catalog::valid_id;
 use crate::icons::{self, IconTheme};
 use serde_json::Value;
 
@@ -138,6 +139,9 @@ pub struct Extension {
     pub commands: Vec<(String, Vec<String>)>,
     /// What it has that Solder does not run, in words for the user.
     pub missing: Vec<String>,
+    /// The extensions it does not work without, and the ones it is a
+    /// pack of, by id: they are installed with it.
+    pub needs: Vec<String>,
 }
 
 impl Extension {
@@ -536,6 +540,7 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         code,
         commands,
         missing,
+        needs: Vec::new(),
     })
 }
 
@@ -686,6 +691,18 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         icon_themes,
         snippets,
         languages,
+        needs: {
+            let mut needs: Vec<String> = Vec::new();
+            for id in strings(&manifest["extensionPack"])
+                .into_iter()
+                .chain(strings(&manifest["extensionDependencies"]))
+            {
+                if valid_id(&id) && !needs.iter().any(|known| known.eq_ignore_ascii_case(&id)) {
+                    needs.push(id);
+                }
+            }
+            needs
+        },
         servers: Vec::new(),
         debug_adapters: Vec::new(),
         context_servers: Vec::new(),

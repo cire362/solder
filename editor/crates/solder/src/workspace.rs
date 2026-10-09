@@ -11106,6 +11106,108 @@ brackets = [
     }
 
     #[gpui::test]
+    fn a_pack_of_extensions_brings_what_it_is_made_of(cx: &mut TestAppContext) {
+        // A pack: one extension that names another it is made of, and
+        // says it needs a part of VS Code itself, which no catalog has.
+        let dir = db::testing::dir("ws-ext-pack-archive");
+        let package = |folder: &str, name: &str, more: &str| {
+            let dir = dir.join(folder).join("extension");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("package.json"),
+                format!(
+                    r#"{{ "name": "{name}", "publisher": "Acme", "version": "1.0.0", "contributes": {{}}{more} }}"#
+                ),
+            )
+            .unwrap();
+        };
+        package(
+            "pack",
+            "pack",
+            r#", "extensionPack": ["Acme.member"], "extensionDependencies": ["vscode.git", "acme.member"]"#,
+        );
+        // The member needs the pack back: that ends where it began.
+        package(
+            "member",
+            "member",
+            r#", "extensionDependencies": ["Acme.pack"]"#,
+        );
+        let (Some(pack), Some(member)) = (
+            zip(&dir.join("pack"), "extension"),
+            zip(&dir.join("member"), "extension"),
+        ) else {
+            eprintln!("skipped: no python3 to build a .vsix");
+            return;
+        };
+        let (files, _) = serve(vec![
+            ("/pack.vsix", Served::ok(pack)),
+            ("/member.vsix", Served::ok(member)),
+        ]);
+        let search = format!(
+            r#"{{"extensions":[{{"namespace":"Acme","name":"pack","version":"1.0.0","files":{{"download":"{files}/pack.vsix"}}}}]}}"#
+        );
+        let found = format!(
+            r#"{{"namespace":"Acme","name":"member","version":"1.0.0","files":{{"download":"{files}/member.vsix"}}}}"#
+        );
+        let (base, requests) = serve(vec![
+            ("/api/-/search", Served::ok(search.into_bytes())),
+            ("/api/Acme/member", Served::ok(found.into_bytes())),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (_config, store, _ws, cx) = extension_setup(cx, "ext-pack", &base);
+        cx.dispatch_action(ShowExtensions);
+        wait_for(cx, "the catalog", &|cx| {
+            !store.read(cx).catalog(Origin::VsCode).entries.is_empty()
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        // The pack is installed, and then what it is made of, with no
+        // more asked of the user.
+        let both = |cx: &App| {
+            let store = store.read(cx);
+            store.find(Origin::VsCode, "Acme.pack").is_some()
+                && store.find(Origin::VsCode, "Acme.member").is_some()
+        };
+        for _ in 0..300 {
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+            if cx.read(|cx| both(cx)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            cx.read(|cx| both(cx)),
+            "installed {:?}, errors {:?}, asked {:?}",
+            cx.read(|cx| store
+                .read(cx)
+                .installed
+                .iter()
+                .map(|e| e.id.clone())
+                .collect::<Vec<_>>()),
+            cx.read(|cx| store.read(cx).errors.values().cloned().collect::<Vec<_>>()),
+            requests.lock().unwrap()
+        );
+        let pack = cx.read(|cx| store.read(cx).find(Origin::VsCode, "Acme.pack").cloned());
+        assert_eq!(pack.unwrap().needs, ["Acme.member", "vscode.git"]);
+        cx.run_until_parked();
+        let asked = requests.lock().unwrap().clone();
+        // The member was asked for once, for this machine, and the part
+        // of VS Code and the pack itself not at all.
+        let member = format!("/api/Acme/member/{}", extension::catalog::target());
+        assert_eq!(
+            asked.iter().filter(|r| **r == member).count(),
+            1,
+            "{asked:?}"
+        );
+        assert!(
+            !asked
+                .iter()
+                .any(|r| r.contains("vscode") || r.contains("/api/Acme/pack"))
+        );
+    }
+
+    #[gpui::test]
     fn a_vscode_extension_says_what_does_not_run_and_points_to_zed(cx: &mut TestAppContext) {
         let dir = db::testing::dir("ws-ext-vsx-archive");
         extension::testing::vscode_extension(&dir.join("extension"));
