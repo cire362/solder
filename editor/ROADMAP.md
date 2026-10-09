@@ -208,7 +208,9 @@ to build them.
 - [ ] Language configuration: brackets, pairs that close themselves, comments,
       indentation rules, and which files are which language
 - [ ] Themes in the old `.tmTheme` format
-- [ ] Icon themes, through the same file icons as Zed's
+- [x] Icon themes, through the same file icons as Zed's: the ones drawn
+      with pictures, by a file's name, ending and language and a folder's
+      name. One drawn with a font is said not to run here
 - [ ] The settings an extension declares, with their defaults, in
       `settings.json`
 - [ ] Debuggers an extension declares with a program to start, in the
@@ -257,8 +259,9 @@ panels move by hand too. Layouts have names and are remembered per project.
 The interface font, size and density are settings, and every color, corner
 radius and border width is a theme token. Key layouts have names too, with
 the user's own bindings (`keymap.json`) on top.
-Phosphor icons are embedded for buttons, panels and bars. File icons come
-from a Zed extension's icon theme.
+Phosphor icons are embedded for buttons, panels and bars, an item of a bar is
+a word, an icon or both, and a button runs any command. File icons come from
+the icon theme of a Zed or VS Code extension.
 
 How it is built: `layout.json`, next to `settings.json`, is the truth and is
 read again when it is saved. Whatever is done by hand in the window (a border
@@ -331,9 +334,9 @@ file, so the two never disagree. It starts after the Zed items of phase 8.
       downloaded). Forty-four regular SVGs are embedded, inherit the text
       color and scale with the interface font; panel tabs, bar items and
       common command buttons use them
-- [~] File icons in the tree and on tabs from the icon themes of Zed and
+- [x] File icons in the tree and on tabs from the icon themes of Zed and
       VS Code extensions (the items of phase 8), chosen in `settings.json`.
-      Zed's are in; VS Code's are not yet
+      VS Code's are read into the same icon theme as Zed's
 
 ## 10. What a daily editor has
 

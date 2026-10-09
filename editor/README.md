@@ -732,7 +732,7 @@ here.
 | From | Solder uses | Does not run here |
 |---|---|---|
 | A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, icon themes, its language servers, its debug adapters, its context servers | |
-| A VS Code extension | Themes (JSON), snippets | Its code, TextMate grammars, everything the code would add |
+| A VS Code extension | Themes (JSON), icon themes drawn with pictures, snippets | Its code, TextMate grammars, icon themes drawn with a font, everything the code would add |
 
 A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
 It is compiled on the first file that needs it and runs in wasmtime inside
@@ -784,6 +784,13 @@ the file's name and ending. Press **Use** on it in the Extensions tab, or
 name it in `settings.json` (`"icon_theme": "Catppuccin Mocha"`); with none
 named, the tree has no pictures. The pictures are the extension's own SVG
 files, read from its folder.
+
+An icon theme of a VS Code extension works the same way, under the name the
+extension shows it by. It says which picture goes with a file's name, its
+ending or its language, and with a folder's name, open or closed. If it draws
+some files differently on a light background, there is a second theme for
+that, with ` Light` after the name. A theme drawn with the letters of a font
+and not with pictures is listed among what does not run here.
 
 An extension may also paint the completions of its server: Vue's shows a
 property as a tag followed by its detail. Its answer is colored as code in
@@ -963,7 +970,7 @@ Panel tabs, bar items and common command buttons have Phosphor icons next to
 their labels. The regular SVGs are embedded in the app under the MIT license;
 they need no icon files or network connection at run time. They use the text
 color of their control and scale with `ui_font_size`. File icons still come
-from the extension icon theme selected with `icon_theme`.
+from the icon theme of a Zed or VS Code extension selected with `icon_theme`.
 
 An item of a bar is drawn as a word, an icon or both, and a bar can hold a
 button for any command. Both are under `items` in the layout file, by the

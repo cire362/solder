@@ -573,6 +573,31 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         ));
     }
 
+    // Icon themes, each under the name the extension shows it by. One
+    // drawn with a font has no pictures to take.
+    let mut icon_themes: Vec<IconTheme> = Vec::new();
+    let mut drawn_with_a_font = 0;
+    for entry in list("iconThemes") {
+        let named = [&entry["label"], &entry["id"]]
+            .into_iter()
+            .map(|name| label(&text(name)))
+            .find(|name| !name.is_empty());
+        let read = named
+            .zip(entry["path"].as_str().and_then(|p| inside(dir, p)))
+            .map(|(name, path)| icons::read_vscode(dir, &path, &name))
+            .unwrap_or_default();
+        if read.is_empty() {
+            drawn_with_a_font += 1;
+        }
+        icon_themes.extend(read);
+    }
+    if drawn_with_a_font > 0 {
+        missing.push(match drawn_with_a_font {
+            1 => "An icon theme (drawn with a font, or not readable)".to_string(),
+            n => format!("{n} icon themes (drawn with a font, or not readable)"),
+        });
+    }
+
     let mut snippets: Vec<SnippetFile> = Vec::new();
     for entry in list("snippets") {
         let Some(path) = entry["path"]
@@ -640,7 +665,6 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         Code::None
     };
     for (key, what) in [
-        ("iconThemes", "Icon themes"),
         ("productIconThemes", "Product icon themes"),
         ("debuggers", "Debuggers"),
         ("keybindings", "Key bindings for its commands"),
@@ -659,7 +683,7 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         description: label(&text(&manifest["description"])),
         dir: dir.to_path_buf(),
         themes,
-        icon_themes: Vec::new(),
+        icon_themes,
         snippets,
         languages,
         servers: Vec::new(),

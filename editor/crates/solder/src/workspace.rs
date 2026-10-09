@@ -10792,6 +10792,30 @@ brackets = [
         assert!(syntax::language_for_path(Path::new("notes.dm")).is_none());
         assert!(cx.read(|cx| ws.read(cx).left == Some(Panel::Extensions)));
 
+        // Its icon theme is drawn with pictures, so it is one Solder has:
+        // the tab offers it, and chosen, files get its pictures. The one
+        // drawn with a font is among what does not work here.
+        assert!(installed.missing.iter().any(|m| m.contains("icon theme")));
+        let icons = |cx: &App| {
+            cx.try_global::<crate::file_icons::FileIcons>()
+                .and_then(|icons| icons.0.as_ref().map(|theme| theme.name.clone()))
+        };
+        assert_eq!(cx.read(|cx| icons(cx)), None);
+        bounds_soon(cx, "extension-icons-0");
+        // Chosen as its button does; the button is below what a window
+        // of the test shows of so long a list.
+        store.update(cx, |store, cx| {
+            store.use_icon_theme("Acme Icons".into(), cx)
+        });
+        wait_for(cx, "the icon theme", &|cx| {
+            icons(cx).as_deref() == Some("Acme Icons")
+        });
+        let picture = |cx: &mut VisualTestContext, name: &str| {
+            cx.read(|cx| crate::file_icons::file(Path::new(name), cx).is_some())
+        };
+        assert!(picture(cx, "src/main.rs") && picture(cx, "Dockerfile"));
+        assert!(cx.read(|cx| crate::file_icons::folder(Path::new("src"), true, cx).is_some()));
+
         // The tab points to the Zed extension for the language and searches
         // for it.
         cx.run_until_parked();

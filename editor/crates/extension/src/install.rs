@@ -582,16 +582,37 @@ mod tests {
         assert_eq!(language.aliases, ["demo", "Demo Lang"]);
         assert_eq!(language.line_comment.as_deref(), Some("#"));
         assert!(language.grammar.is_none());
+        // Its icon theme, and the same for a light background, since it
+        // draws some files differently there. The one drawn with a font
+        // is said to be missing.
+        let icon_themes: Vec<_> = installed
+            .icon_themes
+            .iter()
+            .map(|theme| (theme.name.as_str(), theme.dark))
+            .collect();
+        assert_eq!(
+            icon_themes,
+            [("Acme Icons", true), ("Acme Icons Light", false)]
+        );
+        assert!(
+            installed.icon_themes[0]
+                .file("main.rs")
+                .is_some_and(|icon| icon.ends_with("icons/rust.svg") && icon.is_file())
+        );
         assert_eq!(
             installed.missing,
             [
                 "1 of its themes (not in the JSON format)",
+                "An icon theme (drawn with a font, or not readable)",
                 "Highlighting (a TextMate grammar)",
                 "Its code, which needs VS Code",
                 "Key bindings for its commands",
             ]
         );
-        assert_eq!(installed.provides(), "1 theme, 1 snippet file");
+        assert_eq!(
+            installed.provides(),
+            "1 theme, 2 icon themes, 1 snippet file"
+        );
     }
 
     #[test]
