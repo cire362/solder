@@ -142,6 +142,30 @@ pub struct Extension {
     /// The extensions it does not work without, and the ones it is a
     /// pack of, by id: they are installed with it.
     pub needs: Vec<String>,
+    /// The debug adapters its manifest gives the program of, which need
+    /// none of its code to start.
+    pub debuggers: Vec<Debugger>,
+}
+
+/// A debug adapter a VS Code extension declares with the program that is
+/// it. It talks on its input and output.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Debugger {
+    /// What configurations call it (`type`).
+    pub name: String,
+    pub label: String,
+    /// The ids of the languages it debugs, in small letters.
+    pub languages: Vec<String>,
+    /// The adapter, inside the extension: a program, or with `runtime`
+    /// a script for it.
+    pub program: PathBuf,
+    /// What runs the program: `node` mostly.
+    pub runtime: Option<String>,
+    pub runtime_args: Vec<String>,
+    pub args: Vec<String>,
+    /// The launch it suggests to start from, with places to fill in
+    /// (`${file}`).
+    pub initial: Option<Value>,
 }
 
 impl Extension {
@@ -223,6 +247,7 @@ impl Extension {
                 "context server",
                 "context servers",
             ),
+            count(self.debuggers.len(), "debugger", "debuggers"),
             count(self.themes.len(), "theme", "themes"),
             count(self.icon_themes.len(), "icon theme", "icon themes"),
             count(self.snippets.len(), "snippet file", "snippet files"),
@@ -541,6 +566,7 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         commands,
         missing,
         needs: Vec::new(),
+        debuggers: Vec::new(),
     })
 }
 
@@ -669,9 +695,72 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
     } else {
         Code::None
     };
+    // Debuggers whose manifest names the adapter's program. One that
+    // leaves that to its code cannot be started without it.
+    let mut debuggers: Vec<Debugger> = Vec::new();
+    let mut started_by_code = 0;
+    // A file a breakpoint may be set in is one its debuggers debug.
+    let breakable: Vec<String> = list("breakpoints")
+        .iter()
+        .map(|entry| text(&entry["language"]).to_lowercase())
+        .filter(|language| !language.is_empty())
+        .collect();
+    let platform = match std::env::consts::OS {
+        "macos" => "osx",
+        "windows" => "windows",
+        _ => "linux",
+    };
+    for entry in list("debuggers") {
+        // What it says for this platform comes before what it says for all.
+        let field = |key: &str| match &entry[platform][key] {
+            Value::Null => entry[key].clone(),
+            own => own.clone(),
+        };
+        let name = text(&entry["type"]);
+        let program = field("program")
+            .as_str()
+            .and_then(|program| inside(dir, program))
+            .filter(|program| program.is_file());
+        let (Some(program), false) = (program, name.is_empty()) else {
+            started_by_code += 1;
+            continue;
+        };
+        let mut languages: Vec<String> = strings(&entry["languages"])
+            .iter()
+            .map(|language| language.to_lowercase())
+            .collect();
+        languages.extend(breakable.iter().cloned());
+        languages.dedup();
+        let initial = entry["initialConfigurations"]
+            .as_array()
+            .and_then(|all| {
+                all.iter()
+                    .find(|config| config["request"] == "launch")
+                    .or(all.first())
+            })
+            .filter(|config| config.is_object())
+            .cloned();
+        debuggers.push(Debugger {
+            label: Some(label(&text(&entry["label"])))
+                .filter(|label| !label.is_empty())
+                .unwrap_or_else(|| name.clone()),
+            name,
+            languages,
+            program,
+            runtime: field("runtime").as_str().map(str::to_string),
+            runtime_args: strings(&field("runtimeArgs")),
+            args: strings(&field("args")),
+            initial,
+        });
+    }
+    if started_by_code > 0 {
+        missing.push(match started_by_code {
+            1 => "A debugger its code starts".to_string(),
+            n => format!("{n} debuggers its code starts"),
+        });
+    }
     for (key, what) in [
         ("productIconThemes", "Product icon themes"),
-        ("debuggers", "Debuggers"),
         ("keybindings", "Key bindings for its commands"),
     ] {
         if !list(key).is_empty() {
@@ -703,6 +792,7 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
             }
             needs
         },
+        debuggers,
         servers: Vec::new(),
         debug_adapters: Vec::new(),
         context_servers: Vec::new(),

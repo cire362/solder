@@ -221,8 +221,10 @@ to build them.
       name. One drawn with a font is said not to run here
 - [ ] The settings an extension declares, with their defaults, in
       `settings.json`
-- [ ] Debuggers an extension declares with a program to start, in the
-      debugger
+- [x] Debuggers an extension declares with a program to start, in the
+      debugger: for the files of the languages they name, started with the
+      launch the manifest suggests. One only its code starts is said not
+      to run here
 - [x] The build for this machine when an extension has one per platform, and
       the extensions it depends on or packs, installed with it. The catalog
       is asked for this platform first; parts of VS Code itself are left out

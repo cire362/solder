@@ -157,6 +157,103 @@ struct Gated {
 
 /// The loaded code of an extension: what its slot holds, or loaded now.
 /// Blocking, and slow the first time.
+/// The launch a declared debugger is given: the one its manifest suggests,
+/// with its places filled in for the file to debug, or with none
+/// suggested, the least any adapter is told.
+fn launch_of(
+    debugger: &extension::Debugger,
+    launch: &DebugLaunch,
+    root: &Path,
+) -> serde_json::Value {
+    let file = Path::new(&launch.program);
+    let part = |part: Option<&std::ffi::OsStr>| {
+        part.map(|part| part.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let relative = file
+        .strip_prefix(root)
+        .unwrap_or(file)
+        .display()
+        .to_string();
+    let places = [
+        ("${file}", launch.program.clone()),
+        ("${relativeFile}", relative.clone()),
+        ("${fileBasenameNoExtension}", part(file.file_stem())),
+        ("${fileBasename}", part(file.file_name())),
+        ("${fileDirname}", part(file.parent().map(Path::as_os_str))),
+        ("${workspaceFolder}", root.display().to_string()),
+        ("${workspaceRoot}", root.display().to_string()),
+    ];
+    fn fill(value: &mut serde_json::Value, places: &[(&str, String)], asked: &str) {
+        match value {
+            serde_json::Value::String(text) => {
+                for (place, with) in places {
+                    *text = text.replace(place, with);
+                }
+                // What VS Code would ask the user for is the file: it
+                // is the file in front that is being debugged.
+                while let Some(start) = text.find("${command:").or(text.find("${input:")) {
+                    let end = text[start..]
+                        .find('}')
+                        .map_or(text.len(), |end| start + end + 1);
+                    text.replace_range(start..end, asked);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                items.iter_mut().for_each(|item| fill(item, places, asked))
+            }
+            serde_json::Value::Object(fields) => fields
+                .values_mut()
+                .for_each(|field| fill(field, places, asked)),
+            _ => {}
+        }
+    }
+    let mut config = debugger
+        .initial
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    fill(&mut config, &places, &relative);
+    config["type"] = debugger.name.clone().into();
+    config["request"] = "launch".into();
+    config["name"] = launch.label.clone().into();
+    if config["program"].is_null() {
+        config["program"] = launch.program.clone().into();
+    }
+    if config["cwd"].is_null() {
+        config["cwd"] = launch
+            .cwd
+            .clone()
+            .unwrap_or_else(|| root.display().to_string())
+            .into();
+    }
+    if !launch.args.is_empty() {
+        config["args"] = launch.args.clone().into();
+    }
+    config
+}
+
+/// What an extension reaches outside through: the world tests give, or
+/// the real one, behind the gate of what the user took back from it.
+fn world_in(
+    work_dir: &Path,
+    world: Option<Arc<dyn World>>,
+    statuses: mpsc::UnboundedSender<(String, Status)>,
+    settings: SettingsFor,
+    gated: Gated,
+) -> Arc<Gate> {
+    let world = world.unwrap_or_else(|| {
+        let mut system = System::new(extension::world::user_env(), move |server, status| {
+            let _ = statuses.unbounded_send((server.to_string(), status));
+        });
+        system.settings = Some(settings);
+        // Next to the extensions: their work folders are `work/<id>` under
+        // the same root.
+        system.node_home = work_dir.ancestors().nth(2).map(install::node_dir);
+        Arc::new(system)
+    });
+    Arc::new(Gate::new(world, gated.refusals, gated.did))
+}
+
 fn host_in(
     slot: &Slot,
     extension: &Extension,
@@ -170,17 +267,7 @@ fn host_in(
     if let Some(host) = &*slot {
         return Ok(host.clone());
     }
-    let world = world.unwrap_or_else(|| {
-        let mut system = System::new(extension::world::user_env(), move |server, status| {
-            let _ = statuses.unbounded_send((server.to_string(), status));
-        });
-        system.settings = Some(settings);
-        // Next to the extensions: their work folders are `work/<id>` under
-        // the same root.
-        system.node_home = work_dir.ancestors().nth(2).map(install::node_dir);
-        Arc::new(system)
-    });
-    let world = Arc::new(Gate::new(world, gated.refusals, gated.did));
+    let world = world_in(work_dir, world, statuses, settings, gated);
     let host = Arc::new(Host::load(extension, work_dir, world)?);
     *slot = Some(host.clone());
     Ok(host)
@@ -694,6 +781,117 @@ impl ExtensionStore {
             .collect()
     }
 
+    /// The debug adapters there are for `file`: the extension's id and
+    /// the adapter's name. Those of Zed extensions go by the file's
+    /// language, if it has one here. Those a VS Code extension declares
+    /// go by the languages they name: one that is the file's language, or
+    /// one some installed extension says files so named are of.
+    pub fn debuggers_for_file(&self, file: &Path, language: Option<&str>) -> Vec<(String, String)> {
+        let mut found = language
+            .map(|language| self.debuggers_for(language))
+            .unwrap_or_default();
+        let name = file
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let on: Vec<&Extension> = self
+            .installed
+            .iter()
+            .filter(|e| e.origin == Origin::VsCode && !self.is_off(e.origin, &e.id))
+            .collect();
+        // The ids of the languages a file of this name is of.
+        let ids: Vec<String> = on
+            .iter()
+            .flat_map(|extension| &extension.languages)
+            .filter(|known| {
+                known
+                    .suffixes
+                    .iter()
+                    .any(|suffix| name == *suffix || name.ends_with(&format!(".{suffix}")))
+            })
+            .filter_map(|known| known.aliases.first())
+            .map(|id| id.to_lowercase())
+            .chain(language.map(str::to_lowercase))
+            .collect();
+        for extension in on {
+            for debugger in &extension.debuggers {
+                if debugger.languages.iter().any(|id| ids.contains(id)) {
+                    found.push((extension.id.clone(), debugger.name.clone()));
+                }
+            }
+        }
+        found
+    }
+
+    /// How to start an adapter a VS Code extension declares, with no
+    /// code of the extension's run: the program its manifest names, by
+    /// the runtime it names, and the launch it suggests with its places
+    /// filled in. Finding the runtime may take a download (Node, where
+    /// the machine has none), so this runs on a thread of its own.
+    fn declared_adapter(
+        &mut self,
+        id: &str,
+        launch: DebugLaunch,
+        root: &Path,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<DebugAdapter, String>> {
+        let found = self.find(Origin::VsCode, id).and_then(|extension| {
+            let debugger = extension
+                .debuggers
+                .iter()
+                .find(|debugger| debugger.name == launch.adapter)?;
+            Some((extension.clone(), debugger.clone()))
+        });
+        let Some((extension, debugger)) = found else {
+            return Task::ready(Err(format!("{id} has no debugger to start")));
+        };
+        let work_dir = install::work_dir(&self.root, &extension.id);
+        let world = self.world.clone();
+        let statuses = self.statuses.clone();
+        let settings = self.settings_for();
+        let gated = self.gated(&extension.id);
+        let root = root.to_path_buf();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("solder-extension".into())
+            .spawn(move || {
+                let program = debugger.program.to_string_lossy().into_owned();
+                let command = match debugger.runtime.as_deref() {
+                    None => Ok((program, debugger.args.clone())),
+                    Some(runtime) => {
+                        let runtime = match runtime {
+                            // The machine's Node, or one of Solder's own.
+                            "node" => world_in(&work_dir, world, statuses, settings, gated).node(),
+                            other => Ok(other.to_string()),
+                        };
+                        runtime.map(|runtime| {
+                            let mut args = debugger.runtime_args.clone();
+                            args.push(program);
+                            args.extend(debugger.args.clone());
+                            (runtime, args)
+                        })
+                    }
+                };
+                let answer = command.map(|(command, args)| DebugAdapter {
+                    command: Some(command),
+                    args,
+                    env: Vec::new(),
+                    cwd: Some(extension.dir.to_string_lossy().into_owned()),
+                    connection: None,
+                    attach: false,
+                    configuration: launch_of(&debugger, &launch, &root).to_string(),
+                });
+                let _ = tx.send(answer);
+            });
+        if let Err(error) = spawned {
+            return Task::ready(Err(error.to_string()));
+        }
+        cx.background_executor().spawn(async move {
+            rx.await
+                .unwrap_or_else(|_| Err("The debugger was not found".into()))
+        })
+    }
+
     /// Asks the extension how to start its debug adapter for `launch`. It
     /// may install the adapter first, so this runs on a thread of its own,
     /// like [`ExtensionStore::resolve`].
@@ -705,7 +903,8 @@ impl ExtensionStore {
         cx: &mut Context<Self>,
     ) -> Task<Result<DebugAdapter, String>> {
         let Some(extension) = self.find(Origin::Zed, extension).cloned() else {
-            return Task::ready(Err(format!("{extension} is not installed")));
+            // One a VS Code extension declares needs no code to ask.
+            return self.declared_adapter(extension, launch, root, cx);
         };
         let slot = self.hosts.entry(extension.id.clone()).or_default().clone();
         let work_dir = install::work_dir(&self.root, &extension.id);

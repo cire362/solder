@@ -756,7 +756,7 @@ here.
 | From | Solder uses | Does not run here |
 |---|---|---|
 | A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, icon themes, its language servers, its debug adapters, its context servers | |
-| A VS Code extension | Themes (JSON and the older `.tmTheme`), icon themes drawn with pictures, snippets | Its code, TextMate grammars, icon themes drawn with a font, everything the code would add |
+| A VS Code extension | Themes (JSON and the older `.tmTheme`), icon themes drawn with pictures, snippets, debuggers whose manifest names the adapter's program | Its code, TextMate grammars, icon themes drawn with a font, debuggers only its code can start, everything the code would add |
 
 A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
 It is compiled on the first file that needs it and runs in wasmtime inside
@@ -822,6 +822,15 @@ ending or its language, and with a folder's name, open or closed. If it draws
 some files differently on a light background, there is a second theme for
 that, with ` Light` after the name. A theme drawn with the letters of a font
 and not with pictures is listed among what does not run here.
+
+A debugger of a VS Code extension works where its manifest says what the
+debug adapter is: a program inside the extension, and what runs it (Node
+mostly, the machine's or Solder's own). It is offered for the files of the
+languages it names, even ones Solder has no grammar for, and started with the
+launch its manifest suggests: `${file}`, `${workspaceFolder}` and the like are
+filled in, and where VS Code would ask which program, it is the file in
+front. A debugger whose adapter only the extension's code can start is listed
+among what does not run here.
 
 A VS Code extension that has a build for each platform is installed in the
 one for this machine. What it does not work without, and what it is a pack

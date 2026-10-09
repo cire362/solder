@@ -12304,6 +12304,116 @@ brackets = [
     }
 
     #[gpui::test]
+    fn a_debugger_a_vscode_extension_declares_debugs_a_file(cx: &mut TestAppContext) {
+        // A VS Code extension whose manifest says what its debug adapter
+        // is: a script and what runs it. None of its code is needed.
+        let root = db::testing::dir("ws-vsx-debug").canonicalize().unwrap();
+        let app = root.join("app.demo");
+        std::fs::write(&app, "one\ntwo\nthree\n").unwrap();
+        let data = db::testing::dir("ws-vsx-debug-data");
+        let log = data.join("launch.json");
+        let installed = data.join("extensions/vscode/acme.demo-debug");
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_dap_stdio.py"),
+            installed.join("adapter.py"),
+        )
+        .unwrap();
+        let manifest = serde_json::json!({
+            "name": "demo-debug", "publisher": "Acme", "version": "1.0.0",
+            "contributes": {
+                "languages": [{ "id": "demo", "extensions": [".demo"] }],
+                "breakpoints": [{ "language": "demo" }],
+                "debuggers": [
+                    {
+                        "type": "demo", "label": "Demo Debug",
+                        "runtime": "python3", "program": "./adapter.py", "args": [log],
+                        "initialConfigurations": [
+                            { "type": "demo", "request": "attach", "name": "Attach" },
+                            {
+                                "type": "demo", "request": "launch", "name": "Launch",
+                                "program": "${workspaceFolder}/${command:AskForProgramName}",
+                                "stopOnEntry": true, "trace": ["${fileBasename}"],
+                            },
+                        ],
+                    },
+                    // One whose adapter only its code knows how to start.
+                    { "type": "coded", "label": "Coded" },
+                ],
+            },
+        });
+        std::fs::write(installed.join("package.json"), manifest.to_string()).unwrap();
+        cx.executor().allow_parking();
+        let (extensions, debug) = cx.update(|cx| {
+            let extensions =
+                cx.new(|cx| ExtensionStore::new(data.join("extensions"), data.join("config"), cx));
+            ExtensionStore::set_global(extensions.clone(), cx);
+            extensions.update(cx, |s, cx| s.scan(cx));
+            let debug = cx.new(|_| {
+                crate::debug::DebugStore::new(
+                    data.join("debug"),
+                    crate::debug::AdapterSpec::JsDebug,
+                )
+            });
+            crate::debug::DebugStore::set_global(debug.clone(), cx);
+            (extensions, debug)
+        });
+        let (ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "the extensions folder", &|cx| {
+            extensions.read(cx).loaded
+        });
+        let found = cx.read(|cx| {
+            extensions
+                .read(cx)
+                .find(Origin::VsCode, "Acme.demo-debug")
+                .cloned()
+        });
+        let found = found.unwrap();
+        assert_eq!(found.debuggers.len(), 1);
+        assert_eq!(found.debuggers[0].languages, ["demo"]);
+        assert!(
+            found
+                .missing
+                .contains(&"A debugger its code starts".to_string())
+        );
+        assert_eq!(found.provides(), "1 debugger");
+
+        // The file has no language here, and is debugged all the same:
+        // the debugger says which files are its own.
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(app.clone(), None, window, cx)
+        });
+        let configs = cx.read(|cx| crate::debug_launch::from_extensions(&root, &app, cx));
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "demo app.demo");
+        let other = root.join("notes.txt");
+        assert!(cx.read(|cx| crate::debug_launch::from_extensions(&root, &other, cx).is_empty()));
+
+        // Started, the adapter runs as the manifest says and the run
+        // stops on the breakpoint in the file.
+        debug.update(cx, |s, cx| {
+            s.toggle(&app, 2, cx);
+            s.start(configs[0].clone(), root.clone(), cx)
+        });
+        wait_for(cx, "the pause in app.demo", &|cx| {
+            paused_line(&debug, cx) == Some(2)
+        });
+        // It was given the launch the manifest suggests, with its places
+        // filled in: the file where VS Code would ask for one.
+        let launch: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&log).unwrap()).unwrap();
+        assert_eq!(launch["type"], "demo");
+        assert_eq!(launch["request"], "launch");
+        assert_eq!(launch["program"], app.display().to_string());
+        assert_eq!(launch["cwd"], root.display().to_string());
+        assert_eq!(launch["stopOnEntry"], true);
+        assert_eq!(launch["trace"][0], "app.demo");
+        debug.update(cx, |s, cx| s.stop(cx));
+        cx.run_until_parked();
+        assert!(cx.read(|cx| !debug.read(cx).state.active()));
+    }
+
+    #[gpui::test]
     fn a_debug_adapter_of_an_extension_debugs_a_file_of_its_language(cx: &mut TestAppContext) {
         let _languages = extension_languages();
         // Zed's real Ruby extension, installed, with a Ruby language that

@@ -31,9 +31,9 @@ pub struct ExtensionAdapter {
 /// The open file with each debug adapter that installed extensions bring
 /// for its language: `rdbg app.rb`.
 pub fn from_extensions(root: &Path, file: &Path, cx: &gpui::App) -> Vec<LaunchConfig> {
-    let Some(language) = syntax::language_for_path(file) else {
-        return Vec::new();
-    };
+    // A file may have no language here and still have a debugger: one a
+    // VS Code extension declares goes by the file's name.
+    let language = syntax::language_for_path(file);
     let Some(store) = crate::extension_store::ExtensionStore::try_global(cx) else {
         return Vec::new();
     };
@@ -44,7 +44,7 @@ pub fn from_extensions(root: &Path, file: &Path, cx: &gpui::App) -> Vec<LaunchCo
         .to_string();
     store
         .read(cx)
-        .debuggers_for(language.name)
+        .debuggers_for_file(file, language.as_ref().map(|language| language.name))
         .into_iter()
         .map(|(extension, adapter)| {
             let name = format!("{adapter} {shown}");
