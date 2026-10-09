@@ -22,6 +22,7 @@ use tree_sitter::{
 
 mod outline;
 mod rules;
+pub mod textmate;
 mod wasm;
 pub use outline::{Symbol, outline};
 pub use rules::{Editing, Indent, Line, Pair};
@@ -108,6 +109,10 @@ pub struct LanguageSpec {
     pub highlights: Option<PathBuf>,
     pub injections: Option<PathBuf>,
     pub editing: Editing,
+    /// The grammar is TextMate's, not tree-sitter's: a file of rules that
+    /// color lines (`textmate.rs`). There is no tree for such a language,
+    /// and what it says about typing is in `editing` alone.
+    pub textmate: bool,
 }
 
 enum Source {
@@ -133,6 +138,8 @@ pub struct Language {
     /// The parses of an extension's grammar, which run on a thread of
     /// their own.
     watch: wasm::Watch,
+    /// The grammar of a language that has TextMate's, once it was read.
+    lines: OnceLock<Option<Arc<textmate::Grammar>>>,
 }
 
 struct Highlighter {
@@ -164,7 +171,24 @@ impl Language {
     /// False while the grammar still has to be compiled, which takes long
     /// enough to stay off the UI thread.
     pub fn is_ready(&self) -> bool {
-        self.grammar.get().is_some()
+        match &self.source {
+            Source::Wasm(spec) if spec.textmate => self.lines.get().is_some(),
+            _ => self.grammar.get().is_some(),
+        }
+    }
+
+    /// The rules that color this language's lines, if its grammar is
+    /// TextMate's. Read and compiled the first time, which is slow.
+    fn lines_grammar(&self) -> Option<&Arc<textmate::Grammar>> {
+        let Source::Wasm(spec) = &self.source else {
+            return None;
+        };
+        if !spec.textmate {
+            return None;
+        }
+        self.lines
+            .get_or_init(|| textmate::load(&spec.grammar))
+            .as_ref()
     }
 
     /// Whether its grammar stopped answering and was given up on: its
@@ -180,6 +204,7 @@ impl Language {
         self.grammar
             .get_or_init(|| match &self.source {
                 Source::Native { grammar, .. } => Some(grammar.clone()),
+                Source::Wasm(spec) if spec.textmate => None,
                 Source::Wasm(spec) => wasm::load(spec)
                     .map_err(|e| eprintln!("grammar for {} failed: {e}", self.name))
                     .ok(),
@@ -371,6 +396,7 @@ macro_rules! lang {
             injector: OnceLock::new(),
             rules: OnceLock::new(),
             watch: wasm::Watch::default(),
+            lines: OnceLock::new(),
         })
     };
 }
@@ -551,6 +577,7 @@ pub fn set_extension_languages(specs: Vec<LanguageSpec>) {
                     injector: OnceLock::new(),
                     rules: OnceLock::new(),
                     watch: wasm::Watch::default(),
+                    lines: OnceLock::new(),
                 }),
             }
         })
@@ -640,7 +667,10 @@ pub fn highlight_code(language: &Arc<Language>, code: &str) -> Vec<(Range<usize>
 #[derive(Clone)]
 pub struct SyntaxTree {
     language: Arc<Language>,
-    tree: Tree,
+    /// `None` for a language that is colored by a TextMate grammar: it
+    /// has `lines` in its place, and nothing that asks about a tree.
+    tree: Option<Tree>,
+    lines: Option<textmate::Lines>,
     /// Other languages found inside this one, each parsed over its own
     /// ranges of the same text. A layer comes after the one it was found in.
     layers: Vec<Layer>,
@@ -679,6 +709,17 @@ impl SyntaxTree {
         rope: &Rope,
         deadline: Option<Instant>,
     ) -> Option<Self> {
+        if let Some(grammar) = language.lines_grammar() {
+            let lines = textmate::Lines::parse(grammar.clone(), rope, deadline)?;
+            return Some(Self {
+                language,
+                tree: None,
+                lines: Some(lines),
+                layers: Vec::new(),
+                stale: false,
+                dirty: None,
+            });
+        }
         let tree = parse_rope(&language, &mut new_parser(&language)?, rope, None, deadline)?;
         // An extension's queries are read from disk and compiled here, where
         // the caller already expects to wait, and not at the first paint.
@@ -689,7 +730,8 @@ impl SyntaxTree {
         let layers = parse_layers(&language, &tree, rope, &[], None, deadline)?;
         Some(Self {
             language,
-            tree,
+            tree: Some(tree),
+            lines: None,
             layers,
             stale: false,
             dirty: None,
@@ -707,13 +749,14 @@ impl SyntaxTree {
     /// The language the byte at `offset` is written in: the innermost
     /// injected one that covers it, or the file's own.
     pub fn language_at(&self, offset: usize) -> &Arc<Language> {
-        self.tree_at(offset).0
+        self.tree_at(offset)
+            .map_or(&self.language, |(language, _)| language)
     }
 
-    fn tree_at(&self, offset: usize) -> (&Arc<Language>, &Tree) {
-        self.trees_at(offset)
-            .next()
-            .expect("the file's own tree is always there")
+    /// The innermost tree that covers `offset`. A language colored by a
+    /// TextMate grammar has none.
+    fn tree_at(&self, offset: usize) -> Option<(&Arc<Language>, &Tree)> {
+        self.trees_at(offset).next()
     }
 
     /// The trees that cover `offset`, the innermost first and the file's
@@ -732,14 +775,23 @@ impl SyntaxTree {
                         .any(|r| r.start_byte <= offset && offset <= r.end_byte)
             })
             .map(|layer| (&layer.language, &layer.tree))
-            .chain(std::iter::once((&self.language, &self.tree)))
+            .chain(self.tree.as_ref().map(|tree| (&self.language, tree)))
     }
 
     /// Shifts the old tree to match an edit. Call once per applied edit, in
     /// the order the buffer reported them, then reparse.
     pub fn edit(&mut self, edit: &Edit) {
+        if let Some(lines) = &mut self.lines {
+            lines.edit(
+                edit.start_point.row,
+                edit.old_end_point.row,
+                edit.new_end_point.row,
+            );
+        }
         let edit = input_edit(edit);
-        self.tree.edit(&edit);
+        if let Some(tree) = &mut self.tree {
+            tree.edit(&edit);
+        }
         for layer in &mut self.layers {
             layer.tree.edit(&edit);
         }
@@ -780,12 +832,22 @@ impl SyntaxTree {
     }
 
     fn reparsed(&self, rope: &Rope, deadline: Option<Instant>) -> Option<SyntaxTree> {
+        if let Some(lines) = &self.lines {
+            return Some(SyntaxTree {
+                language: self.language.clone(),
+                tree: None,
+                lines: Some(lines.reparsed(rope, deadline)?),
+                layers: Vec::new(),
+                stale: false,
+                dirty: None,
+            });
+        }
         let mut parser = new_parser(&self.language)?;
         let tree = parse_rope(
             &self.language,
             &mut parser,
             rope,
-            Some(&self.tree),
+            self.tree.as_ref(),
             deadline,
         )?;
         drop(parser);
@@ -799,7 +861,8 @@ impl SyntaxTree {
         )?;
         Some(SyntaxTree {
             language: self.language.clone(),
-            tree,
+            tree: Some(tree),
+            lines: None,
             layers,
             stale: false,
             dirty: None,
@@ -821,10 +884,19 @@ impl SyntaxTree {
             return Vec::new();
         }
 
+        if let Some(lines) = &self.lines {
+            let mut spans = Vec::new();
+            lines.highlights(rope, range, &mut spans);
+            return spans;
+        }
+        let Some(tree) = &self.tree else {
+            return Vec::new();
+        };
+
         // One slot per byte of the visible range. A screen of code is a few KB,
         // so this is cheaper than interval bookkeeping.
         let mut slots = vec![NONE; range.len()];
-        paint(&self.language, &self.tree, rope, &range, &mut slots);
+        paint(&self.language, tree, rope, &range, &mut slots);
         for layer in &self.layers {
             if layer.start < range.end && layer.end > range.start {
                 paint(&layer.language, &layer.tree, rope, &range, &mut slots);
@@ -1336,7 +1408,7 @@ mod tests {
         assert!(rope.chunks().count() > 1);
         let lang = language_for_path(Path::new("a.js")).unwrap();
         let tree = SyntaxTree::parse(lang, &rope).unwrap();
-        assert!(!tree.tree.root_node().has_error());
+        assert!(!tree.tree.as_ref().unwrap().root_node().has_error());
     }
 
     /// The Vue language of the fixtures, registered the way an installed
@@ -1361,6 +1433,7 @@ mod tests {
                     overrides: Some(dir.join("overrides.scm")),
                     ..Default::default()
                 },
+                textmate: false,
             },
             // The same grammar under a name only one test opens files of, so
             // that test sees it before anything has compiled it.
@@ -1377,11 +1450,102 @@ mod tests {
                 grammar: dir.join("missing.wasm"),
                 ..Default::default()
             },
+            // A language whose grammar is TextMate's.
+            LanguageSpec {
+                name: "Demo".into(),
+                suffixes: vec!["dm".into()],
+                symbol: "source.demo".into(),
+                grammar: dir.join("../demo/demo.tmLanguage.json"),
+                textmate: true,
+                editing: Editing {
+                    increase_indent: Some(r"\{\s*$".into()),
+                    decrease_indent: Some(r"^\s*\}".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
         ]);
         language_for_path(Path::new("App.vue")).unwrap()
     }
 
     const COMPONENT: &str = "<template>\n  <div class=\"box\" @click=\"go(1)\">{{ msg }}</div>\n</template>\n<script setup lang=\"ts\">\nconst msg: string = 'hi'\n</script>\n<style>\n.box { color: red; }\n</style>\n";
+
+    #[test]
+    fn a_language_with_a_textmate_grammar_is_colored_line_by_line() {
+        vue();
+        let demo = language_for_path(Path::new("notes.dm")).unwrap();
+        assert_eq!(demo.name, "Demo");
+        let mut buffer = Buffer::new("if 1 # one\n\"two\" 2\nend\n");
+        let tree = SyntaxTree::parse(demo.clone(), buffer.rope()).unwrap();
+        // Read once, the grammar is there for the thread that draws.
+        assert!(demo.is_ready());
+        let colors = |tree: &SyntaxTree, buffer: &Buffer| {
+            let source = buffer.rope().to_string();
+            tree.highlights(buffer.rope(), 0..source.len())
+                .into_iter()
+                .map(|(range, kind)| (source[range].to_string(), kind))
+                .collect::<Vec<_>>()
+        };
+        use HighlightKind::*;
+        assert_eq!(
+            colors(&tree, &buffer),
+            [
+                ("if".to_string(), Keyword),
+                ("1".to_string(), Number),
+                ("# one".to_string(), Comment),
+                ("\"two\"".to_string(), String),
+                ("2".to_string(), Number),
+                ("end".to_string(), Keyword),
+            ]
+        );
+        // Only the range asked for.
+        let part = tree.highlights(buffer.rope(), 3..8);
+        assert_eq!(part, [(3..4, Number), (5..8, Comment)]);
+
+        // There is no tree to ask: the language is the same everywhere,
+        // it has no brackets of its own to find, and where it is in a
+        // string or a comment is read off the colors.
+        assert_eq!(tree.language_at(12).name, "Demo");
+        assert_eq!(tree.brackets_at(buffer.rope(), 0), None);
+        let within = |tree: &SyntaxTree, buffer: &Buffer, offset| {
+            tree.in_scope(buffer.rope(), offset, &["string".to_string()])
+        };
+        assert!(within(&tree, &buffer, 13) && !within(&tree, &buffer, 1));
+        // Indentation goes by the language's two patterns alone.
+        assert!(tree.indents_at(0));
+        let line = rules::Line {
+            above_row: 0,
+            above_start: 0,
+            cut: 11,
+            start: 11,
+        };
+        let deeper = tree.indent(buffer.rope(), line, true, false);
+        assert_eq!((deeper.row, deeper.levels), (0, 1));
+        assert_eq!(tree.indent(buffer.rope(), line, false, true).levels, -1);
+
+        // A comment opened in the first row: the rows after it follow,
+        // within the time the typing path has.
+        let mut tree = tree;
+        for edit in buffer.edit([(0..0, "/* ")], &[], Instant::now()) {
+            tree.edit(&edit);
+        }
+        assert!(tree.is_stale());
+        assert!(tree.reparse_within(buffer.rope(), Duration::from_secs(5)));
+        assert!(!tree.is_stale());
+        let all = colors(&tree, &buffer);
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|(_, kind)| *kind == Comment));
+        // Closed again, the rest is as it was.
+        for edit in buffer.edit([(3..3, "*/ ")], &[], Instant::now()) {
+            tree.edit(&edit);
+        }
+        let tree = tree.reparse_in_background(buffer.rope()).unwrap();
+        assert_eq!(
+            colors(&tree, &buffer)[1..],
+            colors(&SyntaxTree::parse(demo, buffer.rope()).unwrap(), &buffer)[1..]
+        );
+        assert_eq!(colors(&tree, &buffer).len(), 7);
+    }
 
     #[test]
     fn a_grammar_that_does_not_answer_is_given_up_on() {
@@ -1409,6 +1573,7 @@ mod tests {
             injector: OnceLock::new(),
             rules: OnceLock::new(),
             watch: wasm::Watch::patient(Duration::ZERO),
+            lines: OnceLock::new(),
         });
         assert!(SyntaxTree::parse(impatient.clone(), &rope).is_none());
         assert!(impatient.is_hung());
@@ -1449,7 +1614,7 @@ mod tests {
         let rope = Rope::from_str(COMPONENT);
         let tree = SyntaxTree::parse(vue(), &rope).unwrap();
         assert!(tree.language().is_ready());
-        assert!(!tree.tree.root_node().has_error());
+        assert!(!tree.tree.as_ref().unwrap().root_node().has_error());
         let spans = kinds(&tree, &rope, COMPONENT);
         // Vue's own query.
         assert!(spans.contains(&("template".into(), HighlightKind::Tag)));

@@ -124,6 +124,19 @@ pub fn svg(name: &str) -> String {
     )
 }
 
+/// A TextMate grammar as a VS Code extension brings one, for a language
+/// of comments, strings, numbers and two words.
+pub const VSCODE_GRAMMAR: &str = r##"{
+  "scopeName": "source.demo",
+  "patterns": [
+    { "name": "comment.line.number-sign.demo", "match": "#.*$" },
+    { "name": "comment.block.demo", "begin": "/\\*", "end": "\\*/" },
+    { "name": "string.quoted.double.demo", "begin": "\"", "end": "\"" },
+    { "name": "keyword.control.demo", "match": "\\b(if|end)\\b" },
+    { "name": "constant.numeric.demo", "match": "\\b\\d+\\b" }
+  ]
+}"##;
+
 /// An icon theme as a VS Code extension writes one.
 pub const VSCODE_ICON_THEME: &str = r#"{
   // Pictures are named once, then given to files.
@@ -344,8 +357,17 @@ pub fn vscode_extension(dir: &Path) {
     );
     write(
         &dir.join("language.json"),
-        r##"{ "comments": { "lineComment": "#", "blockComment": ["/*", "*/"] } } // trailing"##,
+        r##"{
+  "comments": { "lineComment": "#", "blockComment": ["/*", "*/"] },
+  "brackets": [["{", "}"], ["(", ")"]],
+  "autoClosingPairs": [
+    { "open": "{", "close": "}" },
+    { "open": "\"", "close": "\"", "notIn": ["string", "comment"] }
+  ],
+  "indentationRules": { "increaseIndentPattern": "\\{\\s*$", "decreaseIndentPattern": { "pattern": "^\\s*\\}" } }
+} // trailing"##,
     );
+    write(&dir.join("demo.tmLanguage.json"), VSCODE_GRAMMAR);
     write(&dir.join("out/main.js"), "module.exports = {}");
 }
 

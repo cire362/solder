@@ -1,0 +1,11 @@
+{
+  // A language of comments, strings, numbers and two words, for the tests.
+  "scopeName": "source.demo",
+  "patterns": [
+    { "name": "comment.line.number-sign.demo", "match": "#.*$" },
+    { "name": "comment.block.demo", "begin": "/\\*", "end": "\\*/" },
+    { "name": "string.quoted.double.demo", "begin": "\"", "end": "\"" },
+    { "name": "keyword.control.demo", "match": "\\b(if|end)\\b" },
+    { "name": "constant.numeric.demo", "match": "\\b\\d+\\b" }
+  ]
+}

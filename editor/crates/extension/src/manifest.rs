@@ -82,8 +82,11 @@ pub struct Language {
     pub decrease_indent: Option<String>,
     /// The debug adapters that debug it, by name.
     pub debuggers: Vec<String>,
-    /// Missing for a VS Code language: its TextMate grammar is not read.
+    /// Missing for a VS Code language: it has `textmate` in its place.
     pub grammar: Option<Grammar>,
+    /// The TextMate grammar that colors it: the file, and the name the
+    /// grammar goes by among grammars (`source.demo`).
+    pub textmate: Option<(PathBuf, String)>,
 }
 
 /// A language server the extension knows how to get and start.
@@ -148,6 +151,9 @@ pub struct Extension {
     /// The settings its manifest declares, each with what it is when the
     /// user has not set it.
     pub settings: Vec<Setting>,
+    /// Every TextMate grammar it has, by the name it goes by: also the
+    /// ones that are no language of their own, which others ask for.
+    pub grammars: Vec<(String, PathBuf)>,
 }
 
 /// A setting a VS Code extension declares: its whole name with the dots
@@ -488,6 +494,7 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
             increase_indent: pattern("increase_indent_pattern", "increase_indent_patterns"),
             decrease_indent: pattern("decrease_indent_pattern", "decrease_indent_patterns"),
             grammar,
+            textmate: None,
             name,
         });
     }
@@ -580,7 +587,79 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         needs: Vec::new(),
         debuggers: Vec::new(),
         settings: Vec::new(),
+        grammars: Vec::new(),
     })
+}
+
+/// What a VS Code language's configuration says about typing in it, in
+/// the terms the editor has for that: comments, the pairs that close
+/// themselves and stand a line apart, and the two patterns of indentation.
+fn configure(language: &mut Language, config: &Value) {
+    language.line_comment = config["comments"]["lineComment"]
+        .as_str()
+        // Newer files give it with more said about it.
+        .or(config["comments"]["lineComment"]["comment"].as_str())
+        .map(str::to_string);
+    if let [start, end] = strings(&config["comments"]["blockComment"]).as_slice() {
+        language.block_comment = Some((start.clone(), end.clone()));
+    }
+    // Written as two strings, or by name with where it does not close.
+    let ends = |pair: &Value| -> Option<(String, String, Vec<String>)> {
+        match pair {
+            Value::Array(_) => match strings(pair).as_slice() {
+                [open, close] => Some((open.clone(), close.clone(), Vec::new())),
+                _ => None,
+            },
+            pair => Some((
+                pair["open"].as_str()?.to_string(),
+                pair["close"].as_str()?.to_string(),
+                strings(&pair["notIn"]),
+            )),
+        }
+    };
+    let list = |value: &Value| -> Vec<(String, String, Vec<String>)> {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(ends)
+            .collect()
+    };
+    let closing = list(&config["autoClosingPairs"]);
+    // Brackets stand a line apart on Enter; they close themselves if the
+    // file says so, or says nothing of what does.
+    for (start, end, _) in list(&config["brackets"]) {
+        let closes = closing.iter().find(|(open, ..)| *open == start);
+        language.pairs.push(Pair {
+            close: closes.is_some() || config["autoClosingPairs"].is_null(),
+            not_in: closes
+                .map(|(_, _, not_in)| not_in.clone())
+                .unwrap_or_default(),
+            newline: true,
+            start,
+            end,
+        });
+    }
+    for (start, end, not_in) in closing {
+        if !language.pairs.iter().any(|pair| pair.start == start) {
+            language.pairs.push(Pair {
+                start,
+                end,
+                close: true,
+                newline: false,
+                not_in,
+            });
+        }
+    }
+    let pattern = |value: &Value| {
+        value
+            .as_str()
+            .or(value["pattern"].as_str())
+            .map(str::to_string)
+    };
+    let rules = &config["indentationRules"];
+    language.increase_indent = pattern(&rules["increaseIndentPattern"]);
+    language.decrease_indent = pattern(&rules["decreaseIndentPattern"]);
 }
 
 fn read_vscode(dir: &Path) -> Result<Extension, String> {
@@ -666,8 +745,28 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         }
     }
 
-    // A language here is its file endings and its comment marker. The
-    // grammar is TextMate's, which is not read.
+    // Its TextMate grammars, by the name each goes by, and which of them
+    // is the grammar of which language.
+    let mut grammars: Vec<(String, PathBuf)> = Vec::new();
+    let mut of_language: Vec<(String, usize)> = Vec::new();
+    for entry in list("grammars") {
+        let scope = text(&entry["scopeName"]);
+        let path = entry["path"]
+            .as_str()
+            .and_then(|path| inside(dir, path))
+            .filter(|path| path.is_file());
+        let (Some(path), false) = (path, scope.is_empty()) else {
+            continue;
+        };
+        let language = text(&entry["language"]);
+        if !language.is_empty() {
+            of_language.push((language, grammars.len()));
+        }
+        grammars.push((scope, path));
+    }
+
+    // A language here is the files it is in, what colors them, and what
+    // its configuration says about typing in it.
     let mut languages = Vec::new();
     for entry in list("languages") {
         let id = text(&entry["id"]);
@@ -676,31 +775,36 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
             .map(|e| e.trim_start_matches('.').to_string())
             .collect();
         suffixes.extend(strings(&entry["filenames"]));
+        // A pattern that is only an ending says the same as an ending.
+        for pattern in strings(&entry["filenamePatterns"]) {
+            if let Some(ending) = pattern.strip_prefix("*.")
+                && !ending.contains(['*', '?', '[', '{', '/'])
+            {
+                suffixes.push(ending.to_string());
+            }
+        }
         if id.is_empty() || suffixes.is_empty() {
             continue;
         }
-        let line_comment = entry["configuration"]
+        let config = entry["configuration"]
             .as_str()
             .and_then(|p| inside(dir, p))
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|source| jsonc::parse(&source).ok())
-            .and_then(|config| {
-                config["comments"]["lineComment"]
-                    .as_str()
-                    .map(str::to_string)
-            });
+            .unwrap_or(Value::Null);
         let aliases = strings(&entry["aliases"]);
-        languages.push(Language {
+        let mut language = Language {
             name: aliases.first().cloned().unwrap_or_else(|| id.clone()),
             suffixes,
+            textmate: of_language
+                .iter()
+                .find(|(of, _)| *of == id)
+                .map(|(_, index)| (grammars[*index].1.clone(), grammars[*index].0.clone())),
             aliases: std::iter::once(id).chain(aliases).collect(),
-            line_comment,
             ..Default::default()
-        });
-    }
-
-    if !list("grammars").is_empty() {
-        missing.push("Highlighting (a TextMate grammar)".into());
+        };
+        configure(&mut language, &config);
+        languages.push(language);
     }
     let code = if manifest["main"].is_string() || manifest["browser"].is_string() {
         missing.push("Its code, which needs VS Code".into());
@@ -834,6 +938,7 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         },
         debuggers,
         settings,
+        grammars,
         servers: Vec::new(),
         debug_adapters: Vec::new(),
         context_servers: Vec::new(),

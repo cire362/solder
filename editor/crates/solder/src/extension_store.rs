@@ -102,6 +102,8 @@ pub struct ExtensionStore {
     snippets: Vec<SnippetSet>,
     /// The languages last given to the syntax registry.
     languages: Vec<syntax::LanguageSpec>,
+    /// The TextMate grammars last given to it, by the name each goes by.
+    grammars: std::collections::HashMap<String, PathBuf>,
     zed: Catalog,
     open_vsx: Catalog,
     /// The catalogs' addresses; tests point them at a local server.
@@ -359,6 +361,7 @@ impl ExtensionStore {
             loaded: false,
             snippets: Vec::new(),
             languages: Vec::new(),
+            grammars: Default::default(),
             zed: Catalog::default(),
             open_vsx: Catalog::default(),
             zed_url: catalog::ZED.into(),
@@ -622,14 +625,22 @@ impl ExtensionStore {
             .filter(|extension| !self.is_off(extension.origin, &extension.id))
             .flat_map(|extension| &extension.languages)
             .filter_map(|language| {
-                let grammar = language.grammar.as_ref()?;
+                // A grammar of tree-sitter's, with the queries next to
+                // it, or one of TextMate's, which is all there is to it.
+                let none = extension::Grammar::default();
+                let (grammar, lines) = match (&language.grammar, &language.textmate) {
+                    (Some(grammar), _) => (grammar, None),
+                    (None, Some(lines)) => (&none, Some(lines)),
+                    (None, None) => return None,
+                };
                 Some(syntax::LanguageSpec {
                     name: language.name.clone(),
                     suffixes: language.suffixes.clone(),
                     aliases: language.aliases.clone(),
                     line_comment: language.line_comment.clone(),
-                    symbol: grammar.symbol.clone(),
-                    grammar: grammar.module.clone(),
+                    symbol: lines.map_or(grammar.symbol.clone(), |(_, scope)| scope.clone()),
+                    grammar: lines.map_or(grammar.module.clone(), |(path, _)| path.clone()),
+                    textmate: lines.is_some(),
                     highlights: grammar.highlights.clone(),
                     injections: grammar.injections.clone(),
                     editing: syntax::Editing {
@@ -666,6 +677,18 @@ impl ExtensionStore {
                 lsp.update(cx, |lsp, cx| lsp.extension_servers_changed(cx));
             }
         });
+        // Where each TextMate grammar is, by the name it goes by: one
+        // grammar asks for another by that name.
+        let grammars: std::collections::HashMap<String, PathBuf> = self
+            .installed
+            .iter()
+            .filter(|extension| !self.is_off(extension.origin, &extension.id))
+            .flat_map(|extension| extension.grammars.iter().cloned())
+            .collect();
+        if grammars != self.grammars {
+            self.grammars = grammars.clone();
+            syntax::textmate::set_grammars(grammars);
+        }
         if specs == self.languages {
             return;
         }

@@ -756,7 +756,7 @@ here.
 | From | Solder uses | Does not run here |
 |---|---|---|
 | A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, icon themes, its language servers, its debug adapters, its context servers | |
-| A VS Code extension | Themes (JSON and the older `.tmTheme`), icon themes drawn with pictures, snippets, debuggers whose manifest names the adapter's program | Its code, TextMate grammars, icon themes drawn with a font, debuggers only its code can start, everything the code would add |
+| A VS Code extension | Languages (colors from its TextMate grammar; comments, pairs and indentation from its language configuration), themes (JSON and the older `.tmTheme`), icon themes drawn with pictures, snippets, debuggers whose manifest names the adapter's program | Its code, icon themes drawn with a font, debuggers only its code can start, everything the code would add |
 
 A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
 It is compiled on the first file that needs it and runs in wasmtime inside
@@ -822,6 +822,25 @@ ending or its language, and with a folder's name, open or closed. If it draws
 some files differently on a light background, there is a second theme for
 that, with ` Light` after the name. A theme drawn with the letters of a font
 and not with pictures is listed among what does not run here.
+
+A language that only a VS Code extension has is colored by the TextMate
+grammar the extension brings: rules made of regular expressions, read a line
+at a time, in JSON or in TextMate's own property lists. A change is read again
+from its line until a line ends as it did before, so typing in a long file
+reads a few lines and not all of it. A grammar may bring in another by name,
+among those installed. The expressions are Oniguruma's; the few that
+`fancy-regex` does not read leave their rule out, and the rest of the grammar
+colors what it can. There is no tree behind such a language, so nothing that
+needs one is there for it: no outline of its own, no brackets found by a
+query.
+
+How it is typed comes from the extension's language configuration: the line
+and block comments, the pairs that close themselves (and where they do not, a
+string or a comment, which is read off the colors), the brackets that stand a
+line apart on Enter, and the two patterns that say when a line goes a level in
+or out. Which files are of the language is by their endings and names; a
+pattern that is more than an ending, and a first line that says so, are not
+read.
 
 A debugger of a VS Code extension works where its manifest says what the
 debug adapter is: a program inside the extension, and what runs it (Node

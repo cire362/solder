@@ -7,6 +7,13 @@ publish.workspace = true
 
 [dependencies]
 text.workspace = true
+# TextMate grammars, which VS Code extensions bring: their rules are
+# regular expressions with look-behind and back-references, which `regex`
+# does not have. This is built on it, in Rust. Grammars are JSON or
+# property lists, read with what `import` already has.
+fancy-regex = "0.19.2"
+serde_json = "1.0.151"
+import = { path = "../import" }
 tree-sitter = { workspace = true, features = ["wasm"] }
 ropey.workspace = true
 tree-sitter-rust = "0.24"

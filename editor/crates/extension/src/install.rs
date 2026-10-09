@@ -588,7 +588,34 @@ mod tests {
         assert_eq!(language.suffixes, ["dm", "Demofile"]);
         assert_eq!(language.aliases, ["demo", "Demo Lang"]);
         assert_eq!(language.line_comment.as_deref(), Some("#"));
+        // Its grammar is TextMate's, by the name it goes by, and its
+        // configuration says how it is typed.
         assert!(language.grammar.is_none());
+        let (grammar, scope) = language.textmate.as_ref().unwrap();
+        assert!(grammar.ends_with("demo.tmLanguage.json") && grammar.is_file());
+        assert_eq!(scope, "source.demo");
+        assert_eq!(installed.grammars.len(), 1);
+        assert_eq!(
+            language.block_comment,
+            Some(("/*".to_string(), "*/".to_string()))
+        );
+        let pairs: Vec<_> = language
+            .pairs
+            .iter()
+            .map(|p| (p.start.as_str(), p.end.as_str(), p.close, p.newline))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("{", "}", true, true),
+                // A bracket the file does not let close itself.
+                ("(", ")", false, true),
+                ("\"", "\"", true, false),
+            ]
+        );
+        assert_eq!(language.pairs[2].not_in, ["string", "comment"]);
+        assert_eq!(language.increase_indent.as_deref(), Some(r"\{\s*$"));
+        assert_eq!(language.decrease_indent.as_deref(), Some(r"^\s*\}"));
         // Its icon theme, and the same for a light background, since it
         // draws some files differently there. The one drawn with a font
         // is said to be missing.
@@ -611,7 +638,6 @@ mod tests {
             [
                 "1 of its themes (could not be read)",
                 "An icon theme (drawn with a font, or not readable)",
-                "Highlighting (a TextMate grammar)",
                 "Its code, which needs VS Code",
                 "Key bindings for its commands",
             ]

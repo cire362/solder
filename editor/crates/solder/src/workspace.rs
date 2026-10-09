@@ -11209,6 +11209,9 @@ brackets = [
 
     #[gpui::test]
     fn a_vscode_extension_says_what_does_not_run_and_points_to_zed(cx: &mut TestAppContext) {
+        // Its language becomes one of the editor's: the set of them is
+        // one per process.
+        let _languages = extension_languages();
         let dir = db::testing::dir("ws-ext-vsx-archive");
         extension::testing::vscode_extension(&dir.join("extension"));
         let manifest = std::fs::read_to_string(dir.join("extension/package.json"))
@@ -11252,13 +11255,60 @@ brackets = [
                 .iter()
                 .any(|m| m.contains("needs VS Code"))
         );
-        // Its language (files ending in .dm) has no grammar here, so it is
-        // not a language of the editor. Asked of the registry and not of the
-        // open file: the registry is one per process, and the test next to
-        // this one installs Vue into it.
+        // Its language (files ending in .dm) is colored by the TextMate
+        // grammar it brings, and typed as its configuration says.
         assert_eq!(installed.languages[0].suffixes, ["dm", "Demofile"]);
-        assert!(syntax::language_for_path(Path::new("notes.dm")).is_none());
+        let language = syntax::language_for_path(Path::new("notes.dm")).unwrap();
+        assert_eq!(language.name, "Demo Lang");
         assert!(cx.read(|cx| ws.read(cx).left == Some(Panel::Extensions)));
+
+        let notes = cx.read(|cx| ws.read(cx).root(cx)).join("notes.dm");
+        std::fs::write(&notes, "if 1 # one\n").unwrap();
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(notes.clone(), None, window, cx)
+        });
+        let editor = |cx: &App| ws.read(cx).active_editor().unwrap().clone();
+        wait_for(cx, "the colors of notes.dm", &|cx| {
+            editor(cx).read(cx).path(cx) == Some(notes.as_path())
+                && editor(cx).read(cx).doc(cx).syntax().is_some()
+        });
+        let colors = cx.read(|cx| {
+            let editor = editor(cx);
+            let doc = editor.read(cx).doc(cx);
+            let rope = doc.text().rope();
+            doc.syntax()
+                .unwrap()
+                .highlights(rope, 0..rope.len_bytes())
+                .into_iter()
+                .map(|(range, kind)| (rope.byte_slice(range).to_string(), kind))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            colors,
+            [
+                ("if".to_string(), syntax::HighlightKind::Keyword),
+                ("1".to_string(), syntax::HighlightKind::Number),
+                ("# one".to_string(), syntax::HighlightKind::Comment),
+            ]
+        );
+        assert_eq!(
+            cx.read(|cx| editor(cx).read(cx).doc(cx).language_name()),
+            Some("Demo Lang")
+        );
+        // A brace closes itself, and Enter inside it goes a level in,
+        // by the configuration's pairs and its two patterns.
+        let focus = cx.read(|cx| editor(cx).focus_handle(cx));
+        cx.update(|window, _| window.focus(&focus));
+        cx.dispatch_action(crate::editor::MoveToEnd);
+        cx.simulate_input("{");
+        cx.run_until_parked();
+        let text = |cx: &mut VisualTestContext| cx.read(|cx| editor(cx).read(cx).text(cx));
+        assert_eq!(text(cx), "if 1 # one\n{}");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(text(cx), "if 1 # one\n{\n    \n}");
+        cx.dispatch_action(ShowExtensions);
+        cx.run_until_parked();
 
         // The settings it declares are what it says by default until
         // settings.json says otherwise, with the dots or as objects.
