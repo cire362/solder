@@ -30,6 +30,7 @@ use crate::{
     git_store::{GitStore, GitStoreEvent},
     go_to_line::GoToLine as GoToLineDelegate,
     inline_edit::{InlineEdit, InlineEditEvent},
+    layout::Layout,
     locations::{CodeActionPicker, LocationPicker, RenamePrompt},
     lsp_store::{LspStore, from_range},
     perf::{self, Perf},
@@ -69,6 +70,7 @@ actions!(
         OpenFolder,
         OpenSettings,
         OpenKeymap,
+        OpenLayout,
         SplitRight,
         FocusNextPane,
         FocusPrevPane,
@@ -158,8 +160,6 @@ pub fn bind_keys(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
 
-const SIDEBAR_WIDTH: f32 = 390.;
-
 /// The bottom dock's tab in front.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DockView {
@@ -168,11 +168,6 @@ pub enum DockView {
     Response,
     Debug,
 }
-const CHAT_WIDTH: f32 = 380.;
-const TITLEBAR_HEIGHT: f32 = 38.;
-const TAB_BAR_HEIGHT: f32 = 34.;
-const STATUS_HEIGHT: f32 = 26.;
-const DOCK_HEIGHT: f32 = 280.;
 const RECENT_LIMIT: usize = 20;
 
 /// Where to put the cursor after opening a file.
@@ -2552,7 +2547,8 @@ impl Workspace {
             })
             .collect();
         div()
-            .h(px(DOCK_HEIGHT))
+            .h(px(Layout::get(cx).dock.height))
+            .debug_selector(|| "dock".into())
             .flex_none()
             .flex()
             .flex_col()
@@ -2949,6 +2945,11 @@ impl Workspace {
         self.open_config_file(settings::keymap_path(), default, window, cx);
     }
 
+    fn open_layout(&mut self, _: &OpenLayout, window: &mut Window, cx: &mut Context<Self>) {
+        let default = crate::layout::file(&Layout::get(cx));
+        self.open_config_file(crate::layout::path(), default, window, cx);
+    }
+
     fn open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
         let answer = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -3298,7 +3299,7 @@ impl Workspace {
             .child(
                 div()
                     .id(("tab-bar", p))
-                    .h(px(TAB_BAR_HEIGHT))
+                    .h(px(Layout::get(cx).tab_bar.height))
                     .flex_none()
                     .px_1p5()
                     .flex()
@@ -3354,7 +3355,8 @@ impl Workspace {
                 }))
         };
         div()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(Layout::get(cx).sidebar.width))
+            .debug_selector(|| "sidebar".into())
             .flex_none()
             .h_full()
             .flex()
@@ -3365,7 +3367,7 @@ impl Workspace {
             .child(
                 div()
                     .flex_none()
-                    .h(px(TAB_BAR_HEIGHT))
+                    .h(px(Layout::get(cx).tab_bar.height))
                     .px_2()
                     .flex()
                     .items_center()
@@ -3479,7 +3481,8 @@ impl Workspace {
         }
         let item = |text: String| div().child(text);
         div()
-            .h(px(STATUS_HEIGHT))
+            .h(px(Layout::get(cx).status_bar.height))
+            .debug_selector(|| "status-bar".into())
             .flex_none()
             .flex()
             .items_center()
@@ -3691,6 +3694,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::open_keymap))
+            .on_action(cx.listener(Self::open_layout))
             .on_action(cx.listener(Self::split_right))
             .on_action(cx.listener(Self::focus_next_pane))
             .on_action(cx.listener(Self::focus_prev_pane))
@@ -3740,7 +3744,7 @@ impl Render for Workspace {
             .child(
                 div()
                     .id("titlebar")
-                    .h(px(TITLEBAR_HEIGHT))
+                    .h(px(Layout::get(cx).title_bar.height))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -3788,7 +3792,8 @@ impl Render for Workspace {
                         };
                         d.child(
                             div()
-                                .w(px(CHAT_WIDTH))
+                                .w(px(Layout::get(cx).chat.width))
+                                .debug_selector(|| "chat".into())
                                 .flex_none()
                                 .h_full()
                                 .flex()
@@ -3833,7 +3838,7 @@ impl Render for Workspace {
                 deferred(
                     div()
                         .absolute()
-                        .top(px(TITLEBAR_HEIGHT + 24.))
+                        .top(px(Layout::get(cx).title_bar.height + 24.))
                         .left_0()
                         .right_0()
                         .flex()
@@ -6867,7 +6872,7 @@ mod tests {
             let _ = window.draw(cx);
         });
         let bounds = cx.debug_bounds("inline-edit").unwrap();
-        assert!(bounds.bottom() <= px(320. - STATUS_HEIGHT), "{bounds:?}");
+        assert!(bounds.bottom() <= px(320. - 26.), "{bounds:?}");
         assert!(bounds.right() <= px(480.), "{bounds:?}");
         assert!(cx.debug_bounds("edit-apply").is_none());
     }
@@ -10294,5 +10299,69 @@ brackets = [
         extensions.update(cx, |s, cx| s.set_off(Origin::Zed, "ruby", true, cx));
         let none = cx.read(|cx| extensions.read(cx).debuggers_for("Ruby"));
         assert!(none.is_empty());
+    }
+
+    #[gpui::test]
+    fn the_layout_file_sizes_the_window_and_a_mistake_keeps_the_last(cx: &mut TestAppContext) {
+        let root = db::testing::dir("ws-layout").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        let config = db::testing::dir("ws-layout-config");
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, _, cx| w.set_sidebar(Some(SidebarTab::Files), cx));
+        // Where a part was last drawn, once the window has drawn again.
+        let size = |cx: &mut VisualTestContext, part: &'static str| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            let bounds = cx.debug_bounds(part).unwrap_or_else(|| panic!("no {part}"));
+            (f32::from(bounds.size.width), f32::from(bounds.size.height))
+        };
+        let reload =
+            |cx: &mut VisualTestContext| cx.update(|_, cx| settings::reload_from(&config, cx));
+        let errors = |cx: &mut VisualTestContext| {
+            cx.read(|cx| cx.global::<settings::ConfigErrors>().0.clone())
+        };
+
+        // With no file the parts have the sizes they always had.
+        reload(cx);
+        assert_eq!(size(cx, "sidebar").0, 390.);
+        assert_eq!(size(cx, "status-bar").1, 26.);
+
+        // The file names two parts; the rest stay.
+        std::fs::write(
+            config.join("layout.json"),
+            "// narrower\n{ \"sidebar\": { \"width\": 300 }, \"status_bar\": { \"height\": 32 } }\n",
+        )
+        .unwrap();
+        reload(cx);
+        assert!(errors(cx).is_empty(), "{:?}", errors(cx));
+        assert_eq!(size(cx, "sidebar").0, 300.);
+        assert_eq!(size(cx, "status-bar").1, 32.);
+        assert_eq!(cx.read(Layout::get).dock.height, 280.);
+
+        // A mistake in it is said, and the layout that was right stays.
+        std::fs::write(
+            config.join("layout.json"),
+            "{ \"sidebar\": { \"width\": \"wide\" } }",
+        )
+        .unwrap();
+        reload(cx);
+        let said = errors(cx);
+        assert_eq!(said.len(), 1);
+        assert!(said[0].starts_with("layout.json: "), "{said:?}");
+        assert_eq!(size(cx, "sidebar").0, 300.);
+
+        // Put right, the mistake is gone; taken away, so is the layout.
+        std::fs::write(
+            config.join("layout.json"),
+            "{ \"sidebar\": { \"width\": 2000 } }",
+        )
+        .unwrap();
+        reload(cx);
+        assert!(errors(cx).is_empty());
+        assert_eq!(cx.read(Layout::get).sidebar.width, 900.);
+        std::fs::remove_file(config.join("layout.json")).unwrap();
+        reload(cx);
+        assert_eq!(size(cx, "sidebar").0, 390.);
+        assert_eq!(size(cx, "status-bar").1, 26.);
     }
 }

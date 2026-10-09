@@ -39,6 +39,7 @@ mod indent;
 mod inline_completion;
 mod inline_edit;
 mod key_prompts;
+mod layout;
 mod locations;
 mod lsp_store;
 mod perf;

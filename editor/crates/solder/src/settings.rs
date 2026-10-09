@@ -191,7 +191,7 @@ fn read_theme(dir: &Path, name: &str) -> Result<Theme, String> {
 }
 
 /// Drops `//` line comments so the files can be annotated (JSON with comments).
-fn strip_comments(source: &str) -> String {
+pub(crate) fn strip_comments(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     for line in source.lines() {
         let mut in_string = false;
@@ -355,6 +355,7 @@ pub fn reload_from(dir: &Path, cx: &mut App) {
         cx.bind_keys(bindings);
         errors.extend(keymap_errors);
     }
+    errors.extend(crate::layout::reload_from(dir, cx));
     for e in &errors {
         eprintln!("{e}");
     }

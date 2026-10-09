@@ -805,6 +805,30 @@ For an installed extension the tab has:
 
 These decisions are kept in `extensions/state.json`.
 
+## The layout of the window
+
+Where the parts of the window are and how large is a file,
+`~/.config/solder/layout.json`, next to `settings.json`. **Open Layout** in
+the command palette opens it, written out with what is in use now. It is
+applied as soon as it is saved.
+
+```json
+{
+  "sidebar": { "width": 390 },
+  "chat": { "width": 380 },
+  "dock": { "height": 280 },
+  "title_bar": { "height": 38 },
+  "tab_bar": { "height": 34 },
+  "status_bar": { "height": 26 }
+}
+```
+
+A part left out has the size it came with. A size no window can show is
+brought to the nearest that fits (a side panel is 200 to 900 wide, the dock
+100 to 1200 high, a bar 22 to 64). A mistake in the file is said in the
+status bar, like one in `settings.json`, and the layout that was right stays.
+The file holds sizes so far; places, order and what is hidden come next.
+
 ## Settings from another editor
 
 On a first launch (no `~/.config/solder/settings.json` yet) Solder looks for VS

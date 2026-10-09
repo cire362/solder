@@ -260,10 +260,10 @@ dragged, a tab moved, a button hidden from its menu) is written to the same
 file, so the two never disagree. It starts after the Zed items of phase 8.
 
 ### The layout file
-- [ ] `layout.json`: the sizes that are constants today (sidebar, chat,
-      terminal dock, title bar, tab bar, status bar), read at start and when
-      the file is saved. A mistake in it is reported like one in
-      `settings.json`, and the last layout that was right stays
+- [x] `layout.json`: the sizes that were constants (sidebar, chat, terminal
+      dock, title bar, tab bar, status bar), read at start and when the file
+      is saved. A mistake in it is reported like one in `settings.json`, and
+      the last layout that was right stays
 - [ ] Docks on the left, right and bottom, and any panel in any of them:
       Files, Search, Git, Services, Database, API, AI, Extensions, the chat,
       the agent, the terminal, the debugger. Their order in a dock, which
