@@ -89,7 +89,8 @@ pub struct Settings {
     pub context_servers: BTreeMap<String, ContextServer>,
 }
 
-/// One context server: the program to start and what to start it with.
+/// One context server: the program to start and what to start it with,
+/// or the address of one that is somewhere else.
 /// The command is written as Zed writes it, in either of its two forms:
 /// `"command": "npx", "args": [...]`, or
 /// `"command": { "path": "npx", "args": [...], "env": {...} }`.
@@ -99,6 +100,12 @@ pub struct ContextServer {
     pub command: Option<ServerCommand>,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// A server reached over HTTP, in place of a command: its address,
+    /// and what goes with every message to it (a key, mostly).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
     /// For a server an extension brings, under the extension's name for
     /// it: what the extension reads to start it (a database's address, a
     /// token). The extension says which it needs.
@@ -126,6 +133,8 @@ impl Default for ContextServer {
             command: None,
             args: Vec::new(),
             env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
             settings: None,
             enabled: true,
         }
@@ -133,6 +142,13 @@ impl Default for ContextServer {
 }
 
 impl ContextServer {
+    /// The address of a server that is somewhere else. A command wins:
+    /// an entry with both starts the program.
+    pub fn address(&self) -> Option<&str> {
+        let url = self.url.as_deref().map(str::trim)?;
+        (self.program().is_none() && !url.is_empty()).then_some(url)
+    }
+
     pub fn program(&self) -> Option<String> {
         match self.command.as_ref()? {
             ServerCommand::Program(program) | ServerCommand::Table { path: program, .. } => {
@@ -739,6 +755,20 @@ mod tests {
         assert_eq!(servers["table"].variables()["A"], "b");
         assert!(!servers["table"].enabled);
         assert_eq!(servers["bare"].program(), None);
+        // One that is somewhere else: an address and what to send with
+        // each message. With a command too, the command is what counts.
+        let remote = parse_settings(
+            r#"{ "context_servers": {
+                "issues": { "url": " https://example.com/mcp ", "headers": { "Authorization": "Bearer k" } },
+                "both": { "url": "https://example.com/mcp", "command": "npx" }
+            } }"#,
+        )
+        .unwrap()
+        .context_servers;
+        assert_eq!(remote["issues"].address(), Some("https://example.com/mcp"));
+        assert_eq!(remote["issues"].headers["Authorization"], "Bearer k");
+        assert_eq!(remote["both"].address(), None);
+        assert_eq!(servers["flat"].address(), None);
     }
 
     #[test]

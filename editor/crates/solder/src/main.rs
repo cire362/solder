@@ -12,6 +12,7 @@ mod buffer_search;
 mod chat_panel;
 mod command_palette;
 mod completion;
+mod context_prompts;
 mod database;
 mod database_panel;
 mod debug;

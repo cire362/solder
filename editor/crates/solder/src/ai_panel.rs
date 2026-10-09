@@ -399,18 +399,33 @@ impl AiPanel {
             let entry = store.servers.iter().find(|entry| entry.name == *name);
             let (state, color, tools) = match entry.map(|entry| &entry.state) {
                 _ if !config.enabled => ("Off".to_string(), theme.fg_subtle, String::new()),
-                Some(State::Running(_, tools)) => (
-                    match tools.len() {
-                        1 => "1 tool".to_string(),
-                        n => format!("{n} tools"),
-                    },
-                    theme.fg_muted,
-                    tools
-                        .iter()
-                        .map(|tool| tool.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ),
+                Some(State::Running(_, offer)) => {
+                    let count = |n: usize, one: &str, many: &str| match n {
+                        0 => None,
+                        1 => Some(format!("1 {one}")),
+                        n => Some(format!("{n} {many}")),
+                    };
+                    let has: Vec<String> = [
+                        Some(
+                            count(offer.tools.len(), "tool", "tools").unwrap_or("No tools".into()),
+                        ),
+                        count(offer.prompts.len(), "prompt", "prompts"),
+                        count(offer.resources.len(), "resource", "resources"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    (
+                        has.join(", "),
+                        theme.fg_muted,
+                        offer
+                            .tools
+                            .iter()
+                            .map(|tool| tool.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
+                }
                 Some(State::Starting) => ("Starting...".to_string(), theme.fg_muted, String::new()),
                 Some(State::Failed(why)) => (why.to_string(), theme.error, String::new()),
                 Some(State::Stopped) | None => (

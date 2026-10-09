@@ -537,10 +537,34 @@ what is missing when it is not there:
 `"enabled": false` under its name leaves it out, and an entry with a
 `command` of your own under the same name is used in place of the extension's.
 
-Only tools are used. A server's prompts and resources are not, and what a
-server asks of the client (to sample a model, to list folders) is refused.
-Servers are programs on this machine; one reached over the network is not
-supported yet.
+A server that is somewhere else is an address in place of a command, with
+what to send along with every message to it, which is usually a key:
+
+```json
+"context_servers": {
+  "issues": {
+    "url": "https://mcp.example.com/mcp",
+    "headers": { "Authorization": "Bearer ..." }
+  }
+}
+```
+
+It is reached over HTTP the way the protocol calls streamable: every message
+is a request to that address, answered at once or as a stream of events. The
+older way, where answers come over a second connection that stays open, and
+signing in through a browser are not supported; a server that wants a key says
+so in the AI tab.
+
+What a server has to read (its resources: files, tables, pages) the agent
+gets as two more tools of that server, one that lists them and one that reads
+one by its address, asked for like any other. Its prompts are for you: **Use
+context prompt** in the command palette lists the prompts of every server,
+asks for what the chosen one has to be told, and puts what the server writes
+into the agent's field, to read before sending.
+
+What a server asks of the client (to sample a model, to list folders) is
+refused, and nothing is listened for between requests, so a server that
+changes its list of tools is asked again only when it next starts.
 
 ### Review before push
 

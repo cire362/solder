@@ -78,6 +78,7 @@ actions!(
         SaveKeyLayout,
         OpenKeyLayout,
         ResetLayout,
+        UseContextPrompt,
         SplitRight,
         FocusNextPane,
         FocusPrevPane,
@@ -2477,6 +2478,66 @@ impl Workspace {
         self.show_right(true, window, cx);
     }
 
+    /// Lists the prompts of the context servers, to put one in the
+    /// agent's field. The servers start for it as they do for a task.
+    fn use_context_prompt(
+        &mut self,
+        _: &UseContextPrompt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let root = self.root(cx);
+        let starting = crate::mcp_store::McpStore::global(cx)
+            .update(cx, |store, cx| store.start_all(&root, cx));
+        let workspace = cx.weak_entity();
+        self.toggle_modal(window, cx, move |window, cx| {
+            let picker = Picker::new(crate::context_prompts::Prompts::new(workspace), window, cx);
+            crate::context_prompts::Prompts::load(starting, window, cx);
+            picker
+        });
+    }
+
+    /// Asks for what the chosen prompt still has to be told, one thing
+    /// at a time from `asked` on; then the server writes the prompt and
+    /// it goes into the agent's field, for the user to read and send.
+    pub fn fill_prompt(
+        &mut self,
+        chosen: crate::mcp_store::ServerPrompt,
+        told: Vec<(String, String)>,
+        asked: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if asked < chosen.prompt.arguments.len() {
+            let workspace = cx.weak_entity();
+            self.toggle_modal(window, cx, move |window, cx| {
+                let line = crate::context_prompts::Told::new(workspace, chosen, told, asked);
+                Picker::new(line, window, cx)
+            });
+            return;
+        }
+        self.show_right(true, window, cx);
+        let agent = self.agent.clone();
+        let writing = cx
+            .background_executor()
+            .spawn(async move { chosen.text(&told) });
+        cx.spawn(async move |_, cx| {
+            let written = writing.await;
+            agent
+                .update(cx, |agent, cx| match written {
+                    Ok(text) => {
+                        let text = crate::context_prompts::one_line(&text);
+                        agent
+                            .input()
+                            .update(cx, |input, cx| input.set_text(&text, false, cx));
+                    }
+                    Err(error) => agent.failed(error, cx),
+                })
+                .ok();
+        })
+        .detach();
+    }
+
     /// Shows the chat or the agent, in the dock it is in, and focuses its
     /// field.
     fn show_right(&mut self, agent: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -4793,6 +4854,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_key_layout))
             .on_action(cx.listener(Self::open_key_layout))
             .on_action(cx.listener(Self::reset_layout))
+            .on_action(cx.listener(Self::use_context_prompt))
             .on_action(cx.listener(Self::split_right))
             .on_action(cx.listener(Self::focus_next_pane))
             .on_action(cx.listener(Self::focus_prev_pane))
@@ -8742,6 +8804,132 @@ mod tests {
             "content":"",
             "tool_calls":[{"id": id, "type":"function","function":{"name": name, "arguments": input.to_string()}}],
         }}]})
+    }
+
+    #[gpui::test]
+    fn a_context_server_over_http_has_tools_resources_and_prompts(cx: &mut TestAppContext) {
+        use crate::mcp_store::{McpStore, State};
+        use std::io::BufRead;
+        // The stand-in server, on a port of its own on this machine.
+        struct Ended(std::process::Child);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../ai/tests/fixtures/mock_mcp_http.py");
+        let mut mock = Ended(
+            std::process::Command::new("python3")
+                .arg(script)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut port = String::new();
+        std::io::BufReader::new(mock.0.stdout.take().unwrap())
+            .read_line(&mut port)
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}/mcp", port.trim());
+
+        let root = db::testing::dir("ws-mcp-http").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        // In the settings it is an address and a key, not a command.
+        let settings = serde_json::json!({ "context_servers": {
+            "notes": { "url": url, "headers": { "Authorization": "Bearer t" } },
+        } });
+        cx.update(|_, cx| cx.set_global(settings::parse_settings(&settings.to_string()).unwrap()));
+
+        // The list of prompts starts the servers, as a task does.
+        cx.dispatch_action(UseContextPrompt);
+        let store = cx.update(|_, cx| McpStore::global(cx));
+        wait_for(cx, "the server", &|cx| {
+            matches!(
+                store.read(cx).servers.first().map(|entry| &entry.state),
+                Some(State::Running(..) | State::Failed(_))
+            )
+        });
+        let offer = cx.read(|cx| match &store.read(cx).servers[0].state {
+            State::Running(_, offer) => offer.clone(),
+            State::Failed(why) => panic!("{why}"),
+            _ => unreachable!(),
+        });
+        assert_eq!(offer.tools.len(), 2);
+        assert_eq!(offer.prompts.len(), 2);
+        assert_eq!(offer.resources.len(), 2);
+
+        // What it has to read is two more tools for the agent, next to
+        // its own.
+        let tools = cx.read(|cx| store.read(cx).tools());
+        let names: Vec<&str> = tools.iter().map(|tool| tool.spec.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "mcp_notes_echo",
+                "mcp_notes_slow",
+                "mcp_notes_list_resources",
+                "mcp_notes_read_resource"
+            ]
+        );
+        let run = |name: &str, input: serde_json::Value| {
+            tools
+                .iter()
+                .find(|tool| tool.spec.name == name)
+                .unwrap()
+                .run(input)
+        };
+        assert_eq!(
+            run("mcp_notes_echo", serde_json::json!({ "text": "hi" })),
+            ("hi".into(), false)
+        );
+        let (listed, failed) = run("mcp_notes_list_resources", serde_json::json!({}));
+        assert!(!failed);
+        assert_eq!(
+            listed,
+            "notes://today (Today): What is planned\nnotes://logo"
+        );
+        assert_eq!(
+            run(
+                "mcp_notes_read_resource",
+                serde_json::json!({ "uri": "notes://today" })
+            ),
+            ("Ship the layout.".into(), false)
+        );
+        assert!(run("mcp_notes_read_resource", serde_json::json!({})).1);
+        // The user is shown what such a call is before allowing it.
+        let read = tools.iter().find(|tool| tool.tool == "read resource");
+        assert!(
+            read.unwrap()
+                .shown(&serde_json::json!({ "uri": "notes://today" }))
+                .starts_with("read resource of notes")
+        );
+
+        // A prompt is chosen from the list and told what it needs: one
+        // thing that must be said, one that may be left out. What the
+        // server writes goes into the agent's field, for the user to send.
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        cx.simulate_input("review");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        // Nothing typed for what must be said: the line stays.
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        cx.simulate_input("main");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        cx.simulate_keystrokes("enter");
+        let field = |cx: &App| ws.read(cx).agent.read(cx).input().read(cx).text(cx);
+        wait_for(cx, "the prompt", &|cx| !field(cx).is_empty());
+        assert_eq!(cx.read(|cx| field(cx)), "Review main. Be kind.");
+        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+        assert_eq!(cx.read(|cx| ws.read(cx).right), Some(Panel::Agent));
     }
 
     #[gpui::test]
@@ -13095,7 +13283,7 @@ brackets = [
                 let entry = &mcp.servers[0];
                 assert_eq!(entry.extension.as_deref(), Some("postgres-context-server"));
                 match &entry.state {
-                    State::Running(_, tools) => format!("{} tools", tools.len()),
+                    State::Running(_, offer) => format!("{} tools", offer.tools.len()),
                     State::Failed(why) => why.to_string(),
                     _ => "not started".into(),
                 }

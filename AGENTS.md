@@ -135,7 +135,9 @@ Never guess a signature.
   and random numbers. Do not add files or sockets there.
 
 - Context servers are Model Context Protocol servers the agent gets tools
-  from. The client is `ai::mcp` (no GPUI, everything in it blocks);
+  from: programs started here, or ones reached over HTTP. The client is
+  `ai::mcp` (no GPUI, everything in it blocks, whichever way the server
+  is talked to);
   `McpStore` (`mcp_store.rs`) starts the servers the settings name when an
   agent task begins, never at startup. A server's tool runs outside the
   agent's sandbox: a task asks the user before the first call of each

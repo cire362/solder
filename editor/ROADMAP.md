@@ -80,8 +80,12 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 - [x] Context servers for the agent (MCP): servers named in `settings.json`
       are started with a task, their tools are offered to the model next to
       the agent's own, and the first call of each waits for the user
-- [ ] Context servers reached over the network (HTTP), and what a server has
-      besides tools: prompts and resources
+- [x] Context servers reached over the network (HTTP), and what a server has
+      besides tools: prompts and resources. An address and headers in place
+      of a command (streamable HTTP; the older two-connection way and
+      signing in through a browser are not there). Resources are two more
+      tools for the agent; prompts are chosen by the user and put in the
+      agent's field
 
 ## 7. Debugger, plugins, onboarding
 - [x] Debugger over DAP; one session across browser and server; query timeline
