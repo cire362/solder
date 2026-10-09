@@ -6,7 +6,8 @@ Phase 8 goes past what the website promises: it is what it takes for an
 extension made for Zed or VS Code to be installed with one button and work
 as it does in the editor it was made for. Phase 9 makes the window the
 user's own: where every panel and button is, how it looks and which keys
-drive it.
+drive it. Phase 10 is what an editor used all day is expected to have and
+this one does not have yet.
 
 Status: `[x]` done, `[~]` partial, `[ ]` not started.
 
@@ -306,3 +307,65 @@ file, so the two never disagree. It starts after the Zed items of phase 8.
 - [~] File icons in the tree and on tabs from the icon themes of Zed and
       VS Code extensions (the items of phase 8), chosen in `settings.json`.
       Zed's are in; VS Code's are not yet
+
+## 10. What a daily editor has
+
+Taken on 2026-10-09 from the checklist of another editor's rewrite, read
+against what Solder has: these are the parts it lacked. Each block is one
+update. They come after phase 9, in this order unless one is needed sooner.
+
+### The editor
+- [ ] Folding of blocks, indent guides, lines wrapped at the window's edge
+- [ ] Selection by column (a rectangle of cursors)
+- [ ] Tabs and cursors restored when a project is opened again; pinned tabs;
+      the tab closed last opened again (`cmd-shift-t`)
+- [ ] Unsaved text kept aside as it is typed and offered back after a crash
+- [ ] Line endings and encoding of a file kept as they were; files too large
+      to edit opened for reading, with the reason said
+
+### Symbols and problems
+- [ ] Symbols of the file (`cmd-shift-o`) and of the project (`cmd-t`), from
+      the language server, painted as an extension says (`labels-for-symbols`)
+- [ ] A Structure panel: the file's outline, from the server or from the
+      language's outline query
+- [ ] A Problems panel: every diagnostic of the project, by file
+- [ ] The other places a symbol is used lit up; go to implementations;
+      breadcrumbs with the path and the symbol under the cursor
+
+### Git history
+- [ ] The history as a graph, the history of one file, blame in the gutter
+- [ ] Stash and fetch
+- [ ] A check before a commit: keys and secrets in what is staged stop it
+- [ ] A commit message proposed by the model from what is staged
+- [ ] The pull request of the branch and the state of its checks, through `gh`
+
+### Tests and running
+- [ ] A tree of the project's tests: run one, see what failed, go to its line
+- [ ] Breakpoints with a condition, and ones that only write to the console
+- [ ] Python under the debugger (debugpy), now that an adapter is only
+      something to start
+
+### The terminal
+- [ ] `file:line:column` in the output opens in the editor
+- [ ] Search in what scrolled by; the dock split in two
+- [ ] A command that failed offered to the model to fix
+
+### Windows and the way in
+- [ ] A first window with the projects opened last, open a folder, clone
+- [ ] Several windows, a project in each, the set restored
+- [ ] Markdown shown next to its source; pictures shown as pictures
+- [ ] A log of errors with rotation, and a report of a crash at the next start
+- [ ] The interface in Russian as well as English
+
+### Projects that are somewhere else
+- [ ] A project on a server over SSH: files, terminal, Git, search and
+      language servers there (needs an SSH client, a dependency to decide on)
+- [ ] Dev containers: `devcontainer.json`, with terminals, services and the
+      agent inside
+
+Left out on purpose: notebooks, a list of servers and deploys (far from an
+editor for what they cost), settings synced through a folder (they are files
+already), and moving data over from an Electron version (there is none).
+Accessibility through the system's own tree and installers with updates
+are wanted, but the first waits for GPUI and the second is publishing, which
+is decided apart.
