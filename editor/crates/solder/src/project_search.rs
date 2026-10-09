@@ -483,7 +483,7 @@ impl Render for ProjectSearch {
                                                 div()
                                                     .flex_none()
                                                     .px_1p5()
-                                                    .rounded(px(6.))
+                                                    .rounded(theme.shape.token)
                                                     .bg(theme.bg_elev)
                                                     .text_size(crate::theme::text(11.))
                                                     .text_color(theme.fg_muted)
@@ -553,7 +553,7 @@ impl Render for ProjectSearch {
                                     .px_1p5()
                                     .flex()
                                     .items_center()
-                                    .rounded(px(8.))
+                                    .rounded(theme.shape.control)
                                     .text_size(UI_FONT_SIZE)
                                     .hover(|d| d.bg(theme.accent_soft))
                                     .on_mouse_down(

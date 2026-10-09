@@ -35,6 +35,52 @@ pub struct Theme {
     /// The sixteen colors programs in the terminal ask for by number, in
     /// the order of `import::theme::TERMINAL`.
     pub terminal: [Hsla; 16],
+    pub shape: Shapes,
+}
+
+/// The shapes of the window, which a theme sets next to its colors.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shapes {
+    /// How round the corners of a panel are: a window over the editor, a
+    /// card.
+    pub panel: gpui::Pixels,
+    /// Of a control: a button, a field, a tab, a row of a list.
+    pub control: gpui::Pixels,
+    /// Of what sits inside a line: a key, a badge, an item of a menu.
+    pub token: gpui::Pixels,
+    /// How wide the lines between the parts of the window are.
+    pub border: gpui::Pixels,
+}
+
+impl Default for Shapes {
+    /// The site's: panels 16, controls 8, inline tokens 6.
+    fn default() -> Self {
+        Self {
+            panel: px(16.),
+            control: px(8.),
+            token: px(6.),
+            border: px(1.),
+        }
+    }
+}
+
+impl Shapes {
+    /// Sets the shapes these name, each kept to what a window can draw:
+    /// a corner no rounder than a row is tall, a border one can still see
+    /// through. A name that is no shape changes nothing.
+    pub fn lay(&mut self, shapes: &std::collections::BTreeMap<String, f32>) {
+        let slots: [(&str, &mut gpui::Pixels, f32); 4] = [
+            ("panel_radius", &mut self.panel, 24.),
+            ("control_radius", &mut self.control, 12.),
+            ("token_radius", &mut self.token, 12.),
+            ("border_width", &mut self.border, 3.),
+        ];
+        for (key, slot, most) in slots {
+            if let Some(size) = shapes.get(key).filter(|size| size.is_finite()) {
+                *slot = px(size.clamp(0., most));
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,6 +154,7 @@ impl Theme {
                 0x52525b, 0xfca5a5, 0xbbf7d0, 0xfde68a, 0xbfdbfe, 0xe9d5ff, 0xa5f3fc, 0xfafafa,
             ]
             .map(|color| rgb(color).into()),
+            shape: Shapes::default(),
         }
     }
 
@@ -150,6 +197,7 @@ impl Theme {
                 0x71717a, 0xef4444, 0x16a34a, 0xca8a04, 0x2563eb, 0x9333ea, 0x0891b2, 0x27272a,
             ]
             .map(|color| rgb(color).into()),
+            shape: Shapes::default(),
         }
     }
 
@@ -162,6 +210,7 @@ impl Theme {
             Self::dark()
         };
         theme.lay(&file.colors, &file.syntax, &file.terminal);
+        theme.shape.lay(&file.shapes);
         theme
     }
 

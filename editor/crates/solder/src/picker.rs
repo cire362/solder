@@ -189,16 +189,16 @@ impl<D: PickerDelegate> Render for Picker<D> {
             .flex()
             .flex_col()
             .bg(theme.bg_elev)
-            .border_1()
+            .border(theme.shape.border)
             .border_color(theme.line)
-            .rounded(px(16.))
+            .rounded(theme.shape.panel)
             .shadow_lg()
             .overflow_hidden()
             .child(
                 div()
                     .px_4()
                     .py_3()
-                    .border_b_1()
+                    .border_b(theme.shape.border)
                     .border_color(theme.line)
                     .child(self.query.clone()),
             )
@@ -229,7 +229,7 @@ impl<D: PickerDelegate> Render for Picker<D> {
                                     .px_2p5()
                                     .flex()
                                     .items_center()
-                                    .rounded(px(8.))
+                                    .rounded(theme.shape.control)
                                     .when(ix == selected, |d| d.bg(cx.theme().accent_soft))
                                     .on_mouse_down(
                                         MouseButton::Left,

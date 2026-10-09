@@ -1038,6 +1038,19 @@ them in `settings.json`, over whichever theme is in use:
 A name that is no token, or a value that is no color, changes nothing and is
 said in the status bar.
 
+A theme sets shapes next to its colors, in pixels, in its file or in
+`theme_overrides`:
+
+```json
+"shapes": { "panel_radius": 16, "control_radius": 8, "token_radius": 6, "border_width": 1 }
+```
+
+`control_radius` is the corners of buttons, fields, tabs and rows;
+`token_radius` of what sits inside a line, like a key or an item of a menu;
+`panel_radius` of windows over the editor and cards. `border_width` is the
+lines between the parts of the window, 0 to 3. The room around text is not a
+theme's: it follows `ui_font_size`.
+
 ## Measured so far
 
 Apple M4, 16 GB, built-in 60 Hz display, release build.

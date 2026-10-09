@@ -28,6 +28,9 @@ pub struct ThemeFile {
     /// The sixteen colors programs in the terminal ask for by number.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub terminal: BTreeMap<String, String>,
+    /// Shapes, in pixels: how round corners are and how wide borders.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shapes: BTreeMap<String, f32>,
 }
 
 pub const COLORS: &[&str] = &[
@@ -64,6 +67,14 @@ pub const SYNTAX: &[&str] = &[
     "punctuation",
     "variable",
     "tag",
+];
+
+/// The shapes a theme can set.
+pub const SHAPES: &[&str] = &[
+    "panel_radius",
+    "control_radius",
+    "token_radius",
+    "border_width",
 ];
 
 /// The terminal's colors, in the order programs number them.
@@ -309,6 +320,8 @@ impl Palette {
             syntax: hex(self.syntax),
             // Only the ones the source has: the rest are the editor's.
             terminal: hex(self.terminal),
+            // Neither editor's themes say anything of shapes.
+            shapes: BTreeMap::new(),
         })
     }
 }

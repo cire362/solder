@@ -391,7 +391,7 @@ impl ServicesPanel {
             .px_1p5()
             .flex()
             .items_center()
-            .rounded(px(6.))
+            .rounded(theme.shape.token)
             .text_size(crate::theme::text(11.))
             .text_color(theme.fg_subtle)
             .hover(|d| d.bg(theme.line).text_color(theme.fg))
@@ -408,7 +408,7 @@ impl ServicesPanel {
                     .id(("port", *port as usize))
                     .flex_none()
                     .px_1p5()
-                    .rounded(px(6.))
+                    .rounded(theme.shape.token)
                     .bg(theme.bg_elev)
                     .text_size(crate::theme::text(11.))
                     .text_color(theme.accent)
@@ -435,7 +435,7 @@ impl ServicesPanel {
             .flex()
             .items_center()
             .gap_2()
-            .rounded(px(8.))
+            .rounded(theme.shape.control)
             .text_size(UI_FONT_SIZE);
         match row {
             Row::Header(title) => base
@@ -652,8 +652,8 @@ impl Render for ServicesPanel {
                     .mb_2()
                     .px_2()
                     .py_1()
-                    .rounded(px(8.))
-                    .border_1()
+                    .rounded(theme.shape.control)
+                    .border(theme.shape.border)
                     .border_color(theme.error)
                     .text_size(crate::theme::text(11.5))
                     .text_color(theme.error)

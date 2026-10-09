@@ -83,7 +83,7 @@ impl PluginsView {
         div()
             .flex_none()
             .px_1p5()
-            .rounded(px(6.))
+            .rounded(theme.shape.token)
             .bg(theme.bg_sunken)
             .text_size(crate::theme::text(11.))
             .text_color(color)
@@ -318,8 +318,8 @@ impl Render for PluginsView {
             .max_h(px(460.))
             .flex()
             .flex_col()
-            .rounded(px(16.))
-            .border_1()
+            .rounded(theme.shape.panel)
+            .border(theme.shape.border)
             .border_color(theme.line)
             .bg(theme.bg)
             .overflow_hidden()
@@ -331,7 +331,7 @@ impl Render for PluginsView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .border_b_1()
+                    .border_b(theme.shape.border)
                     .border_color(theme.line)
                     .child(
                         div()
@@ -360,7 +360,7 @@ impl Render for PluginsView {
                             }),
                     )
                 } else {
-                    d.child(div().flex_none().border_b_1().border_color(theme.line).child(list))
+                    d.child(div().flex_none().border_b(theme.shape.border).border_color(theme.line).child(list))
                         .child(self.render_details(&theme, cx))
                 }
             })

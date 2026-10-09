@@ -410,7 +410,7 @@ impl Render for BufferSearchBar {
             .gap_1p5()
             .px_3()
             .py_2()
-            .border_b_1()
+            .border_b(theme.shape.border)
             .border_color(theme.line)
             .bg(theme.bg_sunken)
             .child(

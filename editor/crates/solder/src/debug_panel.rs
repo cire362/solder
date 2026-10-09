@@ -192,7 +192,7 @@ impl DebugPanel {
             .flex()
             .items_center()
             .gap_1p5()
-            .border_b_1()
+            .border_b(theme.shape.border)
             .border_color(theme.line);
         let config = self.configs.get(self.selected).map(|c| c.name.clone());
         match &state {
@@ -207,8 +207,8 @@ impl DebugPanel {
                             .h(px(26.))
                             .flex()
                             .items_center()
-                            .rounded(px(8.))
-                            .border_1()
+                            .rounded(theme.shape.control)
+                            .border(theme.shape.border)
                             .border_color(theme.line)
                             .hover(|d| d.bg(theme.bg_elev))
                             .text_size(UI_FONT_SIZE)
@@ -303,8 +303,8 @@ impl DebugPanel {
             .mx_2()
             .mt_1()
             .p_1()
-            .rounded(px(8.))
-            .border_1()
+            .rounded(theme.shape.control)
+            .border(theme.shape.border)
             .border_color(theme.line)
             .bg(theme.bg_elev)
             .flex()
@@ -325,7 +325,7 @@ impl DebugPanel {
                     .debug_selector(move || format!("debug-config-{i}"))
                     .px_2()
                     .py_1()
-                    .rounded(px(6.))
+                    .rounded(theme.shape.token)
                     .text_size(UI_FONT_SIZE)
                     .text_color(if i == self.selected {
                         theme.accent
@@ -596,7 +596,7 @@ impl Render for DebugPanel {
                             .h_full()
                             .flex()
                             .flex_col()
-                            .border_r_1()
+                            .border_r(theme.shape.border)
                             .border_color(theme.line)
                             .child(Self::header("CALL STACK", &theme))
                             .child(
@@ -661,7 +661,7 @@ impl Render for DebugPanel {
                             .h_full()
                             .flex()
                             .flex_col()
-                            .border_r_1()
+                            .border_r(theme.shape.border)
                             .border_color(theme.line)
                             .child(Self::header("VARIABLES", &theme))
                             .child(
@@ -789,7 +789,7 @@ impl Render for DebugPanel {
                                     div()
                                         .flex_none()
                                         .p_1p5()
-                                        .border_t_1()
+                                        .border_t(theme.shape.border)
                                         .border_color(theme.line)
                                         .flex()
                                         .key_context("DebugConsole")

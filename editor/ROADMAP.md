@@ -307,8 +307,11 @@ file, so the two never disagree. It starts after the Zed items of phase 8.
 - [x] Every color in the window comes from a token a theme can set: the ones
       still written in code become tokens. They were the terminal's sixteen;
       themes from VS Code and Zed bring theirs
-- [ ] Shapes as tokens next to colors: the radii, the spacing, the width of
-      borders
+- [~] Shapes as tokens next to colors: the radii, the spacing, the width of
+      borders. The radii and the width of borders are (`shapes` in a theme
+      file and in `theme_overrides`). Spacing is not a theme's: it is in
+      rems like the text, so it follows `ui_font_size`, and a token of its
+      own would need every text size to know of it
 - [x] A theme file is applied as it is saved, and any token can be set in
       `settings.json` on top of the theme in use (`theme_overrides`)
 

@@ -434,7 +434,7 @@ impl ResultsView {
                 .flex()
                 .items_center()
                 .gap_2()
-                .border_b_1()
+                .border_b(theme.shape.border)
                 .border_color(theme.line)
                 .text_size(UI_FONT_SIZE)
                 .font_family(Settings::get(cx).ui_font())
@@ -1195,7 +1195,7 @@ impl ResultsView {
                 .flex()
                 .items_center()
                 .gap_2()
-                .border_b_1()
+                .border_b(theme.shape.border)
                 .border_color(theme.line)
                 .bg(theme.bg_sunken)
                 .text_size(UI_FONT_SIZE)
@@ -1378,7 +1378,7 @@ impl ResultsView {
                 .flex()
                 .items_center()
                 .gap_2()
-                .border_b_1()
+                .border_b(theme.shape.border)
                 .border_color(theme.line)
                 .text_size(UI_FONT_SIZE)
                 .font_family(Settings::get(cx).ui_font())
@@ -1441,7 +1441,7 @@ impl ResultsView {
             .flex()
             .items_center()
             .gap_2()
-            .border_b_1()
+            .border_b(theme.shape.border)
             .border_color(theme.line)
             .text_size(UI_FONT_SIZE)
             .when(!self.connection.is_empty(), |d| {
@@ -1449,7 +1449,7 @@ impl ResultsView {
                     div()
                         .flex_none()
                         .px_1p5()
-                        .rounded(px(6.))
+                        .rounded(theme.shape.token)
                         .bg(theme.bg_elev)
                         .text_color(theme.fg_muted)
                         .child(self.connection.clone()),
@@ -1480,7 +1480,7 @@ impl ResultsView {
                             .id("results-add-row")
                             .flex_none()
                             .px_1p5()
-                            .rounded(px(6.))
+                            .rounded(theme.shape.token)
                             .text_color(theme.fg_subtle)
                             .hover(|d| d.bg(theme.line).text_color(theme.fg))
                             .child("Add row")
@@ -1506,7 +1506,7 @@ impl ResultsView {
             .h(ROW_HEIGHT)
             .flex()
             .overflow_hidden()
-            .border_b_1()
+            .border_b(theme.shape.border)
             .border_color(theme.line)
             .bg(theme.bg_sunken)
             .child(
@@ -1535,7 +1535,7 @@ impl ResultsView {
                                 .items_center()
                                 .gap_1p5()
                                 .overflow_hidden()
-                                .border_r_1()
+                                .border_r(theme.shape.border)
                                 .border_color(theme.line)
                                 .when(self.browsing.is_some(), |d| d.hover(|d| d.bg(theme.line)))
                                 .child(
@@ -1610,7 +1610,7 @@ impl ResultsView {
                             .items_center()
                             .when(value.is_numeric(), |d| d.justify_end())
                             .overflow_hidden()
-                            .border_r_1()
+                            .border_r(theme.shape.border)
                             .border_color(theme.line)
                             .text_color(match value {
                                 _ if deleted => theme.error,
@@ -1626,7 +1626,9 @@ impl ResultsView {
                             .when((staged || added) && !deleted, |d| d.bg(theme.accent_soft))
                             .when(deleted, |d| d.line_through())
                             .when(selected, |d| {
-                                d.bg(theme.selection).border_1().border_color(theme.accent)
+                                d.bg(theme.selection)
+                                    .border(theme.shape.border)
+                                    .border_color(theme.accent)
                             })
                             .map(|d| match editor {
                                 Some(editor) => d.bg(theme.bg).child(div().flex_1().child(editor)),
@@ -1656,7 +1658,7 @@ impl ResultsView {
                     div()
                         .h(ROW_HEIGHT)
                         .flex()
-                        .border_b_1()
+                        .border_b(theme.shape.border)
                         .border_color(theme.line)
                         .child(
                             div()

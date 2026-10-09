@@ -567,7 +567,7 @@ impl ProjectPanel {
                 .px_2()
                 .flex()
                 .items_center()
-                .rounded(px(6.))
+                .rounded(theme.shape.token)
                 .text_size(UI_FONT_SIZE)
                 .text_color(if enabled { theme.fg } else { theme.fg_subtle })
                 .when(enabled, |d| d.hover(|d| d.bg(theme.accent_soft)))
@@ -588,9 +588,9 @@ impl ProjectPanel {
                     .flex()
                     .flex_col()
                     .bg(theme.bg_elev)
-                    .border_1()
+                    .border(theme.shape.border)
                     .border_color(theme.line)
-                    .rounded(px(8.))
+                    .rounded(theme.shape.control)
                     .shadow_lg()
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                         this.menu = None;
@@ -752,8 +752,8 @@ impl Render for ProjectPanel {
                                             div()
                                                 .h(px(20.))
                                                 .px_1()
-                                                .rounded(px(6.))
-                                                .border_1()
+                                                .rounded(theme.shape.token)
+                                                .border(theme.shape.border)
                                                 .border_color(if edit.error.is_some() {
                                                     theme.error
                                                 } else {
@@ -780,7 +780,7 @@ impl Render for ProjectPanel {
                                     .flex()
                                     .items_center()
                                     .gap_1p5()
-                                    .rounded(px(8.))
+                                    .rounded(theme.shape.control)
                                     .text_size(UI_FONT_SIZE)
                                     .text_color(tint.unwrap_or(if selected {
                                         theme.fg
@@ -850,9 +850,9 @@ impl Render for ProjectPanel {
                     .mb_2()
                     .px_2()
                     .py_1()
-                    .rounded(px(8.))
+                    .rounded(theme.shape.control)
                     .bg(theme.bg_elev)
-                    .border_1()
+                    .border(theme.shape.border)
                     .border_color(theme.error)
                     .text_size(crate::theme::text(11.5))
                     .text_color(theme.error)

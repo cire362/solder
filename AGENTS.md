@@ -206,7 +206,11 @@ pattern for new widgets instead of calling `cx.propagate()` everywhere.
 ### Style
 
 - Colors come from `theme.rs` tokens, which mirror the website's
-  `globals.css`. Shapes: panels 16px, controls 8px, inline tokens 6px.
+  `globals.css`, the terminal's sixteen included: write no color outside
+  that file. Shapes are tokens too, never numbers: `theme.shape.panel`
+  (16px as it comes), `.control` (8px), `.token` (6px) for corners, and
+  `.border` (1px) for the lines between parts, as in
+  `.border_b(theme.shape.border)`.
 - Text sizes of the interface are rems, never pixels: `UI_FONT_SIZE`,
   `UI_FONT_SMALL` or `theme::text(11.5)`, since a rem follows
   `ui_font_size`. The height of a row of a list is `theme::row(ROW, cx)`,

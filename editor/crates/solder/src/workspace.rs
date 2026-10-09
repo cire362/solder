@@ -299,9 +299,9 @@ impl Render for DraggedTab {
             .px_2()
             .flex()
             .items_center()
-            .rounded(px(8.))
+            .rounded(theme.shape.control)
             .bg(theme.bg_elev)
-            .border_1()
+            .border(theme.shape.border)
             .border_color(theme.line)
             .text_size(UI_FONT_SIZE)
             .text_color(theme.fg)
@@ -1620,12 +1620,12 @@ impl Workspace {
         tab: AnyElement,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let over = cx.theme().accent_soft;
+        let (over, round) = (cx.theme().accent_soft, cx.theme().shape.control);
         let workspace = cx.weak_entity();
         div()
             .id(("dock-tab", key))
             .flex_none()
-            .rounded(px(8.))
+            .rounded(round)
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -1670,9 +1670,9 @@ impl Workspace {
             .bg(theme.bg_sunken)
             .border_color(theme.line)
             .map(|d| match place {
-                Place::Left => d.w(px(36.)).h_full().border_r_1(),
-                Place::Right => d.w(px(36.)).h_full().border_l_1(),
-                Place::Bottom => d.h(px(36.)).w_full().border_t_1(),
+                Place::Left => d.w(px(36.)).h_full().border_r(theme.shape.border),
+                Place::Right => d.w(px(36.)).h_full().border_l(theme.shape.border),
+                Place::Bottom => d.h(px(36.)).w_full().border_t(theme.shape.border),
             })
             .drag_over::<DraggedPanel>(move |style, _, _, _| style.bg(theme.accent_soft))
             .on_drop(
@@ -1698,7 +1698,7 @@ impl Workspace {
                 .px_2()
                 .flex()
                 .items_center()
-                .rounded(px(6.))
+                .rounded(theme.shape.token)
                 .text_size(UI_FONT_SIZE)
                 .text_color(theme.fg)
                 .hover(|d| d.bg(theme.accent_soft))
@@ -1761,9 +1761,9 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .bg(theme.bg_elev)
-                    .border_1()
+                    .border(theme.shape.border)
                     .border_color(theme.line)
-                    .rounded(px(8.))
+                    .rounded(theme.shape.control)
                     .shadow_lg()
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                         this.dock_menu = None;
@@ -2729,7 +2729,7 @@ impl Workspace {
             .flex()
             .items_center()
             .gap_1p5()
-            .rounded(px(8.))
+            .rounded(theme.shape.control)
             .text_size(UI_FONT_SIZE)
             .text_color(if active { theme.fg } else { theme.fg_subtle })
             .when(active, |d| d.bg(theme.bg_elev))
@@ -2748,7 +2748,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(6.))
+                    .rounded(theme.shape.token)
                     .hover(|d| d.bg(theme.line))
                     .child("×")
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -2888,7 +2888,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .rounded(px(8.))
+                    .rounded(theme.shape.control)
                     .text_size(UI_FONT_SIZE)
                     .text_color(if active { theme.fg } else { theme.fg_subtle })
                     .when(active, |d| d.bg(theme.bg_elev))
@@ -2917,7 +2917,7 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(6.))
+                            .rounded(theme.shape.token)
                             .hover(|d| d.bg(theme.line))
                             .child("×")
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -2937,7 +2937,7 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(8.))
+                .rounded(theme.shape.control)
                 .text_color(theme.fg_subtle)
                 .hover(|d| d.bg(theme.line).text_color(theme.fg))
                 .child("+")
@@ -2964,7 +2964,7 @@ impl Workspace {
             .flex()
             .items_center()
             .gap_1p5()
-            .rounded(px(8.))
+            .rounded(theme.shape.control)
             .text_size(UI_FONT_SIZE)
             .text_color(if active { theme.fg } else { theme.fg_subtle })
             .when(active, |d| d.bg(theme.bg_elev))
@@ -2982,7 +2982,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(6.))
+                    .rounded(theme.shape.token)
                     .hover(|d| d.bg(theme.line))
                     .child("×")
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -3006,7 +3006,7 @@ impl Workspace {
             .flex()
             .items_center()
             .gap_1p5()
-            .rounded(px(8.))
+            .rounded(theme.shape.control)
             .text_size(UI_FONT_SIZE)
             .text_color(if active { theme.fg } else { theme.fg_subtle })
             .when(active, |d| d.bg(theme.bg_elev))
@@ -3024,7 +3024,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(6.))
+                    .rounded(theme.shape.token)
                     .hover(|d| d.bg(theme.line))
                     .child("×")
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -3698,7 +3698,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .rounded(px(8.))
+                    .rounded(theme.shape.control)
                     .text_size(UI_FONT_SIZE)
                     .text_color(if active && is_active_pane {
                         theme.fg
@@ -3708,7 +3708,9 @@ impl Workspace {
                         theme.fg_subtle
                     })
                     .when(active, |d| {
-                        d.bg(theme.bg_elev).border_1().border_color(theme.line)
+                        d.bg(theme.bg_elev)
+                            .border(theme.shape.border)
+                            .border_color(theme.line)
                     })
                     .hover(|d| d.text_color(theme.fg))
                     .on_mouse_down(
@@ -3738,7 +3740,7 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(6.))
+                            .rounded(theme.shape.token)
                             .text_color(theme.fg_subtle)
                             .hover(|d| d.bg(theme.line).text_color(theme.fg))
                             .child(if dirty { "●" } else { "×" })
@@ -3765,8 +3767,8 @@ impl Workspace {
                 .gap_1()
                 .overflow_x_scroll()
                 .map(|d| match tabs_at {
-                    TabsAt::Bottom => d.border_t_1(),
-                    _ => d.border_b_1(),
+                    TabsAt::Bottom => d.border_t(theme.shape.border),
+                    _ => d.border_b(theme.shape.border),
                 })
                 .border_color(theme.line)
                 .bg(theme.bg_sunken)
@@ -3778,7 +3780,9 @@ impl Workspace {
             .h_full()
             .flex()
             .flex_col()
-            .when(p > 0, |d| d.border_l_1().border_color(theme.line))
+            .when(p > 0, |d| {
+                d.border_l(theme.shape.border).border_color(theme.line)
+            })
             .children(if tabs_at == TabsAt::Top {
                 tab_bar.take()
             } else {
@@ -3846,7 +3850,7 @@ impl Workspace {
                         .px_1()
                         .flex()
                         .items_center()
-                        .rounded(px(8.))
+                        .rounded(theme.shape.control)
                         .text_size(UI_FONT_SIZE)
                         .text_color(if active { theme.fg } else { theme.fg_subtle })
                         .when(active, |d| d.bg(theme.bg_elev))
@@ -3894,14 +3898,14 @@ impl Workspace {
                 Place::Left => d
                     .w(px(layout.left.width))
                     .h_full()
-                    .border_r_1()
+                    .border_r(theme.shape.border)
                     .bg(theme.bg_sunken),
                 Place::Right => d
                     .w(px(layout.right.width))
                     .h_full()
-                    .border_l_1()
+                    .border_l(theme.shape.border)
                     .bg(theme.bg_sunken),
-                Place::Bottom => d.h(px(layout.bottom.height)).border_t_1(),
+                Place::Bottom => d.h(px(layout.bottom.height)).border_t(theme.shape.border),
             })
             .child(
                 div()
@@ -3914,7 +3918,7 @@ impl Workspace {
                     .items_center()
                     .gap_1()
                     .bg(theme.bg_sunken)
-                    .border_b_1()
+                    .border_b(theme.shape.border)
                     .border_color(theme.line)
                     .on_mouse_down(
                         MouseButton::Right,
@@ -3995,7 +3999,7 @@ impl Workspace {
             div()
                 .id(id)
                 .px_1p5()
-                .rounded(px(6.))
+                .rounded(theme.shape.token)
                 .text_color(color)
                 .hover(|d| d.bg(theme.line).text_color(theme.fg))
                 .child(text)
@@ -4201,7 +4205,7 @@ impl Workspace {
             .items_center()
             .justify_between()
             .px_3()
-            .border_t_1()
+            .border_t(theme.shape.border)
             .border_color(theme.line)
             .bg(theme.bg_sunken)
             .text_size(crate::theme::text(11.5))
@@ -4426,7 +4430,7 @@ impl Render for Workspace {
                     // Room for the macOS traffic lights.
                     .pl(px(if cfg!(target_os = "macos") { 84. } else { 12. }))
                     .pr_3()
-                    .border_b_1()
+                    .border_b(theme.shape.border)
                     .border_color(theme.line)
                     .bg(theme.bg_sunken)
                     .text_size(UI_FONT_SIZE)
@@ -11391,7 +11395,8 @@ brackets = [
             format!(
                 r##"{{ "name": "Mine", "appearance": "dark",
                       "colors": {{ "bg": "{bg}", "accent": "#112233" }},
-                      "terminal": {{ "red": "#ff0000" }} }}"##
+                      "terminal": {{ "red": "#ff0000" }},
+                      "shapes": {{ "control_radius": 3, "border_width": 2 }} }}"##
             )
         };
         std::fs::create_dir_all(config.join("themes")).unwrap();
@@ -11412,6 +11417,10 @@ brackets = [
         assert_eq!(cx.read(theme).bg, Hsla::from(rgb(0x101010)));
         assert_eq!(cx.read(theme).terminal[1], Hsla::from(rgb(0xff0000)));
         assert_eq!(cx.read(theme).accent, Hsla::from(rgb(0x00ff88)));
+        // Its shapes too; the ones it leaves out are the editor's.
+        let shape = cx.read(theme).shape;
+        assert_eq!((shape.control, shape.border), (px(3.), px(2.)));
+        assert_eq!(shape.token, px(6.));
         assert_eq!(cx.read(theme).fg, crate::theme::Theme::dark().fg);
 
         // The theme's file is saved with another background: the window

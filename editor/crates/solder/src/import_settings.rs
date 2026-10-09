@@ -144,6 +144,7 @@ mod tests {
             colors: [("bg".to_string(), "#011627".to_string())].into(),
             syntax: Default::default(),
             terminal: Default::default(),
+            shapes: Default::default(),
         };
         let done = apply(
             &dir,

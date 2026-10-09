@@ -135,7 +135,7 @@ impl ResponseView {
             .flex()
             .items_center()
             .gap_2()
-            .border_b_1()
+            .border_b(theme.shape.border)
             .border_color(theme.line)
             .text_size(UI_FONT_SIZE)
             .child(
@@ -151,7 +151,7 @@ impl ResponseView {
                 div()
                     .flex_none()
                     .px_1p5()
-                    .rounded(px(6.))
+                    .rounded(theme.shape.token)
                     .bg(theme.bg_elev)
                     .text_color(color)
                     .child(text)

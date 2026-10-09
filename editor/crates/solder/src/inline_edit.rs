@@ -472,8 +472,8 @@ impl Render for InlineEdit {
             .flex_col()
             .mx_2()
             .my_2()
-            .rounded(px(16.))
-            .border_1()
+            .rounded(theme.shape.panel)
+            .border(theme.shape.border)
             .border_color(theme.line)
             .bg(theme.bg_sunken)
             .overflow_hidden()
@@ -617,7 +617,7 @@ impl Render for InlineEdit {
                         ))
                         .min_h_0()
                         .flex_shrink()
-                        .border_t_1()
+                        .border_t(theme.shape.border)
                         .border_color(theme.line)
                         .map(|body| {
                             if let Some(diff) = &self.diff {

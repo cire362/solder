@@ -1,6 +1,6 @@
 use gpui::{
     Action, AnyElement, Context, DismissEvent, Entity, FocusHandle, SharedString, Task, Window,
-    div, prelude::*, px,
+    div, prelude::*,
 };
 
 use crate::{
@@ -192,7 +192,7 @@ impl PickerDelegate for CommandPalette {
                 div()
                     .flex_none()
                     .px_1p5()
-                    .rounded(px(6.))
+                    .rounded(theme.shape.token)
                     .bg(theme.bg_sunken)
                     .text_size(crate::theme::text(11.))
                     .text_color(theme.fg_muted)

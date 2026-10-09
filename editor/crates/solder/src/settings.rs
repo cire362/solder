@@ -175,6 +175,9 @@ pub struct ThemeOverrides {
     pub syntax: Tokens,
     #[serde(skip_serializing_if = "Tokens::is_empty")]
     pub terminal: Tokens,
+    /// `control_radius`, `border_width` and the like, in pixels.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub shapes: BTreeMap<String, f32>,
     #[serde(flatten)]
     pub colors: Tokens,
 }
@@ -200,6 +203,13 @@ impl ThemeOverrides {
                         "settings.json: theme_overrides: {of}{name}: \u{201c}{value}\u{201d} is not a color"
                     ));
                 }
+            }
+        }
+        for name in self.shapes.keys() {
+            if !import::theme::SHAPES.contains(&name.as_str()) {
+                mistakes.push(format!(
+                    "settings.json: theme_overrides: no shape \u{201c}{name}\u{201d}"
+                ));
             }
         }
         mistakes
@@ -313,6 +323,7 @@ impl Settings {
         };
         let over = &self.theme_overrides;
         theme.lay(&over.colors, &over.syntax, &over.terminal);
+        theme.shape.lay(&over.shapes);
         theme
     }
 }
@@ -718,6 +729,23 @@ mod tests {
         );
         // Nothing set is nothing written.
         assert!(default_settings_file().contains("\"theme_overrides\": {}"));
+
+        // Shapes are set the same way, in pixels, and kept to what a
+        // window can draw.
+        let shaped = parse_settings(
+            r#"{ "theme_overrides": { "shapes": {
+                "control_radius": 2, "token_radius": 0, "border_width": 40, "corner": 3
+            } } }"#,
+        )
+        .unwrap();
+        let shape = shaped.theme(Dark).shape;
+        assert_eq!((shape.control, shape.token), (px(2.), px(0.)));
+        assert_eq!(shape.border, px(3.));
+        assert_eq!(shape.panel, crate::theme::Shapes::default().panel);
+        assert_eq!(shaped.theme(Dark).bg, Theme::dark().bg);
+        let mistakes = shaped.theme_overrides.mistakes();
+        assert_eq!(mistakes.len(), 1, "{mistakes:?}");
+        assert!(mistakes[0].contains("no shape") && mistakes[0].contains("corner"));
     }
 
     #[test]
