@@ -658,15 +658,14 @@ impl Workspace {
             ),
             cx.observe_window_appearance(window, |_, window, cx| {
                 let theme = Settings::get(cx).theme(window.appearance());
-                cx.set_global(theme);
+                crate::theme::put(theme, window, cx);
                 window.refresh();
             }),
             // Settings changed: the theme mode may have too, and the size
             // of the interface's text.
             cx.observe_global_in::<Settings>(window, |_, window, cx| {
                 let theme = Settings::get(cx).theme(window.appearance());
-                cx.set_global(theme);
-                window.set_rem_size(Settings::get(cx).rem_size());
+                crate::theme::put(theme, window, cx);
                 window.refresh();
             }),
         ];
@@ -695,7 +694,7 @@ impl Workspace {
                 }
             }
         });
-        window.set_rem_size(Settings::get(cx).rem_size());
+        crate::theme::fit(window, cx);
         // The docks start on the panels they were left on. The terminals,
         // the debugger and the answers have nothing to show yet, so a dock
         // left on one of them starts closed.
@@ -12612,6 +12611,41 @@ brackets = [
         // Back as it came when the file says nothing.
         settings(cx, "{}");
         assert_eq!(row(cx), (24., px(16.)));
+
+        // A theme that leaves more room around things: gaps and paddings
+        // grow, which is the rem, and the text stays the size it was.
+        let inset = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            let dock = cx.debug_bounds("dock-left").unwrap();
+            let tab = cx.debug_bounds("panel-files").unwrap();
+            f32::from(tab.left() - dock.left())
+        };
+        let text = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| {
+                gpui::Rems::from(crate::theme::UI_FONT_SIZE).to_pixels(window.rem_size())
+            })
+        };
+        let (tight, written) = (inset(cx), text(cx));
+        assert_eq!(written, px(12.5));
+        settings(
+            cx,
+            r#"{ "theme_overrides": { "shapes": { "spacing": 1.5 } } }"#,
+        );
+        assert_eq!(row(cx), (24., px(24.)));
+        assert_eq!(inset(cx), tight * 1.5);
+        assert_eq!(text(cx), px(12.5));
+        // With larger text as well: the two multiply, and the text is
+        // only as large as it was asked to be.
+        settings(
+            cx,
+            r#"{ "ui_font_size": 15, "theme_overrides": { "shapes": { "spacing": 1.5 } } }"#,
+        );
+        let near = |size: gpui::Pixels, wanted: f32| (f32::from(size) - wanted).abs() < 0.001;
+        assert!(near(cx.update(|window, _| window.rem_size()), 28.8));
+        assert!(near(text(cx), 15.));
+        settings(cx, "{}");
+        assert_eq!((inset(cx), text(cx)), (tight, px(12.5)));
     }
 
     #[gpui::test]

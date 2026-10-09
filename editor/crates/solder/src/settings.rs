@@ -840,6 +840,16 @@ mod tests {
         let shape = shaped.theme(Dark).shape;
         assert_eq!((shape.control, shape.token), (px(2.), px(0.)));
         assert_eq!(shape.border, px(3.));
+        // How much room there is around things is a shape too: a number
+        // to multiply by, kept to what still reads.
+        assert_eq!(shape.spacing, 1.);
+        let airy =
+            parse_settings(r#"{ "theme_overrides": { "shapes": { "spacing": 1.25 } } }"#).unwrap();
+        assert_eq!(airy.theme(Dark).shape.spacing, 1.25);
+        assert!(airy.theme_overrides.mistakes().is_empty());
+        let wide =
+            parse_settings(r#"{ "theme_overrides": { "shapes": { "spacing": 9 } } }"#).unwrap();
+        assert_eq!(wide.theme(Dark).shape.spacing, 1.5);
         assert_eq!(shape.panel, crate::theme::Shapes::default().panel);
         assert_eq!(shaped.theme(Dark).bg, Theme::dark().bg);
         let mistakes = shaped.theme_overrides.mistakes();

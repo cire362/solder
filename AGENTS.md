@@ -224,9 +224,11 @@ pattern for new widgets instead of calling `cx.propagate()` everywhere.
   (16px as it comes), `.control` (8px), `.token` (6px) for corners, and
   `.border` (1px) for the lines between parts, as in
   `.border_b(theme.shape.border)`.
-- Text sizes of the interface are rems, never pixels: `UI_FONT_SIZE`,
-  `UI_FONT_SMALL` or `theme::text(11.5)`, since a rem follows
-  `ui_font_size`. The height of a row of a list is `theme::row(ROW, cx)`,
+- Text sizes of the interface are `theme::TextSize`, never pixels or
+  plain rems: `UI_FONT_SIZE`, `UI_FONT_SMALL` or `theme::text(11.5)`. A
+  rem follows `ui_font_size` and the theme's `spacing`, and a `TextSize`
+  takes the first alone. A theme is put in use with `theme::put`, which
+  also sizes the rem: do not set the `Theme` global of a window directly. The height of a row of a list is `theme::row(ROW, cx)`,
   which follows `ui_density`. Code is sized by `buffer_font_size` alone.
 - Comments explain why, not what. Match the density of the surrounding code.
 - User-facing strings are short and plain, with no em dashes.

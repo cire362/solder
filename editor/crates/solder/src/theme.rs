@@ -50,6 +50,10 @@ pub struct Shapes {
     pub token: gpui::Pixels,
     /// How wide the lines between the parts of the window are.
     pub border: gpui::Pixels,
+    /// How much room there is around things, next to what the editor
+    /// comes with: 1 is that, less is tighter, more is airier. Not
+    /// pixels: every gap and padding is this many times its own size.
+    pub spacing: f32,
 }
 
 impl Default for Shapes {
@@ -60,6 +64,7 @@ impl Default for Shapes {
             control: px(8.),
             token: px(6.),
             border: px(1.),
+            spacing: 1.,
         }
     }
 }
@@ -79,6 +84,9 @@ impl Shapes {
             if let Some(size) = shapes.get(key).filter(|size| size.is_finite()) {
                 *slot = px(size.clamp(0., most));
             }
+        }
+        if let Some(spacing) = shapes.get("spacing").filter(|size| size.is_finite()) {
+            self.spacing = spacing.clamp(0.75, 1.5);
         }
     }
 }
@@ -316,13 +324,73 @@ pub const UI_FONT_PX: f32 = 12.5;
 /// A text size of the interface: `size` pixels while `ui_font_size` is as
 /// it comes. Sizes are in rems and a rem follows that setting, so the
 /// text and the room around it grow and shrink together.
-pub const fn text(size: f32) -> gpui::Rems {
-    gpui::Rems(size / 16.)
+pub const fn text(size: f32) -> TextSize {
+    TextSize(size)
 }
 
-pub const UI_FONT_SIZE: gpui::Rems = text(UI_FONT_PX);
+pub const UI_FONT_SIZE: TextSize = text(UI_FONT_PX);
 /// One step smaller, for what stands next to a label.
-pub const UI_FONT_SMALL: gpui::Rems = text(UI_FONT_PX - 1.);
+pub const UI_FONT_SMALL: TextSize = text(UI_FONT_PX - 1.);
+
+/// A size that follows the interface's text and nothing else. A rem is
+/// two things multiplied: the text's size, and how much room a theme
+/// leaves around things. Gaps and paddings are written in rems and take
+/// both. A text size takes the first alone, so it is divided by the
+/// second where it becomes a length: a theme that spaces things out does
+/// not also enlarge what is written in them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextSize(f32);
+
+thread_local! {
+    /// The spacing of the theme in use, for [`TextSize`] to divide by.
+    /// It is the theme's own number, kept where a size can read it
+    /// without being handed the app: sizes are written as constants.
+    static SPACING: std::cell::Cell<f32> = const { std::cell::Cell::new(1.) };
+}
+
+impl From<TextSize> for gpui::Rems {
+    fn from(size: TextSize) -> Self {
+        gpui::Rems(size.0 / 16. / SPACING.get())
+    }
+}
+
+impl From<TextSize> for gpui::AbsoluteLength {
+    fn from(size: TextSize) -> Self {
+        gpui::Rems::from(size).into()
+    }
+}
+
+impl From<TextSize> for gpui::DefiniteLength {
+    fn from(size: TextSize) -> Self {
+        gpui::Rems::from(size).into()
+    }
+}
+
+impl From<TextSize> for gpui::Length {
+    fn from(size: TextSize) -> Self {
+        gpui::Rems::from(size).into()
+    }
+}
+
+/// Puts `theme` in use: its colors and shapes for whatever draws, and in
+/// `window` the size of a rem, which is the text's size by the theme's
+/// spacing.
+pub fn put(theme: Theme, window: &mut gpui::Window, cx: &mut App) {
+    cx.set_global(theme);
+    fit(window, cx);
+}
+
+/// Gives `window` the rem of the theme and the settings in use.
+pub fn fit(window: &mut gpui::Window, cx: &App) {
+    let spacing = cx
+        .try_global::<Theme>()
+        .map_or(1., |theme| theme.shape.spacing);
+    SPACING.set(spacing);
+    let rem = cx
+        .try_global::<crate::settings::Settings>()
+        .map_or(px(16.), crate::settings::Settings::rem_size);
+    window.set_rem_size(rem * spacing);
+}
 
 /// The height of a row of a list: `base` as it comes, lower or taller by
 /// `ui_density`, and grown with the interface's text so that a line of it

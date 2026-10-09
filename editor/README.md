@@ -1225,14 +1225,16 @@ A theme sets shapes next to its colors, in pixels, in its file or in
 `theme_overrides`:
 
 ```json
-"shapes": { "panel_radius": 16, "control_radius": 8, "token_radius": 6, "border_width": 1 }
+"shapes": { "panel_radius": 16, "control_radius": 8, "token_radius": 6, "border_width": 1, "spacing": 1 }
 ```
 
 `control_radius` is the corners of buttons, fields, tabs and rows;
 `token_radius` of what sits inside a line, like a key or an item of a menu;
 `panel_radius` of windows over the editor and cards. `border_width` is the
-lines between the parts of the window, 0 to 3. The room around text is not a
-theme's: it follows `ui_font_size`.
+lines between the parts of the window, 0 to 3. `spacing` is how much room
+there is around things, as a number to multiply by: 1 is what Solder comes
+with, 0.75 the tightest and 1.5 the airiest. It widens gaps and paddings and
+leaves the text the size `ui_font_size` gives it.
 
 ## Measured so far
 

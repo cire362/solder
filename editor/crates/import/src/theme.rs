@@ -75,6 +75,7 @@ pub const SHAPES: &[&str] = &[
     "control_radius",
     "token_radius",
     "border_width",
+    "spacing",
 ];
 
 /// The terminal's colors, in the order programs number them.
