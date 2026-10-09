@@ -288,11 +288,12 @@ file, so the two never disagree. It starts after the Zed items of phase 8.
 
 ### By hand
 - [x] Borders are dragged to resize; a double click puts a size back
-- [~] A panel's tab is dragged to another place in its dock or to another
-      dock; an item of a bar is dragged along it or to the other bar. Tabs
-      are, onto a closed dock too; the bars wait for their lists of items
-- [~] A menu on every panel tab and bar item: hide, move to, and the list of
-      what is hidden, to bring it back. Tabs have it; bar items not yet
+- [x] A panel's tab is dragged to another place in its dock or to another
+      dock, onto a closed dock too. A bar item is dragged before another
+      or appended at either end of either bar, even an empty end
+- [x] A menu on every panel tab and bar item: hide, move to, and the list of
+      what is hidden, to bring it back. An empty bar end has the menu too;
+      menus close on Escape, an outside click or a layout switch
 - [x] A command that puts the layout back as it came: Reset Layout, which
       puts the file aside as `layout.json.old`
 

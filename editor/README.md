@@ -933,6 +933,14 @@ right one: `left` and `right` say which and in what order. An item is in one
 place; one the file names nowhere is on no bar, and an end the file leaves out
 keeps the items it comes with.
 
+Drag an item onto another and it goes before it. Drop it on empty space at
+either end of either bar and it goes after that end's other items. An empty
+end still has room to drop one on. The right button on an item opens its
+menu: **Hide**, **Move to**, the hidden items to **Show**, and **Reset layout**.
+The right button on empty space opens the same list of hidden items, to bring
+one back there. Escape or a click outside closes the menu. Clickable items,
+such as the branch, keep their actions after moving.
+
 | Item | Says |
 |---|---|
 | `project` | the project's name |
@@ -959,8 +967,8 @@ or `none`. With none, files are changed by the keys and the file finder.
 left alone. **Workspace: Switch layout** opens a searchable list of saved
 layouts; **Default** in that list is the original `layout.json`.
 
-While a named layout is selected, its file is the truth: dragging, panel
-menus and opening or closing docks write into it, **Open layout** opens it,
+While a named layout is selected, its file is the truth: dragging, panel and
+bar menus and opening or closing docks write into it, **Open layout** opens it,
 and saving it by hand applies it. **Reset layout** puts that file aside as
 `<name>.json.old` and gives it the default layout. Switching waits for earlier
 changes to reach their file, so no change ends up in the wrong layout.

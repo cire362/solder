@@ -32,7 +32,7 @@ use crate::{
     go_to_line::GoToLine as GoToLineDelegate,
     inline_edit::{InlineEdit, InlineEditEvent},
     key_layout_picker::{KeyLayoutPicker, SwitchKeyLayout},
-    layout::{self, Item, Layout, Panel, Part, Place, TabBar, TabsAt},
+    layout::{self, BarEnd, Item, Layout, Panel, Part, Place, TabBar, TabsAt},
     layout_picker::{LayoutPicker, SwitchLayout},
     locations::{CodeActionPicker, LocationPicker, RenamePrompt},
     lsp_store::{LspStore, from_range},
@@ -277,6 +277,7 @@ pub struct Workspace {
     /// The menu of a dock: where it opened, the dock, and the panel whose
     /// tab was under the pointer, if one was.
     dock_menu: Option<(Point<Pixels>, Place, Option<Panel>)>,
+    bar_menu: Option<(Point<Pixels>, BarEnd, Option<Item>)>,
     /// The panel whose tab is being dragged. A closed dock has a place to
     /// drop it on for as long as it is.
     dragging: Option<Panel>,
@@ -287,7 +288,7 @@ pub struct Workspace {
     _hud_tick: Task<()>,
 }
 
-/// What an item of a dock's menu does.
+/// What an item of a layout menu does.
 type MenuRun = Box<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
 
 /// A panel's tab while it is dragged to another place.
@@ -296,6 +297,29 @@ struct DraggedPanel(Panel);
 
 /// What follows the pointer then.
 struct DraggedTab(Panel);
+
+#[derive(Clone, Copy)]
+struct DraggedItem(Item);
+
+struct DraggedBarItem(Item);
+
+impl Render for DraggedBarItem {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .h(crate::theme::row(px(24.), cx))
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded(theme.shape.control)
+            .bg(theme.bg_elev)
+            .border(theme.shape.border)
+            .border_color(theme.line)
+            .text_size(UI_FONT_SIZE)
+            .text_color(theme.fg)
+            .child(self.0.label())
+    }
+}
 
 impl Render for DraggedTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -667,6 +691,7 @@ impl Workspace {
             layout_selection: layout::selection(cx),
             resizing: None,
             dock_menu: None,
+            bar_menu: None,
             dragging: None,
             modal: None,
             terminals: Vec::new(),
@@ -1609,6 +1634,7 @@ impl Workspace {
     /// The window as it comes: the layout, and what the docks show.
     fn reset_layout(&mut self, _: &ResetLayout, window: &mut Window, cx: &mut Context<Self>) {
         self.dock_menu = None;
+        self.bar_menu = None;
         layout::reset(cx);
         for place in Place::ALL {
             *self.dock(place) = Layout::get(cx).open_in(place);
@@ -1638,6 +1664,7 @@ impl Workspace {
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                     this.dock_menu = Some((event.position, place, Some(panel)));
+                    this.bar_menu = None;
                     // The row of tabs would open its own, with no panel.
                     cx.stop_propagation();
                     cx.notify();
@@ -1691,34 +1718,83 @@ impl Workspace {
             .into_any_element()
     }
 
+    fn menu_item(id: String, label: String, run: MenuRun, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let selector = id.clone();
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || selector.clone())
+            .h(crate::theme::row(px(26.), cx))
+            .flex_none()
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded(theme.shape.token)
+            .text_size(UI_FONT_SIZE)
+            .text_color(theme.fg)
+            .hover(|d| d.bg(theme.accent_soft))
+            .child(label)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.dock_menu = None;
+                this.bar_menu = None;
+                run(this, window, cx);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    fn menu_surface(
+        position: Point<Pixels>,
+        items: Vec<AnyElement>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        deferred(
+            anchored().position(position).snap_to_window().child(
+                div()
+                    .id("layout-menu")
+                    .occlude()
+                    .w(crate::theme::text(240.))
+                    .max_h(window.viewport_size().height)
+                    .overflow_y_scroll()
+                    .p_1()
+                    .flex()
+                    .flex_col()
+                    .bg(theme.bg_elev)
+                    .border(theme.shape.border)
+                    .border_color(theme.line)
+                    .rounded(theme.shape.control)
+                    .shadow_lg()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.dock_menu = None;
+                        this.bar_menu = None;
+                        cx.notify();
+                    }))
+                    .children(items),
+            ),
+        )
+    }
+
     /// The menu of a dock: what can be done with the tab it was opened
     /// on, and the hidden panels, to bring one back into this dock.
-    fn render_dock_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn render_dock_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         let (position, place, panel) = self.dock_menu?;
         let theme = cx.theme().clone();
         let layout = Layout::get(cx).clone();
-        let item = |id: String, label: String, cx: &mut Context<Self>, run: MenuRun| {
-            let selector = id.clone();
+        let item =
+            |id, label, cx: &mut Context<Self>, run: MenuRun| Self::menu_item(id, label, run, cx);
+        let separator = || {
             div()
-                .id(SharedString::from(id))
-                .debug_selector(move || selector.clone())
-                .h(px(26.))
-                .px_2()
-                .flex()
-                .items_center()
-                .rounded(theme.shape.token)
-                .text_size(UI_FONT_SIZE)
-                .text_color(theme.fg)
-                .hover(|d| d.bg(theme.accent_soft))
-                .child(label)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.dock_menu = None;
-                    run(this, window, cx);
-                    cx.notify();
-                }))
+                .my_1()
+                .h(theme.shape.border)
+                .bg(theme.line)
                 .into_any_element()
         };
-        let separator = || div().my_1().h(px(1.)).bg(theme.line).into_any_element();
         let mut items: Vec<AnyElement> = Vec::new();
         if let Some(panel) = panel {
             if layout.place(panel).is_some() {
@@ -1760,26 +1836,64 @@ impl Workspace {
             cx,
             Box::new(|this, window, cx| this.reset_layout(&ResetLayout, window, cx)),
         ));
-        Some(deferred(
-            anchored().position(position).child(
-                div()
-                    .occlude()
-                    .w(px(200.))
-                    .p_1()
-                    .flex()
-                    .flex_col()
-                    .bg(theme.bg_elev)
-                    .border(theme.shape.border)
-                    .border_color(theme.line)
-                    .rounded(theme.shape.control)
-                    .shadow_lg()
-                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                        this.dock_menu = None;
-                        cx.notify();
-                    }))
-                    .children(items),
-            ),
-        ))
+        Some(Self::menu_surface(position, items, window, cx))
+    }
+
+    fn render_bar_menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (position, end, selected) = self.bar_menu?;
+        let theme = cx.theme().clone();
+        let layout = Layout::get(cx).clone();
+        let separator = || {
+            div()
+                .my_1()
+                .h(theme.shape.border)
+                .bg(theme.line)
+                .into_any_element()
+        };
+        let mut items = Vec::new();
+        if let Some(item) = selected {
+            items.push(Self::menu_item(
+                "bar-menu-hide".into(),
+                format!("Hide {}", item.label()),
+                Box::new(move |_, _, cx| {
+                    layout::put(Layout::get(cx).clone().hiding_item(item), cx);
+                }),
+                cx,
+            ));
+            for to in BarEnd::ALL {
+                if layout.item_place(item) != Some(to) {
+                    items.push(Self::menu_item(
+                        format!("bar-menu-move-{}", to.id()),
+                        format!("Move to {}", to.label()),
+                        Box::new(move |_, _, cx| {
+                            layout::put(Layout::get(cx).clone().moved_item(item, to, None), cx);
+                        }),
+                        cx,
+                    ));
+                }
+            }
+            items.push(separator());
+        }
+        for hidden in Item::ALL {
+            if layout.item_place(hidden).is_none() {
+                items.push(Self::menu_item(
+                    format!("bar-menu-show-{}", hidden.id()),
+                    format!("Show {}", hidden.label()),
+                    Box::new(move |_, _, cx| {
+                        layout::put(Layout::get(cx).clone().moved_item(hidden, end, None), cx);
+                    }),
+                    cx,
+                ));
+            }
+        }
+        items.push(separator());
+        items.push(Self::menu_item(
+            "bar-menu-reset".into(),
+            "Reset layout".into(),
+            Box::new(|this, window, cx| this.reset_layout(&ResetLayout, window, cx)),
+            cx,
+        ));
+        Some(Self::menu_surface(position, items, window, cx))
     }
 
     /// The dock a panel shows in.
@@ -1868,6 +1982,10 @@ impl Workspace {
         let selection = layout::selection(cx);
         let switched = self.layout_selection != selection;
         self.layout_selection = selection;
+        if switched {
+            self.dock_menu = None;
+            self.bar_menu = None;
+        }
         let before = [self.left, self.right, self.bottom];
         for (index, place) in Place::ALL.into_iter().enumerate() {
             let now = if switched || layout.open.is_some() {
@@ -3996,6 +4114,7 @@ impl Workspace {
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                             this.dock_menu = Some((event.position, place, None));
+                            this.bar_menu = None;
                             cx.notify();
                         }),
                     )
@@ -4062,8 +4181,8 @@ impl Workspace {
     fn bar_item(&self, item: Item, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let theme = cx.theme().clone();
         let says = |text: String| div().child(text).into_any_element();
-        // An item that does something. A press on it stays with it: on
-        // the title bar it would take hold of the window.
+        // The wrapper of the whole item keeps the window from being
+        // dragged, while these parts keep their own click actions.
         let does = |id: (&'static str, usize),
                     text: String,
                     color: gpui::Hsla,
@@ -4075,7 +4194,6 @@ impl Workspace {
                 .text_color(color)
                 .hover(|d| d.bg(theme.line).text_color(theme.fg))
                 .child(text)
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
                 .into_any_element()
         };
@@ -4241,34 +4359,94 @@ impl Workspace {
         }
     }
 
-    /// The items of one end of a bar that have something to say now.
-    fn bar_end(&self, items: &[Item], cx: &mut Context<Self>) -> Vec<AnyElement> {
-        items
+    /// Items are dropped before the one under the pointer. Even an empty
+    /// end has room to append one or to bring one back through its menu.
+    fn bar_end(&self, end: BarEnd, items: &[Item], cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let children: Vec<_> = items
             .iter()
             .filter_map(|item| {
                 let item = *item;
                 let parts = self.bar_item(item, cx);
                 (!parts.is_empty()).then(|| {
                     div()
+                        .id(("bar-item", item as usize))
                         .debug_selector(move || format!("item-{}", item.id()))
+                        // Native title-bar hit testing must stop here too.
+                        .occlude()
                         .flex()
                         .items_center()
                         .gap_4()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.dock_menu = None;
+                                this.bar_menu = Some((event.position, end, Some(item)));
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        )
+                        .on_drag(DraggedItem(item), |dragged, _, _, cx| {
+                            cx.new(|_| DraggedBarItem(dragged.0))
+                        })
+                        .drag_over::<DraggedItem>(move |style, dragged, _, _| {
+                            if dragged.0 == item {
+                                style
+                            } else {
+                                style.bg(theme.accent_soft)
+                            }
+                        })
+                        .on_drop(cx.listener(move |_, dragged: &DraggedItem, _, cx| {
+                            layout::put(
+                                Layout::get(cx)
+                                    .clone()
+                                    .moved_item(dragged.0, end, Some(item)),
+                                cx,
+                            );
+                        }))
                         .children(parts)
                         .into_any_element()
                 })
             })
-            .collect()
+            .collect();
+        // Config errors stay visible even when their own layout is empty.
+        let error = (end == BarEnd::StatusLeft)
+            .then(|| {
+                cx.try_global::<settings::ConfigErrors>()
+                    .and_then(|e| e.0.first().cloned())
+            })
+            .flatten();
+        div()
+            .id(("bar-end", end as usize))
+            .debug_selector(move || format!("bar-{}", end.id()))
+            .flex_grow()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .items_center()
+            .gap_4()
+            .when(end.is_right(), |d| d.justify_end())
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.dock_menu = None;
+                    this.bar_menu = Some((event.position, end, None));
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .drag_over::<DraggedItem>(move |style, _, _, _| style.bg(theme.accent_soft))
+            .on_drop(cx.listener(move |_, dragged: &DraggedItem, _, cx| {
+                layout::put(Layout::get(cx).clone().moved_item(dragged.0, end, None), cx);
+            }))
+            .children(children)
+            .children(error.map(|e| div().truncate().text_color(theme.error).child(e)))
     }
 
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let bar = Layout::get(cx).status_bar.clone();
-        // A mistake in a config file is said here whatever the bar holds:
-        // the bar's own items are in one of those files.
-        let config_error = cx
-            .try_global::<settings::ConfigErrors>()
-            .and_then(|e| e.0.first().cloned());
         div()
             .h(px(bar.height))
             .debug_selector(|| "status-bar".into())
@@ -4282,23 +4460,8 @@ impl Workspace {
             .bg(theme.bg_sunken)
             .text_size(crate::theme::text(11.5))
             .text_color(theme.fg_subtle)
-            .child(
-                div()
-                    .flex()
-                    .gap_4()
-                    .min_w_0()
-                    .children(self.bar_end(bar.left(), cx))
-                    .children(
-                        config_error.map(|e| div().truncate().text_color(theme.error).child(e)),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .gap_4()
-                    .children(self.bar_end(bar.right(), cx)),
-            )
+            .child(self.bar_end(BarEnd::StatusLeft, bar.left(), cx))
+            .child(self.bar_end(BarEnd::StatusRight, bar.right(), cx))
     }
 
     fn render_empty(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4421,6 +4584,16 @@ impl Render for Workspace {
         div()
             .id("workspace")
             .key_context("Workspace")
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape"
+                    && (this.bar_menu.is_some() || this.dock_menu.is_some())
+                {
+                    this.bar_menu = None;
+                    this.dock_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::next_tab))
@@ -4520,21 +4693,8 @@ impl Render for Workspace {
                             window.start_window_move();
                         }
                     })
-                    .child(
-                        div()
-                            .flex()
-                            .gap_4()
-                            .min_w_0()
-                            .children(self.bar_end(title_bar.left(), cx)),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .gap_4()
-                            .children(self.bar_end(title_bar.right(), cx)),
-                    ),
+                    .child(self.bar_end(BarEnd::TitleLeft, title_bar.left(), cx))
+                    .child(self.bar_end(BarEnd::TitleRight, title_bar.right(), cx)),
             )
             .child(
                 div()
@@ -4555,7 +4715,8 @@ impl Render for Workspace {
                 self.bottom
                     .map(|tab| self.render_dock(Place::Bottom, tab, cx)),
             )
-            .children(self.render_dock_menu(cx))
+            .children(self.render_dock_menu(window, cx))
+            .children(self.render_bar_menu(window, cx))
             .child(self.render_status(cx))
             .children(self.resize_handles(cx))
             .on_mouse_move(cx.listener(Self::resize_move))
@@ -11760,6 +11921,151 @@ brackets = [
         assert_eq!(body.top(), title.bottom());
         assert_eq!(body.bottom(), status.top());
         assert!(cx.read(|cx| Layout::get(cx).status_bar.left().contains(&Item::Position)));
+    }
+
+    #[gpui::test]
+    fn bar_items_are_dragged_and_restored_in_the_selected_layout(cx: &mut TestAppContext) {
+        use BarEnd::*;
+        use Item::*;
+        cx.executor().allow_parking();
+        let root = git_fixture("ws-bar-hand");
+        let config = db::testing::dir("ws-bar-hand-config");
+        let common = config.join("layout.json");
+        let original = "// default stays here\n{}\n";
+        std::fs::write(&common, original).unwrap();
+        std::fs::create_dir_all(config.join("layouts")).unwrap();
+        let named = config.join("layouts/Review.json");
+        std::fs::write(
+            &named,
+            r#"// review
+        {
+          "title_bar": { "left": ["project"], "right": [] },
+          "status_bar": { "left": ["position", "indent", "language", "problems"], "right": [] },
+          "tab_bar": { "place": "bottom" }
+        }"#,
+        )
+        .unwrap();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(root.join("a.txt")), "one\ntwo\n", None, window, cx)
+        });
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        cx.dispatch_action(SwitchLayout {
+            name: Some("Review".into()),
+        });
+        wait_for(cx, "Review selected", &|cx| {
+            layout::active(cx).as_deref() == Some("Review")
+        });
+        wait_for(cx, "the branch", &|cx| {
+            ws.read(cx).git.read(cx).status().branch.is_some()
+        });
+        let none = gpui::Modifiers::default();
+        let at = |cx: &mut VisualTestContext, selector: &'static str| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            bounds_soon(cx, selector).center()
+        };
+        let open = |cx: &mut VisualTestContext, selector: &'static str| {
+            let point = at(cx, selector);
+            cx.simulate_mouse_down(point, MouseButton::Right, none);
+            cx.simulate_mouse_up(point, MouseButton::Right, none);
+            cx.run_until_parked();
+        };
+        let menu = |cx: &mut VisualTestContext, selector: &'static str, option: &'static str| {
+            open(cx, selector);
+            let point = at(cx, option);
+            cx.simulate_click(point, none);
+            cx.run_until_parked();
+        };
+        let drag = |cx: &mut VisualTestContext, from: &'static str, to: &'static str| {
+            let from = at(cx, from);
+            cx.simulate_mouse_down(from, MouseButton::Left, none);
+            cx.simulate_mouse_move(from + gpui::point(px(6.), px(0.)), MouseButton::Left, none);
+            let to = at(cx, to);
+            cx.simulate_mouse_move(to, MouseButton::Left, none);
+            cx.simulate_mouse_up(to, MouseButton::Left, none);
+            cx.run_until_parked();
+        };
+        let layout = |cx: &mut VisualTestContext| cx.read(|cx| Layout::get(cx).clone());
+
+        menu(cx, "item-position", "bar-menu-move-title-right");
+        assert_eq!(layout(cx).item_place(Position), Some(TitleRight));
+        menu(cx, "item-project", "bar-menu-hide");
+        assert_eq!(layout(cx).item_place(Project), None);
+        assert!(cx.read(|cx| ws.read(cx).bar_menu.is_none()));
+        // The now empty end still has a menu and can bring it back.
+        menu(cx, "bar-title-left", "bar-menu-show-project");
+        assert_eq!(layout(cx).items(TitleLeft), [Project]);
+        menu(cx, "item-language", "bar-menu-move-status-right");
+        assert_eq!(layout(cx).items(StatusRight), [Language]);
+
+        drag(cx, "item-project", "item-position");
+        assert_eq!(layout(cx).items(TitleRight), [Project, Position]);
+        drag(cx, "item-position", "bar-status-left");
+        assert_eq!(layout(cx).items(StatusLeft), [Indent, Problems, Position]);
+        drag(cx, "item-indent", "bar-title-left");
+        assert_eq!(layout(cx).items(TitleLeft), [Indent]);
+        drag(cx, "item-language", "item-position");
+        assert_eq!(layout(cx).items(StatusLeft), [Problems, Language, Position]);
+        assert!(layout(cx).items(StatusRight).is_empty());
+        let before = layout(cx);
+        drag(cx, "item-project", "item-project");
+        assert_eq!(layout(cx), before);
+        assert_eq!(layout(cx).item_place(Problems), Some(StatusLeft));
+        assert!(ws.update(cx, |w, cx| w.bar_item(Problems, cx).is_empty()));
+
+        open(cx, "item-indent");
+        cx.simulate_keystrokes("escape");
+        assert!(cx.read(|cx| ws.read(cx).bar_menu.is_none()));
+        open(cx, "bar-status-right");
+        let outside = at(cx, "pane-body-0");
+        cx.simulate_click(outside, none);
+        assert!(cx.read(|cx| ws.read(cx).bar_menu.is_none()));
+        // A clickable item keeps its action after moving and does not
+        // open its picker while it is being dragged instead.
+        menu(cx, "bar-status-right", "bar-menu-show-branch");
+        drag(cx, "item-branch", "bar-title-left");
+        assert_eq!(layout(cx).items(TitleLeft), [Indent, Branch]);
+        drag(cx, "item-branch", "item-indent");
+        assert_eq!(layout(cx).items(TitleLeft), [Branch, Indent]);
+        let before = layout(cx);
+        drag(cx, "item-branch", "pane-body-0");
+        assert_eq!(layout(cx), before);
+        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+        let branch = at(cx, "item-branch");
+        cx.simulate_click(branch, none);
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        cx.simulate_keystrokes("escape");
+
+        // Both bars were edited quickly. Every write reaches the named
+        // file, leaving the tab placement and the Default file alone.
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if std::fs::read_to_string(&named)
+                .is_ok_and(|s| layout::parse(&s).is_ok_and(|read| read == layout(cx)))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let saved = std::fs::read_to_string(&named).unwrap();
+        assert_eq!(layout::parse(&saved).unwrap(), layout(cx));
+        assert!(saved.contains("// review"));
+        assert_eq!(layout(cx).tab_bar.place, TabsAt::Bottom);
+        assert_eq!(std::fs::read_to_string(&common).unwrap(), original);
+        open(cx, "item-branch");
+        cx.dispatch_action(SwitchLayout {
+            name: Some(layout::DEFAULT_NAME.into()),
+        });
+        wait_for(cx, "Default selected", &|cx| layout::active(cx).is_none());
+        assert!(cx.read(|cx| ws.read(cx).bar_menu.is_none()));
+        cx.dispatch_action(SwitchLayout {
+            name: Some("Review".into()),
+        });
+        wait_for(cx, "Review restored", &|cx| {
+            layout::active(cx).as_deref() == Some("Review")
+        });
+        assert_eq!(layout(cx), layout::parse(&saved).unwrap());
     }
 
     #[gpui::test]

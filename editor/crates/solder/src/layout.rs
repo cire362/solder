@@ -239,6 +239,36 @@ pub enum Item {
 }
 
 impl Item {
+    pub const ALL: [Item; 11] = [
+        Item::Project,
+        Item::File,
+        Item::Branch,
+        Item::Position,
+        Item::Indent,
+        Item::Language,
+        Item::Problems,
+        Item::Activity,
+        Item::Connection,
+        Item::Plugins,
+        Item::Performance,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Item::Project => "Project",
+            Item::File => "File",
+            Item::Branch => "Branch",
+            Item::Position => "Position",
+            Item::Indent => "Indent",
+            Item::Language => "Language",
+            Item::Problems => "Problems",
+            Item::Activity => "Activity",
+            Item::Connection => "Connection",
+            Item::Plugins => "Plugins",
+            Item::Performance => "Performance",
+        }
+    }
+
     /// Its name in the file, and in the names tests find it by.
     pub fn id(self) -> &'static str {
         match self {
@@ -254,6 +284,46 @@ impl Item {
             Item::Plugins => "plugins",
             Item::Performance => "performance",
         }
+    }
+}
+
+/// One of the four lists an item can be moved into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarEnd {
+    TitleLeft,
+    TitleRight,
+    StatusLeft,
+    StatusRight,
+}
+
+impl BarEnd {
+    pub const ALL: [BarEnd; 4] = [
+        BarEnd::TitleLeft,
+        BarEnd::TitleRight,
+        BarEnd::StatusLeft,
+        BarEnd::StatusRight,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::TitleLeft => "title-left",
+            Self::TitleRight => "title-right",
+            Self::StatusLeft => "status-left",
+            Self::StatusRight => "status-right",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TitleLeft => "title bar, left",
+            Self::TitleRight => "title bar, right",
+            Self::StatusLeft => "status bar, left",
+            Self::StatusRight => "status bar, right",
+        }
+    }
+
+    pub fn is_right(self) -> bool {
+        matches!(self, Self::TitleRight | Self::StatusRight)
     }
 }
 
@@ -595,6 +665,54 @@ impl Layout {
         ]
     }
 
+    pub fn items(&self, end: BarEnd) -> &[Item] {
+        match end {
+            BarEnd::TitleLeft => self.title_bar.left(),
+            BarEnd::TitleRight => self.title_bar.right(),
+            BarEnd::StatusLeft => self.status_bar.left(),
+            BarEnd::StatusRight => self.status_bar.right(),
+        }
+    }
+
+    pub fn item_place(&self, item: Item) -> Option<BarEnd> {
+        BarEnd::ALL
+            .into_iter()
+            .find(|end| self.items(*end).contains(&item))
+    }
+
+    fn items_mut(&mut self, end: BarEnd) -> &mut Vec<Item> {
+        let items = match end {
+            BarEnd::TitleLeft => &mut self.title_bar.left,
+            BarEnd::TitleRight => &mut self.title_bar.right,
+            BarEnd::StatusLeft => &mut self.status_bar.left,
+            BarEnd::StatusRight => &mut self.status_bar.right,
+        };
+        items.get_or_insert_default()
+    }
+
+    /// Materialize defaults before removing an item, so it cannot come
+    /// back through a list the file had left implicit.
+    pub fn hiding_item(self, item: Item) -> Self {
+        let mut layout = self.fitted();
+        for end in BarEnd::ALL {
+            layout.items_mut(end).retain(|other| *other != item);
+        }
+        layout
+    }
+
+    pub fn moved_item(self, item: Item, to: BarEnd, before: Option<Item>) -> Self {
+        if before == Some(item) {
+            return self;
+        }
+        let mut layout = self.hiding_item(item);
+        let items = layout.items_mut(to);
+        let at = before
+            .and_then(|before| items.iter().position(|other| *other == before))
+            .unwrap_or(items.len());
+        items.insert(at, item);
+        layout
+    }
+
     fn panels_mut(&mut self, place: Place) -> &mut Vec<Panel> {
         match place {
             Place::Left => &mut self.left.panels,
@@ -854,6 +972,15 @@ pub fn put(layout: Layout, cx: &mut App) {
     }
     if layout.open != old.open {
         changed.push(("open", serde_json::to_value(&layout.open)));
+    }
+    if layout.title_bar != old.title_bar {
+        changed.push(("title_bar", serde_json::to_value(&layout.title_bar)));
+    }
+    if layout.status_bar != old.status_bar {
+        changed.push(("status_bar", serde_json::to_value(&layout.status_bar)));
+    }
+    if layout.tab_bar != old.tab_bar {
+        changed.push(("tab_bar", serde_json::to_value(layout.tab_bar)));
     }
     cx.set_global(layout);
     for (key, value) in changed {
@@ -1297,6 +1424,55 @@ mod tests {
             error.starts_with("layout.json") && error.contains("clock"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn bar_items_move_between_ends_without_returning_through_defaults() {
+        use BarEnd::*;
+        use Item::*;
+        let layout = parse(r#"{"title_bar":{"height":46},"status_bar":{"height":32}}"#).unwrap();
+        let hidden = layout.clone().hiding_item(Position).hiding_item(Project);
+        assert_eq!(hidden.item_place(Position), None);
+        assert_eq!(hidden.item_place(Project), None);
+        assert_eq!(parse(&file(&hidden)).unwrap(), hidden);
+
+        let moved = hidden
+            .moved_item(Project, StatusRight, None)
+            .moved_item(Language, TitleLeft, None)
+            .moved_item(File, TitleRight, None)
+            .moved_item(Position, StatusLeft, Some(Indent));
+        assert_eq!(moved.title_bar.left(), [Language]);
+        assert_eq!(moved.title_bar.right(), [File]);
+        assert_eq!(moved.status_bar.right(), [Plugins, Performance, Project]);
+        assert_eq!(
+            moved.status_bar.left(),
+            [Position, Indent, Problems, Activity, Connection]
+        );
+        assert_eq!(moved.title_bar.height, 46.);
+        assert_eq!(moved.status_bar.height, 32.);
+        assert_eq!(parse(&file(&moved)).unwrap(), moved);
+        assert_eq!(
+            moved.clone().moved_item(File, TitleRight, Some(File)),
+            moved
+        );
+        let moved = moved.moved_item(Project, TitleRight, Some(File));
+        assert_eq!(moved.title_bar.right(), [Project, File]);
+        // A stale insertion point is harmless: append instead.
+        let moved = moved.moved_item(File, TitleRight, Some(Branch));
+        assert_eq!(moved.title_bar.right(), [Project, File]);
+        for item in Item::ALL {
+            assert!(
+                BarEnd::ALL
+                    .into_iter()
+                    .map(|end| moved
+                        .items(end)
+                        .iter()
+                        .filter(|other| **other == item)
+                        .count())
+                    .sum::<usize>()
+                    <= 1
+            );
+        }
     }
 
     #[test]
