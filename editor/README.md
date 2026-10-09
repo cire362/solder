@@ -959,6 +959,12 @@ An item with nothing to say now is not drawn. `file` and `branch` are on no bar
 until the file puts them on one. A mistake in a config file is always said in
 the status bar, whatever it holds.
 
+Panel tabs, bar items and common command buttons have Phosphor icons next to
+their labels. The regular SVGs are embedded in the app under the MIT license;
+they need no icon files or network connection at run time. They use the text
+color of their control and scale with `ui_font_size`. File icons still come
+from the extension icon theme selected with `icon_theme`.
+
 `place` of `tab_bar` is where the tabs of the open files are: `top`, `bottom`
 or `none`. With none, files are changed by the keys and the file finder.
 

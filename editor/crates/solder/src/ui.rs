@@ -64,6 +64,8 @@ pub fn button(
     theme: &Theme,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> Stateful<Div> {
+    let label = label.into();
+    let icon = crate::icons::button(&label);
     let (bg, fg): (Hsla, Hsla) = if primary {
         (theme.accent, theme.accent_fg)
     } else {
@@ -77,6 +79,7 @@ pub fn button(
         .flex()
         .items_center()
         .justify_center()
+        .gap_1p5()
         .rounded(theme.shape.control)
         .border(theme.shape.border)
         .border_color(theme.line)
@@ -85,6 +88,7 @@ pub fn button(
         .text_color(fg)
         .hover(|d| d.opacity(0.9))
         .active(|d| d.opacity(0.8))
-        .child(label.into())
+        .children(icon.map(crate::icons::draw))
+        .child(label)
         .on_click(on_click)
 }

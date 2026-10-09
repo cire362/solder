@@ -257,8 +257,8 @@ panels move by hand too. Layouts have names and are remembered per project.
 The interface font, size and density are settings, and every color, corner
 radius and border width is a theme token. Key layouts have names too, with
 the user's own bindings (`keymap.json`) on top.
-The only icons are those of files, from a Zed extension's icon theme;
-buttons and panels are still words.
+Phosphor icons are embedded for buttons, panels and bars. File icons come
+from a Zed extension's icon theme.
 
 How it is built: `layout.json`, next to `settings.json`, is the truth and is
 read again when it is saved. Whatever is done by hand in the window (a border
@@ -322,9 +322,11 @@ file, so the two never disagree. It starts after the Zed items of phase 8.
       `settings.json` on top of the theme in use (`theme_overrides`)
 
 ### Icons
-- [ ] A set of icons of Solder's own for buttons, panels and the bars
+- [x] A set of icons of Solder's own for buttons, panels and the bars
       (Phosphor, MIT, drawn from files kept in the app, so nothing is
-      downloaded)
+      downloaded). Forty-four regular SVGs are embedded, inherit the text
+      color and scale with the interface font; panel tabs, bar items and
+      common command buttons use them
 - [~] File icons in the tree and on tabs from the icon themes of Zed and
       VS Code extensions (the items of phase 8), chosen in `settings.json`.
       Zed's are in; VS Code's are not yet

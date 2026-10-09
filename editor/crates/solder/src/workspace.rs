@@ -317,6 +317,8 @@ impl Render for DraggedBarItem {
             .border_color(theme.line)
             .text_size(UI_FONT_SIZE)
             .text_color(theme.fg)
+            .gap_1p5()
+            .child(crate::icons::draw(crate::icons::item(self.0)))
             .child(self.0.label())
     }
 }
@@ -335,6 +337,8 @@ impl Render for DraggedTab {
             .border_color(theme.line)
             .text_size(UI_FONT_SIZE)
             .text_color(theme.fg)
+            .gap_1p5()
+            .child(crate::icons::draw(crate::icons::panel(self.0)))
             .child(self.0.label())
     }
 }
@@ -2869,6 +2873,7 @@ impl Workspace {
             .when(paused, |d| {
                 d.child(div().size(px(6.)).rounded(px(3.)).bg(theme.warning))
             })
+            .child(crate::icons::draw(crate::icons::panel(Panel::Debug)))
             .child("Debug")
             .child(
                 div()
@@ -3030,6 +3035,7 @@ impl Workspace {
                         }
                         cx.notify();
                     }))
+                    .child(crate::icons::draw(crate::icons::panel(Panel::Terminal)))
                     .child({
                         let t = terminal.read(cx);
                         match (t.exited, t.exit_code) {
@@ -3103,6 +3109,7 @@ impl Workspace {
                 window.focus(&this.results.focus_handle(cx));
                 cx.notify();
             }))
+            .child(crate::icons::draw(crate::icons::panel(Panel::Results)))
             .child("Results")
             .child(
                 div()
@@ -3145,6 +3152,7 @@ impl Workspace {
                 window.focus(&this.response.focus_handle(cx));
                 cx.notify();
             }))
+            .child(crate::icons::draw(crate::icons::panel(Panel::Response)))
             .child("Response")
             .child(
                 div()
@@ -4040,11 +4048,13 @@ impl Workspace {
                         .px_1()
                         .flex()
                         .items_center()
+                        .gap_1p5()
                         .rounded(theme.shape.control)
                         .text_size(UI_FONT_SIZE)
                         .text_color(if active { theme.fg } else { theme.fg_subtle })
                         .when(active, |d| d.bg(theme.bg_elev))
                         .hover(|d| d.text_color(theme.fg))
+                        .child(crate::icons::draw(crate::icons::panel(panel)))
                         .child(panel.label())
                         .on_click(cx.listener(move |this, _, window, cx| match panel {
                             Panel::Files => this.show_files(&ShowFiles, window, cx),
@@ -4376,7 +4386,7 @@ impl Workspace {
                         .occlude()
                         .flex()
                         .items_center()
-                        .gap_4()
+                        .gap_1p5()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_mouse_down(
                             MouseButton::Right,
@@ -4405,7 +4415,8 @@ impl Workspace {
                                 cx,
                             );
                         }))
-                        .children(parts)
+                        .child(crate::icons::draw(crate::icons::item(item)))
+                        .child(div().flex().items_center().gap_4().children(parts))
                         .into_any_element()
                 })
             })
