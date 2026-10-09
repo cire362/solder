@@ -64,6 +64,7 @@ mod services;
 mod services_panel;
 mod settings;
 mod structure;
+mod symbols;
 mod terminal;
 mod theme;
 mod ui;

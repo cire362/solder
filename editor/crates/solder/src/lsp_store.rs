@@ -219,6 +219,8 @@ fn supports(caps: &lt::ServerCapabilities, method: &str) -> bool {
         "textDocument/signatureHelp" => caps.signature_help_provider.is_some(),
         "textDocument/definition" => yes(&caps.definition_provider),
         "textDocument/references" => yes(&caps.references_provider),
+        "textDocument/documentSymbol" => yes(&caps.document_symbol_provider),
+        "workspace/symbol" => yes(&caps.workspace_symbol_provider),
         "textDocument/rename" => yes(&caps.rename_provider),
         "textDocument/formatting" => yes(&caps.document_formatting_provider),
         "textDocument/codeAction" => !matches!(
@@ -1295,6 +1297,64 @@ impl LspStore {
                 };
                 let request = server.request::<R>(params(id, encoding, buffer)).boxed();
                 (name, encoding, request)
+            })
+            .collect()
+    }
+
+    /// Asks for the symbols of `document`: the first of its servers that
+    /// lists them, by name, since the extension that brought it may have
+    /// a way to paint them. `None` when none does.
+    pub fn document_symbols(
+        &self,
+        document: &Entity<Document>,
+    ) -> Option<Asked<lt::request::DocumentSymbolRequest>> {
+        let entry = self.docs.get(&document.entity_id())?;
+        let (name, server) = self.opened(entry).find(|(_, server)| {
+            // Said outright: a server that says nothing of it has none.
+            server.capabilities().document_symbol_provider.is_some()
+                && supports(&server.capabilities(), "textDocument/documentSymbol")
+        })?;
+        let params = lt::DocumentSymbolParams {
+            text_document: lt::TextDocumentIdentifier {
+                uri: entry.uri.clone(),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let request = server
+            .request::<lt::request::DocumentSymbolRequest>(params)
+            .boxed();
+        Some((name, server.encoding(), request))
+    }
+
+    /// Asks every running server of the project in `root` that lists the
+    /// project's symbols for the ones that match `query`.
+    pub fn workspace_symbols(
+        &self,
+        root: &Path,
+        query: &str,
+    ) -> Vec<Asked<lt::request::WorkspaceSymbolRequest>> {
+        self.servers
+            .iter()
+            .filter(|(key, _)| key.root.starts_with(root) || root.starts_with(&key.root))
+            .filter_map(|(key, state)| {
+                let ServerState::Running { server, .. } = state else {
+                    return None;
+                };
+                let caps = server.capabilities();
+                if caps.workspace_symbol_provider.is_none() || !supports(&caps, "workspace/symbol")
+                {
+                    return None;
+                }
+                let params = lt::WorkspaceSymbolParams {
+                    query: query.to_string(),
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                };
+                let request = server
+                    .request::<lt::request::WorkspaceSymbolRequest>(params)
+                    .boxed();
+                Some((key.name, server.encoding(), request))
             })
             .collect()
     }

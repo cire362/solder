@@ -827,6 +827,15 @@ An extension may also paint the completions of its server: Vue's shows a
 property as a tag followed by its detail. Its answer is colored as code in
 the file's language, and what you type is matched against the name in it.
 
+The same goes for symbols. `cmd-shift-o` lists what the file in front
+declares and `cmd-t` what the project does, to go to one by typing its name;
+a name typed exactly comes first. They are the language server's lists: the
+file's with what each symbol is inside of, the project's asked again as you
+type, with the file and line of each. An extension paints them as it paints
+completions (Ruby's colors the name of a class as a class is colored). A
+file whose language has no server that lists symbols still has its list,
+from the language's own outline.
+
 A file can have several servers: the one Solder knows for its language and
 every one that installed extensions bring for it. Their diagnostics show
 together, their completions make one menu and their code actions one list;

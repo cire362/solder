@@ -79,6 +79,8 @@ actions!(
         OpenKeyLayout,
         ResetLayout,
         UseContextPrompt,
+        GoToSymbol,
+        GoToProjectSymbol,
         SplitRight,
         FocusNextPane,
         FocusPrevPane,
@@ -119,6 +121,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-p", ToggleCommandPalette, None),
         KeyBinding::new("f1", ToggleCommandPalette, None),
         KeyBinding::new("secondary-p", ToggleFileFinder, None),
+        KeyBinding::new("secondary-shift-o", GoToSymbol, None),
+        KeyBinding::new("secondary-t", GoToProjectSymbol, None),
         KeyBinding::new("ctrl-g", GoToLine, Some("Editor")),
         KeyBinding::new("secondary-f", Find, None),
         KeyBinding::new("secondary-alt-f", FindReplace, None),
@@ -2476,6 +2480,42 @@ impl Workspace {
 
     fn show_agent(&mut self, _: &ShowAgent, window: &mut Window, cx: &mut Context<Self>) {
         self.show_right(true, window, cx);
+    }
+
+    /// The symbols of the file in front, to go to one.
+    fn go_to_symbol(&mut self, _: &GoToSymbol, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(document) = self.active_editor().map(|e| e.read(cx).document().clone()) else {
+            return;
+        };
+        let Some((path, source)) = crate::symbols::file_of(&document, cx) else {
+            return;
+        };
+        let asked =
+            LspStore::global(cx).and_then(|store| store.read(cx).document_symbols(&document));
+        let workspace = cx.weak_entity();
+        self.toggle_modal(window, cx, move |window, cx| {
+            let picker = Picker::new(crate::symbols::Symbols::of_file(workspace), window, cx);
+            crate::symbols::Symbols::load_file(asked, path, source, window, cx);
+            picker
+        });
+    }
+
+    /// The symbols of the project, as its language servers find them
+    /// for the name being typed.
+    fn go_to_project_symbol(
+        &mut self,
+        _: &GoToProjectSymbol,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (workspace, root) = (cx.weak_entity(), self.root(cx));
+        self.toggle_modal(window, cx, move |window, cx| {
+            Picker::new(
+                crate::symbols::Symbols::of_project(workspace, root),
+                window,
+                cx,
+            )
+        });
     }
 
     /// Lists the prompts of the context servers, to put one in the
@@ -4865,6 +4905,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_key_layout))
             .on_action(cx.listener(Self::reset_layout))
             .on_action(cx.listener(Self::use_context_prompt))
+            .on_action(cx.listener(Self::go_to_symbol))
+            .on_action(cx.listener(Self::go_to_project_symbol))
             .on_action(cx.listener(Self::split_right))
             .on_action(cx.listener(Self::focus_next_pane))
             .on_action(cx.listener(Self::focus_prev_pane))
@@ -5218,6 +5260,133 @@ mod tests {
         cx.simulate_keystrokes("secondary-w");
         assert_eq!(cx.read(|cx| ws.read(cx).panes.len()), 1);
         assert_eq!(active_text(&ws, cx), ">> abc");
+    }
+
+    #[gpui::test]
+    fn symbols_of_a_file_and_of_the_project_are_listed_to_go_to(cx: &mut TestAppContext) {
+        use crate::symbols::Symbols;
+        let root = fixture("lsp-symbols");
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        let file = root.join("src/main.rs");
+        let other = root.join("src/lib.rs");
+        std::fs::write(&file, "fn helper() {}\n\nfn main() {\n    helper();\n}\n").unwrap();
+        std::fs::write(&other, "// a library\npub fn mainly() {}\n").unwrap();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        // What the list shows, and where the cursor of the file in front is.
+        let shown = |cx: &mut VisualTestContext| -> Vec<(String, String, Option<String>)> {
+            cx.read(|cx| {
+                let modal = ws.read(cx).modal.as_ref()?;
+                let picker = modal.view.clone().downcast::<Picker<Symbols>>().ok()?;
+                Some(picker.read(cx).delegate.shown())
+            })
+            .unwrap_or_default()
+        };
+        let listed = |cx: &mut VisualTestContext, names: &[&str]| {
+            for _ in 0..400 {
+                cx.run_until_parked();
+                let now: Vec<String> = shown(cx).into_iter().map(|row| row.0).collect();
+                if now == names {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the list never showed {names:?}, but {:?}", shown(cx));
+        };
+        let at = |cx: &mut VisualTestContext| {
+            cx.read(|cx| {
+                let editor = ws.read(cx).active_editor().unwrap().read(cx);
+                let (line, column, _) = editor.cursor_position(cx);
+                (editor.path(cx).map(Path::to_path_buf), line, column)
+            })
+        };
+
+        // With no server that lists them (the language's is turned off
+        // here), a file's symbols are the ones its outline finds.
+        cx.update(|_, cx| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "rust-analyzer".into(),
+                settings::ServerOverride {
+                    disabled: true,
+                    ..Default::default()
+                },
+            );
+            cx.set_global(settings);
+        });
+        ws.update_in(cx, |w, window, cx| {
+            let content = std::fs::read_to_string(&file).unwrap();
+            w.add_editor(Some(file.clone()), &content, None, window, cx)
+        });
+        cx.simulate_keystrokes("secondary-shift-o");
+        listed(cx, &["helper", "main"]);
+        assert_eq!(shown(cx)[0].1, "fn");
+        cx.simulate_input("mai");
+        listed(cx, &["main"]);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+        assert_eq!(at(cx), (Some(file.clone()), 3, 1));
+
+        // With a server, they are the server's, each with what it is in.
+        cx.update(|_, cx| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "rust-analyzer".into(),
+                settings::ServerOverride {
+                    command: Some("python3".into()),
+                    args: Some(vec![script.display().to_string()]),
+                    ..Default::default()
+                },
+            );
+            cx.set_global(settings);
+        });
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(other.clone(), None, window, cx)
+        });
+        let document = |cx: &App| {
+            ws.read(cx)
+                .active_editor()
+                .unwrap()
+                .read(cx)
+                .document()
+                .clone()
+        };
+        wait_for(cx, "the server", &|cx| {
+            LspStore::global(cx)
+                .is_some_and(|store| store.read(cx).document_symbols(&document(cx)).is_some())
+        });
+        cx.simulate_keystrokes("secondary-shift-o");
+        listed(cx, &["crate", "mainly"]);
+        assert_eq!(shown(cx)[1].1, "crate");
+        cx.simulate_input("mainly");
+        listed(cx, &["mainly"]);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        // The name itself is selected, not the line it is on.
+        assert_eq!(at(cx), (Some(other.clone()), 2, 14));
+
+        // The project's symbols are asked of the servers as the name is
+        // typed, and say which file each is in. Going to one opens it.
+        cx.simulate_keystrokes("secondary-t");
+        cx.simulate_input("mainl");
+        listed(cx, &["mainly"]);
+        assert_eq!(shown(cx)[0].1, "crate  src/lib.rs:2");
+        cx.simulate_keystrokes("escape");
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(file.clone(), None, window, cx)
+        });
+        wait_for(cx, "the first file at the server", &|cx| {
+            LspStore::global(cx)
+                .is_some_and(|store| store.read(cx).document_symbols(&document(cx)).is_some())
+        });
+        cx.simulate_keystrokes("secondary-t");
+        cx.simulate_input("main");
+        listed(cx, &["main", "mainly"]);
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        assert_eq!(at(cx), (Some(other), 2, 14));
     }
 
     /// Runs the real client against `tests/fixtures/mock_lsp.py` over stdio.
@@ -11929,6 +12098,108 @@ brackets = [
         // Nothing said again: Zed's choice.
         choose(cx, None);
         assert_eq!(cx.read(|cx| servers(cx)), ["solargraph"]);
+    }
+
+    #[gpui::test]
+    fn an_extension_paints_the_symbols_its_server_lists(cx: &mut TestAppContext) {
+        use crate::symbols::Symbols;
+        let _languages = extension_languages();
+        // Zed's real Ruby extension, with `solargraph` "on the PATH" as a
+        // script that starts the stand-in server. (The grammar is Vue's:
+        // the test needs a language, not its colors.)
+        let root = db::testing::dir("ws-ruby-symbols").canonicalize().unwrap();
+        let app = root.join("app.rb");
+        std::fs::write(&app, "fn total\nfn tax\n").unwrap();
+        let data = db::testing::dir("ws-ruby-symbols-data");
+        let installed = data.join("extensions/zed/ruby");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        std::fs::create_dir_all(installed.join("grammars")).unwrap();
+        for file in ["extension.toml", "extension.wasm"] {
+            std::fs::copy(
+                fixtures.join("extension/tests/fixtures/ruby").join(file),
+                installed.join(file),
+            )
+            .unwrap();
+        }
+        std::fs::copy(
+            fixtures.join("syntax/tests/fixtures/vue/vue.wasm"),
+            installed.join("grammars/vue.wasm"),
+        )
+        .unwrap();
+        write_file(
+            &installed.join("languages/ruby/config.toml"),
+            "name = \"Ruby\"\ngrammar = \"vue\"\npath_suffixes = [\"rb\"]\n",
+        );
+        let mock = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        let solargraph = db::testing::dir("ws-ruby-symbols-bin").join("solargraph");
+        executable(
+            &solargraph,
+            &format!("#!/bin/sh\nexec python3 '{}'\n", mock.display()),
+        );
+        cx.executor().allow_parking();
+        let extensions = cx.update(|cx| {
+            let extensions = cx.new(|cx| {
+                let mut store =
+                    ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
+                store.world = Some(std::sync::Arc::new(ServerOnPath(
+                    "solargraph",
+                    solargraph.to_string_lossy().into_owned(),
+                )));
+                store
+            });
+            ExtensionStore::set_global(extensions.clone(), cx);
+            extensions.update(cx, |s, cx| s.scan(cx));
+            extensions
+        });
+        let (ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "the extensions folder", &|cx| {
+            extensions.read(cx).loaded
+        });
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(app.clone(), None, window, cx)
+        });
+        let document = |cx: &App| {
+            ws.read(cx)
+                .active_editor()
+                .map(|e| e.read(cx).document().clone())
+        };
+        wait_for(cx, "the extension's server", &|cx| {
+            document(cx).is_some_and(|document| {
+                LspStore::global(cx)
+                    .is_some_and(|store| store.read(cx).document_symbols(&document).is_some())
+            })
+        });
+
+        // The server lists a module and two functions. The extension has
+        // a way to show a module (its name, colored as one is where it
+        // is declared) and none for these functions, which stay as the
+        // server named them.
+        cx.simulate_keystrokes("secondary-shift-o");
+        let shown = |cx: &mut VisualTestContext| -> Vec<(String, String, Option<String>)> {
+            cx.read(|cx| {
+                let modal = ws.read(cx).modal.as_ref()?;
+                let picker = modal.view.clone().downcast::<Picker<Symbols>>().ok()?;
+                Some(picker.read(cx).delegate.shown())
+            })
+            .unwrap_or_default()
+        };
+        for _ in 0..400 {
+            cx.run_until_parked();
+            if shown(cx).first().is_some_and(|row| row.2.is_some()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let rows = shown(cx);
+        let names: Vec<&str> = rows.iter().map(|row| row.0.as_str()).collect();
+        assert_eq!(names, ["crate", "total", "tax"]);
+        assert_eq!(rows[0].2.as_deref(), Some("crate"));
+        assert_eq!((rows[1].2.as_deref(), rows[2].2.as_deref()), (None, None));
+        // The name is still what is typed to find it.
+        cx.simulate_input("crat");
+        cx.run_until_parked();
+        assert_eq!(shown(cx).len(), 1);
+        assert_eq!(shown(cx)[0].2.as_deref(), Some("crate"));
     }
 
     #[gpui::test]

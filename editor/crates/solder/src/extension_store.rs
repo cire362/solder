@@ -17,7 +17,7 @@ use std::{
 use extension::{
     Entry, Event, Extension, Origin, Refusals, Snippet, catalog,
     gate::{Did, Gate},
-    host::{CodeLabel, Completion, DebugAdapter, DebugLaunch, Host, Status, World},
+    host::{CodeLabel, Completion, DebugAdapter, DebugLaunch, Host, Status, Symbol, World},
     install::{self, Progress, Staged},
     world::{SettingsFor, System},
 };
@@ -740,6 +740,33 @@ impl ExtensionStore {
         completions: Vec<Completion>,
         cx: &App,
     ) -> Option<Task<Vec<Option<CodeLabel>>>> {
+        let name = server.to_string();
+        self.painted(server, cx, move |host| {
+            host.labels_for_completions(&name, &completions)
+        })
+    }
+
+    /// The same for the symbols `server` lists.
+    pub fn symbol_labels(
+        &self,
+        server: &str,
+        symbols: Vec<Symbol>,
+        cx: &App,
+    ) -> Option<Task<Vec<Option<CodeLabel>>>> {
+        let name = server.to_string();
+        self.painted(server, cx, move |host| {
+            host.labels_for_symbols(&name, &symbols)
+        })
+    }
+
+    /// Asks the extension that brought `server` for labels, on a thread
+    /// of its own.
+    fn painted(
+        &self,
+        server: &str,
+        cx: &App,
+        ask: impl FnOnce(&Host) -> Option<Result<Vec<Option<CodeLabel>>, String>> + Send + 'static,
+    ) -> Option<Task<Vec<Option<CodeLabel>>>> {
         let extension = self.installed.iter().find(|extension| {
             extension.runs_code()
                 && !self.is_off(extension.origin, &extension.id)
@@ -751,15 +778,11 @@ impl ExtensionStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()?;
-        let server = server.to_string();
         let (tx, rx) = futures::channel::oneshot::channel();
         std::thread::Builder::new()
             .name("solder-extension".into())
             .spawn(move || {
-                let labels = host
-                    .labels_for_completions(&server, &completions)
-                    .and_then(Result::ok)
-                    .unwrap_or_default();
+                let labels = ask(&host).and_then(Result::ok).unwrap_or_default();
                 let _ = tx.send(labels);
             })
             .ok()?;

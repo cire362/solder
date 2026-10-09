@@ -168,8 +168,9 @@ to build them.
 - [x] Completion labels as the extension paints them
       (`labels-for-completions`): colored as code in the file's language,
       with the typed word matched against the part that is the name
-- [ ] Symbol labels (`labels-for-symbols`). The editor has no list of a
-      file's or a project's symbols to paint them in; it comes with one
+- [x] Symbol labels (`labels-for-symbols`), in the lists of a file's and of
+      the project's symbols, which came with them (the first item of
+      "Symbols and problems" in phase 10)
 - [x] The languages Zed builds in and so does not list in its catalog (C,
       C++, Markdown, YAML, shell): built in here too, as grammars in the
       binary, with the servers Zed has for them (clangd, yaml-language-server)
@@ -360,8 +361,10 @@ update. They come after phase 9, in this order unless one is needed sooner.
       to edit opened for reading, with the reason said
 
 ### Symbols and problems
-- [ ] Symbols of the file (`cmd-shift-o`) and of the project (`cmd-t`), from
-      the language server, painted as an extension says (`labels-for-symbols`)
+- [x] Symbols of the file (`cmd-shift-o`) and of the project (`cmd-t`), from
+      the language server, painted as an extension says (`labels-for-symbols`).
+      Done ahead of the rest of the block, to close the item of phase 8. A
+      file with no server that lists them has its language's outline
 - [ ] A Structure panel: the file's outline, from the server or from the
       language's outline query
 - [ ] A Problems panel: every diagnostic of the project, by file

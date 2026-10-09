@@ -416,6 +416,7 @@ fn client_capabilities() -> ClientCapabilities {
             "definition": { "linkSupport": true },
             "typeDefinition": { "linkSupport": true },
             "references": {},
+            "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
             "rename": { "prepareSupport": true },
             "formatting": {},
             "publishDiagnostics": { "relatedInformation": false, "versionSupport": true },
@@ -432,6 +433,7 @@ fn client_capabilities() -> ClientCapabilities {
         },
         "workspace": {
             "workspaceFolders": true,
+            "symbol": {},
             "configuration": true,
             "applyEdit": true,
             "workspaceEdit": { "documentChanges": true }

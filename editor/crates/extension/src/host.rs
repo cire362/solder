@@ -54,8 +54,16 @@ pub struct Completion {
     pub format: Option<i32>,
 }
 
-/// How an extension wants a completion shown: a piece of code in its
-/// language, to be highlighted as code, and the parts of it to show.
+/// A symbol a language server named: a function, a type, a file. `kind`
+/// is the protocol's number for which.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Symbol {
+    pub name: String,
+    pub kind: i32,
+}
+
+/// How an extension wants a completion or a symbol shown: a piece of code
+/// in its language, to be highlighted as code, and the parts of it to show.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeLabel {
     pub code: String,
@@ -497,6 +505,16 @@ trait Calls: Send {
         completions: &[Completion],
     ) -> wasmtime::Result<Result<Vec<Option<CodeLabel>>, String>> {
         Ok(Ok(vec![None; completions.len()]))
+    }
+
+    /// The same for the symbols a server lists.
+    fn labels_for_symbols(
+        &self,
+        _store: &mut Store<State>,
+        _server: &str,
+        symbols: &[Symbol],
+    ) -> wasmtime::Result<Result<Vec<Option<CodeLabel>>, String>> {
+        Ok(Ok(vec![None; symbols.len()]))
     }
 }
 
@@ -978,33 +996,86 @@ macro_rules! start {
             Ok(labels.map(|labels| {
                 labels
                     .into_iter()
-                    .map(|label| {
-                        let label = label?;
-                        Some(CodeLabel {
-                            code: label.code,
-                            spans: label
-                                .spans
-                                .into_iter()
-                                .map(|span| match span {
-                                    $bindings::CodeLabelSpan::CodeRange(range) => {
-                                        LabelSpan::Code(range.start as usize..range.end as usize)
-                                    }
-                                    $bindings::CodeLabelSpan::Literal(literal) => {
-                                        LabelSpan::Literal {
-                                            text: literal.text,
-                                            highlight: literal.highlight_name,
-                                        }
-                                    }
-                                })
-                                .collect(),
-                            filter: label.filter_range.start as usize
-                                ..label.filter_range.end as usize,
-                        })
-                    })
+                    .map(|label| label.map(|label| start!(@label $bindings, label)))
+                    .collect()
+            }))
+        }
+
+        fn labels_for_symbols(
+            &self,
+            store: &mut Store<State>,
+            server: &str,
+            symbols: &[Symbol],
+        ) -> wasmtime::Result<Result<Vec<Option<CodeLabel>>, String>> {
+            use $bindings::zed::extension::lsp;
+            let symbols: Vec<lsp::Symbol> = symbols
+                .iter()
+                .map(|symbol| lsp::Symbol {
+                    name: symbol.name.clone(),
+                    kind: {
+                        use lsp::SymbolKind as K;
+                        match symbol.kind {
+                            1 => K::File,
+                            2 => K::Module,
+                            3 => K::Namespace,
+                            4 => K::Package,
+                            5 => K::Class,
+                            6 => K::Method,
+                            7 => K::Property,
+                            8 => K::Field,
+                            9 => K::Constructor,
+                            10 => K::Enum,
+                            11 => K::Interface,
+                            12 => K::Function,
+                            13 => K::Variable,
+                            14 => K::Constant,
+                            15 => K::String,
+                            16 => K::Number,
+                            17 => K::Boolean,
+                            18 => K::Array,
+                            19 => K::Object,
+                            20 => K::Key,
+                            21 => K::Null,
+                            22 => K::EnumMember,
+                            23 => K::Struct,
+                            24 => K::Event,
+                            25 => K::Operator,
+                            26 => K::TypeParameter,
+                            other => K::Other(other),
+                        }
+                    },
+                })
+                .collect();
+            let labels = self.call_labels_for_symbols(store, server, &symbols)?;
+            Ok(labels.map(|labels| {
+                labels
+                    .into_iter()
+                    .map(|label| label.map(|label| start!(@label $bindings, label)))
                     .collect()
             }))
         }
     };
+    // A label as the extension wrote it, in the editor's own shape.
+    (@label $bindings:ident, $label:expr) => {{
+        let label = $label;
+        CodeLabel {
+            code: label.code,
+            spans: label
+                .spans
+                .into_iter()
+                .map(|span| match span {
+                    $bindings::CodeLabelSpan::CodeRange(range) => {
+                        LabelSpan::Code(range.start as usize..range.end as usize)
+                    }
+                    $bindings::CodeLabelSpan::Literal(literal) => LabelSpan::Literal {
+                        text: literal.text,
+                        highlight: literal.highlight_name,
+                    },
+                })
+                .collect(),
+            filter: label.filter_range.start as usize..label.filter_range.end as usize,
+        }
+    }};
     (@by_id $bindings:ident { $($more:tt)* }) => {
         impl Calls for $bindings::Extension {
             fn command(
@@ -1312,20 +1383,44 @@ impl Host {
         server: &str,
         completions: &[Completion],
     ) -> Option<Result<Vec<Option<CodeLabel>>, String>> {
+        self.labels(completions.len(), |extension, store| {
+            extension.labels_for_completions(store, server, completions)
+        })
+    }
+
+    /// The same for the symbols its `server` lists.
+    pub fn labels_for_symbols(
+        &self,
+        server: &str,
+        symbols: &[Symbol],
+    ) -> Option<Result<Vec<Option<CodeLabel>>, String>> {
+        self.labels(symbols.len(), |extension, store| {
+            extension.labels_for_symbols(store, server, symbols)
+        })
+    }
+
+    /// Asks the extension for labels, one for each of `count` things.
+    fn labels(
+        &self,
+        count: usize,
+        ask: impl FnOnce(
+            &dyn Calls,
+            &mut Store<State>,
+        ) -> wasmtime::Result<Result<Vec<Option<CodeLabel>>, String>>,
+    ) -> Option<Result<Vec<Option<CodeLabel>>, String>> {
         let mut running = self.running.try_lock().ok()?;
         let Running { store, extension } = &mut *running;
         let problem = |e: wasmtime::Error| format!("The extension failed: {e:#}");
         if let Err(error) = store.set_fuel(LABEL_FUEL) {
             return Some(Err(problem(error)));
         }
-        let labels = extension
-            .labels_for_completions(store, server, completions)
+        let labels = ask(&**extension, store)
             .map_err(problem)
             .and_then(|labels| labels);
-        // An extension answers up to the last completion it has a label
-        // for: the list may be shorter than what it was asked about.
+        // An extension answers up to the last thing it has a label for:
+        // the list may be shorter than what it was asked about.
         Some(labels.map(|mut labels| {
-            labels.resize(completions.len(), None);
+            labels.resize(count, None);
             labels
         }))
     }
