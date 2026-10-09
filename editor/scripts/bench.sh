@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 file="${1:-crates/solder/src/editor.rs}"
 cargo build --release -p solder --quiet
-bin=target/release/solder
+bin="${CARGO_TARGET_DIR:-target}/release/solder"
 
 SOLDER_BENCH_STARTUP=1 "$bin" "$file" >/dev/null
 starts=()
