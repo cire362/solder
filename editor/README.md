@@ -756,7 +756,7 @@ here.
 | From | Solder uses | Does not run here |
 |---|---|---|
 | A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, icon themes, its language servers, its debug adapters, its context servers | |
-| A VS Code extension | Themes (JSON), icon themes drawn with pictures, snippets | Its code, TextMate grammars, icon themes drawn with a font, everything the code would add |
+| A VS Code extension | Themes (JSON and the older `.tmTheme`), icon themes drawn with pictures, snippets | Its code, TextMate grammars, icon themes drawn with a font, everything the code would add |
 
 A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
 It is compiled on the first file that needs it and runs in wasmtime inside

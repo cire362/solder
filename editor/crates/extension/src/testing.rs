@@ -251,7 +251,8 @@ pub fn vscode_extension(dir: &Path) {
   "contributes": {
     "themes": [
       {"label": "Acme Dark", "uiTheme": "vs-dark", "path": "./themes/dark.json"},
-      {"label": "Acme Old", "uiTheme": "vs-dark", "path": "./themes/old.tmTheme"}
+      {"label": "Acme Old", "uiTheme": "vs-dark", "path": "./themes/old.tmTheme"},
+      {"label": "Acme Broken", "uiTheme": "vs-dark", "path": "./themes/broken.tmTheme"}
     ],
     "snippets": [
       {"language": "javascript", "path": "./snippets/js.json"},
@@ -301,7 +302,35 @@ pub fn vscode_extension(dir: &Path) {
         &dir.join("themes/dark.json"),
         r##"{"name":"Acme Dark","type":"dark","colors":{"editor.background":"#101014","editor.foreground":"#e0e0e6"},"tokenColors":[{"scope":"keyword","settings":{"foreground":"#ff8800"}}]}"##,
     );
-    write(&dir.join("themes/old.tmTheme"), "<plist/>");
+    // The format TextMate had: a property list.
+    write(
+        &dir.join("themes/old.tmTheme"),
+        r##"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>name</key><string>Acme Old</string>
+  <key>settings</key>
+  <array>
+    <dict><key>settings</key><dict>
+      <key>background</key><string>#272822</string>
+      <key>foreground</key><string>#F8F8F2</string>
+      <key>selection</key><string>#49483E</string>
+    </dict></dict>
+    <dict>
+      <key>name</key><string>Comment</string>
+      <key>scope</key><string>comment</string>
+      <key>settings</key><dict><key>foreground</key><string>#75715E</string></dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>keyword, storage</string>
+      <key>settings</key><dict><key>foreground</key><string>#F92672</string></dict>
+    </dict>
+  </array>
+</dict>
+</plist>"##,
+    );
+    write(&dir.join("themes/broken.tmTheme"), "<plist/>");
     write(
         &dir.join("snippets/js.json"),
         r#"{"Log": {"prefix": "clg", "body": "console.log($1)"}}"#,

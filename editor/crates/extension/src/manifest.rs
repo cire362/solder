@@ -568,7 +568,7 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
     let declared = list("themes").len();
     if themes.len() < declared {
         missing.push(format!(
-            "{} of its themes (not in the JSON format)",
+            "{} of its themes (could not be read)",
             declared - themes.len()
         ));
     }

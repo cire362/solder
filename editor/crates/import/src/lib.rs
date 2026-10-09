@@ -6,6 +6,7 @@
 
 pub mod jsonc;
 pub mod keymap;
+pub mod plist;
 pub mod source;
 pub mod theme;
 

@@ -568,8 +568,15 @@ mod tests {
         assert_eq!(installed.id, "Acme.demo");
         assert_eq!(installed.name, "Acme Demo");
         assert_eq!(installed.code, Code::Node);
-        assert_eq!(installed.themes.len(), 1);
-        assert_eq!(installed.themes[0].name, "Acme Dark");
+        // Its themes, the one in TextMate's old format too.
+        let themes: Vec<&str> = installed.themes.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(themes, ["Acme Dark", "Acme Old"]);
+        let old = &installed.themes[1];
+        assert_eq!(old.appearance, "dark");
+        assert_eq!(old.colors["bg"], "#272822");
+        assert_eq!(old.colors["selection"], "#49483e");
+        assert_eq!(old.syntax["comment"], "#75715e");
+        assert_eq!(old.syntax["keyword"], "#f92672");
         // One file for two languages; the one outside the folder is ignored.
         assert_eq!(installed.snippets.len(), 1);
         assert_eq!(
@@ -602,7 +609,7 @@ mod tests {
         assert_eq!(
             installed.missing,
             [
-                "1 of its themes (not in the JSON format)",
+                "1 of its themes (could not be read)",
                 "An icon theme (drawn with a font, or not readable)",
                 "Highlighting (a TextMate grammar)",
                 "Its code, which needs VS Code",
@@ -611,7 +618,7 @@ mod tests {
         );
         assert_eq!(
             installed.provides(),
-            "1 theme, 2 icon themes, 1 snippet file"
+            "2 themes, 2 icon themes, 1 snippet file"
         );
     }
 

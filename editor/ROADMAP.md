@@ -214,7 +214,8 @@ to build them.
       which is a dependency to decide on)
 - [ ] Language configuration: brackets, pairs that close themselves, comments,
       indentation rules, and which files are which language
-- [ ] Themes in the old `.tmTheme` format
+- [x] Themes in the old `.tmTheme` format: a property list, read by a
+      reader of Solder's own into what a JSON theme says
 - [x] Icon themes, through the same file icons as Zed's: the ones drawn
       with pictures, by a file's name, ending and language and a folder's
       name. One drawn with a font is said not to run here

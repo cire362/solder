@@ -11143,7 +11143,7 @@ brackets = [
         });
         let installed = cx.read(|cx| store.read(cx).find(Origin::VsCode, "Vue.volar").cloned());
         let installed = installed.unwrap();
-        assert_eq!(installed.themes.len(), 1);
+        assert_eq!(installed.themes.len(), 2);
         assert!(
             installed
                 .missing
