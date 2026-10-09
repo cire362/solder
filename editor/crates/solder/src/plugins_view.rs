@@ -85,7 +85,7 @@ impl PluginsView {
             .px_1p5()
             .rounded(px(6.))
             .bg(theme.bg_sunken)
-            .text_size(px(11.))
+            .text_size(crate::theme::text(11.))
             .text_color(color)
             .child(text)
             .into_any_element()
@@ -121,7 +121,7 @@ impl PluginsView {
                 details = details.child(
                     div()
                         .pt_1()
-                        .text_size(px(10.5))
+                        .text_size(crate::theme::text(10.5))
                         .text_color(theme.fg_subtle)
                         .child(match state {
                             PluginState::Enabled => "ALLOWED",
@@ -189,7 +189,7 @@ impl PluginsView {
                 details = details.child(
                     div()
                         .font_family(crate::theme::CODE_FONT)
-                        .text_size(px(11.5))
+                        .text_size(crate::theme::text(11.5))
                         .text_color(theme.fg_subtle)
                         .child(entry.clone()),
                 );
@@ -259,7 +259,7 @@ impl Render for PluginsView {
                         .id(("plugin", i))
                         .debug_selector(move || format!("plugin-{i}"))
                         .w_full()
-                        .h(ROW)
+                        .h(crate::theme::row(ROW, cx))
                         .px_3()
                         .flex()
                         .items_center()
@@ -306,7 +306,7 @@ impl Render for PluginsView {
                 })
                 .collect()
         })
-        .h(ROW * count.clamp(1, 6) as f32);
+        .h(crate::theme::row(ROW, cx) * count.clamp(1, 6) as f32);
         div()
             .key_context("PluginsView")
             .track_focus(&self.focus)

@@ -772,7 +772,8 @@ impl Render for ProjectPanel {
                                 };
                                 div()
                                     .id(row_ix)
-                                    .h(ROW)
+                                    .debug_selector(move || format!("file-row-{row_ix}"))
+                                    .h(crate::theme::row(ROW, cx))
                                     .mx_1p5()
                                     .pl(px(8. + depth as f32 * 12.))
                                     .pr_2()
@@ -853,7 +854,7 @@ impl Render for ProjectPanel {
                     .bg(theme.bg_elev)
                     .border_1()
                     .border_color(theme.error)
-                    .text_size(px(11.5))
+                    .text_size(crate::theme::text(11.5))
                     .text_color(theme.error)
                     .child(err)
             }))

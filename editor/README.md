@@ -954,6 +954,22 @@ the status bar, whatever it holds.
 `place` of `tab_bar` is where the tabs of the open files are: `top`, `bottom`
 or `none`. With none, files are changed by the keys and the file finder.
 
+The text of the interface is set in `settings.json`, apart from the code's:
+
+```json
+{
+  "ui_font_family": "Inter",
+  "ui_font_size": 14,
+  "ui_density": "comfortable"
+}
+```
+
+`ui_font_size` is 12.5 as it comes and may be 9 to 18. The room around the
+text grows and shrinks with it, and the rows of lists grow with larger text so
+that a line always fits. `ui_density` is how tall those rows are: `compact`,
+`default` or `comfortable`. The bars keep the heights `layout.json` gives
+them.
+
 ## Settings from another editor
 
 On a first launch (no `~/.config/solder/settings.json` yet) Solder looks for VS

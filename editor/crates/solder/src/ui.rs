@@ -43,7 +43,7 @@ pub fn toggle(
         .items_center()
         .justify_center()
         .rounded(px(6.))
-        .text_size(px(11.5))
+        .text_size(crate::theme::text(11.5))
         .font_family(crate::theme::CODE_FONT)
         .text_color(if active {
             theme.accent

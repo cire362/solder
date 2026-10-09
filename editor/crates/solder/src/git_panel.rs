@@ -213,7 +213,7 @@ impl GitPanel {
 
     fn render_review(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let review = self.review.as_ref()?;
-        let small = UI_FONT_SIZE - px(1.);
+        let small = crate::theme::UI_FONT_SMALL;
         let mut block = div()
             .p_2()
             .rounded(px(8.))
@@ -304,7 +304,7 @@ impl GitPanel {
                                 div()
                                     .flex()
                                     .gap_1p5()
-                                    .text_size(px(11.))
+                                    .text_size(crate::theme::text(11.))
                                     .child(div().text_color(color).child(f.severity.label()))
                                     .child(
                                         div()
@@ -482,12 +482,12 @@ impl GitPanel {
                 };
                 div()
                     .id(ix)
-                    .h(ROW_HEIGHT)
+                    .h(crate::theme::row(ROW_HEIGHT, cx))
                     .px_3()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .text_size(px(11.5))
+                    .text_size(crate::theme::text(11.5))
                     .text_color(theme.fg_subtle)
                     .child(format!("{} ({count})", section.title()))
                     .children(action.map(|(label, f)| {
@@ -576,7 +576,7 @@ impl GitPanel {
                 div()
                     .id(ix)
                     .group("git-row")
-                    .h(ROW_HEIGHT)
+                    .h(crate::theme::row(ROW_HEIGHT, cx))
                     .mx_1p5()
                     .px_2()
                     .flex()
@@ -589,7 +589,7 @@ impl GitPanel {
                         div()
                             .w(px(12.))
                             .flex_none()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::text(11.))
                             .font_family(crate::theme::CODE_FONT)
                             .text_color(color)
                             .child(letter),
@@ -606,7 +606,7 @@ impl GitPanel {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::text(11.))
                             .text_color(theme.fg_subtle)
                             .child(dir.to_string()),
                     )
@@ -805,7 +805,7 @@ impl Render for GitPanel {
                             .rounded(px(8.))
                             .border_1()
                             .border_color(theme.error)
-                            .text_size(px(11.5))
+                            .text_size(crate::theme::text(11.5))
                             .text_color(theme.error)
                             .child(e)
                     })),

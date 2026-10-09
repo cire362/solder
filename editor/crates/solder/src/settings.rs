@@ -13,7 +13,7 @@ use gpui::{App, Font, Global, KeyBinding, Pixels, px};
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 
-use crate::theme::{CODE_FONT, Theme};
+use crate::theme::{CODE_FONT, Theme, UI_FONT, UI_FONT_PX};
 
 /// `system`, `dark`, `light`, or the name of a theme in the `themes`
 /// folder next to `settings.json`.
@@ -60,6 +60,12 @@ pub struct Settings {
     pub buffer_font_family: String,
     pub buffer_font_size: f32,
     pub buffer_line_height: f32,
+    /// The font of everything that is not code: panels, tabs, the bars.
+    pub ui_font_family: String,
+    /// Its size. The room around the text grows and shrinks with it.
+    pub ui_font_size: f32,
+    /// How tall the rows of lists are: `compact`, `default`, `comfortable`.
+    pub ui_density: Density,
     /// Indent width for files whose indentation cannot be detected.
     pub indent_size: usize,
     /// Latency, frame time and memory in the status bar.
@@ -158,6 +164,22 @@ pub struct ServerOverride {
     pub settings: Option<serde_json::Value>,
 }
 
+/// How tall the rows of lists are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Density {
+    Compact,
+    #[default]
+    #[serde(rename = "default")]
+    Standard,
+    Comfortable,
+}
+
+/// The sizes the interface's text may have. Below the first it cannot be
+/// read; above the second a tab no longer holds its name.
+const UI_FONT_LEAST: f32 = 9.;
+const UI_FONT_MOST: f32 = 18.;
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -166,6 +188,9 @@ impl Default for Settings {
             buffer_font_family: CODE_FONT.to_string(),
             buffer_font_size: 13.,
             buffer_line_height: 20.,
+            ui_font_family: UI_FONT.to_string(),
+            ui_font_size: UI_FONT_PX,
+            ui_density: Density::Standard,
             indent_size: 4,
             show_performance_hud: true,
             language_servers: BTreeMap::new(),
@@ -193,6 +218,38 @@ impl Settings {
 
     pub fn line_height(&self) -> Pixels {
         px(self.buffer_line_height.max(self.buffer_font_size * 1.1))
+    }
+
+    pub fn ui_font(&self) -> gpui::SharedString {
+        self.ui_font_family.clone().into()
+    }
+
+    /// The interface's text size, kept to what its rows can hold.
+    fn ui_scale(&self) -> f32 {
+        let size = if self.ui_font_size.is_finite() {
+            self.ui_font_size
+        } else {
+            UI_FONT_PX
+        };
+        size.clamp(UI_FONT_LEAST, UI_FONT_MOST) / UI_FONT_PX
+    }
+
+    /// What a rem is in a window: 16 pixels as it comes. Every text size
+    /// and most of the spacing of the interface is in rems.
+    pub fn rem_size(&self) -> Pixels {
+        px(16. * self.ui_scale())
+    }
+
+    /// How much taller than it comes a row of a list is: by the density,
+    /// and by the text when that is larger. Smaller text leaves rows as
+    /// they are; `compact` is what lowers them.
+    pub fn row_scale(&self) -> f32 {
+        let density = match self.ui_density {
+            Density::Compact => 0.85,
+            Density::Standard => 1.,
+            Density::Comfortable => 1.25,
+        };
+        density * self.ui_scale().max(1.)
     }
 
     pub fn indent_unit(&self) -> &'static str {
@@ -502,6 +559,30 @@ mod tests {
         assert_eq!(parse_settings("").unwrap(), Settings::default());
         let url = parse_settings("{ \"buffer_font_family\": \"a//b\" }").unwrap();
         assert_eq!(url.buffer_font_family, "a//b");
+        // The interface's text as it comes: a rem is 16 pixels, and rows
+        // are as tall as they were written.
+        assert_eq!(s.ui_font_family, UI_FONT);
+        assert_eq!((s.rem_size(), s.row_scale()), (px(16.), 1.));
+        // Larger text, and the rem and the rows grow with it; a size no
+        // row can hold is brought to the nearest that fits.
+        let large = parse_settings(r#"{ "ui_font_size": 15, "ui_font_family": "Inter" }"#).unwrap();
+        assert_eq!(large.ui_font(), "Inter");
+        assert_eq!(large.rem_size(), px(19.2));
+        assert_eq!(large.row_scale(), 1.2);
+        let huge = parse_settings(r#"{ "ui_font_size": 400 }"#).unwrap();
+        assert_eq!(huge.rem_size(), px(16. * 18. / 12.5));
+        // Smaller text leaves the rows alone: `compact` lowers them.
+        let small = parse_settings(r#"{ "ui_font_size": 10 }"#).unwrap();
+        assert_eq!((small.rem_size(), small.row_scale()), (px(12.8), 1.));
+        let compact = parse_settings(r#"{ "ui_density": "compact" }"#).unwrap();
+        assert_eq!(compact.row_scale(), 0.85);
+        let roomy = parse_settings(r#"{ "ui_density": "comfortable" }"#).unwrap();
+        assert_eq!(roomy.row_scale(), 1.25);
+        assert_eq!(
+            parse_settings(r#"{ "ui_density": "default" }"#).unwrap(),
+            Settings::default()
+        );
+        assert!(parse_settings(r#"{ "ui_density": "airy" }"#).is_err());
         // A context server's command in both of the forms Zed writes it.
         let servers = parse_settings(
             r#"{ "context_servers": {

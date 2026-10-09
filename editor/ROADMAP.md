@@ -282,8 +282,8 @@ file, so the two never disagree. It starts after the Zed items of phase 8.
       none. Eleven items, two of them new (`file`, `branch`)
 - [ ] An item is drawn as a word, an icon or both, and its command and icon
       can be changed, so a button for any command can be put on a bar
-- [ ] The interface font, its size and how dense rows are, in
-      `settings.json`
+- [x] The interface font, its size and how dense rows are, in
+      `settings.json` (`ui_font_family`, `ui_font_size`, `ui_density`)
 
 ### By hand
 - [x] Borders are dragged to resize; a double click puts a size back

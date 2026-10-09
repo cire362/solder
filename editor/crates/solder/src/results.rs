@@ -437,7 +437,7 @@ impl ResultsView {
                 .border_b_1()
                 .border_color(theme.line)
                 .text_size(UI_FONT_SIZE)
-                .font_family(crate::theme::UI_FONT)
+                .font_family(Settings::get(cx).ui_font())
                 .child(
                     div()
                         .font_family(crate::theme::CODE_FONT)
@@ -1175,7 +1175,7 @@ impl ResultsView {
         cx.notify();
     }
 
-    fn render_changes_bar(&self, theme: &Theme) -> Option<gpui::AnyElement> {
+    fn render_changes_bar(&self, theme: &Theme, cx: &App) -> Option<gpui::AnyElement> {
         if self.changes.is_empty() && self.notice.is_none() {
             return None;
         }
@@ -1199,7 +1199,7 @@ impl ResultsView {
                 .border_color(theme.line)
                 .bg(theme.bg_sunken)
                 .text_size(UI_FONT_SIZE)
-                .font_family(crate::theme::UI_FONT)
+                .font_family(Settings::get(cx).ui_font())
                 .when(!summary.is_empty(), |d| {
                     d.child(div().flex_none().text_color(theme.accent).child(summary))
                 })
@@ -1381,7 +1381,7 @@ impl ResultsView {
                 .border_b_1()
                 .border_color(theme.line)
                 .text_size(UI_FONT_SIZE)
-                .font_family(crate::theme::UI_FONT)
+                .font_family(Settings::get(cx).ui_font())
                 .when(!self.history.is_empty(), |d| {
                     d.child(ui::button("results-back-table", "Back", false, theme, {
                         let view = cx.entity();
@@ -1718,7 +1718,7 @@ impl Render for ResultsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let settings = Settings::get(cx).clone();
-        let changes_bar = self.render_changes_bar(&theme);
+        let changes_bar = self.render_changes_bar(&theme, cx);
         let body = match &self.state {
             State::Done(_) if self.reviewing => self.render_review(&theme, cx),
             State::Done(result) if !result.columns.is_empty() => {

@@ -481,7 +481,7 @@ impl StructureView {
         div()
             .pt_4()
             .pb_1p5()
-            .text_size(px(11.5))
+            .text_size(crate::theme::text(11.5))
             .text_color(theme.fg_subtle)
             .child(title)
     }
@@ -543,7 +543,7 @@ impl StructureView {
                 .when(c.auto, |d| {
                     d.child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::text(11.))
                             .text_color(theme.fg_subtle)
                             .child("auto"),
                     )
@@ -551,7 +551,7 @@ impl StructureView {
                 .when(c.original.is_none(), |d| {
                     d.child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::text(11.))
                             .text_color(theme.accent)
                             .child("new"),
                     )

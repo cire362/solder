@@ -233,4 +233,26 @@ pub const UI_FONT: &str = if cfg!(target_os = "macos") {
     "Cantarell"
 };
 
-pub const UI_FONT_SIZE: gpui::Pixels = px(12.5);
+/// The size of the interface's text as it comes, in pixels.
+pub const UI_FONT_PX: f32 = 12.5;
+
+/// A text size of the interface: `size` pixels while `ui_font_size` is as
+/// it comes. Sizes are in rems and a rem follows that setting, so the
+/// text and the room around it grow and shrink together.
+pub const fn text(size: f32) -> gpui::Rems {
+    gpui::Rems(size / 16.)
+}
+
+pub const UI_FONT_SIZE: gpui::Rems = text(UI_FONT_PX);
+/// One step smaller, for what stands next to a label.
+pub const UI_FONT_SMALL: gpui::Rems = text(UI_FONT_PX - 1.);
+
+/// The height of a row of a list: `base` as it comes, lower or taller by
+/// `ui_density`, and grown with the interface's text so that a line of it
+/// always fits.
+pub fn row(base: gpui::Pixels, cx: &gpui::App) -> gpui::Pixels {
+    let scale = cx
+        .try_global::<crate::settings::Settings>()
+        .map_or(1., crate::settings::Settings::row_scale);
+    px((f32::from(base) * scale).round())
+}

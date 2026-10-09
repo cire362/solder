@@ -207,6 +207,10 @@ pattern for new widgets instead of calling `cx.propagate()` everywhere.
 
 - Colors come from `theme.rs` tokens, which mirror the website's
   `globals.css`. Shapes: panels 16px, controls 8px, inline tokens 6px.
+- Text sizes of the interface are rems, never pixels: `UI_FONT_SIZE`,
+  `UI_FONT_SMALL` or `theme::text(11.5)`, since a rem follows
+  `ui_font_size`. The height of a row of a list is `theme::row(ROW, cx)`,
+  which follows `ui_density`. Code is sized by `buffer_font_size` alone.
 - Comments explain why, not what. Match the density of the surrounding code.
 - User-facing strings are short and plain, with no em dashes.
 

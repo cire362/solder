@@ -423,7 +423,7 @@ impl Render for ProjectSearch {
                                 div()
                                     .ml_1()
                                     .truncate()
-                                    .text_size(px(11.5))
+                                    .text_size(crate::theme::text(11.5))
                                     .text_color(if self.error.is_some() {
                                         theme.error
                                     } else {
@@ -475,7 +475,7 @@ impl Render for ProjectSearch {
                                                 div()
                                                     .flex_1()
                                                     .truncate()
-                                                    .text_size(px(11.))
+                                                    .text_size(crate::theme::text(11.))
                                                     .text_color(theme.fg_subtle)
                                                     .child(dir.to_string()),
                                             )
@@ -485,7 +485,7 @@ impl Render for ProjectSearch {
                                                     .px_1p5()
                                                     .rounded(px(6.))
                                                     .bg(theme.bg_elev)
-                                                    .text_size(px(11.))
+                                                    .text_size(crate::theme::text(11.))
                                                     .text_color(theme.fg_muted)
                                                     .child(count.to_string()),
                                             )
@@ -525,7 +525,7 @@ impl Render for ProjectSearch {
                                                 div()
                                                     .flex_none()
                                                     .w(px(28.))
-                                                    .text_size(px(11.))
+                                                    .text_size(crate::theme::text(11.))
                                                     .text_color(theme.fg_subtle)
                                                     .child((line.row + 1).to_string()),
                                             )
@@ -537,7 +537,7 @@ impl Render for ProjectSearch {
                                                             .buffer_font_family
                                                             .clone(),
                                                     )
-                                                    .text_size(px(12.))
+                                                    .text_size(crate::theme::text(12.))
                                                     .text_color(theme.fg_muted)
                                                     .child(
                                                         StyledText::new(line.text.clone())
@@ -548,7 +548,7 @@ impl Render for ProjectSearch {
                                 };
                                 div()
                                     .id(ix)
-                                    .h(ROW)
+                                    .h(crate::theme::row(ROW, cx))
                                     .mx_1p5()
                                     .px_1p5()
                                     .flex()

@@ -255,7 +255,7 @@ impl AgentPanel {
         let Some(entry) = task.read(cx).entries.get(ix).cloned() else {
             return div().into_any_element();
         };
-        let small = UI_FONT_SIZE - px(1.);
+        let small = crate::theme::UI_FONT_SMALL;
         let body = match entry {
             Entry::Text(text) => div()
                 .text_size(UI_FONT_SIZE)
@@ -307,7 +307,7 @@ impl AgentPanel {
                             .rounded(px(8.))
                             .bg(theme.bg_sunken)
                             .font_family(crate::theme::CODE_FONT)
-                            .text_size(px(11.))
+                            .text_size(crate::theme::text(11.))
                             .text_color(theme.fg_muted)
                             .children(output.lines().take(200).map(|l| div().child(l.to_string()))),
                     )
@@ -326,7 +326,7 @@ impl AgentPanel {
         if task.plan.is_empty() {
             return None;
         }
-        let small = UI_FONT_SIZE - px(1.);
+        let small = crate::theme::UI_FONT_SMALL;
         let mut block = div()
             .mx_2()
             .mb_2()
@@ -339,7 +339,7 @@ impl AgentPanel {
             .gap_1()
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(crate::theme::text(11.))
                     .text_color(theme.fg_subtle)
                     .child("PLAN"),
             );
@@ -422,7 +422,7 @@ impl AgentPanel {
     fn render_action(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let task_entity = self.task.clone()?;
         let task = task_entity.read(cx);
-        let small = UI_FONT_SIZE - px(1.);
+        let small = crate::theme::UI_FONT_SMALL;
         match &task.status {
             Status::AwaitingApproval {
                 command,
@@ -453,7 +453,7 @@ impl AgentPanel {
                                 .rounded(px(6.))
                                 .bg(theme.bg_sunken)
                                 .font_family(crate::theme::CODE_FONT)
-                                .text_size(px(11.5))
+                                .text_size(crate::theme::text(11.5))
                                 .text_color(theme.fg)
                                 .child(command.clone()),
                         )
@@ -519,7 +519,7 @@ impl AgentPanel {
                 block = block.child(
                     div()
                         .pt_1()
-                        .text_size(px(11.))
+                        .text_size(crate::theme::text(11.))
                         .text_color(theme.fg_subtle)
                         .child(match task.changes.len() {
                             0 => "NO CHANGES".to_string(),
@@ -607,7 +607,7 @@ impl Focusable for AgentPanel {
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let small = UI_FONT_SIZE - px(1.);
+        let small = crate::theme::UI_FONT_SMALL;
         let status = self.task_status(cx);
         let model = {
             let s = self.store.read(cx);

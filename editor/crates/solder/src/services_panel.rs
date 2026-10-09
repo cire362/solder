@@ -392,7 +392,7 @@ impl ServicesPanel {
             .flex()
             .items_center()
             .rounded(px(6.))
-            .text_size(px(11.))
+            .text_size(crate::theme::text(11.))
             .text_color(theme.fg_subtle)
             .hover(|d| d.bg(theme.line).text_color(theme.fg))
             .child(label)
@@ -410,7 +410,7 @@ impl ServicesPanel {
                     .px_1p5()
                     .rounded(px(6.))
                     .bg(theme.bg_elev)
-                    .text_size(px(11.))
+                    .text_size(crate::theme::text(11.))
                     .text_color(theme.accent)
                     .hover(|d| d.bg(theme.accent_soft))
                     .child(format!(":{port}"))
@@ -429,7 +429,7 @@ impl ServicesPanel {
     ) -> gpui::AnyElement {
         let base = div()
             .id(ix)
-            .h(ROW_HEIGHT)
+            .h(crate::theme::row(ROW_HEIGHT, cx))
             .mx_1p5()
             .px_2()
             .flex()
@@ -440,7 +440,7 @@ impl ServicesPanel {
         match row {
             Row::Header(title) => base
                 .justify_between()
-                .text_size(px(11.5))
+                .text_size(crate::theme::text(11.5))
                 .text_color(theme.fg_subtle)
                 .child(*title)
                 .into_any_element(),
@@ -484,7 +484,7 @@ impl ServicesPanel {
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::text(11.))
                             .text_color(theme.fg_subtle)
                             .child(label),
                     )
@@ -560,7 +560,7 @@ impl ServicesPanel {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::text(11.))
                             .text_color(theme.fg_subtle)
                             .child(format!("{}  {}", c.image, c.status)),
                     )
@@ -655,7 +655,7 @@ impl Render for ServicesPanel {
                     .rounded(px(8.))
                     .border_1()
                     .border_color(theme.error)
-                    .text_size(px(11.5))
+                    .text_size(crate::theme::text(11.5))
                     .text_color(theme.error)
                     .child(e)
             }))

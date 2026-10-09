@@ -194,7 +194,7 @@ impl PickerDelegate for CommandPalette {
                     .px_1p5()
                     .rounded(px(6.))
                     .bg(theme.bg_sunken)
-                    .text_size(px(11.))
+                    .text_size(crate::theme::text(11.))
                     .text_color(theme.fg_muted)
                     .child(b)
             }))

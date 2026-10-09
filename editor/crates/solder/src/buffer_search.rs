@@ -455,7 +455,7 @@ impl Render for BufferSearchBar {
                         div()
                             .w(px(96.))
                             .flex_none()
-                            .text_size(px(11.5))
+                            .text_size(crate::theme::text(11.5))
                             .truncate()
                             .text_color(if self.error.is_some() {
                                 theme.error

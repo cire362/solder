@@ -44,7 +44,7 @@ use crate::{
     services_panel::{RunStack, ServicesEvent, ServicesPanel, StopAll},
     settings::{self, Settings},
     terminal::{Terminal, TerminalCommand, TerminalEvent},
-    theme::{ActiveTheme, UI_FONT, UI_FONT_SIZE},
+    theme::{ActiveTheme, UI_FONT_SIZE},
 };
 
 actions!(
@@ -596,10 +596,12 @@ impl Workspace {
                 cx.set_global(theme);
                 window.refresh();
             }),
-            // Settings changed: the theme mode may have too.
+            // Settings changed: the theme mode may have too, and the size
+            // of the interface's text.
             cx.observe_global_in::<Settings>(window, |_, window, cx| {
                 let theme = Settings::get(cx).theme(window.appearance());
                 cx.set_global(theme);
+                window.set_rem_size(Settings::get(cx).rem_size());
                 window.refresh();
             }),
         ];
@@ -628,6 +630,7 @@ impl Workspace {
                 }
             }
         });
+        window.set_rem_size(Settings::get(cx).rem_size());
         // The docks start on the panels they were left on. The terminals,
         // the debugger and the answers have nothing to show yet, so a dock
         // left on one of them starts closed.
@@ -4201,7 +4204,7 @@ impl Workspace {
             .border_t_1()
             .border_color(theme.line)
             .bg(theme.bg_sunken)
-            .text_size(px(11.5))
+            .text_size(crate::theme::text(11.5))
             .text_color(theme.fg_subtle)
             .child(
                 div()
@@ -4410,7 +4413,7 @@ impl Render for Workspace {
             .flex()
             .flex_col()
             .bg(theme.bg)
-            .font_family(UI_FONT)
+            .font_family(Settings::get(cx).ui_font())
             .text_color(theme.fg)
             .child(
                 div()
@@ -11374,6 +11377,47 @@ brackets = [
         assert_eq!(docks(cx), (Some(Panel::Files), None, Some(Panel::Search)));
         cx.dispatch_action(ShowAgent);
         assert_eq!(docks(cx).0, Some(Panel::Agent));
+    }
+
+    #[gpui::test]
+    fn the_interface_has_the_font_size_and_density_of_the_settings(cx: &mut TestAppContext) {
+        let root = db::testing::dir("ws-ui-font").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        let config = db::testing::dir("ws-ui-font-config");
+        let (ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "the tree", &|cx| {
+            !ws.read(cx).project.read(cx).is_scanning()
+        });
+        let settings = |cx: &mut VisualTestContext, text: &str| {
+            std::fs::write(config.join("settings.json"), text).unwrap();
+            cx.update(|_, cx| settings::reload_from(&config, cx));
+            assert!(cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+        };
+        // The height of a row of the file tree as it is drawn now, and
+        // what a rem is in the window.
+        let row = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            let row = cx.debug_bounds("file-row-0").expect("a row of the tree");
+            (
+                f32::from(row.size.height),
+                cx.update(|window, _| window.rem_size()),
+            )
+        };
+        // As it comes.
+        assert_eq!(row(cx), (24., px(16.)));
+        // Rows lower and taller by the density; the text is the same.
+        settings(cx, r#"{ "ui_density": "compact" }"#);
+        assert_eq!(row(cx), (20., px(16.)));
+        settings(cx, r#"{ "ui_density": "comfortable" }"#);
+        assert_eq!(row(cx), (30., px(16.)));
+        // Larger text: everything sized in rems grows, and rows with it,
+        // so that a line still fits.
+        settings(cx, r#"{ "ui_font_size": 15 }"#);
+        assert_eq!(row(cx), (29., px(19.2)));
+        // Back as it came when the file says nothing.
+        settings(cx, "{}");
+        assert_eq!(row(cx), (24., px(16.)));
     }
 
     #[gpui::test]
