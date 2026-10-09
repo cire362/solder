@@ -60,6 +60,15 @@ pub enum Place {
 
 impl Place {
     pub const ALL: [Place; 3] = [Place::Left, Place::Right, Place::Bottom];
+
+    /// Its name in the file.
+    pub fn id(self) -> &'static str {
+        match self {
+            Place::Left => "left",
+            Place::Right => "right",
+            Place::Bottom => "bottom",
+        }
+    }
 }
 
 impl Panel {
@@ -255,7 +264,7 @@ struct Home(PathBuf);
 
 impl Global for Home {}
 
-/// Writes of ours that have not reached the file yet. They go one after
+/// Changes of ours that have not reached the file yet. They go one after
 /// another: each reads the file and puts one key in it, and two at once
 /// would lose one of the keys.
 #[derive(Default)]
@@ -313,6 +322,41 @@ impl Layout {
                 Place::Right | Place::Bottom => None,
             },
         }
+    }
+
+    fn panels_mut(&mut self, place: Place) -> &mut Vec<Panel> {
+        match place {
+            Place::Left => &mut self.left.panels,
+            Place::Right => &mut self.right.panels,
+            Place::Bottom => &mut self.bottom.panels,
+        }
+    }
+
+    /// The layout with `panel` in the dock `to`, before `before` or after
+    /// the dock's other panels. It leaves the dock it was in, or stops
+    /// being hidden.
+    pub fn moved(mut self, panel: Panel, to: Place, before: Option<Panel>) -> Self {
+        if before == Some(panel) {
+            return self;
+        }
+        for place in Place::ALL {
+            self.panels_mut(place).retain(|other| *other != panel);
+        }
+        self.hidden.retain(|other| *other != panel);
+        let panels = self.panels_mut(to);
+        let at = before
+            .and_then(|before| panels.iter().position(|other| *other == before))
+            .unwrap_or(panels.len());
+        panels.insert(at, panel);
+        self.fitted()
+    }
+
+    /// The layout with `panel` in no dock.
+    pub fn hiding(mut self, panel: Panel) -> Self {
+        if !self.hidden.contains(&panel) {
+            self.hidden.push(panel);
+        }
+        self.fitted()
     }
 
     /// The size of a part that can be dragged: a width or a height.
@@ -458,7 +502,7 @@ pub fn keep(part: Part, cx: &mut App) {
         Part::Bottom => serde_json::to_value(&layout.bottom),
     };
     if let Ok(value) = value {
-        write(part.key(), value, cx);
+        write(Change::Set(part.key(), value), cx);
     }
 }
 
@@ -471,21 +515,86 @@ pub fn keep_open(open: Vec<Panel>, cx: &mut App) {
     }
     let mut layout = Layout::get(cx).clone();
     layout.open = Some(open);
-    let layout = layout.fitted();
-    if layout.open == Layout::get(cx).open {
-        return;
-    }
-    let Ok(value) = serde_json::to_value(&layout.open) else {
-        return;
-    };
-    cx.set_global(layout);
-    write("open", value, cx);
+    put(layout.fitted(), cx);
 }
 
-/// Puts one key into the file, leaving the rest of the file as the user
-/// wrote it. A file with a mistake in it is left alone: it is the user's
-/// to put right.
-fn write(key: &'static str, value: serde_json::Value, cx: &mut App) {
+/// Puts in use a layout changed by hand, and writes the parts of it that
+/// changed into the file.
+pub fn put(layout: Layout, cx: &mut App) {
+    let old = Layout::get(cx).clone();
+    if layout == old {
+        return;
+    }
+    let mut changed = Vec::new();
+    if layout.left != old.left {
+        changed.push(("left", serde_json::to_value(&layout.left)));
+    }
+    if layout.right != old.right {
+        changed.push(("right", serde_json::to_value(&layout.right)));
+    }
+    if layout.bottom != old.bottom {
+        changed.push(("bottom", serde_json::to_value(&layout.bottom)));
+    }
+    if layout.hidden != old.hidden {
+        changed.push(("hidden", serde_json::to_value(&layout.hidden)));
+    }
+    if layout.open != old.open {
+        changed.push(("open", serde_json::to_value(&layout.open)));
+    }
+    cx.set_global(layout);
+    for (key, value) in changed {
+        if let Ok(value) = value {
+            write(Change::Set(key, value), cx);
+        }
+    }
+}
+
+/// The layout as the editor comes. The file is the truth, so it has to
+/// stop saying otherwise: it is put aside as `layout.json.old`, with all
+/// the user wrote in it.
+pub fn reset(cx: &mut App) {
+    cx.set_global(Layout::default());
+    write(Change::Aside, cx);
+}
+
+/// What a write does to the file.
+enum Change {
+    /// Puts one key into it, leaving the rest as the user wrote it. A
+    /// file with a mistake in it is left alone: it is the user's to put
+    /// right.
+    Set(&'static str, serde_json::Value),
+    /// Moves it out of the way.
+    Aside,
+}
+
+impl Change {
+    fn make(self, dir: &Path) {
+        let path = dir.join(FILE);
+        match self {
+            Change::Set(key, value) => {
+                let text = std::fs::read_to_string(&path)
+                    .ok()
+                    .filter(|text| !settings::strip_comments(text).trim().is_empty())
+                    .unwrap_or_else(|| "{\n}\n".into());
+                if parse(&text).is_err() {
+                    return;
+                }
+                let text = import::jsonc::set_key(&text, key, &value);
+                // Whole or not at all: the file is read as soon as it changes.
+                let fresh = dir.join(format!("{FILE}.new"));
+                if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&fresh, text).is_ok() {
+                    let _ = std::fs::rename(&fresh, &path);
+                }
+            }
+            Change::Aside => {
+                let _ = std::fs::rename(&path, dir.join(format!("{FILE}.old")));
+            }
+        }
+    }
+}
+
+/// Makes a change to the file, after the ones that were asked before it.
+fn write(change: Change, cx: &mut App) {
     let Some(dir) = cx.try_global::<Home>().map(|home| home.0.clone()) else {
         return;
     };
@@ -498,25 +607,7 @@ fn write(key: &'static str, value: serde_json::Value, cx: &mut App) {
             before.await;
         }
         let folder = dir.clone();
-        background
-            .spawn(async move {
-                let path = folder.join(FILE);
-                let text = std::fs::read_to_string(&path)
-                    .ok()
-                    .filter(|text| !settings::strip_comments(text).trim().is_empty())
-                    .unwrap_or_else(|| "{\n}\n".into());
-                if parse(&text).is_err() {
-                    return;
-                }
-                let text = import::jsonc::set_key(&text, key, &value);
-                // Whole or not at all: the file is read as soon as it changes.
-                let fresh = folder.join(format!("{FILE}.new"));
-                if std::fs::create_dir_all(&folder).is_ok() && std::fs::write(&fresh, text).is_ok()
-                {
-                    let _ = std::fs::rename(&fresh, &path);
-                }
-            })
-            .await;
+        background.spawn(async move { change.make(&folder) }).await;
         let _ = cx.update(|cx| {
             let writes = cx.default_global::<Writes>();
             writes.pending = writes.pending.saturating_sub(1);
@@ -567,6 +658,41 @@ mod tests {
         assert!(error.contains("nothing"), "{error}");
         // What the editor writes is what it reads.
         assert_eq!(parse(&file(&layout)).unwrap(), layout);
+    }
+
+    #[test]
+    fn a_panel_is_moved_and_hidden_by_hand() {
+        use Panel::*;
+        let standard = Layout::default();
+        // To another dock, at the end or before one of its panels.
+        let layout = standard.clone().moved(Git, Place::Right, None);
+        assert_eq!(layout.right.panels, [Chat, Agent, Git]);
+        assert!(!layout.left.panels.contains(&Git));
+        let layout = layout.moved(Terminal, Place::Right, Some(Agent));
+        assert_eq!(layout.right.panels, [Chat, Terminal, Agent, Git]);
+        assert_eq!(layout.bottom.panels, [Debug, Response, Results]);
+        // Along its own dock.
+        let layout = layout.moved(Git, Place::Right, Some(Chat));
+        assert_eq!(layout.right.panels, [Git, Chat, Terminal, Agent]);
+        // Onto itself, or before a panel that is not there: nothing, and
+        // the end of the dock.
+        assert_eq!(layout.clone().moved(Chat, Place::Right, Some(Chat)), layout);
+        let last = layout.clone().moved(Git, Place::Right, Some(Files));
+        assert_eq!(last.right.panels, [Chat, Terminal, Agent, Git]);
+
+        // Hidden, it is in no dock; moved to one, it is hidden no more.
+        let hidden = layout.hiding(Chat).hiding(Chat);
+        assert_eq!(hidden.hidden, [Chat]);
+        assert_eq!(hidden.place(Chat), None);
+        let back = hidden.moved(Chat, Place::Bottom, None);
+        assert!(back.hidden.is_empty());
+        assert_eq!(back.bottom.panels, [Debug, Response, Results, Chat]);
+        // What was open goes on being so where it is now.
+        let open = parse(r#"{ "open": ["files", "chat"] }"#).unwrap();
+        let moved = open.moved(Chat, Place::Bottom, None);
+        assert_eq!(moved.open, Some(vec![Files, Chat]));
+        assert_eq!(moved.open_in(Place::Bottom), Some(Chat));
+        assert_eq!(moved.open_in(Place::Right), None);
     }
 
     #[test]

@@ -912,6 +912,18 @@ the file, next to whatever else you wrote there, comments included. A double
 click on a border puts its dock back to the size it came with. A file with a
 mistake in it is not written to.
 
+So can the panels. Drag a tab onto another tab and it goes before it, in the
+same dock or another one; dropped anywhere else in a dock, it goes to the end
+of that dock's row. While a tab is held, a closed dock shows a strip at its
+edge of the window to drop it on. The terminals move together, by any of
+their tabs. A panel moved to another dock is shown there.
+
+The right button on a tab opens a menu: hide the panel, move it to another
+dock, bring a hidden one back into this dock, and **Reset layout**. That
+command, also in the command palette, puts the window back as it comes. Since
+the file is what says how the window is, the file is put aside, whole, as
+`layout.json.old`.
+
 The bars' items are not in the file yet.
 
 ## Settings from another editor

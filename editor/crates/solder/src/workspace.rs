@@ -10,8 +10,8 @@ use std::{
 use gpui::{
     AnyElement, AnyView, App, Context, DismissEvent, Entity, EntityId, FocusHandle, Focusable,
     KeyBinding, ManagedView, MouseButton, MouseDownEvent, MouseMoveEvent, PathPromptOptions,
-    PromptLevel, SharedString, Subscription, Task, Window, WindowControlArea, actions, deferred,
-    div, prelude::*, px,
+    Pixels, Point, PromptLevel, SharedString, Subscription, Task, Window, WindowControlArea,
+    actions, anchored, deferred, div, prelude::*, px,
 };
 
 use crate::{
@@ -72,6 +72,7 @@ actions!(
         OpenSettings,
         OpenKeymap,
         OpenLayout,
+        ResetLayout,
         SplitRight,
         FocusNextPane,
         FocusPrevPane,
@@ -267,11 +268,45 @@ pub struct Workspace {
     /// A border being dragged: the part it sizes, where the pointer went
     /// down along the border's way, and the part's size then.
     resizing: Option<(Part, f32, f32)>,
+    /// The menu of a dock: where it opened, the dock, and the panel whose
+    /// tab was under the pointer, if one was.
+    dock_menu: Option<(Point<Pixels>, Place, Option<Panel>)>,
+    /// The panel whose tab is being dragged. A closed dock has a place to
+    /// drop it on for as long as it is.
+    dragging: Option<Panel>,
     modal: Option<Modal>,
     terminals: Vec<(Entity<Terminal>, Subscription)>,
     active_terminal: usize,
     _subscriptions: Vec<Subscription>,
     _hud_tick: Task<()>,
+}
+
+/// What an item of a dock's menu does.
+type MenuRun = Box<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
+
+/// A panel's tab while it is dragged to another place.
+#[derive(Clone, Copy)]
+struct DraggedPanel(Panel);
+
+/// What follows the pointer then.
+struct DraggedTab(Panel);
+
+impl Render for DraggedTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .h(px(24.))
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded(px(8.))
+            .bg(theme.bg_elev)
+            .border_1()
+            .border_color(theme.line)
+            .text_size(UI_FONT_SIZE)
+            .text_color(theme.fg)
+            .child(self.0.label())
+    }
 }
 
 impl Workspace {
@@ -620,6 +655,8 @@ impl Workspace {
             dock_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
             _layout: cx.observe_global_in::<Layout>(window, Self::follow_layout),
             resizing: None,
+            dock_menu: None,
+            dragging: None,
             modal: None,
             terminals: Vec::new(),
             active_terminal: 0,
@@ -1504,6 +1541,236 @@ impl Workspace {
         }
     }
 
+    /// The keyboard is not left in a panel no dock shows: no key would
+    /// reach anything from there. The file in front takes it.
+    fn rescue_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let lost = Panel::ALL.into_iter().any(|panel| {
+            !self.shown(panel)
+                && self
+                    .panel_focus(panel, cx)
+                    .is_some_and(|focus| focus.contains_focused(window, cx))
+        });
+        if lost {
+            match self.active_editor() {
+                Some(editor) => window.focus(&editor.focus_handle(cx)),
+                None => window.focus(&self.focus_handle),
+            }
+        }
+    }
+
+    /// Puts a panel's tab in the dock `to` by hand, before the tab of
+    /// `before` or after the dock's others. In a dock it was not in, it
+    /// is shown, and the dock it left goes on with what it has.
+    fn put_panel(
+        &mut self,
+        panel: Panel,
+        to: Place,
+        before: Option<Panel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dragging = None;
+        let from = Layout::get(cx).place(panel);
+        let shown_in = Place::ALL
+            .into_iter()
+            .find(|place| *self.dock(*place) == Some(panel));
+        if shown_in.is_some_and(|place| place != to) {
+            self.panel_gone(panel, cx);
+        }
+        layout::put(Layout::get(cx).clone().moved(panel, to, before), cx);
+        if from != Some(to) && self.available(panel) {
+            self.show_panel(panel, cx);
+        }
+        self.rescue_focus(window, cx);
+        cx.notify();
+    }
+
+    /// Takes a panel's tab out of the docks. Its command still opens it.
+    fn hide_panel(&mut self, panel: Panel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shown(panel) {
+            self.panel_gone(panel, cx);
+        }
+        layout::put(Layout::get(cx).clone().hiding(panel), cx);
+        self.rescue_focus(window, cx);
+        cx.notify();
+    }
+
+    /// The window as it comes: the layout, and what the docks show.
+    fn reset_layout(&mut self, _: &ResetLayout, window: &mut Window, cx: &mut Context<Self>) {
+        self.dock_menu = None;
+        layout::reset(cx);
+        for place in Place::ALL {
+            *self.dock(place) = Layout::get(cx).open_in(place);
+        }
+        self.rescue_focus(window, cx);
+        self.tell_panels(None, cx);
+    }
+
+    /// A tab of a dock as the hand takes it: the right button opens the
+    /// dock's menu on it, and it is dragged to another place, where it
+    /// goes before the tab it is dropped on.
+    fn held(
+        &self,
+        place: Place,
+        panel: Panel,
+        key: usize,
+        tab: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let over = cx.theme().accent_soft;
+        let workspace = cx.weak_entity();
+        div()
+            .id(("dock-tab", key))
+            .flex_none()
+            .rounded(px(8.))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.dock_menu = Some((event.position, place, Some(panel)));
+                    // The row of tabs would open its own, with no panel.
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_drag(DraggedPanel(panel), move |dragged, _, _, cx| {
+                let panel = dragged.0;
+                workspace
+                    .update(cx, |this, cx| {
+                        this.dragging = Some(panel);
+                        cx.notify();
+                    })
+                    .ok();
+                cx.new(|_| DraggedTab(panel))
+            })
+            .drag_over::<DraggedPanel>(move |style, dragged, _, _| {
+                if dragged.0 == panel {
+                    style
+                } else {
+                    style.bg(over)
+                }
+            })
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedPanel, window, cx| {
+                    this.put_panel(dragged.0, place, Some(panel), window, cx)
+                }),
+            )
+            .child(tab)
+            .into_any_element()
+    }
+
+    /// Where a dragged tab is dropped to open a dock that is closed.
+    fn drop_zone(&self, place: Place, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        div()
+            .debug_selector(move || format!("drop-{}", place.id()))
+            .flex_none()
+            .bg(theme.bg_sunken)
+            .border_color(theme.line)
+            .map(|d| match place {
+                Place::Left => d.w(px(36.)).h_full().border_r_1(),
+                Place::Right => d.w(px(36.)).h_full().border_l_1(),
+                Place::Bottom => d.h(px(36.)).w_full().border_t_1(),
+            })
+            .drag_over::<DraggedPanel>(move |style, _, _, _| style.bg(theme.accent_soft))
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedPanel, window, cx| {
+                    this.put_panel(dragged.0, place, None, window, cx)
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// The menu of a dock: what can be done with the tab it was opened
+    /// on, and the hidden panels, to bring one back into this dock.
+    fn render_dock_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (position, place, panel) = self.dock_menu?;
+        let theme = cx.theme().clone();
+        let layout = Layout::get(cx).clone();
+        let item = |id: String, label: String, cx: &mut Context<Self>, run: MenuRun| {
+            let selector = id.clone();
+            div()
+                .id(SharedString::from(id))
+                .debug_selector(move || selector.clone())
+                .h(px(26.))
+                .px_2()
+                .flex()
+                .items_center()
+                .rounded(px(6.))
+                .text_size(UI_FONT_SIZE)
+                .text_color(theme.fg)
+                .hover(|d| d.bg(theme.accent_soft))
+                .child(label)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.dock_menu = None;
+                    run(this, window, cx);
+                    cx.notify();
+                }))
+                .into_any_element()
+        };
+        let separator = || div().my_1().h(px(1.)).bg(theme.line).into_any_element();
+        let mut items: Vec<AnyElement> = Vec::new();
+        if let Some(panel) = panel {
+            if layout.place(panel).is_some() {
+                items.push(item(
+                    "menu-hide".into(),
+                    format!("Hide {}", panel.label()),
+                    cx,
+                    Box::new(move |this, window, cx| this.hide_panel(panel, window, cx)),
+                ));
+            }
+            for to in Place::ALL {
+                if layout.place(panel) != Some(to) {
+                    items.push(item(
+                        format!("menu-move-{}", to.id()),
+                        format!("Move to {} dock", to.id()),
+                        cx,
+                        Box::new(move |this, window, cx| {
+                            this.put_panel(panel, to, None, window, cx)
+                        }),
+                    ));
+                }
+            }
+            items.push(separator());
+        }
+        for hidden in layout.hidden.iter().copied() {
+            items.push(item(
+                format!("menu-show-{}", hidden.id()),
+                format!("Show {}", hidden.label()),
+                cx,
+                Box::new(move |this, window, cx| this.put_panel(hidden, place, None, window, cx)),
+            ));
+        }
+        if !layout.hidden.is_empty() {
+            items.push(separator());
+        }
+        items.push(item(
+            "menu-reset".into(),
+            "Reset layout".into(),
+            cx,
+            Box::new(|this, window, cx| this.reset_layout(&ResetLayout, window, cx)),
+        ));
+        Some(deferred(
+            anchored().position(position).child(
+                div()
+                    .occlude()
+                    .w(px(200.))
+                    .p_1()
+                    .flex()
+                    .flex_col()
+                    .bg(theme.bg_elev)
+                    .border_1()
+                    .border_color(theme.line)
+                    .rounded(px(8.))
+                    .shadow_lg()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.dock_menu = None;
+                        cx.notify();
+                    }))
+                    .children(items),
+            ),
+        ))
+    }
+
     /// The dock a panel shows in.
     fn place_of(&self, panel: Panel, cx: &App) -> Place {
         Layout::get(cx).dock_of(panel)
@@ -1609,18 +1876,7 @@ impl Workspace {
             };
             *self.dock(place) = now;
         }
-        let lost = Panel::ALL.into_iter().any(|panel| {
-            !self.shown(panel)
-                && self
-                    .panel_focus(panel, cx)
-                    .is_some_and(|focus| focus.contains_focused(window, cx))
-        });
-        if lost {
-            match self.active_editor() {
-                Some(editor) => window.focus(&editor.focus_handle(cx)),
-                None => window.focus(&self.focus_handle),
-            }
-        }
+        self.rescue_focus(window, cx);
         // A panel that came into view reads what it shows.
         for (index, place) in Place::ALL.into_iter().enumerate() {
             let now = *self.dock(place);
@@ -3539,52 +3795,59 @@ impl Workspace {
         }
         let mut tabs: Vec<AnyElement> = Vec::new();
         for panel in panels {
+            let key = panel as usize;
             match panel {
-                Panel::Terminal => tabs.extend(self.terminal_tabs(cx)),
+                // Each terminal's tab is the terminals' as far as the
+                // layout goes: they move together.
+                Panel::Terminal => {
+                    for (ix, tab) in self.terminal_tabs(cx).into_iter().enumerate() {
+                        tabs.push(self.held(place, panel, 100 + ix, tab, cx));
+                    }
+                }
                 Panel::Debug if self.show_debug => {
-                    tabs.push(self.render_debug_tab(&theme, cx).into_any_element())
+                    let tab = self.render_debug_tab(&theme, cx).into_any_element();
+                    tabs.push(self.held(place, panel, key, tab, cx));
                 }
                 Panel::Response if self.show_response => {
-                    tabs.push(self.render_response_tab(&theme, cx).into_any_element())
+                    let tab = self.render_response_tab(&theme, cx).into_any_element();
+                    tabs.push(self.held(place, panel, key, tab, cx));
                 }
                 Panel::Results if self.show_results => {
-                    tabs.push(self.render_results_tab(&theme, cx).into_any_element())
+                    let tab = self.render_results_tab(&theme, cx).into_any_element();
+                    tabs.push(self.held(place, panel, key, tab, cx));
                 }
                 Panel::Debug | Panel::Response | Panel::Results => {}
                 _ => {
                     let active = tab == panel;
-                    tabs.push(
-                        div()
-                            .id(("panel", panel as usize))
-                            .debug_selector(move || format!("panel-{}", panel.id()))
-                            .flex_none()
-                            .h(px(24.))
-                            .px_1()
-                            .flex()
-                            .items_center()
-                            .rounded(px(8.))
-                            .text_size(UI_FONT_SIZE)
-                            .text_color(if active { theme.fg } else { theme.fg_subtle })
-                            .when(active, |d| d.bg(theme.bg_elev))
-                            .hover(|d| d.text_color(theme.fg))
-                            .child(panel.label())
-                            .on_click(cx.listener(move |this, _, window, cx| match panel {
-                                Panel::Files => this.show_files(&ShowFiles, window, cx),
-                                Panel::Search => this.show_search(&ShowSearch, window, cx),
-                                Panel::Git => this.show_git(&ShowGit, window, cx),
-                                Panel::Services => this.show_services(&ShowServices, window, cx),
-                                Panel::Database => this.show_database(&ShowDatabase, window, cx),
-                                Panel::Api => this.show_api(&ShowApi, window, cx),
-                                Panel::Ai => this.show_ai(&ShowAi, window, cx),
-                                Panel::Extensions => {
-                                    this.show_extensions(&ShowExtensions, window, cx)
-                                }
-                                Panel::Chat => this.show_right(false, window, cx),
-                                Panel::Agent => this.show_right(true, window, cx),
-                                _ => {}
-                            }))
-                            .into_any_element(),
-                    );
+                    let label = div()
+                        .id(("panel", panel as usize))
+                        .debug_selector(move || format!("panel-{}", panel.id()))
+                        .flex_none()
+                        .h(px(24.))
+                        .px_1()
+                        .flex()
+                        .items_center()
+                        .rounded(px(8.))
+                        .text_size(UI_FONT_SIZE)
+                        .text_color(if active { theme.fg } else { theme.fg_subtle })
+                        .when(active, |d| d.bg(theme.bg_elev))
+                        .hover(|d| d.text_color(theme.fg))
+                        .child(panel.label())
+                        .on_click(cx.listener(move |this, _, window, cx| match panel {
+                            Panel::Files => this.show_files(&ShowFiles, window, cx),
+                            Panel::Search => this.show_search(&ShowSearch, window, cx),
+                            Panel::Git => this.show_git(&ShowGit, window, cx),
+                            Panel::Services => this.show_services(&ShowServices, window, cx),
+                            Panel::Database => this.show_database(&ShowDatabase, window, cx),
+                            Panel::Api => this.show_api(&ShowApi, window, cx),
+                            Panel::Ai => this.show_ai(&ShowAi, window, cx),
+                            Panel::Extensions => this.show_extensions(&ShowExtensions, window, cx),
+                            Panel::Chat => this.show_right(false, window, cx),
+                            Panel::Agent => this.show_right(true, window, cx),
+                            _ => {}
+                        }))
+                        .into_any_element();
+                    tabs.push(self.held(place, panel, key, label, cx));
                 }
             }
         }
@@ -3599,6 +3862,15 @@ impl Workspace {
             .flex()
             .flex_col()
             .border_color(theme.line)
+            // A tab from another dock dropped anywhere in this one comes
+            // to the end of its row.
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedPanel, window, cx| {
+                    if Layout::get(cx).place(dragged.0) != Some(place) {
+                        this.put_panel(dragged.0, place, None, window, cx);
+                    }
+                }),
+            )
             .map(|d| match place {
                 Place::Left => d
                     .w(px(layout.left.width))
@@ -3625,6 +3897,18 @@ impl Workspace {
                     .bg(theme.bg_sunken)
                     .border_b_1()
                     .border_color(theme.line)
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.dock_menu = Some((event.position, place, None));
+                            cx.notify();
+                        }),
+                    )
+                    .on_drop(
+                        cx.listener(move |this, dragged: &DraggedPanel, window, cx| {
+                            this.put_panel(dragged.0, place, None, window, cx)
+                        }),
+                    )
                     .children(tabs),
             )
             .child(div().flex_1().min_h_0().map(|d| {
@@ -3864,6 +4148,19 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        // A tab let go anywhere is no longer dragged.
+        if self.dragging.is_some() && !cx.has_active_drag() {
+            self.dragging = None;
+        }
+        // While one is, a closed dock has a place to drop it on.
+        let zone = |this: &Self, place: Place, cx: &mut Context<Self>| {
+            let closed = match place {
+                Place::Left => this.left.is_none(),
+                Place::Right => this.right.is_none(),
+                Place::Bottom => this.bottom.is_none(),
+            };
+            (closed && this.dragging.is_some()).then(|| this.drop_zone(place, cx))
+        };
         let root = self.root(cx);
         let project_name = root.file_name().map_or_else(
             || root.display().to_string(),
@@ -3939,6 +4236,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::open_layout))
+            .on_action(cx.listener(Self::reset_layout))
             .on_action(cx.listener(Self::split_right))
             .on_action(cx.listener(Self::focus_next_pane))
             .on_action(cx.listener(Self::focus_prev_pane))
@@ -4016,16 +4314,20 @@ impl Render for Workspace {
                     .min_h_0()
                     .flex()
                     .children(self.left.map(|tab| self.render_dock(Place::Left, tab, cx)))
+                    .children(zone(self, Place::Left, cx))
                     .children(panes)
+                    .children(zone(self, Place::Right, cx))
                     .children(
                         self.right
                             .map(|tab| self.render_dock(Place::Right, tab, cx)),
                     ),
             )
+            .children(zone(self, Place::Bottom, cx))
             .children(
                 self.bottom
                     .map(|tab| self.render_dock(Place::Bottom, tab, cx)),
             )
+            .children(self.render_dock_menu(cx))
             .child(self.render_status(cx))
             .children(self.resize_handles(cx))
             .on_mouse_move(cx.listener(Self::resize_move))
@@ -10928,6 +11230,127 @@ brackets = [
         assert_eq!(docks(cx), (Some(Panel::Files), None, Some(Panel::Search)));
         cx.dispatch_action(ShowAgent);
         assert_eq!(docks(cx).0, Some(Panel::Agent));
+    }
+
+    #[gpui::test]
+    fn tabs_of_the_docks_are_moved_and_hidden_by_hand(cx: &mut TestAppContext) {
+        use Panel::*;
+        let root = db::testing::dir("ws-hand").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        let config = db::testing::dir("ws-hand-config");
+        let file = config.join("layout.json");
+        std::fs::write(&file, "// mine\n{\n}\n").unwrap();
+        let (ws, cx) = setup(cx, root.clone());
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        let none = gpui::Modifiers::default();
+        // Where something is in the window as it is drawn now: what was
+        // drawn once is remembered where it was.
+        let at = |cx: &mut VisualTestContext, selector: &'static str| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("no {selector}"))
+                .center()
+        };
+        let menu = |cx: &mut VisualTestContext, tab: &'static str, item: &'static str| {
+            let tab = at(cx, tab);
+            cx.simulate_mouse_down(tab, MouseButton::Right, none);
+            cx.simulate_mouse_up(tab, MouseButton::Right, none);
+            let item = at(cx, item);
+            cx.simulate_click(item, none);
+            cx.run_until_parked();
+        };
+        let drag = |cx: &mut VisualTestContext, tab: &'static str, to: &'static str| {
+            let from = at(cx, tab);
+            cx.simulate_mouse_down(from, MouseButton::Left, none);
+            cx.simulate_mouse_move(from + gpui::point(px(6.), px(0.)), MouseButton::Left, none);
+            // Where it goes may be drawn only now that a tab is held.
+            let to = at(cx, to);
+            cx.simulate_mouse_move(to, MouseButton::Left, none);
+            cx.simulate_mouse_up(to, MouseButton::Left, none);
+            cx.run_until_parked();
+        };
+        let layout = |cx: &mut VisualTestContext| cx.read(|cx| Layout::get(cx).clone());
+        let docks = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.read(|cx| {
+                let ws = ws.read(cx);
+                (ws.left, ws.right, ws.bottom)
+            })
+        };
+        // The file once all that was done has reached it.
+        let written = |cx: &mut VisualTestContext| {
+            for _ in 0..200 {
+                cx.run_until_parked();
+                let text = std::fs::read_to_string(&file).unwrap_or_default();
+                if layout::parse(&text).is_ok_and(|read| read == layout(cx)) {
+                    return text;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("layout.json never said what the window shows");
+        };
+
+        // The menu of a tab hides its panel: Files, which was in front,
+        // leaves the dock to the next panel it has.
+        menu(cx, "panel-files", "menu-hide");
+        assert_eq!(layout(cx).hidden, [Files]);
+        assert_eq!(layout(cx).left.panels[0], Search);
+        assert_eq!(docks(cx), (Some(Search), None, None));
+        assert!(cx.read(|cx| ws.read(cx).dock_menu.is_none()));
+        // Its command still opens it, and the menu of any tab of a dock
+        // brings it back into that dock, where it is shown.
+        menu(cx, "panel-git", "menu-show-files");
+        assert!(layout(cx).hidden.is_empty());
+        assert_eq!(layout(cx).left.panels.last(), Some(&Files));
+        assert_eq!(docks(cx), (Some(Files), None, None));
+        // To another dock, which opens on it.
+        menu(cx, "panel-git", "menu-move-right");
+        assert_eq!(layout(cx).right.panels, [Chat, Agent, Git]);
+        assert_eq!(docks(cx), (Some(Files), Some(Git), None));
+        let text = written(cx);
+        assert!(text.contains("// mine"), "{text}");
+
+        // A tab dragged onto another of its dock goes before it.
+        drag(cx, "panel-files", "panel-database");
+        assert_eq!(
+            layout(cx).left.panels,
+            [Search, Services, Files, Database, Api, Ai, Extensions]
+        );
+        assert_eq!(docks(cx).0, Some(Files));
+        // Onto a tab of another dock: before it there, and shown there.
+        drag(cx, "panel-api", "panel-agent");
+        assert_eq!(layout(cx).right.panels, [Chat, Api, Agent, Git]);
+        assert_eq!(docks(cx), (Some(Files), Some(Api), None));
+        // A closed dock has a place to drop a tab on while one is held,
+        // and opens on what is dropped there.
+        drag(cx, "panel-search", "drop-bottom");
+        assert_eq!(layout(cx).bottom.panels.last(), Some(&Search));
+        assert_eq!(docks(cx), (Some(Files), Some(Api), Some(Search)));
+        assert!(cx.read(|cx| ws.read(cx).dragging.is_none()));
+        // The tab in front dragged away: its dock shows what it has left.
+        drag(cx, "panel-files", "panel-search");
+        assert_eq!(docks(cx), (Some(Services), Some(Api), Some(Files)));
+        written(cx);
+
+        // Reset: the window as it comes, and the file put aside whole.
+        cx.dispatch_action(ResetLayout);
+        assert_eq!(docks(cx), (Some(Files), None, None));
+        assert_eq!(layout(cx), Layout::default());
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if !file.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!file.exists());
+        let old = std::fs::read_to_string(config.join("layout.json.old")).unwrap();
+        assert!(
+            old.contains("// mine") && old.contains("\"hidden\""),
+            "{old}"
+        );
+        assert_eq!(layout(cx), Layout::default());
     }
 
     #[gpui::test]

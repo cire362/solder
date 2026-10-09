@@ -85,8 +85,8 @@ Never guess a signature.
   debugger included; which dock a panel is in is the layout's to say
   (`Workspace::show_panel`), never a field of its own, and one that has
   nothing left to show leaves through `Workspace::panel_gone`. A change made
-  by hand in the window is written back to the file (`layout::keep`,
-  `layout::keep_open`): one key at a time and one write after another, and
+  by hand in the window is written back to the file (`layout::keep` for a
+  size, `layout::put` for the rest): one key at a time and one write after another, and
   the file is not read while a write of ours is on its way. Global state lives in `Settings`, `Theme`, `Perf` and
   `LspStore` (see `main.rs` for init order).
 - A document belongs to several language servers (`LspStore`): the one
