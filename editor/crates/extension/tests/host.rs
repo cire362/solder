@@ -100,7 +100,7 @@ impl World for Script {
         let (_, json) = self
             .settings
             .iter()
-            .find(|(name, _)| category == "lsp" && key == Some(name))?;
+            .find(|(name, _)| matches!(category, "lsp" | "context_servers") && key == Some(name))?;
         Some(json.clone())
     }
 }
@@ -567,4 +567,72 @@ fn an_extension_says_how_to_start_its_debug_adapter() {
     .unwrap();
     let error = old_host.debug_adapter(&launch, &project).unwrap_err();
     assert!(error.contains("no debug adapter"), "{error}");
+}
+
+#[test]
+fn an_extension_says_how_to_start_its_context_server() {
+    let extension = fixture("postgres-context-server");
+    assert_eq!(extension.context_servers, ["postgres-context-server"]);
+    // It installs its server from npm, then reads what the user set for
+    // it. Without the database's address it says what is missing.
+    let world = Arc::new(Script {
+        latest: "0.1.6".into(),
+        ..Default::default()
+    });
+    let work = work_dir("host-postgres");
+    let host = Host::load(&extension, &work, world.clone()).unwrap();
+    let error = host
+        .context_server_command("postgres-context-server")
+        .unwrap_err();
+    assert_eq!(error, "missing `database_url` setting");
+    let did = world.take();
+    assert_eq!(did[0], "latest @zeddotdev/postgres-context-server");
+    assert_eq!(did[1], "install @zeddotdev/postgres-context-server@0.1.6");
+    assert_eq!(
+        did[2],
+        "settings context_servers Some(\"postgres-context-server\")"
+    );
+
+    // With it, the answer is Node running the server's script, which is
+    // told the address.
+    let world = Arc::new(Script {
+        latest: "0.1.6".into(),
+        settings: vec![(
+            "postgres-context-server",
+            r#"{"command":null,"settings":{"database_url":"postgresql://localhost/app"}}"#.into(),
+        )],
+        ..Default::default()
+    });
+    let host = Host::load(&extension, &work, world.clone()).unwrap();
+    let command = host
+        .context_server_command("postgres-context-server")
+        .unwrap();
+    assert_eq!(command.command, "/opt/node/bin/node");
+    let script = &command.args[0];
+    assert!(
+        script.ends_with("node_modules/@zeddotdev/postgres-context-server/index.mjs"),
+        "{command:?}"
+    );
+    assert!(
+        command.env.contains(&(
+            "DATABASE_URL".to_string(),
+            "postgresql://localhost/app".to_string()
+        )),
+        "{command:?}"
+    );
+    // The package was there from the first time: not installed again.
+    assert!(!world.take().iter().any(|line| line.starts_with("install ")));
+
+    // A server it does not have, and an extension that has none.
+    assert!(host.context_server_command("other").is_err());
+    let html = Host::load(
+        &html(),
+        &work_dir("host-html-context"),
+        Arc::new(Script::default()),
+    )
+    .unwrap();
+    assert!(
+        html.context_server_command("postgres-context-server")
+            .is_err()
+    );
 }

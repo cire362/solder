@@ -130,6 +130,8 @@ pub struct Extension {
     pub servers: Vec<Server>,
     /// The debug adapters its code knows how to get and start, by name.
     pub debug_adapters: Vec<String>,
+    /// The context servers (MCP servers) its code knows how to start.
+    pub context_servers: Vec<String>,
     pub code: Code,
     /// The commands its manifest declares its code runs: a program and the
     /// arguments it may be given (`*` for any one, `**` for any that remain).
@@ -160,6 +162,11 @@ impl Extension {
                 self.debug_adapters
                     .iter()
                     .map(|adapter| format!("Get and start the debug adapter {adapter}")),
+            )
+            .chain(
+                self.context_servers
+                    .iter()
+                    .map(|server| format!("Get and start the context server {server}")),
             );
         let commands = self.commands.iter().map(|(program, args)| {
             if args.is_empty() {
@@ -202,6 +209,15 @@ impl Extension {
                 },
                 "debug adapter",
                 "debug adapters",
+            ),
+            count(
+                if self.runs_code() {
+                    self.context_servers.len()
+                } else {
+                    0
+                },
+                "context server",
+                "context servers",
             ),
             count(self.themes.len(), "theme", "themes"),
             count(self.icon_themes.len(), "icon theme", "icon themes"),
@@ -482,7 +498,6 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         _ => false,
     };
     for (key, what) in [
-        ("context_servers", "Context servers"),
         ("slash_commands", "Slash commands"),
         ("agent_servers", "Agent servers"),
         ("indexed_docs_providers", "Documentation indexing"),
@@ -507,6 +522,12 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         languages,
         servers,
         debug_adapters: manifest["debug_adapters"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(name, _)| name.clone())
+            .collect(),
+        context_servers: manifest["context_servers"]
             .as_object()
             .into_iter()
             .flatten()
@@ -643,6 +664,7 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         languages,
         servers: Vec::new(),
         debug_adapters: Vec::new(),
+        context_servers: Vec::new(),
         code,
         commands: Vec::new(),
         missing,

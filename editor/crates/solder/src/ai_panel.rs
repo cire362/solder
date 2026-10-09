@@ -13,7 +13,6 @@ use crate::{
     ai_store::{AiStore, BenchStep},
     editor::Editor,
     mcp_store::{McpStore, State},
-    settings::Settings,
     theme::{ActiveTheme, Theme, UI_FONT_SIZE},
     ui,
 };
@@ -392,11 +391,11 @@ impl AiPanel {
     /// start with an agent task, so before the first one all of them wait.
     fn render_servers(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let small = UI_FONT_SIZE - px(1.);
-        let configured = Settings::get(cx).context_servers.clone();
+        let configured = McpStore::listed(cx);
         let store = McpStore::global(cx);
         let store = store.read(cx);
         let mut list = div().px_3().flex().flex_col().gap_2();
-        for (i, (name, config)) in configured.iter().enumerate() {
+        for (i, (name, config, extension)) in configured.iter().enumerate() {
             let entry = store.servers.iter().find(|entry| entry.name == *name);
             let (state, color, tools) = match entry.map(|entry| &entry.state) {
                 _ if !config.enabled => ("Off".to_string(), theme.fg_subtle, String::new()),
@@ -425,12 +424,12 @@ impl AiPanel {
                     .flex()
                     .flex_col()
                     .debug_selector(move || format!("context-server-{i}"))
-                    .child(
-                        div()
-                            .text_size(UI_FONT_SIZE)
-                            .text_color(theme.fg)
-                            .child(name.clone()),
-                    )
+                    .child(div().text_size(UI_FONT_SIZE).text_color(theme.fg).child(
+                        match extension {
+                            Some(extension) => format!("{name} (extension {extension})"),
+                            None => name.clone(),
+                        },
+                    ))
                     .child(div().text_size(small).text_color(color).child(state))
                     .when(!tools.is_empty(), |d| {
                         d.child(
@@ -443,7 +442,7 @@ impl AiPanel {
             );
         }
         let hint = if configured.is_empty() {
-            "A context server gives the agent tools of its own: a database to query, an issue tracker to read. Add one under context_servers in settings.json, with the command that starts it."
+            "A context server gives the agent tools of its own: a database to query, an issue tracker to read. Add one under context_servers in settings.json, with the command that starts it, or install an extension that brings one."
         } else {
             "They start when an agent task begins. A tool runs outside the agent's sandbox, so the agent asks before the first call of each."
         };

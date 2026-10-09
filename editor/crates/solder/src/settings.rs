@@ -87,6 +87,10 @@ pub struct ContextServer {
     pub command: Option<ServerCommand>,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// For a server an extension brings, under the extension's name for
+    /// it: what the extension reads to start it (a database's address, a
+    /// token). The extension says which it needs.
+    pub settings: Option<serde_json::Value>,
     /// `false` keeps it in the file and out of use.
     pub enabled: bool,
 }
@@ -110,6 +114,7 @@ impl Default for ContextServer {
             command: None,
             args: Vec::new(),
             env: BTreeMap::new(),
+            settings: None,
             enabled: true,
         }
     }

@@ -475,6 +475,19 @@ trait Calls: Send {
         ))
     }
 
+    /// How to start the context server `server` of this extension. Versions
+    /// before 0.2 know none.
+    fn context_server_command(
+        &self,
+        _store: &mut Store<State>,
+        _server: &str,
+        _project: Resource<Project>,
+    ) -> wasmtime::Result<Result<Command, String>> {
+        Ok(Err(
+            "It was built for a version of Zed's API that has no context servers".into(),
+        ))
+    }
+
     /// How to show each of a server's completions; `None` leaves one as
     /// the server sent it. Versions before 0.0.6 cannot say.
     fn labels_for_completions(
@@ -832,6 +845,7 @@ macro_rules! start {
                 }
             )
             .filter(|d| d.detail.is_some() || d.description.is_some()));
+            start!(@context $bindings);
         });
     };
     // 0.0.6 and 0.1.0: a completion had no label details yet.
@@ -858,6 +872,7 @@ macro_rules! start {
                 }
             )
             .filter(|d| d.detail.is_some() || d.description.is_some()));
+            start!(@context $bindings);
 
             fn additional_initialization_options(
                 &self,
@@ -885,6 +900,24 @@ macro_rules! start {
 
             $($extra)*
         });
+    };
+    // From 0.2, an extension may bring a context server: it says how to
+    // start it, for a project it is handed.
+    (@context $bindings:ident) => {
+        fn context_server_command(
+            &self,
+            store: &mut Store<State>,
+            server: &str,
+            project: Resource<Project>,
+        ) -> wasmtime::Result<Result<Command, String>> {
+            Ok(self
+                .call_context_server_command(store, server, project)?
+                .map(|command| Command {
+                    command: command.command,
+                    args: command.args,
+                    env: command.env,
+                }))
+        }
     };
     (@labels $bindings:ident $(, |$c:ident| $details:expr)?) => {
         fn labels_for_completions(
@@ -1147,6 +1180,7 @@ pub struct Host {
     languages: Vec<(String, String)>,
     /// The debug adapters the manifest declares.
     debug_adapters: Vec<String>,
+    context_servers: Vec<String>,
 }
 
 impl Host {
@@ -1213,6 +1247,7 @@ impl Host {
                 })
                 .collect(),
             debug_adapters: extension.debug_adapters.clone(),
+            context_servers: extension.context_servers.clone(),
         })
     }
 
@@ -1314,6 +1349,39 @@ impl Host {
             .command
             .map(|command| program(&running.store.data().work_dir, &command));
         Ok(adapter)
+    }
+
+    /// How to start the context server `server` this extension brings. It
+    /// may install the server first, and reads the user's settings for it
+    /// (a database's address, a token): without one it needs, it says so.
+    pub fn context_server_command(&self, server: &str) -> Result<Command, String> {
+        if !self.context_servers.iter().any(|known| known == server) {
+            return Err(format!(
+                "The extension has no context server called {server}"
+            ));
+        }
+        let mut running = self.running.lock().unwrap();
+        let Running { store, extension } = &mut *running;
+        let problem = |e: wasmtime::Error| format!("The extension failed: {e:#}");
+        store.set_fuel(FUEL).map_err(problem)?;
+        let project = store
+            .data_mut()
+            .table
+            .push(Project)
+            .map_err(|e| e.to_string())?;
+        let rep = project.rep();
+        let answer = extension.context_server_command(store, server, project);
+        // Borrowed for the call, as a worktree is.
+        let _ = store
+            .data_mut()
+            .table
+            .delete(Resource::<Project>::new_own(rep));
+        let command = answer.map_err(problem)??;
+        Ok(Command {
+            command: program(&store.data().work_dir, &command.command),
+            args: command.args,
+            env: command.env,
+        })
     }
 
     /// The JSON to send the server as `initializationOptions`, if any.

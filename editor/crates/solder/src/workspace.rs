@@ -10522,4 +10522,143 @@ brackets = [
         let none = cx.read(|cx| extensions.read(cx).debuggers_for("Ruby"));
         assert!(none.is_empty());
     }
+
+    #[gpui::test]
+    fn an_extension_brings_a_context_server_and_reads_its_settings(cx: &mut TestAppContext) {
+        use crate::mcp_store::{McpStore, State};
+        // Zed's real Postgres context server extension, installed. Its
+        // code installs the server from npm and starts it with Node, which
+        // here is a script that runs the stand-in server and hands it the
+        // address the extension read from the user's settings.
+        let root = db::testing::dir("ws-pg").canonicalize().unwrap();
+        let data = db::testing::dir("ws-pg-data");
+        let installed = data.join("extensions/zed/postgres-context-server");
+        std::fs::create_dir_all(&installed).unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../extension/tests/fixtures/postgres-context-server");
+        for file in ["extension.toml", "extension.wasm"] {
+            std::fs::copy(fixtures.join(file), installed.join(file)).unwrap();
+        }
+        let scratch = db::testing::dir("ws-pg-bin");
+        let log = scratch.join("calls.jsonl");
+        let node = scratch.join("node");
+        let mock = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ai/tests/fixtures/mock_mcp.py");
+        executable(
+            &node,
+            &format!(
+                "#!/bin/sh\nMOCK_MCP_LOG='{}' MOCK_MCP_KEY=\"$DATABASE_URL\" exec python3 '{}'\n",
+                log.display(),
+                mock.display()
+            ),
+        );
+        cx.executor().allow_parking();
+        let extensions = cx.update(|cx| {
+            let store = cx.new(|cx| {
+                let mut store =
+                    ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
+                store.world = Some(std::sync::Arc::new(VueWorld {
+                    node: node.to_string_lossy().into_owned(),
+                    settings: store.settings_for(),
+                }));
+                store
+            });
+            ExtensionStore::set_global(store.clone(), cx);
+            store.update(cx, |s, cx| s.scan(cx));
+            store
+        });
+        let (_ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "the extensions folder", &|cx| {
+            extensions.read(cx).loaded
+        });
+        assert_eq!(
+            cx.read(|cx| extensions
+                .read(cx)
+                .find(Origin::Zed, "postgres-context-server")
+                .unwrap()
+                .provides()),
+            "1 context server"
+        );
+        let mcp = cx.update(|_, cx| {
+            let mcp = McpStore::global(cx);
+            mcp.update(cx, |mcp, _| mcp.env = Some(std::env::vars().collect()));
+            mcp
+        });
+        // Started as an agent task starts them, and waited for: each ends
+        // up running or failed.
+        let start = |cx: &mut VisualTestContext| {
+            mcp.update(cx, |mcp, cx| mcp.start_all(&root, cx)).detach();
+            wait_for(cx, "the context servers", &|cx| {
+                !mcp.read(cx)
+                    .servers
+                    .iter()
+                    .any(|entry| matches!(entry.state, State::Starting))
+            });
+        };
+        let state = |cx: &mut VisualTestContext| {
+            cx.read(|cx| {
+                let mcp = mcp.read(cx);
+                assert_eq!(mcp.servers.len(), 1);
+                let entry = &mcp.servers[0];
+                assert_eq!(entry.extension.as_deref(), Some("postgres-context-server"));
+                match &entry.state {
+                    State::Running(_, tools) => format!("{} tools", tools.len()),
+                    State::Failed(why) => why.to_string(),
+                    _ => "not started".into(),
+                }
+            })
+        };
+
+        // The server is listed with no line in the settings. Started, the
+        // extension says what it needs and does not have.
+        start(cx);
+        assert_eq!(state(cx), "missing `database_url` setting");
+        // Its code installed the server on the way, which is written down.
+        assert!(
+            cx.read(|cx| extensions.read(cx).did("postgres-context-server"))
+                .contains(&extension::Event::Installed(
+                    "@zeddotdev/postgres-context-server".into()
+                ))
+        );
+
+        // With the address in the settings, under the server's name, it
+        // starts, and the server is told the address.
+        let settings = serde_json::json!({ "context_servers": {
+            "postgres-context-server": { "settings": { "database_url": "postgresql://localhost/app" } },
+        } });
+        cx.update(|_, cx| cx.set_global(settings::parse_settings(&settings.to_string()).unwrap()));
+        cx.run_until_parked();
+        start(cx);
+        assert_eq!(state(cx), "4 tools");
+        let tools = cx.read(|cx| mcp.read(cx).tools());
+        let echo = tools
+            .iter()
+            .find(|tool| tool.spec.name == "mcp_postgres-context-server_echo")
+            .expect("the server's tool under a name of its own");
+        let said = echo
+            .server
+            .call(
+                &echo.tool,
+                serde_json::json!({ "text": "select 1" }),
+                crate::mcp_store::CALL,
+            )
+            .unwrap();
+        assert_eq!(said.0, "select 1\n[image]");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("postgresql://localhost/app"), "{logged}");
+
+        // Turned off in the settings, or with its extension turned off, it
+        // is stopped and gone from the list.
+        let off = serde_json::json!({ "context_servers": {
+            "postgres-context-server": { "enabled": false },
+        } });
+        cx.update(|_, cx| cx.set_global(settings::parse_settings(&off.to_string()).unwrap()));
+        start(cx);
+        assert!(cx.read(|cx| mcp.read(cx).servers.is_empty()));
+        cx.update(|_, cx| cx.set_global(Settings::default()));
+        extensions.update(cx, |s, cx| {
+            s.set_off(Origin::Zed, "postgres-context-server", true, cx)
+        });
+        start(cx);
+        assert!(cx.read(|cx| mcp.read(cx).servers.is_empty()));
+    }
 }

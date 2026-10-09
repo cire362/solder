@@ -16,7 +16,10 @@ use ai::{
 use futures::FutureExt;
 use gpui::{App, AppContext, Context, Entity, Global, SharedString, Task};
 
-use crate::settings::{ContextServer, Settings};
+use crate::{
+    extension_store::ExtensionStore,
+    settings::{ContextServer, ServerCommand, Settings},
+};
 
 /// How long a server may take to answer its greeting. One started with
 /// `npx` downloads itself the first time.
@@ -34,6 +37,9 @@ pub enum State {
 
 pub struct Entry {
     pub name: String,
+    /// The extension that brings it, for one that is not the user's own
+    /// command.
+    pub extension: Option<String>,
     /// What the settings say about it, to tell when they changed.
     config: ContextServer,
     pub state: State,
@@ -141,22 +147,53 @@ impl McpStore {
             .map(|store| store.0.clone())
     }
 
-    /// Brings the list in line with the settings. A server that is gone
-    /// from them, turned off or changed is stopped; the rest keep running.
-    fn sync(&mut self, cx: &App) {
-        let wanted: BTreeMap<String, ContextServer> = cx
+    /// Every context server there is to use, by name: what the settings
+    /// say about it, and the extension that brings it, if one does. A
+    /// server of the settings that has a command is the user's own, even
+    /// under a name an extension also uses. One of an extension needs no
+    /// entry in the settings; an entry may turn it off or give it what it
+    /// reads.
+    pub fn listed(cx: &App) -> Vec<(String, ContextServer, Option<String>)> {
+        let mut listed: BTreeMap<String, (ContextServer, Option<String>)> = cx
             .try_global::<Settings>()
             .map(|settings| settings.context_servers.clone())
             .unwrap_or_default()
             .into_iter()
-            .filter(|(_, config)| config.enabled)
+            .map(|(name, config)| (name, (config, None)))
             .collect();
-        self.servers
-            .retain(|entry| wanted.get(&entry.name) == Some(&entry.config));
-        for (name, config) in wanted {
+        let brought = ExtensionStore::try_global(cx)
+            .map(|store| store.read(cx).context_servers())
+            .unwrap_or_default();
+        for (extension, server) in brought {
+            let entry = listed.entry(server).or_default();
+            if entry.0.program().is_none() {
+                entry.1 = Some(extension);
+            }
+        }
+        listed
+            .into_iter()
+            .map(|(name, (config, extension))| (name, config, extension))
+            .collect()
+    }
+
+    /// Brings the list in line with the settings and the extensions. A
+    /// server that is gone, turned off or changed is stopped; the rest
+    /// keep running.
+    fn sync(&mut self, cx: &App) {
+        let wanted: Vec<(String, ContextServer, Option<String>)> = Self::listed(cx)
+            .into_iter()
+            .filter(|(_, config, _)| config.enabled)
+            .collect();
+        self.servers.retain(|entry| {
+            wanted.iter().any(|(name, config, extension)| {
+                *name == entry.name && *config == entry.config && *extension == entry.extension
+            })
+        });
+        for (name, config, extension) in wanted {
             if !self.servers.iter().any(|entry| entry.name == name) {
                 self.servers.push(Entry {
                     name,
+                    extension,
                     config,
                     state: State::Stopped,
                     starting: None,
@@ -175,13 +212,37 @@ impl McpStore {
             let entry = &mut self.servers[index];
             if matches!(entry.state, State::Stopped | State::Failed(_)) {
                 entry.state = State::Starting;
-                let (name, config, root) =
+                let (name, mut config, root) =
                     (entry.name.clone(), entry.config.clone(), root.to_path_buf());
                 let env = self.env.clone();
+                // A server of an extension: the extension says how to
+                // start it, and may install it first.
+                let asked = entry.extension.clone().and_then(|extension| {
+                    let store = ExtensionStore::try_global(cx)?;
+                    Some(store.update(cx, |store, cx| {
+                        store.context_server_command(&extension, &name, cx)
+                    }))
+                });
+                let background = cx.background_executor().clone();
                 let started = cx.background_executor().spawn(async move {
-                    let server = Server::start(&launch(&config, &root, env)?, START)?;
-                    let tools = server.tools(LIST)?;
-                    Ok::<_, String>((Arc::new(server), tools))
+                    if let Some(asked) = asked {
+                        let command = asked.await?;
+                        config.command = Some(ServerCommand::Table {
+                            path: command.command,
+                            args: command.args,
+                            env: command.env.into_iter().collect(),
+                        });
+                        config.args.clear();
+                    }
+                    // Starting waits for the server's answer: on a thread
+                    // that may, not on the one that waited above.
+                    background
+                        .spawn(async move {
+                            let server = Server::start(&launch(&config, &root, env)?, START)?;
+                            let tools = server.tools(LIST)?;
+                            Ok::<_, String>((Arc::new(server), tools))
+                        })
+                        .await
                 });
                 let task = cx.spawn(async move |this, cx| {
                     let started = started.await;
