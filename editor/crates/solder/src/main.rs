@@ -41,6 +41,7 @@ mod inline_edit;
 mod key_prompts;
 mod locations;
 mod lsp_store;
+mod mcp_store;
 mod perf;
 mod picker;
 mod plugin_store;

@@ -72,6 +72,73 @@ pub struct Settings {
     /// The icon theme of an installed extension, by name: pictures next
     /// to file names in the tree and on tabs. None by default.
     pub icon_theme: Option<String>,
+    /// Model Context Protocol servers the agent may use, by a name of the
+    /// user's choosing. Started when an agent task begins.
+    pub context_servers: BTreeMap<String, ContextServer>,
+}
+
+/// One context server: the program to start and what to start it with.
+/// The command is written as Zed writes it, in either of its two forms:
+/// `"command": "npx", "args": [...]`, or
+/// `"command": { "path": "npx", "args": [...], "env": {...} }`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextServer {
+    pub command: Option<ServerCommand>,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    /// `false` keeps it in the file and out of use.
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ServerCommand {
+    Program(String),
+    Table {
+        path: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+    },
+}
+
+impl Default for ContextServer {
+    fn default() -> Self {
+        Self {
+            command: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            enabled: true,
+        }
+    }
+}
+
+impl ContextServer {
+    pub fn program(&self) -> Option<String> {
+        match self.command.as_ref()? {
+            ServerCommand::Program(program) | ServerCommand::Table { path: program, .. } => {
+                Some(program.clone()).filter(|program| !program.trim().is_empty())
+            }
+        }
+    }
+
+    pub fn arguments(&self) -> Vec<String> {
+        match &self.command {
+            Some(ServerCommand::Table { args, .. }) if self.args.is_empty() => args.clone(),
+            _ => self.args.clone(),
+        }
+    }
+
+    pub fn variables(&self) -> BTreeMap<String, String> {
+        let mut variables = match &self.command {
+            Some(ServerCommand::Table { env, .. }) => env.clone(),
+            _ => BTreeMap::new(),
+        };
+        variables.extend(self.env.clone());
+        variables
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -99,6 +166,7 @@ impl Default for Settings {
             language_servers: BTreeMap::new(),
             format_on_save: false,
             icon_theme: None,
+            context_servers: BTreeMap::new(),
         }
     }
 }
@@ -428,6 +496,25 @@ mod tests {
         assert_eq!(parse_settings("").unwrap(), Settings::default());
         let url = parse_settings("{ \"buffer_font_family\": \"a//b\" }").unwrap();
         assert_eq!(url.buffer_font_family, "a//b");
+        // A context server's command in both of the forms Zed writes it.
+        let servers = parse_settings(
+            r#"{ "context_servers": {
+                "flat": { "command": "npx", "args": ["-y", "pkg"], "env": { "KEY": "1" } },
+                "table": { "command": { "path": "uvx", "args": ["tool"], "env": { "A": "b" } }, "enabled": false },
+                "bare": {}
+            } }"#,
+        )
+        .unwrap()
+        .context_servers;
+        assert_eq!(servers["flat"].program().as_deref(), Some("npx"));
+        assert_eq!(servers["flat"].arguments(), ["-y", "pkg"]);
+        assert_eq!(servers["flat"].variables()["KEY"], "1");
+        assert!(servers["flat"].enabled);
+        assert_eq!(servers["table"].program().as_deref(), Some("uvx"));
+        assert_eq!(servers["table"].arguments(), ["tool"]);
+        assert_eq!(servers["table"].variables()["A"], "b");
+        assert!(!servers["table"].enabled);
+        assert_eq!(servers["bare"].program(), None);
     }
 
     #[test]

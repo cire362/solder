@@ -116,6 +116,13 @@ Never guess a signature.
   compiled from Go) gets only what `wasi.rs` gives it: its streams, a clock
   and random numbers. Do not add files or sockets there.
 
+- Context servers are Model Context Protocol servers the agent gets tools
+  from. The client is `ai::mcp` (no GPUI, everything in it blocks);
+  `McpStore` (`mcp_store.rs`) starts the servers the settings name when an
+  agent task begins, never at startup. A server's tool runs outside the
+  agent's sandbox: a task asks the user before the first call of each
+  (`agent_task.rs`), and nothing may call one without that.
+
 - Extensions of other editors are read by `crates/extension` (no GPUI) and
   kept by `ExtensionStore` (`extension_store.rs`). A language from one is a
   tree-sitter grammar in WebAssembly: `crates/syntax` compiles it on the

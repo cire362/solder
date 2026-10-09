@@ -121,6 +121,21 @@ export const DOC_GROUPS: DocGroup[] = [
           { code: ["{", '  "ai.completions": "ollama:qwen2.5-coder:7b",', '  "ai.agent": "ollama:qwen2.5-coder:32b"', "}"], file: "settings.json" },
         ],
       },
+      {
+        slug: "context-servers",
+        title: "Context servers",
+        description: "Give the agent tools of its own with Model Context Protocol servers: a database to query, an issue tracker to read.",
+        keywords: "mcp model context protocol context server tools agent postgres github",
+        body: [
+          { h: "Add a server", id: "add" },
+          { p: "A context server is a Model Context Protocol (MCP) server: a program Solder starts and that gives the agent tools of its own. Name it in `settings.json` with the command that starts it, in the form Zed uses." },
+          { code: ["{", '  "context_servers": {', '    "postgres": {', '      "command": "npx",', '      "args": ["-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/app"]', "    }", "  }", "}"], file: "settings.json" },
+          { h: "When it runs", id: "runs" },
+          { p: "Nothing starts with the editor. Servers start when an agent task begins and stay for the next one. The **context servers** view of the AI tab lists them with their tools, and says why one did not start." },
+          { h: "What asks first", id: "asks-first" },
+          { p: "A server's tool runs where the server does, not in the agent's sandbox. The first call of each tool in a task waits for you and shows the tool, the server and the arguments. After you allow it, that task may call the tool again." },
+        ],
+      },
     ],
   },
   {

@@ -493,6 +493,37 @@ command (which declines that command) or after it finished. **Stop** halts it
 between steps. Files `.env` and `.solderignore` keep from AI stay unreadable to
 it, as in the chat; a task stops after 60 steps and asks how to go on.
 
+### Context servers
+
+A context server gives the agent tools of its own: a database to query, an
+issue tracker to read, documentation to look up. It is a Model Context
+Protocol (MCP) server, a program Solder starts and talks to on its input and
+output. Name the ones you want in `settings.json`, as Zed does:
+
+```json
+"context_servers": {
+  "postgres": {
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/app"],
+    "env": { "PGPASSWORD": "..." }
+  },
+  "docs": { "command": { "path": "uvx", "args": ["some-docs-server"] }, "enabled": false }
+}
+```
+
+Nothing starts with the editor. The servers start when an agent task begins,
+with your shell's environment and the variables you gave, and stay for the
+next task; changing an entry stops the server it was for. The agent offers
+the model their tools next to its own. A server's tool runs where the server
+does, not in the agent's sandbox, so the first call of each tool in a task
+waits for **Allow once** and shows the tool, the server and the arguments;
+after that the task may call that tool again. A server that does not start is
+named in the task with its reason, and the task goes on without it. The
+**context servers** view of the AI tab lists them with their tools.
+
+Only tools are used. A server's prompts and resources are not, and what a
+server asks of the client (to sample a model, to list folders) is refused.
+
 ### Review before push
 
 **Push** in the Git tab first has the chat model read what the push sends: the

@@ -76,6 +76,9 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
       review the diff and merge (commands sandboxed with `sandbox-exec` or `bwrap`)
 - [x] AI review before push (outgoing commits' diff, findings as data, push waits
       only when something is found)
+- [x] Context servers for the agent (MCP): servers named in `settings.json`
+      are started with a task, their tools are offered to the model next to
+      the agent's own, and the first call of each waits for the user
 
 ## 7. Debugger, plugins, onboarding
 - [x] Debugger over DAP; one session across browser and server; query timeline
