@@ -832,6 +832,12 @@ filled in, and where VS Code would ask which program, it is the file in
 front. A debugger whose adapter only the extension's code can start is listed
 among what does not run here.
 
+The settings a VS Code extension declares are set in `settings.json` under
+their own names, as in VS Code: `"prettier.tabWidth": 2`, or as objects inside
+objects. The Extensions tab lists them with what each is now: what you set,
+or what the extension says it is when not set. They are what its code will be
+handed when it asks for its configuration; nothing else reads them yet.
+
 A VS Code extension that has a build for each platform is installed in the
 one for this machine. What it does not work without, and what it is a pack
 of, are installed with it; a part of VS Code itself that it names is left

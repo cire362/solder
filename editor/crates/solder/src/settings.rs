@@ -87,6 +87,11 @@ pub struct Settings {
     /// Model Context Protocol servers the agent may use, by a name of the
     /// user's choosing. Started when an agent task begins.
     pub context_servers: BTreeMap<String, ContextServer>,
+    /// What the file sets that is none of the above: the settings of
+    /// extensions, under the names their manifests declare, written with
+    /// the dots (`"prettier.tabWidth": 2`) or as objects inside objects.
+    #[serde(flatten)]
+    pub other: BTreeMap<String, serde_json::Value>,
 }
 
 /// One context server: the program to start and what to start it with,
@@ -284,6 +289,7 @@ impl Default for Settings {
             format_on_save: false,
             icon_theme: None,
             context_servers: BTreeMap::new(),
+            other: BTreeMap::new(),
         }
     }
 }
@@ -702,6 +708,16 @@ mod tests {
         assert_eq!(parse_settings("").unwrap(), Settings::default());
         let url = parse_settings("{ \"buffer_font_family\": \"a//b\" }").unwrap();
         assert_eq!(url.buffer_font_family, "a//b");
+        // What the file sets that Solder has no setting for is kept, for
+        // the extension that declared it; what Solder has is not.
+        let kept = parse_settings(
+            r#"{ "indent_size": 2, "acme.lint.level": 3, "acme": { "format": false } }"#,
+        )
+        .unwrap();
+        assert_eq!(kept.indent_size, 2);
+        let keys: Vec<&str> = kept.other.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["acme", "acme.lint.level"]);
+        assert!(s.other.is_empty());
         // Which servers a language starts, as Zed writes it.
         let ruby = parse_settings(
             r#"{ "languages": { "Ruby": { "language_servers": ["ruby-lsp", "!solargraph", "..."] } } }"#,

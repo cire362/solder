@@ -11260,6 +11260,28 @@ brackets = [
         assert!(syntax::language_for_path(Path::new("notes.dm")).is_none());
         assert!(cx.read(|cx| ws.read(cx).left == Some(Panel::Extensions)));
 
+        // The settings it declares are what it says by default until
+        // settings.json says otherwise, with the dots or as objects.
+        let configured = |cx: &mut VisualTestContext, section: &str| {
+            cx.read(|cx| store.read(cx).configuration(section, cx))
+        };
+        assert_eq!(
+            configured(cx, "acme"),
+            serde_json::json!({ "lint": { "level": 2 }, "format": true })
+        );
+        assert_eq!(configured(cx, "acme.lint.level"), 2);
+        assert_eq!(configured(cx, "acme.name"), serde_json::Value::Null);
+        cx.update(|_, cx| {
+            let set = r#"{ "acme.lint.level": 3, "acme": { "format": false, "name": "x" } }"#;
+            cx.set_global(settings::parse_settings(set).unwrap());
+        });
+        assert_eq!(
+            configured(cx, "acme"),
+            serde_json::json!({ "lint": { "level": 3 }, "format": false, "name": "x" })
+        );
+        assert_eq!(configured(cx, "")["acme"]["lint"]["level"], 3);
+        cx.update(|_, cx| cx.set_global(Settings::default()));
+
         // Its icon theme is drawn with pictures, so it is one Solder has:
         // the tab offers it, and chosen, files get its pictures. The one
         // drawn with a font is among what does not work here.

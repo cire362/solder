@@ -219,8 +219,10 @@ to build them.
 - [x] Icon themes, through the same file icons as Zed's: the ones drawn
       with pictures, by a file's name, ending and language and a folder's
       name. One drawn with a font is said not to run here
-- [ ] The settings an extension declares, with their defaults, in
-      `settings.json`
+- [x] The settings an extension declares, with their defaults, in
+      `settings.json`: kept there under their own names, listed in the
+      Extensions tab with what each is now, and resolved to one object as
+      an extension's code will ask for them
 - [x] Debuggers an extension declares with a program to start, in the
       debugger: for the files of the languages they name, started with the
       launch the manifest suggests. One only its code starts is said not

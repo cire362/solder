@@ -620,6 +620,25 @@ mod tests {
             installed.provides(),
             "2 themes, 2 icon themes, 1 snippet file"
         );
+        // The settings it declares, each with what it is by default; one
+        // declared twice is the first.
+        let settings: Vec<_> = installed
+            .settings
+            .iter()
+            .map(|s| (s.key.as_str(), s.default.clone(), s.description.as_str()))
+            .collect();
+        assert_eq!(
+            settings,
+            [
+                ("acme.format", serde_json::json!(true), "Formats on save."),
+                (
+                    "acme.lint.level",
+                    serde_json::json!(2),
+                    "How strict the linter is"
+                ),
+                ("acme.name", serde_json::Value::Null, ""),
+            ]
+        );
     }
 
     #[test]

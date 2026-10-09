@@ -157,6 +157,27 @@ struct Gated {
 
 /// The loaded code of an extension: what its slot holds, or loaded now.
 /// Blocking, and slow the first time.
+/// Puts `value` where the dots of `key` lead: `a.b.c` is `c` in `b` in
+/// `a`. An object put where one is already is laid over it, name by name,
+/// so that `"a": { "b": 1 }` and `"a.c": 2` in one file both hold.
+fn put_at(into: &mut serde_json::Value, key: &str, value: serde_json::Value) {
+    let mut at = into;
+    for part in key.split('.').filter(|part| !part.is_empty()) {
+        if !at.is_object() {
+            *at = serde_json::json!({});
+        }
+        at = &mut at[part];
+    }
+    match (at.is_object(), value) {
+        (true, serde_json::Value::Object(fields)) => {
+            for (name, field) in fields {
+                put_at(at, &name, field);
+            }
+        }
+        (_, value) => *at = value,
+    }
+}
+
 /// The launch a declared debugger is given: the one its manifest suggests,
 /// with its places filled in for the file to debug, or with none
 /// suggested, the least any adapter is told.
@@ -779,6 +800,36 @@ impl ExtensionStore {
                     .map(|adapter| (extension.id.clone(), adapter.clone()))
             })
             .collect()
+    }
+
+    /// What the settings of installed extensions are under `section`
+    /// (`prettier`, or `editor.suggest`; all of them for an empty one):
+    /// what their manifests declare by default, with what the user set in
+    /// settings.json over it. An object, as VS Code hands one to an
+    /// extension that asks for its configuration.
+    pub fn configuration(&self, section: &str, cx: &App) -> serde_json::Value {
+        let mut all = serde_json::json!({});
+        let declared = self
+            .installed
+            .iter()
+            .filter(|e| !self.is_off(e.origin, &e.id))
+            .flat_map(|extension| &extension.settings);
+        for setting in declared {
+            if !setting.default.is_null() {
+                put_at(&mut all, &setting.key, setting.default.clone());
+            }
+        }
+        if let Some(settings) = cx.try_global::<Settings>() {
+            for (key, value) in &settings.other {
+                put_at(&mut all, key, value.clone());
+            }
+        }
+        section
+            .split('.')
+            .filter(|part| !part.is_empty())
+            .try_fold(&all, |at, part| at.get(part))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
     }
 
     /// The debug adapters there are for `file`: the extension's id and

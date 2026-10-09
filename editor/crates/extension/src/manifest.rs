@@ -145,6 +145,18 @@ pub struct Extension {
     /// The debug adapters its manifest gives the program of, which need
     /// none of its code to start.
     pub debuggers: Vec<Debugger>,
+    /// The settings its manifest declares, each with what it is when the
+    /// user has not set it.
+    pub settings: Vec<Setting>,
+}
+
+/// A setting a VS Code extension declares: its whole name with the dots
+/// in it (`prettier.tabWidth`), what it is by default, and what it is for.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Setting {
+    pub key: String,
+    pub default: Value,
+    pub description: String,
 }
 
 /// A debug adapter a VS Code extension declares with the program that is
@@ -567,6 +579,7 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         missing,
         needs: Vec::new(),
         debuggers: Vec::new(),
+        settings: Vec::new(),
     })
 }
 
@@ -695,6 +708,33 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
     } else {
         Code::None
     };
+    // The settings it declares: one group of them, or several.
+    let mut settings: Vec<Setting> = Vec::new();
+    let groups = match &contributes["configuration"] {
+        Value::Array(groups) => groups.clone(),
+        Value::Null => Vec::new(),
+        group => vec![group.clone()],
+    };
+    for group in &groups {
+        for (key, declared) in group["properties"].as_object().into_iter().flatten() {
+            if key.trim().is_empty() || settings.iter().any(|known| known.key == *key) {
+                continue;
+            }
+            let said = [&declared["description"], &declared["markdownDescription"]]
+                .into_iter()
+                .map(|said| label(&text(said)))
+                .find(|said| !said.is_empty())
+                .unwrap_or_default();
+            settings.push(Setting {
+                key: key.clone(),
+                default: declared["default"].clone(),
+                // The first line is enough to say what it is for.
+                description: said.lines().next().unwrap_or_default().to_string(),
+            });
+        }
+    }
+    settings.sort_by(|a, b| a.key.cmp(&b.key));
+
     // Debuggers whose manifest names the adapter's program. One that
     // leaves that to its code cannot be started without it.
     let mut debuggers: Vec<Debugger> = Vec::new();
@@ -793,6 +833,7 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
             needs
         },
         debuggers,
+        settings,
         servers: Vec::new(),
         debug_adapters: Vec::new(),
         context_servers: Vec::new(),

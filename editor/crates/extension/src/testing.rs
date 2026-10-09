@@ -267,13 +267,20 @@ pub fn vscode_extension(dir: &Path) {
       {"id": "acme-icons", "label": "%icons%", "path": "./dist/icons.json"},
       {"id": "acme-font", "label": "Acme Font", "path": "./dist/font.json"}
     ],
+    "configuration": [
+      {"title": "Acme", "properties": {
+        "acme.lint.level": {"type": "number", "default": 2, "description": "%level%"},
+        "acme.format": {"type": "boolean", "default": true, "markdownDescription": "Formats on save.\nAnd more."}
+      }},
+      {"properties": {"acme.name": {"type": "string"}, "acme.format": {"default": false}}}
+    ],
     "keybindings": [{"command": "demo.run", "key": "ctrl+r"}]
   }
 }"#,
     );
     write(
         &dir.join("package.nls.json"),
-        r#"{"title": "Acme Demo", "icons": "Acme Icons"}"#,
+        r#"{"title": "Acme Demo", "icons": "Acme Icons", "level": "How strict the linter is"}"#,
     );
     // Pictures beside the folder of the theme's file, as such themes
     // keep them.
