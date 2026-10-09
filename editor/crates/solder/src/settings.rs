@@ -77,6 +77,8 @@ pub struct Settings {
     /// Per-server overrides, keyed by server name (`rust-analyzer`,
     /// `typescript-language-server`, ...).
     pub language_servers: BTreeMap<String, ServerOverride>,
+    /// What is set for one language, by the language's name.
+    pub languages: BTreeMap<String, LanguageSettings>,
     /// Format with the language server before every save.
     pub format_on_save: bool,
     /// The icon theme of an installed extension, by name: pictures next
@@ -154,6 +156,18 @@ impl ContextServer {
         variables.extend(self.env.clone());
         variables
     }
+}
+
+/// The settings of one language.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LanguageSettings {
+    /// Which of the language's servers start, the first being the one
+    /// asked what only one can answer. Written as Zed writes it: a name,
+    /// `!name` for one that does not start, and `...` for all the others.
+    /// Without `...` only the ones named start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language_servers: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -250,6 +264,7 @@ impl Default for Settings {
             indent_size: 4,
             show_performance_hud: true,
             language_servers: BTreeMap::new(),
+            languages: BTreeMap::new(),
             format_on_save: false,
             icon_theme: None,
             context_servers: BTreeMap::new(),
@@ -671,6 +686,16 @@ mod tests {
         assert_eq!(parse_settings("").unwrap(), Settings::default());
         let url = parse_settings("{ \"buffer_font_family\": \"a//b\" }").unwrap();
         assert_eq!(url.buffer_font_family, "a//b");
+        // Which servers a language starts, as Zed writes it.
+        let ruby = parse_settings(
+            r#"{ "languages": { "Ruby": { "language_servers": ["ruby-lsp", "!solargraph", "..."] } } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ruby.languages["Ruby"].language_servers.as_deref(),
+            Some(&["ruby-lsp".to_string(), "!solargraph".into(), "...".into()][..])
+        );
+        assert!(s.languages.is_empty());
         // The interface's text as it comes: a rem is 16 pixels, and rows
         // are as tall as they were written.
         assert_eq!(s.ui_font_family, UI_FONT);

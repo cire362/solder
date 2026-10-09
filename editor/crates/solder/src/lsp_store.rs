@@ -280,6 +280,26 @@ pub struct LspStore {
     starts: HashMap<ServerKey, u64>,
     /// Latest progress or error message, shown in the status bar.
     status: Option<SharedString>,
+    /// Which servers the settings chose when the documents were last
+    /// given theirs.
+    chosen: Choice,
+}
+
+/// What the settings say of which servers start: the choice of each
+/// language, and the servers turned off by name.
+type Choice = (
+    std::collections::BTreeMap<String, crate::settings::LanguageSettings>,
+    Vec<String>,
+);
+
+fn choice(settings: &Settings) -> Choice {
+    let off = settings
+        .language_servers
+        .iter()
+        .filter(|(_, server)| server.disabled)
+        .map(|(name, _)| name.clone())
+        .collect();
+    (settings.languages.clone(), off)
 }
 
 /// A server asked the client to apply an edit (usually after a code action
@@ -313,7 +333,101 @@ pub fn init(cx: &mut App) {
         }
     })
     .detach();
+    // The settings chose other servers: open files go to them at once,
+    // not when they are next opened.
+    cx.observe_global::<Settings>({
+        let store = store.downgrade();
+        move |cx| {
+            store
+                .update(cx, |store, cx| {
+                    let now = choice(Settings::get(cx));
+                    if store.chosen != now {
+                        store.chosen = now;
+                        store.extension_servers_changed(cx);
+                    }
+                })
+                .ok();
+        }
+    })
+    .detach();
     cx.set_global(GlobalLspStore(store));
+}
+
+/// The servers of a language that start, in order: `available` are the
+/// ones there are, and `choice` is which of them, as Zed writes it. A name
+/// starts that server, `!name` keeps it from starting, and `...` stands for
+/// all the others in the order they come. Without `...`, a server that is
+/// not named does not start.
+pub fn chosen_servers<'a>(available: &[&'a str], choice: &[&str]) -> Vec<&'a str> {
+    let named = |name: &str| {
+        choice
+            .iter()
+            .any(|entry| entry.strip_prefix('!').unwrap_or(entry) == name)
+    };
+    let mut chosen: Vec<&'a str> = Vec::new();
+    for entry in choice {
+        if *entry == "..." {
+            for name in available {
+                if !named(name) && !chosen.contains(name) {
+                    chosen.push(name);
+                }
+            }
+        } else if !entry.starts_with('!')
+            && let Some(name) = available.iter().find(|name| *name == entry)
+            && !chosen.contains(name)
+        {
+            chosen.push(name);
+        }
+    }
+    chosen
+}
+
+/// Which servers start for a language whose extension brings several
+/// that do the same work, where the user has not said. These are Zed's
+/// own choices (its default settings, read on 2026-10-10), so that an
+/// extension made for Zed starts here what it starts there. Languages
+/// Solder has a server of its own for are not here: that one starts.
+fn default_servers(language: &str) -> Option<&'static [&'static str]> {
+    const ELIXIR: &[&str] = &[
+        "elixir-ls",
+        "!expert",
+        "!dexter",
+        "!next-ls",
+        "!lexical",
+        "...",
+    ];
+    Some(match language {
+        "CSharp" => &["roslyn", "!csharp-ls", "!omnisharp", "..."],
+        "Elixir" => &[
+            "elixir-ls",
+            "!expert",
+            "!dexter",
+            "!next-ls",
+            "!lexical",
+            "!emmet-language-server",
+            "...",
+        ],
+        "EEx" | "HEEx" => ELIXIR,
+        "Erlang" => &["erlang-ls", "!elp", "..."],
+        "HTML+ERB" => &["herb", "!ruby-lsp", "..."],
+        "JS+ERB" | "YAML+ERB" => &["!ruby-lsp", "..."],
+        "Kotlin" => &["!kotlin-language-server", "kotlin-lsp", "..."],
+        "PHP" => &["phpactor", "!intelephense", "!phptools", "!phpantom", "..."],
+        "Proto" => &["buf", "!protols", "!protobuf-language-server", "..."],
+        "Ruby" => &[
+            "solargraph",
+            "!ruby-lsp",
+            "!rubocop",
+            "!sorbet",
+            "!steep",
+            "!kanayago",
+            "!fuzzy-ruby-server",
+            "...",
+        ],
+        "Starlark" => &["starpls", "!buck2-lsp", "!tilt", "..."],
+        "SystemVerilog" => &["slang", "!verible", "!veridian", "!svls", "..."],
+        _ => return None,
+    })
 }
 
 impl LspStore {
@@ -336,6 +450,16 @@ impl LspStore {
 
     pub fn status(&self) -> Option<&SharedString> {
         self.status.as_ref()
+    }
+
+    /// The servers a document belongs to, the first being the one asked
+    /// what only one can answer.
+    #[cfg(test)]
+    pub fn servers_of(&self, document: EntityId) -> Vec<&'static str> {
+        self.docs
+            .get(&document)
+            .map(|entry| entry.servers.iter().map(|s| s.key.name).collect())
+            .unwrap_or_default()
     }
 
     fn register_document(&mut self, document: &Entity<Document>, cx: &mut Context<Self>) {
@@ -434,6 +558,26 @@ impl LspStore {
                     .get(attached.key.name)
                     .is_some_and(|s| s.disabled)
             });
+            // Of the servers there are for the language, the ones that
+            // start, in the order the user gave them or Zed does.
+            let users = settings
+                .languages
+                .get(language)
+                .and_then(|language| language.language_servers.as_deref());
+            let choice: Option<Vec<&str>> = match users {
+                Some(names) => Some(names.iter().map(String::as_str).collect()),
+                None => default_servers(language).map(<[&str]>::to_vec),
+            };
+            if let Some(choice) = choice {
+                let names: Vec<&str> = wanted.iter().map(|(a, ..)| a.key.name).collect();
+                let order = chosen_servers(&names, &choice);
+                wanted.retain(|(attached, ..)| order.contains(&attached.key.name));
+                wanted.sort_by_key(|(attached, ..)| {
+                    order.iter().position(|name| *name == attached.key.name)
+                });
+                // A server that does not start has nothing to be set up.
+                asking = asking.filter(|(key, ..)| order.contains(&key.name));
+            }
         }
         // A server the document stays in keeps it open; one it leaves is
         // told it closed.
@@ -1248,6 +1392,49 @@ pub fn from_range(buffer: &Buffer, range: lt::Range, encoding: Encoding) -> Rang
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_servers_of_a_language_are_the_ones_chosen() {
+        let ruby = [
+            "fuzzy-ruby-server",
+            "herb",
+            "kanayago",
+            "rubocop",
+            "ruby-lsp",
+            "solargraph",
+            "sorbet",
+            "steep",
+        ];
+        // As Zed chooses for Ruby: one of the eight, and those it does
+        // not name. An extension that brings a ninth starts it.
+        let defaults = default_servers("Ruby").unwrap();
+        assert_eq!(chosen_servers(&ruby, defaults), ["solargraph", "herb"]);
+        // The user's own: named ones first, in their order, then the rest
+        // less the ones left out.
+        assert_eq!(
+            chosen_servers(
+                &ruby,
+                &["ruby-lsp", "!solargraph", "!herb", "rubocop", "..."]
+            )[..3],
+            ["ruby-lsp", "rubocop", "fuzzy-ruby-server"]
+        );
+        // Without `...` only the named start; one that is not there, or
+        // is named twice, changes nothing.
+        assert_eq!(
+            chosen_servers(&ruby, &["sorbet", "pyright", "sorbet", "steep"]),
+            ["sorbet", "steep"]
+        );
+        // `...` keeps the order servers come in, and none at all is none.
+        assert_eq!(chosen_servers(&["a", "b", "c"], &["...", "!b"]), ["a", "c"]);
+        assert_eq!(
+            chosen_servers(&["a", "b", "c"], &["c", "..."]),
+            ["c", "a", "b"]
+        );
+        assert!(chosen_servers(&ruby, &[]).is_empty());
+        // A language Solder has a server of its own for has no choice
+        // made for it.
+        assert!(default_servers("Rust").is_none() && default_servers("TypeScript").is_none());
+    }
 
     #[test]
     fn root_is_nearest_marker() {

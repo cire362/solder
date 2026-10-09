@@ -834,6 +834,26 @@ some ask by a name of their own: Vue's reads `"vue"`, not the id of its
 server. A language's tab size comes from `indent_size`. A change takes effect
 when the server next starts.
 
+An extension may bring several servers that do the same work for a language:
+Ruby's lists seven. Which of them start is the language's to say, written as
+Zed writes it:
+
+```json
+{
+  "languages": {
+    "Ruby": { "language_servers": ["ruby-lsp", "!solargraph", "..."] }
+  }
+}
+```
+
+A name starts that server, `!name` keeps it from starting, and `"..."` stands
+for all the others. Without `"..."` only the named ones start. The first is
+the one asked what a single server answers, such as where a definition is.
+With nothing said, a language whose extension brings alternatives starts what
+Zed starts for it (`solargraph` for Ruby, `phpactor` for PHP, `elixir-ls` for
+Elixir); any other starts all its servers. Open files go to the chosen servers
+as soon as the settings are saved.
+
 That is why such an extension **asks first**. It is downloaded and read, and
 then waits: the tab shows what installing it allows (the servers it gets, the
 commands its manifest declares), and nothing is in place until you press

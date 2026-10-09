@@ -11623,6 +11623,117 @@ brackets = [
     }
 
     #[gpui::test]
+    fn a_language_starts_the_servers_chosen_for_it(cx: &mut TestAppContext) {
+        let _languages = extension_languages();
+        // Zed's real Ruby extension, which lists seven servers for Ruby.
+        // (Its grammar here is Vue's: the test needs a language, not its
+        // colors.) None of them is on this machine, and none is needed:
+        // what is checked is which of them the file is given to.
+        let root = db::testing::dir("ws-ruby-servers").canonicalize().unwrap();
+        let app = root.join("app.rb");
+        std::fs::write(&app, "puts 1\n").unwrap();
+        let data = db::testing::dir("ws-ruby-servers-data");
+        let installed = data.join("extensions/zed/ruby");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        std::fs::create_dir_all(installed.join("grammars")).unwrap();
+        for file in ["extension.toml", "extension.wasm"] {
+            std::fs::copy(
+                fixtures.join("extension/tests/fixtures/ruby").join(file),
+                installed.join(file),
+            )
+            .unwrap();
+        }
+        std::fs::copy(
+            fixtures.join("syntax/tests/fixtures/vue/vue.wasm"),
+            installed.join("grammars/vue.wasm"),
+        )
+        .unwrap();
+        write_file(
+            &installed.join("languages/ruby/config.toml"),
+            "name = \"Ruby\"\ngrammar = \"vue\"\npath_suffixes = [\"rb\"]\n",
+        );
+        cx.executor().allow_parking();
+        let extensions = cx.update(|cx| {
+            let extensions = cx.new(|cx| {
+                let mut store =
+                    ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
+                store.world = Some(std::sync::Arc::new(ServerOnPath("nothing", String::new())));
+                store
+            });
+            ExtensionStore::set_global(extensions.clone(), cx);
+            extensions.update(cx, |s, cx| s.scan(cx));
+            extensions
+        });
+        let (ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "the extensions folder", &|cx| {
+            extensions.read(cx).loaded
+        });
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(app.clone(), None, window, cx)
+        });
+        let servers = |cx: &App| -> Vec<&'static str> {
+            let Some(editor) = ws.read(cx).active_editor() else {
+                return Vec::new();
+            };
+            let document = editor.read(cx).document().entity_id();
+            LspStore::global(cx)
+                .map(|store| store.read(cx).servers_of(document))
+                .unwrap_or_default()
+        };
+        // With nothing said, the one Zed starts for Ruby, of the seven.
+        wait_for(cx, "Ruby's server", &|cx| servers(cx) == ["solargraph"]);
+
+        // The user's choice for the language, as Zed writes it: these
+        // two in this order, and the open file goes to them at once.
+        let choose = |cx: &mut VisualTestContext, names: Option<&[&str]>| {
+            cx.update(|_, cx| {
+                let mut settings = Settings::get(cx).clone();
+                settings.languages.insert(
+                    "Ruby".into(),
+                    settings::LanguageSettings {
+                        language_servers: names
+                            .map(|names| names.iter().map(|name| name.to_string()).collect()),
+                    },
+                );
+                cx.set_global(settings);
+            });
+            cx.run_until_parked();
+        };
+        choose(cx, Some(&["ruby-lsp", "rubocop"]));
+        assert_eq!(cx.read(|cx| servers(cx)), ["ruby-lsp", "rubocop"]);
+        // One left out of all the rest.
+        choose(cx, Some(&["...", "!solargraph", "!sorbet"]));
+        assert_eq!(
+            cx.read(|cx| servers(cx)),
+            [
+                "fuzzy-ruby-server",
+                "kanayago",
+                "rubocop",
+                "ruby-lsp",
+                "steep"
+            ]
+        );
+        // A server turned off by its own name stays off whatever the
+        // language says.
+        cx.update(|_, cx| {
+            let mut settings = Settings::get(cx).clone();
+            settings.language_servers.insert(
+                "rubocop".into(),
+                settings::ServerOverride {
+                    disabled: true,
+                    ..Default::default()
+                },
+            );
+            cx.set_global(settings);
+        });
+        cx.run_until_parked();
+        assert!(!cx.read(|cx| servers(cx)).contains(&"rubocop"));
+        // Nothing said again: Zed's choice.
+        choose(cx, None);
+        assert_eq!(cx.read(|cx| servers(cx)), ["solargraph"]);
+    }
+
+    #[gpui::test]
     fn a_debug_adapter_of_an_extension_debugs_a_file_of_its_language(cx: &mut TestAppContext) {
         let _languages = extension_languages();
         // Zed's real Ruby extension, installed, with a Ruby language that

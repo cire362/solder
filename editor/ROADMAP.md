@@ -190,10 +190,11 @@ to build them.
 - [x] Debug adapters of extensions, in the debugger: the open file with
       each adapter its language names, started as the extension says, over
       a port or the adapter's own input and output
-- [ ] Which of a language's servers start. Every server an extension lists
-      for a language is started today, and Ruby's lists eight: the user's
-      choice per language (`language_servers`, with `!name` to leave one
-      out), and Zed's defaults for the languages that need them
+- [x] Which of a language's servers start. Every server an extension lists
+      for a language was started, and Ruby's lists seven for Ruby: the
+      user's choice per language (`languages.<name>.language_servers`, with
+      `!name` to leave one out and `...` for the rest), and Zed's defaults
+      for the languages whose extensions bring alternatives
 - [x] Context servers of extensions, in the agent. They are MCP servers
       (context7, GitHub and Postgres are the most installed): the extension
       says how to start one and reads the user's settings for it, and the
