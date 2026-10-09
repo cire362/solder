@@ -130,6 +130,9 @@ pub struct Language {
     highlighter: OnceLock<Option<Highlighter>>,
     injector: OnceLock<Option<Injector>>,
     rules: OnceLock<rules::Rules>,
+    /// The parses of an extension's grammar, which run on a thread of
+    /// their own.
+    watch: wasm::Watch,
 }
 
 struct Highlighter {
@@ -164,7 +167,16 @@ impl Language {
         self.grammar.get().is_some()
     }
 
+    /// Whether its grammar stopped answering and was given up on: its
+    /// files are plain text until the editor starts again.
+    pub fn is_hung(&self) -> bool {
+        self.watch.is_hung()
+    }
+
     fn grammar(&self) -> Option<&tree_sitter::Language> {
+        if self.is_hung() {
+            return None;
+        }
         self.grammar
             .get_or_init(|| match &self.source {
                 Source::Native { grammar, .. } => Some(grammar.clone()),
@@ -358,6 +370,7 @@ macro_rules! lang {
             highlighter: OnceLock::new(),
             injector: OnceLock::new(),
             rules: OnceLock::new(),
+            watch: wasm::Watch::default(),
         })
     };
 }
@@ -537,6 +550,7 @@ pub fn set_extension_languages(specs: Vec<LanguageSpec>) {
                     highlighter: OnceLock::new(),
                     injector: OnceLock::new(),
                     rules: OnceLock::new(),
+                    watch: wasm::Watch::default(),
                 }),
             }
         })
@@ -651,14 +665,28 @@ const MAX_DEPTH: usize = 3;
 
 impl SyntaxTree {
     pub fn parse(language: Arc<Language>, rope: &Rope) -> Option<Self> {
-        let tree = parse_rope(&mut *new_parser(&language)?, rope, None, None)?;
+        Self::parse_until(language, rope, None)
+    }
+
+    /// A parse that gives up after `budget`: for the thread that draws,
+    /// which finishes elsewhere with [`SyntaxTree::parse`].
+    pub fn parse_within(language: Arc<Language>, rope: &Rope, budget: Duration) -> Option<Self> {
+        Self::parse_until(language, rope, Some(Instant::now() + budget))
+    }
+
+    fn parse_until(
+        language: Arc<Language>,
+        rope: &Rope,
+        deadline: Option<Instant>,
+    ) -> Option<Self> {
+        let tree = parse_rope(&language, &mut new_parser(&language)?, rope, None, deadline)?;
         // An extension's queries are read from disk and compiled here, where
         // the caller already expects to wait, and not at the first paint.
         if matches!(language.source, Source::Wasm(_)) {
             language.highlighter();
             language.rules();
         }
-        let layers = parse_layers(&language, &tree, rope, &[], None, None)?;
+        let layers = parse_layers(&language, &tree, rope, &[], None, deadline)?;
         Some(Self {
             language,
             tree,
@@ -753,7 +781,13 @@ impl SyntaxTree {
 
     fn reparsed(&self, rope: &Rope, deadline: Option<Instant>) -> Option<SyntaxTree> {
         let mut parser = new_parser(&self.language)?;
-        let tree = parse_rope(&mut parser, rope, Some(&self.tree), deadline)?;
+        let tree = parse_rope(
+            &self.language,
+            &mut parser,
+            rope,
+            Some(&self.tree),
+            deadline,
+        )?;
         drop(parser);
         let layers = parse_layers(
             &self.language,
@@ -1020,7 +1054,8 @@ fn inject(
                 if parser.set_included_ranges(&ranges).is_err() {
                     continue;
                 }
-                parse_rope(&mut parser, rope, before.map(|layer| &layer.tree), deadline)?
+                let old = before.map(|layer| &layer.tree);
+                parse_rope(&target, &mut parser, rope, old, deadline)?
             }
         };
         // Compiled here for the same reason as in `SyntaxTree::parse`.
@@ -1098,14 +1133,58 @@ thread_local! {
     static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// The grammars that stopped answering and were given up on, by the name
+/// of their language, for the editor to say so.
+pub fn hung_grammars() -> Vec<&'static str> {
+    HUNG.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+static HUNG: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+
+/// Parses with `parser`, which is set up for `language`. An extension's
+/// grammar does not run on this thread: see `wasm.rs`.
 fn parse_rope(
-    parser: &mut Parser,
+    language: &Language,
+    parser: &mut LanguageParser,
     rope: &Rope,
     old: Option<&Tree>,
     deadline: Option<Instant>,
 ) -> Option<Tree> {
     #[cfg(test)]
     PARSES.with(|parses| parses.set(parses.get() + 1));
+    if !parser.pooled {
+        return run_parser(parser, rope, old, deadline);
+    }
+    let mut taken = parser.parser.take()?;
+    // Snapshots: both are shared underneath, not copied.
+    let (rope, old) = (rope.clone(), old.cloned());
+    let outcome = language.watch.run(deadline, move || {
+        let tree = run_parser(&mut taken, &rope, old.as_ref(), deadline);
+        (taken, tree)
+    });
+    match outcome {
+        wasm::Outcome::Done((back, tree)) => {
+            parser.parser = Some(back);
+            tree
+        }
+        wasm::Outcome::Late => None,
+        wasm::Outcome::Hung => {
+            let mut hung = HUNG.lock().unwrap_or_else(|e| e.into_inner());
+            if !hung.contains(&language.name) {
+                eprintln!("the grammar of {} stopped answering", language.name);
+                hung.push(language.name);
+            }
+            None
+        }
+    }
+}
+
+fn run_parser(
+    parser: &mut Parser,
+    rope: &Rope,
+    old: Option<&Tree>,
+    deadline: Option<Instant>,
+) -> Option<Tree> {
     let len = rope.len_bytes();
     let mut read = |byte: usize, _| -> &[u8] {
         if byte >= len {
@@ -1303,6 +1382,45 @@ mod tests {
     }
 
     const COMPONENT: &str = "<template>\n  <div class=\"box\" @click=\"go(1)\">{{ msg }}</div>\n</template>\n<script setup lang=\"ts\">\nconst msg: string = 'hi'\n</script>\n<style>\n.box { color: red; }\n</style>\n";
+
+    #[test]
+    fn a_grammar_that_does_not_answer_is_given_up_on() {
+        let vue = vue();
+        let rope = Rope::from_str(COMPONENT);
+        // An extension's grammar parses on a thread of its own, and the
+        // tree is the same as ever.
+        let tree = SyntaxTree::parse(vue.clone(), &rope).unwrap();
+        assert!(!tree.highlights(&rope, 0..rope.len_bytes()).is_empty());
+        assert!(wasm::THREADS.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(!vue.is_hung() && !hung_grammars().contains(&"Vue.js"));
+
+        // The same grammar under a language with no patience at all, in
+        // place of one whose scanner never returns: its first parse is
+        // not waited for, and that is the last one it is asked for.
+        let Source::Wasm(spec) = &vue.source else {
+            unreachable!()
+        };
+        let impatient = Arc::new(Language {
+            name: "Impatient",
+            line_comment: None,
+            source: Source::Wasm(spec.clone()),
+            grammar: OnceLock::new(),
+            highlighter: OnceLock::new(),
+            injector: OnceLock::new(),
+            rules: OnceLock::new(),
+            watch: wasm::Watch::patient(Duration::ZERO),
+        });
+        assert!(SyntaxTree::parse(impatient.clone(), &rope).is_none());
+        assert!(impatient.is_hung());
+        assert_eq!(hung_grammars(), ["Impatient"]);
+        // Its files are plain text from then on, at no cost.
+        let asked = Instant::now();
+        assert!(SyntaxTree::parse(impatient.clone(), &rope).is_none());
+        assert!(SyntaxTree::parse_within(impatient, &rope, Duration::from_secs(5)).is_none());
+        assert!(asked.elapsed() < Duration::from_millis(200));
+        // The others go on as before.
+        assert!(SyntaxTree::parse(vue, &rope).is_some());
+    }
 
     #[test]
     fn an_extension_language_is_found_by_suffix_or_whole_name() {

@@ -762,6 +762,13 @@ A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
 It is compiled on the first file that needs it and runs in wasmtime inside
 the parser, where it sees nothing but the text.
 
+It also cannot hold the editor. Such a grammar parses on a thread of its own,
+and typing waits for it no longer than a frame allows. One that has not
+answered in ten seconds, which is a scanner that never returns, is given up
+on: the status bar says so, and files of that language are plain text until
+Solder starts again. The thread such a grammar holds cannot be taken back
+before then.
+
 The other files of a language are read too, and mean here what they mean in
 Zed:
 

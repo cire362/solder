@@ -147,7 +147,11 @@ Never guess a signature.
   kept by `ExtensionStore` (`extension_store.rs`). A language from one is a
   tree-sitter grammar in WebAssembly: `crates/syntax` compiles it on the
   first file that needs it, never on the UI thread (`Language::is_ready`),
-  and parsers that run such grammars come from a pool. The network is used
+  and parsers that run such grammars come from a pool. Such a grammar
+  never parses on the thread that asked either: its scanner cannot be
+  stopped, so every parse goes through `parse_rope`, which runs it on a
+  thread of its own and gives up on a grammar that does not answer
+  (`wasm::Watch`). Do not call a pooled parser directly. The network is used
   only when the Extensions tab is opened, searches or installs, and only against
   Zed's catalog and Open VSX. An archive is unpacked in a staging folder
   and checked before it replaces anything. Highlight queries follow the

@@ -55,7 +55,14 @@ fn with_budget(
         }
     };
     let options = ParseOptions::new().progress_callback(&mut stop);
-    let Some(tree) = parser.parse_with_options(&mut read, None, Some(options)) else {
+    let tree = if parser.pooled {
+        // An extension's grammar does not parse on this thread.
+        let rope = ropey::Rope::from_str(source);
+        super::parse_rope(&language, &mut parser, &rope, None, Some(deadline))
+    } else {
+        parser.parse_with_options(&mut read, None, Some(options))
+    };
+    let Some(tree) = tree else {
         return Vec::new();
     };
     let mut symbols = Vec::new();

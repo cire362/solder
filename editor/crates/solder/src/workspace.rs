@@ -4450,6 +4450,16 @@ impl Workspace {
                 if self.project.read(cx).is_scanning() {
                     parts.push(says("Indexing files...".into()));
                 }
+                // An extension's grammar that stopped answering: its
+                // files are plain text until the editor starts again.
+                for language in syntax::hung_grammars() {
+                    parts.push(BarPart {
+                        text: format!("{language} grammar hung: no highlighting until restart"),
+                        id: None,
+                        color: Some(theme.warning),
+                        action: None,
+                    });
+                }
                 parts
             }
             Item::Connection => {

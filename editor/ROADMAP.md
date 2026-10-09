@@ -184,13 +184,14 @@ to build them.
       granted or refused per extension (Zed's capabilities): commands, npm,
       downloads and single hosts, each taken back or given again in the
       extension's details
-- [ ] A time limit for a grammar's scanner, which today can hold a parse.
+- [x] A time limit for a grammar's scanner, which could hold a parse.
       tree-sitter 0.26 makes the WebAssembly store itself and has no way to
       put a deadline on it (with interruption turned on in the engine, its
-      store would trap at once). What is left is to reach into its store, to
-      parse such grammars off the UI thread and give up on one that hangs,
-      or to change tree-sitter. Decided on 2026-10-05: left open until
-      tree-sitter has a way of its own, as Zed has no such limit either
+      store would trap at once), so a scanner cannot be stopped. Decided
+      again on 2026-10-10: an extension's grammar parses on a thread of its
+      own, whoever asked waits no longer than it can, and a grammar that has
+      not answered in ten seconds is given up on until the editor starts
+      again. The thread it holds stays held: that is the price
 - [x] Debug adapters of extensions, in the debugger: the open file with
       each adapter its language names, started as the extension says, over
       a port or the adapter's own input and output

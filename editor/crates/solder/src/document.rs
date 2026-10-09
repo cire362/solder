@@ -23,6 +23,9 @@ const SYNC_PARSE_LIMIT: usize = 256 * 1024;
 /// Time an incremental reparse may take on the typing path before it moves to
 /// a worker thread.
 const REPARSE_BUDGET: Duration = Duration::from_millis(1);
+/// How long the first parse of a small file may hold the thread that
+/// draws. A file that small parses in a fraction of it.
+const SYNC_BUDGET: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -620,9 +623,14 @@ impl Document {
         // An extension's grammar is compiled on first use, which is too slow
         // for this thread whatever the size of the file.
         if self.text.len() <= SYNC_PARSE_LIMIT && language.is_ready() {
-            self.syntax = SyntaxTree::parse(language, self.text.rope());
-            self.syntax_generation += 1;
-            return;
+            // With a limit all the same: an extension's grammar, the
+            // file's own or one inside it, may not answer at all.
+            let parsed = SyntaxTree::parse_within(language.clone(), self.text.rope(), SYNC_BUDGET);
+            if parsed.is_some() {
+                self.syntax = parsed;
+                self.syntax_generation += 1;
+                return;
+            }
         }
         let rope = self.text.rope().clone();
         let version = self.text.version();
