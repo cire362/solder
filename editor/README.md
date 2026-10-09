@@ -869,9 +869,13 @@ applied as soon as it is saved.
   },
   "right": { "width": 380, "panels": ["chat", "agent"] },
   "bottom": { "height": 280, "panels": ["terminal", "debug", "response", "results"] },
-  "title_bar": { "height": 38 },
-  "tab_bar": { "height": 34 },
-  "status_bar": { "height": 26 },
+  "title_bar": { "height": 38, "left": ["project"], "right": [] },
+  "tab_bar": { "height": 34, "place": "top" },
+  "status_bar": {
+    "height": 26,
+    "left": ["position", "indent", "language", "problems", "activity", "connection"],
+    "right": ["plugins", "performance"]
+  },
   "hidden": [],
   "open": ["files"]
 }
@@ -924,7 +928,31 @@ command, also in the command palette, puts the window back as it comes. Since
 the file is what says how the window is, the file is put aside, whole, as
 `layout.json.old`.
 
-The bars' items are not in the file yet.
+The title bar and the status bar hold items, from the left end and from the
+right one: `left` and `right` say which and in what order. An item is in one
+place; one the file names nowhere is on no bar, and an end the file leaves out
+keeps the items it comes with.
+
+| Item | Says |
+|---|---|
+| `project` | the project's name |
+| `file` | the file in front, from the project's folder |
+| `branch` | the branch; a click opens the list of branches |
+| `position` | the line and column of the cursor, and how many cursors |
+| `indent` | spaces or tabs, and how many |
+| `language` | the language of the file |
+| `problems` | how many errors and warnings the file has |
+| `activity` | a language server starting, files being read |
+| `connection` | the database of a query file; a click picks another |
+| `plugins` | what plugins show; a click opens the Plugins window |
+| `performance` | the numbers of `show_performance_hud` |
+
+An item with nothing to say now is not drawn. `file` and `branch` are on no bar
+until the file puts them on one. A mistake in a config file is always said in
+the status bar, whatever it holds.
+
+`place` of `tab_bar` is where the tabs of the open files are: `top`, `bottom`
+or `none`. With none, files are changed by the keys and the file finder.
 
 ## Settings from another editor
 

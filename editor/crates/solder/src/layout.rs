@@ -11,6 +11,9 @@
 //! a tab for each: which panels a dock holds and in what order is the
 //! file's to say, and a panel can be hidden from all of them. Which panel
 //! each dock has open is there too, so the window starts as it was left.
+//!
+//! The title bar and the status bar hold items, from the left end and
+//! from the right one. An item is in one place, or in none.
 
 use std::{
     path::{Path, PathBuf},
@@ -157,19 +160,105 @@ pub struct Low {
     pub panels: Vec<Panel>,
 }
 
-/// A bar across the window: its height.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Across {
-    pub height: f32,
+/// What a bar can hold. Each says one thing about the window, and is not
+/// drawn while it has nothing to say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Item {
+    /// The project's name.
+    Project,
+    /// What is in front: the file, or the view that took its place.
+    File,
+    /// The branch the repository is on. Opens the list of branches.
+    Branch,
+    /// The line and the column of the cursor, and how many cursors.
+    Position,
+    Indent,
+    Language,
+    /// How many errors and warnings the file has.
+    Problems,
+    /// What is going on: a language server starting, files being read.
+    Activity,
+    /// The database a query file runs against. Opens the list of them.
+    Connection,
+    /// What plugins show. Opens the Plugins window.
+    Plugins,
+    /// The numbers of `show_performance_hud`.
+    Performance,
 }
 
-// A part left out of the file has the size it always had; which one that
-// is depends on the part, so each is filled in by `Layout`'s own default.
-impl Default for Across {
-    fn default() -> Self {
-        Self { height: 0. }
+impl Item {
+    /// Its name in the file, and in the names tests find it by.
+    pub fn id(self) -> &'static str {
+        match self {
+            Item::Project => "project",
+            Item::File => "file",
+            Item::Branch => "branch",
+            Item::Position => "position",
+            Item::Indent => "indent",
+            Item::Language => "language",
+            Item::Problems => "problems",
+            Item::Activity => "activity",
+            Item::Connection => "connection",
+            Item::Plugins => "plugins",
+            Item::Performance => "performance",
+        }
     }
+}
+
+/// The items of the bars as they come. `file` and `branch` are in none.
+const TITLE_LEFT: &[Item] = &[Item::Project];
+const TITLE_RIGHT: &[Item] = &[];
+const STATUS_LEFT: &[Item] = &[
+    Item::Position,
+    Item::Indent,
+    Item::Language,
+    Item::Problems,
+    Item::Activity,
+    Item::Connection,
+];
+const STATUS_RIGHT: &[Item] = &[Item::Plugins, Item::Performance];
+
+/// A bar across the window: its height, and its items from each end. An
+/// end the file leaves out has the items it comes with, less those the
+/// file put elsewhere; `fitted` fills it in, so in a layout in use both
+/// are there.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Bar {
+    pub height: f32,
+    pub left: Option<Vec<Item>>,
+    pub right: Option<Vec<Item>>,
+}
+
+impl Bar {
+    pub fn left(&self) -> &[Item] {
+        self.left.as_deref().unwrap_or_default()
+    }
+
+    pub fn right(&self) -> &[Item] {
+        self.right.as_deref().unwrap_or_default()
+    }
+}
+
+/// Where the tabs of the open files are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TabsAt {
+    /// Above the file, as they come.
+    #[default]
+    Top,
+    Bottom,
+    /// Nowhere: files are changed by the keys and the file finder.
+    None,
+}
+
+/// The bar of a pane's tabs: its height and where it is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TabBar {
+    pub height: f32,
+    pub place: TabsAt,
 }
 
 // Each part left out of the file is read as nothing, not as what the
@@ -191,11 +280,11 @@ pub struct Layout {
     #[serde(default)]
     pub bottom: Low,
     #[serde(default)]
-    pub title_bar: Across,
+    pub title_bar: Bar,
     #[serde(default)]
-    pub tab_bar: Across,
+    pub tab_bar: TabBar,
     #[serde(default)]
-    pub status_bar: Across,
+    pub status_bar: Bar,
     /// Panels with no tab in any dock. A command still opens one.
     #[serde(default)]
     pub hidden: Vec<Panel>,
@@ -227,9 +316,20 @@ impl Default for Layout {
                 height: 280.,
                 panels: at(Place::Bottom),
             },
-            title_bar: Across { height: 38. },
-            tab_bar: Across { height: 34. },
-            status_bar: Across { height: 26. },
+            title_bar: Bar {
+                height: 38.,
+                left: Some(TITLE_LEFT.to_vec()),
+                right: Some(TITLE_RIGHT.to_vec()),
+            },
+            tab_bar: TabBar {
+                height: 34.,
+                place: TabsAt::Top,
+            },
+            status_bar: Bar {
+                height: 26.,
+                left: Some(STATUS_LEFT.to_vec()),
+                right: Some(STATUS_RIGHT.to_vec()),
+            },
             hidden: Vec::new(),
             open: None,
         }
@@ -324,6 +424,16 @@ impl Layout {
         }
     }
 
+    /// The four ends of the two bars, each with the items it comes with.
+    fn ends(&mut self) -> [(&mut Option<Vec<Item>>, &'static [Item]); 4] {
+        [
+            (&mut self.title_bar.left, TITLE_LEFT),
+            (&mut self.title_bar.right, TITLE_RIGHT),
+            (&mut self.status_bar.left, STATUS_LEFT),
+            (&mut self.status_bar.right, STATUS_RIGHT),
+        ]
+    }
+
     fn panels_mut(&mut self, place: Place) -> &mut Vec<Panel> {
         match place {
             Place::Left => &mut self.left.panels,
@@ -388,7 +498,9 @@ impl Layout {
     /// not name at all goes to the dock it comes in, after the others. Of
     /// the panels named as open, the first of each dock is, and they are
     /// kept in the order of the docks, so that the same window is always
-    /// written the same way.
+    /// written the same way. An item of a bar named twice stays where it
+    /// was named first, and an end of a bar the file leaves out has the
+    /// items it comes with that the file names nowhere.
     fn fitted(mut self) -> Self {
         let mut placed: Vec<Panel> = Vec::new();
         let mut hidden: Vec<Panel> = Vec::new();
@@ -426,6 +538,28 @@ impl Layout {
                 docks[self.dock_of(panel) as usize].get_or_insert(panel);
             }
             self.open = Some(docks.into_iter().flatten().collect());
+        }
+
+        let mut named: Vec<Item> = Vec::new();
+        for (end, _) in self.ends() {
+            if let Some(items) = end {
+                items.retain(|item| {
+                    let keep = !named.contains(item);
+                    if keep {
+                        named.push(*item);
+                    }
+                    keep
+                });
+            }
+        }
+        for (end, standard) in self.ends() {
+            end.get_or_insert_with(|| {
+                standard
+                    .iter()
+                    .copied()
+                    .filter(|item| !named.contains(item))
+                    .collect()
+            });
         }
 
         let standard = Layout::default();
@@ -658,6 +792,63 @@ mod tests {
         assert!(error.contains("nothing"), "{error}");
         // What the editor writes is what it reads.
         assert_eq!(parse(&file(&layout)).unwrap(), layout);
+    }
+
+    #[test]
+    fn the_bars_hold_the_items_the_file_names() {
+        use Item::*;
+        // As they come.
+        let standard = Layout::default();
+        assert_eq!(standard.title_bar.left(), [Project]);
+        assert!(standard.title_bar.right().is_empty());
+        assert_eq!(
+            standard.status_bar.left(),
+            [Position, Indent, Language, Problems, Activity, Connection]
+        );
+        assert_eq!(standard.status_bar.right(), [Plugins, Performance]);
+        assert_eq!(standard.tab_bar.place, TabsAt::Top);
+        assert_eq!(parse("{}").unwrap(), standard);
+        // A bar's height alone leaves its items as they come.
+        let taller = parse(r#"{ "status_bar": { "height": 30 } }"#).unwrap();
+        assert_eq!(taller.status_bar.left(), standard.status_bar.left());
+
+        // The file names them: which, in what order, at which end of
+        // which bar. An item named twice stays where it was named first,
+        // and an end left out keeps what it comes with, less what the
+        // file put elsewhere.
+        let layout = parse(
+            r#"{
+              "title_bar": { "left": ["project", "branch"], "right": ["position", "branch"] },
+              "status_bar": { "right": ["language", "file"] },
+              "tab_bar": { "place": "bottom" }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(layout.title_bar.left(), [Project, Branch]);
+        assert_eq!(layout.title_bar.right(), [Position]);
+        assert_eq!(
+            layout.status_bar.left(),
+            [Indent, Problems, Activity, Connection]
+        );
+        assert_eq!(layout.status_bar.right(), [Language, File]);
+        assert_eq!(layout.tab_bar.place, TabsAt::Bottom);
+        assert_eq!(layout.tab_bar.height, 34.);
+        assert_eq!(parse(&file(&layout)).unwrap(), layout);
+        // An end with nothing in it is empty, and an item named nowhere
+        // is on no bar.
+        let bare = parse(
+            r#"{ "status_bar": { "left": [], "right": [] }, "tab_bar": { "place": "none" } }"#,
+        )
+        .unwrap();
+        assert!(bare.status_bar.left().is_empty() && bare.status_bar.right().is_empty());
+        assert_eq!(bare.title_bar.left(), [Project]);
+        assert_eq!(bare.tab_bar.place, TabsAt::None);
+        // A name that is no item is a mistake, said with the file's name.
+        let error = parse(r#"{ "status_bar": { "left": ["clock"] } }"#).unwrap_err();
+        assert!(
+            error.starts_with("layout.json") && error.contains("clock"),
+            "{error}"
+        );
     }
 
     #[test]

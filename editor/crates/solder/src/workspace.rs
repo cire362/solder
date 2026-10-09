@@ -31,7 +31,7 @@ use crate::{
     git_store::{GitStore, GitStoreEvent},
     go_to_line::GoToLine as GoToLineDelegate,
     inline_edit::{InlineEdit, InlineEditEvent},
-    layout::{self, Layout, Panel, Part, Place},
+    layout::{self, Item, Layout, Panel, Part, Place, TabBar, TabsAt},
     locations::{CodeActionPicker, LocationPicker, RenamePrompt},
     lsp_store::{LspStore, from_range},
     perf::{self, Perf},
@@ -3746,6 +3746,29 @@ impl Workspace {
                     )
             })
             .collect();
+        let TabBar {
+            height,
+            place: tabs_at,
+        } = Layout::get(cx).tab_bar;
+        let mut tab_bar = (tabs_at != TabsAt::None).then(|| {
+            div()
+                .id(("tab-bar", p))
+                .debug_selector(move || format!("tab-bar-{p}"))
+                .h(px(height))
+                .flex_none()
+                .px_1p5()
+                .flex()
+                .items_center()
+                .gap_1()
+                .overflow_x_scroll()
+                .map(|d| match tabs_at {
+                    TabsAt::Bottom => d.border_t_1(),
+                    _ => d.border_b_1(),
+                })
+                .border_color(theme.line)
+                .bg(theme.bg_sunken)
+                .children(tabs)
+        });
         div()
             .flex_1()
             .min_w_0()
@@ -3753,27 +3776,18 @@ impl Workspace {
             .flex()
             .flex_col()
             .when(p > 0, |d| d.border_l_1().border_color(theme.line))
-            .child(
-                div()
-                    .id(("tab-bar", p))
-                    .h(px(Layout::get(cx).tab_bar.height))
-                    .flex_none()
-                    .px_1p5()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .overflow_x_scroll()
-                    .border_b_1()
-                    .border_color(theme.line)
-                    .bg(theme.bg_sunken)
-                    .children(tabs),
-            )
+            .children(if tabs_at == TabsAt::Top {
+                tab_bar.take()
+            } else {
+                None
+            })
             .when(search_visible, |d| d.child(self.search_bar.clone()))
             .when(is_active_pane, |pane| {
                 pane.children(self.inline_edit.as_ref().map(|(panel, _)| panel.clone()))
             })
             .child(
                 div()
+                    .debug_selector(move || format!("pane-body-{p}"))
                     .flex_1()
                     .min_h_0()
                     .map(|d| match pane.active_editor() {
@@ -3781,6 +3795,8 @@ impl Workspace {
                         None => d.child(self.render_empty(window, cx)),
                     }),
             )
+            // Below the file, if that is where the layout puts them.
+            .children(tab_bar)
     }
 
     /// A dock: a tab for each panel the layout puts in it that has
@@ -3935,81 +3951,247 @@ impl Workspace {
             }))
     }
 
+    /// What is in front, as the window's title says it: the file, or the
+    /// view that took its place, or with neither the project's folder.
+    fn front_title(&self, cx: &App) -> String {
+        self.structure
+            .as_ref()
+            .map(|(view, _)| format!("Structure of {}", view.read(cx).title(cx)))
+            .or_else(|| {
+                self.erd
+                    .as_ref()
+                    .map(|(view, _)| format!("Diagram of {}", view.read(cx).connection))
+            })
+            .or_else(|| {
+                self.file_diff
+                    .as_ref()
+                    .map(|view| view.read(cx).path.display().to_string())
+            })
+            .or_else(|| {
+                self.active_editor().and_then(|editor| {
+                    editor
+                        .read(cx)
+                        .path(cx)
+                        .map(|path| path.display().to_string())
+                })
+            })
+            .unwrap_or_else(|| self.root(cx).display().to_string())
+    }
+
+    /// What an item of a bar shows now, in as many pieces as it has to
+    /// say; none while it has nothing to say.
+    fn bar_item(&self, item: Item, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let theme = cx.theme().clone();
+        let says = |text: String| div().child(text).into_any_element();
+        // An item that does something. A press on it stays with it: on
+        // the title bar it would take hold of the window.
+        let does = |id: (&'static str, usize),
+                    text: String,
+                    color: gpui::Hsla,
+                    action: Box<dyn gpui::Action>| {
+            div()
+                .id(id)
+                .px_1p5()
+                .rounded(px(6.))
+                .text_color(color)
+                .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                .child(text)
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+                .into_any_element()
+        };
+        // A file in front has a cursor, an indent and a language; a diff
+        // in its place has none of them.
+        let editor = match self.file_diff {
+            Some(_) => None,
+            None => self.active_editor(),
+        };
+        match item {
+            Item::Project => {
+                let root = self.root(cx);
+                let name = root.file_name().map_or_else(
+                    || root.display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                vec![says(name)]
+            }
+            Item::File => {
+                let title = self.front_title(cx);
+                let root = self.root(cx);
+                // Inside the project, the way from its folder is enough.
+                let short = Path::new(&title)
+                    .strip_prefix(&root)
+                    .ok()
+                    .filter(|rest| !rest.as_os_str().is_empty())
+                    .map(|rest| rest.display().to_string());
+                vec![says(short.unwrap_or(title))]
+            }
+            Item::Branch => {
+                let branch = self.git.read(cx).status().branch.clone();
+                branch
+                    .map(|branch| {
+                        does(
+                            ("item-branch", 0),
+                            branch,
+                            theme.fg_muted,
+                            Box::new(git_panel::SwitchBranch),
+                        )
+                    })
+                    .into_iter()
+                    .collect()
+            }
+            Item::Position => {
+                if self.file_diff.is_some() {
+                    return vec![says("Git diff".into()), says("Read-only".into())];
+                }
+                let Some(editor) = editor else {
+                    return Vec::new();
+                };
+                let e = editor.read(cx);
+                let (line, col, cursors) = e.cursor_position(cx);
+                let mut parts = vec![says(format!("Ln {line}, Col {col}"))];
+                if cursors > 1 {
+                    parts.push(says(format!("{cursors} cursors")));
+                }
+                if e.doc(cx).is_read_only() {
+                    parts.push(says("Read-only".into()));
+                }
+                parts
+            }
+            Item::Indent => editor
+                .map(|e| says(e.read(cx).doc(cx).indent_label().to_string()))
+                .into_iter()
+                .collect(),
+            Item::Language => editor
+                .map(|e| {
+                    let name = e.read(cx).doc(cx).language_name();
+                    says(name.unwrap_or("Plain text").to_string())
+                })
+                .into_iter()
+                .collect(),
+            Item::Problems => editor
+                .and_then(|e| {
+                    let (errors, warnings) =
+                        crate::editor_lsp::diagnostic_counts(e.read(cx).doc(cx));
+                    crate::editor_lsp::status_text(errors, warnings)
+                })
+                .map(|text| says(text.to_string()))
+                .into_iter()
+                .collect(),
+            Item::Activity => {
+                let mut parts = Vec::new();
+                if let Some(status) =
+                    LspStore::global(cx).and_then(|s| s.read(cx).status().cloned())
+                {
+                    parts.push(says(status.to_string()));
+                }
+                if self.project.read(cx).is_scanning() {
+                    parts.push(says("Indexing files...".into()));
+                }
+                parts
+            }
+            Item::Connection => {
+                let connection = self.active_editor().and_then(|e| {
+                    let path = e.read(cx).path(cx)?;
+                    let store = self.database.read(cx);
+                    match store.binding(path) {
+                        Some(name) => Some(name.to_string()),
+                        None => {
+                            database::query_file_engines(path).map(|_| "No connection".to_string())
+                        }
+                    }
+                });
+                connection
+                    .map(|name| {
+                        does(
+                            ("status-connection", 0),
+                            name,
+                            theme.fg_muted,
+                            Box::new(SelectConnection),
+                        )
+                    })
+                    .into_iter()
+                    .collect()
+            }
+            // What plugins show, and a notice when one is slow; both open
+            // the Plugins window.
+            Item::Plugins => {
+                let plugins = self.plugins.read(cx);
+                let mut items: Vec<(String, bool)> = plugins
+                    .status
+                    .values()
+                    .map(|text| (text.to_string(), false))
+                    .collect();
+                match plugins.slow().as_slice() {
+                    [] => {}
+                    [name] => items.push((format!("Slow plugin: {name}"), true)),
+                    names => items.push((format!("{} slow plugins", names.len()), true)),
+                }
+                items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (text, slow))| {
+                        let color = if slow { theme.warning } else { theme.fg_muted };
+                        does(("status-plugin", i), text, color, Box::new(ShowPlugins))
+                    })
+                    .collect()
+            }
+            Item::Performance => {
+                let perf = cx.global::<Perf>();
+                let mut parts = Vec::new();
+                if perf.hud_visible {
+                    if let Some((p50, p99)) = perf.input_p50_p99() {
+                        parts.push(says(format!(
+                            "input {} ms, p99 {}",
+                            perf::ms(p50),
+                            perf::ms(p99)
+                        )));
+                    }
+                    if let Some((p50, _)) = perf.frame_p50_p99() {
+                        parts.push(says(format!("frame {} ms", perf::ms(p50))));
+                    }
+                    if let Some(bytes) = perf::resident_memory() {
+                        parts.push(says(format!("{} MB", bytes / (1024 * 1024))));
+                    }
+                    if let Some(start) = perf.first_frame {
+                        parts.push(says(format!("start {} ms", perf::ms(start))));
+                    }
+                }
+                parts
+            }
+        }
+    }
+
+    /// The items of one end of a bar that have something to say now.
+    fn bar_end(&self, items: &[Item], cx: &mut Context<Self>) -> Vec<AnyElement> {
+        items
+            .iter()
+            .filter_map(|item| {
+                let item = *item;
+                let parts = self.bar_item(item, cx);
+                (!parts.is_empty()).then(|| {
+                    div()
+                        .debug_selector(move || format!("item-{}", item.id()))
+                        .flex()
+                        .items_center()
+                        .gap_4()
+                        .children(parts)
+                        .into_any_element()
+                })
+            })
+            .collect()
+    }
+
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let mut left: Vec<String> = Vec::new();
-        if self.file_diff.is_some() {
-            left.push("Git diff".into());
-            left.push("Read-only".into());
-        } else if let Some(editor) = self.active_editor() {
-            let e = editor.read(cx);
-            let doc = e.doc(cx);
-            let (line, col, cursors) = e.cursor_position(cx);
-            left.push(format!("Ln {line}, Col {col}"));
-            if cursors > 1 {
-                left.push(format!("{cursors} cursors"));
-            }
-            if doc.is_read_only() {
-                left.push("Read-only".into());
-            }
-            left.push(doc.indent_label().to_string());
-            left.push(doc.language_name().unwrap_or("Plain text").to_string());
-            let (errors, warnings) = crate::editor_lsp::diagnostic_counts(doc);
-            if let Some(text) = crate::editor_lsp::status_text(errors, warnings) {
-                left.push(text.to_string());
-            }
-        }
-        if let Some(status) = LspStore::global(cx).and_then(|s| s.read(cx).status().cloned()) {
-            left.push(status.to_string());
-        }
-        if self.project.read(cx).is_scanning() {
-            left.push("Indexing files...".into());
-        }
+        let bar = Layout::get(cx).status_bar.clone();
+        // A mistake in a config file is said here whatever the bar holds:
+        // the bar's own items are in one of those files.
         let config_error = cx
             .try_global::<settings::ConfigErrors>()
             .and_then(|e| e.0.first().cloned());
-
-        let perf = cx.global::<Perf>();
-        let mut right: Vec<String> = Vec::new();
-        if perf.hud_visible {
-            if let Some((p50, p99)) = perf.input_p50_p99() {
-                right.push(format!("input {} ms, p99 {}", perf::ms(p50), perf::ms(p99)));
-            }
-            if let Some((p50, _)) = perf.frame_p50_p99() {
-                right.push(format!("frame {} ms", perf::ms(p50)));
-            }
-            if let Some(bytes) = perf::resident_memory() {
-                right.push(format!("{} MB", bytes / (1024 * 1024)));
-            }
-            if let Some(start) = perf.first_frame {
-                right.push(format!("start {} ms", perf::ms(start)));
-            }
-        }
-
-        let connection = self.active_editor().and_then(|e| {
-            let path = e.read(cx).path(cx)?;
-            let store = self.database.read(cx);
-            match store.binding(path) {
-                Some(name) => Some(name.to_string()),
-                None => database::query_file_engines(path).map(|_| "No connection".to_string()),
-            }
-        });
-        // What plugins show, and a notice when one is slow; both open the
-        // Plugins window.
-        let plugins = self.plugins.read(cx);
-        let mut plugin_items: Vec<(String, bool)> = plugins
-            .status
-            .values()
-            .map(|text| (text.to_string(), false))
-            .collect();
-        match plugins.slow().as_slice() {
-            [] => {}
-            [name] => plugin_items.push((format!("Slow plugin: {name}"), true)),
-            names => plugin_items.push((format!("{} slow plugins", names.len()), true)),
-        }
-        let item = |text: String| div().child(text);
         div()
-            .h(px(Layout::get(cx).status_bar.height))
+            .h(px(bar.height))
             .debug_selector(|| "status-bar".into())
             .flex_none()
             .flex()
@@ -4026,19 +4208,7 @@ impl Workspace {
                     .flex()
                     .gap_4()
                     .min_w_0()
-                    .children(left.into_iter().map(item))
-                    .children(connection.map(|name| {
-                        div()
-                            .id("status-connection")
-                            .px_1p5()
-                            .rounded(px(6.))
-                            .text_color(theme.fg_muted)
-                            .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                            .child(name)
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(SelectConnection), cx)
-                            })
-                    }))
+                    .children(self.bar_end(bar.left(), cx))
                     .children(
                         config_error.map(|e| div().truncate().text_color(theme.error).child(e)),
                     ),
@@ -4048,22 +4218,7 @@ impl Workspace {
                     .flex()
                     .flex_none()
                     .gap_4()
-                    .children(
-                        plugin_items
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, (text, slow))| {
-                                div()
-                                    .id(("status-plugin", i))
-                                    .text_color(if slow { theme.warning } else { theme.fg_muted })
-                                    .hover(|d| d.text_color(theme.fg))
-                                    .child(text)
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(Box::new(ShowPlugins), cx)
-                                    })
-                            }),
-                    )
-                    .children(right.into_iter().map(item)),
+                    .children(self.bar_end(bar.right(), cx)),
             )
     }
 
@@ -4161,35 +4316,9 @@ impl Render for Workspace {
             };
             (closed && this.dragging.is_some()).then(|| this.drop_zone(place, cx))
         };
-        let root = self.root(cx);
-        let project_name = root.file_name().map_or_else(
-            || root.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        );
-        let title = self
-            .structure
-            .as_ref()
-            .map(|(view, _)| format!("Structure of {}", view.read(cx).title(cx)))
-            .or_else(|| {
-                self.erd
-                    .as_ref()
-                    .map(|(view, _)| format!("Diagram of {}", view.read(cx).connection))
-            })
-            .or_else(|| {
-                self.file_diff
-                    .as_ref()
-                    .map(|view| view.read(cx).path.display().to_string())
-            })
-            .or_else(|| {
-                self.active_editor().and_then(|editor| {
-                    editor
-                        .read(cx)
-                        .path(cx)
-                        .map(|path| path.display().to_string())
-                })
-            })
-            .unwrap_or_else(|| root.display().to_string());
+        let title = self.front_title(cx);
         window.set_window_title(&title);
+        let title_bar = Layout::get(cx).title_bar.clone();
         let special: Option<AnyView> = self
             .structure
             .as_ref()
@@ -4286,7 +4415,8 @@ impl Render for Workspace {
             .child(
                 div()
                     .id("titlebar")
-                    .h(px(Layout::get(cx).title_bar.height))
+                    .debug_selector(|| "title-bar".into())
+                    .h(px(title_bar.height))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -4306,7 +4436,21 @@ impl Render for Workspace {
                             window.start_window_move();
                         }
                     })
-                    .child(project_name),
+                    .child(
+                        div()
+                            .flex()
+                            .gap_4()
+                            .min_w_0()
+                            .children(self.bar_end(title_bar.left(), cx)),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .gap_4()
+                            .children(self.bar_end(title_bar.right(), cx)),
+                    ),
             )
             .child(
                 div()
@@ -11230,6 +11374,89 @@ brackets = [
         assert_eq!(docks(cx), (Some(Panel::Files), None, Some(Panel::Search)));
         cx.dispatch_action(ShowAgent);
         assert_eq!(docks(cx).0, Some(Panel::Agent));
+    }
+
+    #[gpui::test]
+    fn the_bars_show_the_items_the_layout_names(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let root = git_fixture("ws-bars");
+        let config = db::testing::dir("ws-bars-config");
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(root.join("a.txt")), "one\ntwo\n", None, window, cx)
+        });
+        wait_for(cx, "the branch", &|cx| {
+            ws.read(cx).git.read(cx).status().branch.is_some()
+        });
+        // Where something is in the window as it is drawn now.
+        let at = |cx: &mut VisualTestContext, selector: &'static str| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("no {selector}"))
+        };
+        let layout = |cx: &mut VisualTestContext, text: &str| {
+            std::fs::write(config.join("layout.json"), text).unwrap();
+            cx.update(|_, cx| settings::reload_from(&config, cx));
+            assert!(cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+        };
+        // Whether an item has something to say now.
+        let says = |cx: &mut VisualTestContext, item: Item| {
+            ws.update(cx, |w, cx| !w.bar_item(item, cx).is_empty())
+        };
+
+        // As they come: the project's name in the title bar, the cursor,
+        // the indent and the language at the left of the status bar, in
+        // that order. The tabs are above the file.
+        let (title, status) = (at(cx, "title-bar"), at(cx, "status-bar"));
+        assert!(title.contains(&at(cx, "item-project").center()));
+        let (position, indent) = (at(cx, "item-position"), at(cx, "item-indent"));
+        let language = at(cx, "item-language");
+        assert!(status.contains(&position.center()) && status.contains(&language.center()));
+        assert!(position.left() < indent.left() && indent.left() < language.left());
+        let (tabs, body) = (at(cx, "tab-bar-0"), at(cx, "pane-body-0"));
+        assert_eq!(tabs.top(), title.bottom());
+        assert_eq!(body.top(), tabs.bottom());
+        assert_eq!(body.bottom(), status.top());
+        // An item with nothing to say is not drawn: no query file is in
+        // front, and no file has a problem.
+        assert!(!says(cx, Item::Connection) && !says(cx, Item::Problems));
+        assert!(says(cx, Item::Branch) && says(cx, Item::File));
+
+        // The file names them. The cursor goes to the right of the title
+        // bar, the branch and the file's name come to the status bar,
+        // the language to its right end, and the tabs below the file.
+        layout(
+            cx,
+            r#"{
+              "title_bar": { "right": ["position"] },
+              "status_bar": { "left": ["branch", "file"], "right": ["language"] },
+              "tab_bar": { "place": "bottom" }
+            }"#,
+        );
+        let position = at(cx, "item-position");
+        assert!(title.contains(&position.center()));
+        assert!(position.left() > at(cx, "item-project").right());
+        let (branch, file) = (at(cx, "item-branch"), at(cx, "item-file"));
+        assert!(status.contains(&branch.center()) && status.contains(&file.center()));
+        assert!(branch.left() < file.left());
+        assert!(at(cx, "item-language").left() > file.right());
+        let (tabs, body) = (at(cx, "tab-bar-0"), at(cx, "pane-body-0"));
+        assert_eq!(body.top(), title.bottom());
+        assert_eq!(tabs.top(), body.bottom());
+        assert_eq!(tabs.bottom(), status.top());
+        // The branch opens the list of branches.
+        cx.simulate_click(branch.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        cx.simulate_keystrokes("escape");
+
+        // No tabs at all: the file has the whole height between the bars.
+        layout(cx, r#"{ "tab_bar": { "place": "none" } }"#);
+        let body = at(cx, "pane-body-0");
+        assert_eq!(body.top(), title.bottom());
+        assert_eq!(body.bottom(), status.top());
+        assert!(cx.read(|cx| Layout::get(cx).status_bar.left().contains(&Item::Position)));
     }
 
     #[gpui::test]

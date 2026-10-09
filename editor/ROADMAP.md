@@ -277,9 +277,9 @@ file, so the two never disagree. It starts after the Zed items of phase 8.
       with the ten of the sides), in the file's order, with hidden ones.
       `open` names the panel each dock has open and is written when that
       changes, so the window starts as it was left
-- [ ] The title bar and the status bar as lists of items: which are there, in
+- [x] The title bar and the status bar as lists of items: which are there, in
       what order, on which side. The tab bar: above or below the editor, or
-      none
+      none. Eleven items, two of them new (`file`, `branch`)
 - [ ] An item is drawn as a word, an icon or both, and its command and icon
       can be changed, so a button for any command can be put on a bar
 - [ ] The interface font, its size and how dense rows are, in
