@@ -12,6 +12,7 @@ use crate::{
     ai_providers::{Kind, Status},
     ai_store::{AiStore, BenchStep},
     editor::Editor,
+    mcp_store::{McpStore, State},
     theme::{ActiveTheme, Theme, UI_FONT_SIZE},
     ui,
 };
@@ -32,6 +33,8 @@ pub fn bind_keys(cx: &mut App) {
 pub enum View {
     Models,
     Providers,
+    /// The context servers the agent may use.
+    Servers,
 }
 
 pub struct AiPanel {
@@ -46,6 +49,8 @@ pub struct AiPanel {
     provider_name: Entity<Editor>,
     provider_url: Entity<Editor>,
     provider_key: Entity<Editor>,
+    /// Hears the context servers start and stop, once their list is shown.
+    servers_watch: Option<gpui::Subscription>,
     focus: FocusHandle,
 }
 
@@ -64,6 +69,7 @@ impl AiPanel {
             provider_name: cx.new(|cx| Editor::single_line("Name", cx)),
             provider_url: cx.new(|cx| Editor::single_line("https://host/v1", cx)),
             provider_key: cx.new(|cx| Editor::masked("API key, if it needs one", cx)),
+            servers_watch: None,
             focus: cx.focus_handle(),
         }
     }
@@ -72,6 +78,10 @@ impl AiPanel {
         self.view = view;
         if view == View::Providers {
             self.store.update(cx, |s, cx| s.refresh_providers(cx));
+        }
+        if view == View::Servers && self.servers_watch.is_none() {
+            let servers = McpStore::global(cx);
+            self.servers_watch = Some(cx.observe(&servers, |_, _, cx| cx.notify()));
         }
         cx.notify();
     }
@@ -375,6 +385,74 @@ impl AiPanel {
             .child(completions)
             .child(self.render_review_toggle(theme, cx))
             .into_any_element()
+    }
+
+    /// The context servers of the settings and how each is doing. They
+    /// start with an agent task, so before the first one all of them wait.
+    fn render_servers(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let small = UI_FONT_SIZE - px(1.);
+        let configured = McpStore::listed(cx);
+        let store = McpStore::global(cx);
+        let store = store.read(cx);
+        let mut list = div().px_3().flex().flex_col().gap_2();
+        for (i, (name, config, extension)) in configured.iter().enumerate() {
+            let entry = store.servers.iter().find(|entry| entry.name == *name);
+            let (state, color, tools) = match entry.map(|entry| &entry.state) {
+                _ if !config.enabled => ("Off".to_string(), theme.fg_subtle, String::new()),
+                Some(State::Running(_, tools)) => (
+                    match tools.len() {
+                        1 => "1 tool".to_string(),
+                        n => format!("{n} tools"),
+                    },
+                    theme.fg_muted,
+                    tools
+                        .iter()
+                        .map(|tool| tool.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+                Some(State::Starting) => ("Starting...".to_string(), theme.fg_muted, String::new()),
+                Some(State::Failed(why)) => (why.to_string(), theme.error, String::new()),
+                Some(State::Stopped) | None => (
+                    "Starts with the next agent task".to_string(),
+                    theme.fg_subtle,
+                    String::new(),
+                ),
+            };
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .debug_selector(move || format!("context-server-{i}"))
+                    .child(div().text_size(UI_FONT_SIZE).text_color(theme.fg).child(
+                        match extension {
+                            Some(extension) => format!("{name} (extension {extension})"),
+                            None => name.clone(),
+                        },
+                    ))
+                    .child(div().text_size(small).text_color(color).child(state))
+                    .when(!tools.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_size(small)
+                                .text_color(theme.fg_subtle)
+                                .child(tools),
+                        )
+                    }),
+            );
+        }
+        let hint = if configured.is_empty() {
+            "A context server gives the agent tools of its own: a database to query, an issue tracker to read. Add one under context_servers in settings.json, with the command that starts it, or install an extension that brings one."
+        } else {
+            "They start when an agent task begins. A tool runs outside the agent's sandbox, so the agent asks before the first call of each."
+        };
+        list.child(
+            div()
+                .text_size(small)
+                .text_color(theme.fg_subtle)
+                .child(hint),
+        )
+        .into_any_element()
     }
 
     fn render_review_toggle(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -978,7 +1056,30 @@ impl Render for AiPanel {
                     cx.listener(|this, _, _, cx| this.show(View::Providers, cx)),
                 )
                 .debug_selector(|| "ai-view-providers".into()),
+            )
+            .child(
+                ui::toggle(
+                    "ai-view-servers",
+                    "context servers",
+                    "",
+                    view == View::Servers,
+                    &theme,
+                    cx.listener(|this, _, _, cx| this.show(View::Servers, cx)),
+                )
+                .debug_selector(|| "ai-view-servers".into()),
             );
+        if view == View::Servers {
+            let servers = self.render_servers(&theme, cx);
+            return div()
+                .key_context("AiPanel")
+                .track_focus(&self.focus)
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(tabs)
+                .child(servers)
+                .into_any_element();
+        }
         if view == View::Providers {
             let providers = self.render_providers(window, &theme, cx);
             let error = self.store.read(cx).error.clone();

@@ -12,6 +12,7 @@ use crate::{
     agent::{self, Access, Change, Outcome, Phase, PlanStep, Sandbox, ToolBox, Worktree},
     ai_providers::{LOCAL, ModelRef},
     ai_store::AiStore,
+    mcp_store::{self, McpStore, McpTool},
 };
 
 /// Steps a task may take before it stops and asks.
@@ -89,6 +90,11 @@ pub struct AgentTask {
     store: Entity<AiStore>,
     sandbox: Sandbox,
     turns: Vec<Turn>,
+    /// The tools of the context servers that run, as of the last step.
+    mcp: Vec<McpTool>,
+    /// Those of them the user let this task call. Each asks once: a
+    /// server's tool runs outside the sandbox.
+    mcp_allowed: Vec<String>,
     /// Calls left in the current step while one waits for the user.
     pending: Vec<ToolCall>,
     results: Vec<ToolResult>,
@@ -142,6 +148,8 @@ impl AgentTask {
             store,
             sandbox: Sandbox::None,
             turns: vec![Turn::User(format!("Task: {title}"))],
+            mcp: Vec::new(),
+            mcp_allowed: Vec::new(),
             pending: Vec::new(),
             results: Vec::new(),
             task: None,
@@ -165,13 +173,44 @@ impl AgentTask {
                     )));
                     this.worktree = Some(wt);
                     this.sandbox = sandbox;
-                    this.next(cx);
+                    this.connect(cx);
                 }
                 Err(e) => this.fail(e, cx),
             })
             .ok();
         }));
         this
+    }
+
+    /// Starts the context servers of the settings, then takes the first
+    /// step. With none configured this is no wait at all; one that does
+    /// not start is said, and the task goes on without it.
+    fn connect(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.worktree.as_ref().map(|wt| wt.path.clone()) else {
+            return self.next(cx);
+        };
+        let store = McpStore::global(cx);
+        let ready = store.update(cx, |store, cx| store.start_all(&root, cx));
+        self.task = Some(cx.spawn(async move |this, cx| {
+            ready.await;
+            this.update(cx, |this, cx| {
+                for (name, why) in store.read(cx).failures() {
+                    this.entries.push(Entry::Note(format!(
+                        "The context server {name} did not start: {why}"
+                    )));
+                }
+                this.next(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// What a call is called in the list of what the agent did.
+    fn title(&self, call: &ToolCall) -> String {
+        match self.mcp.iter().find(|tool| tool.spec.name == call.name) {
+            Some(tool) => format!("Called {} of {}", tool.tool, tool.server_name),
+            None => describe(call),
+        }
     }
 
     fn changed(&mut self, cx: &mut Context<Self>) {
@@ -236,15 +275,40 @@ impl AgentTask {
             } else {
                 self.model.model.clone()
             },
-            system: SYSTEM.into(),
+            system: self.system(),
             turns,
-            tools: agent::specs(self.phase),
+            tools: agent::specs(self.phase)
+                .into_iter()
+                .chain(self.mcp.iter().map(|tool| tool.spec.clone()))
+                .collect(),
             max_tokens: 8192,
         }
     }
 
+    /// The standing instructions: the agent's own, then what each context
+    /// server says about using it.
+    fn system(&self) -> String {
+        let mut system = SYSTEM.to_string();
+        let mut said: Vec<&str> = Vec::new();
+        for tool in &self.mcp {
+            if said.contains(&tool.server_name.as_str()) {
+                continue;
+            }
+            said.push(&tool.server_name);
+            if let Some(instructions) = &tool.server.instructions {
+                system.push_str(&format!(
+                    "\n\nThe tools named mcp_... come from context servers and reach outside \
+                     the project. About {}: {instructions}",
+                    tool.server_name
+                ));
+            }
+        }
+        system
+    }
+
     /// Asks the model for its next step.
     fn next(&mut self, cx: &mut Context<Self>) {
+        self.mcp = McpStore::global(cx).read(cx).tools();
         if self.steps >= MAX_STEPS {
             self.entries.push(Entry::Note(format!(
                 "Stopped after {MAX_STEPS} steps. Say how to continue, or review what changed."
@@ -327,6 +391,15 @@ impl AgentTask {
         };
         let calls = std::mem::take(&mut self.pending);
         let phase = self.phase;
+        // The user's yes to a tool of a context server holds for the task.
+        if approved_first
+            && let Some(first) = calls.first()
+            && self.mcp.iter().any(|tool| tool.spec.name == first.name)
+            && !self.mcp_allowed.contains(&first.name)
+        {
+            self.mcp_allowed.push(first.name.clone());
+        }
+        let (mcp, allowed) = (self.mcp.clone(), self.mcp_allowed.clone());
         self.status = Status::Thinking;
         self.changed(cx);
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -335,10 +408,41 @@ impl AgentTask {
             while let Some(call) = calls.next() {
                 let tb = toolbox.clone();
                 let c = call.clone();
-                let outcome = cx
-                    .background_executor()
-                    .spawn(async move { tb.execute(&c, phase, approved) })
-                    .await;
+                let tool = mcp.iter().find(|tool| tool.spec.name == c.name).cloned();
+                let outcome = match tool {
+                    // A context server's tool: it runs where the server
+                    // does, so the user is asked the first time.
+                    Some(tool) if !approved && !allowed.contains(&c.name) => {
+                        Outcome::NeedsApproval {
+                            command: tool.shown(&c.input),
+                            access: Access::Full,
+                            reason: format!(
+                                "{} is a context server. Allowing this lets the task call this tool again without asking.",
+                                tool.server_name
+                            ),
+                        }
+                    }
+                    Some(tool) => {
+                        cx.background_executor()
+                            .spawn(async move {
+                                let (output, error) = tool
+                                    .server
+                                    .call(&tool.tool, c.input.clone(), mcp_store::CALL)
+                                    .unwrap_or_else(|error| (error, true));
+                                Outcome::Result(ToolResult {
+                                    id: c.id,
+                                    output,
+                                    error,
+                                })
+                            })
+                            .await
+                    }
+                    None => {
+                        cx.background_executor()
+                            .spawn(async move { tb.execute(&c, phase, approved) })
+                            .await
+                    }
+                };
                 approved = false;
                 let go_on = this
                     .update(cx, |this, cx| {
@@ -364,7 +468,7 @@ impl AgentTask {
         match outcome {
             Outcome::Result(result) => {
                 self.entries.push(Entry::Tool {
-                    title: describe(&call),
+                    title: self.title(&call),
                     output: result.output.clone(),
                     error: result.error,
                     open: false,
@@ -493,7 +597,7 @@ impl AgentTask {
             let mut calls = std::mem::take(&mut self.pending).into_iter();
             if let Some(call) = calls.next() {
                 self.entries.push(Entry::Tool {
-                    title: describe(&call),
+                    title: self.title(&call),
                     output: "Declined by the user.".into(),
                     error: true,
                     open: false,

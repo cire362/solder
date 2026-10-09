@@ -16,6 +16,7 @@ pub mod gguf;
 pub mod hardware;
 pub mod install;
 pub mod keys;
+pub mod mcp;
 pub mod provider;
 pub mod review;
 pub mod server;

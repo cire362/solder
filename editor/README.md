@@ -493,6 +493,55 @@ command (which declines that command) or after it finished. **Stop** halts it
 between steps. Files `.env` and `.solderignore` keep from AI stay unreadable to
 it, as in the chat; a task stops after 60 steps and asks how to go on.
 
+### Context servers
+
+A context server gives the agent tools of its own: a database to query, an
+issue tracker to read, documentation to look up. It is a Model Context
+Protocol (MCP) server, a program Solder starts and talks to on its input and
+output. Name the ones you want in `settings.json`, as Zed does:
+
+```json
+"context_servers": {
+  "postgres": {
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/app"],
+    "env": { "PGPASSWORD": "..." }
+  },
+  "docs": { "command": { "path": "uvx", "args": ["some-docs-server"] }, "enabled": false }
+}
+```
+
+Nothing starts with the editor. The servers start when an agent task begins,
+with your shell's environment and the variables you gave, and stay for the
+next task; changing an entry stops the server it was for. The agent offers
+the model their tools next to its own. A server's tool runs where the server
+does, not in the agent's sandbox, so the first call of each tool in a task
+waits for **Allow once** and shows the tool, the server and the arguments;
+after that the task may call that tool again. A server that does not start is
+named in the task with its reason, and the task goes on without it. The
+**context servers** view of the AI tab lists them with their tools.
+
+A Zed extension may bring a context server (the Postgres, GitHub and
+Context7 ones are in Zed's catalog). Installed, it is in the list with no
+line in the settings: the extension's code says how to start it and installs
+it first, through the same permissions as a language server. What such a
+server needs to know is set under its name, as in Zed, and the extension says
+what is missing when it is not there:
+
+```json
+"context_servers": {
+  "postgres-context-server": { "settings": { "database_url": "postgresql://localhost/app" } }
+}
+```
+
+`"enabled": false` under its name leaves it out, and an entry with a
+`command` of your own under the same name is used in place of the extension's.
+
+Only tools are used. A server's prompts and resources are not, and what a
+server asks of the client (to sample a model, to list folders) is refused.
+Servers are programs on this machine; one reached over the network is not
+supported yet.
+
 ### Review before push
 
 **Push** in the Git tab first has the chat model read what the push sends: the
@@ -682,7 +731,7 @@ here.
 
 | From | Solder uses | Does not run here |
 |---|---|---|
-| A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, icon themes, its language servers, its debug adapters | Context servers (they need an MCP client, which is planned) |
+| A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, icon themes, its language servers, its debug adapters, its context servers | |
 | A VS Code extension | Themes (JSON), snippets | Its code, TextMate grammars, everything the code would add |
 
 A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
