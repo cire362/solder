@@ -2,6 +2,8 @@
 //! to `settings.json`. The file is the truth. It is read at the start and
 //! again whenever it is saved, and what is changed by hand in the window is
 //! written back to it, so the two never disagree.
+//! A named layout uses `layouts/<name>.json` instead. `layouts.json`
+//! remembers the choice for the app and for each open project.
 //!
 //! A file that cannot be read leaves the last layout that could, and says
 //! what is wrong where a mistake in `settings.json` is said. A size outside
@@ -16,19 +18,68 @@
 //! from the right one. An item is in one place, or in none.
 
 use std::{
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::LazyLock,
 };
 
-use gpui::{App, Global, Task};
+use gpui::{App, Global, Task, Window};
 use serde::{Deserialize, Serialize};
 
 use crate::settings;
 
 pub const FILE: &str = "layout.json";
+const CHOICES: &str = "layouts.json";
+pub const DEFAULT_NAME: &str = "Default";
 
-pub fn path() -> PathBuf {
-    settings::config_dir().join(FILE)
+pub fn path(cx: &App) -> PathBuf {
+    let dir = folder(cx);
+    layout_path(&dir, active(cx).as_deref())
+}
+
+pub fn folder(cx: &App) -> PathBuf {
+    cx.try_global::<Home>()
+        .map(|home| home.dir.clone())
+        .unwrap_or_else(settings::config_dir)
+}
+
+pub fn active(cx: &App) -> Option<String> {
+    cx.try_global::<Home>()
+        .and_then(|home| home.choices.active.clone())
+}
+
+fn layout_path(dir: &Path, name: Option<&str>) -> PathBuf {
+    match name {
+        Some(name) => dir.join("layouts").join(format!("{name}.json")),
+        None => dir.join(FILE),
+    }
+}
+
+/// A name is one file's stem, never a path. Unicode names are welcome.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 80
+        && name.trim() == name
+        && !name.eq_ignore_ascii_case(DEFAULT_NAME)
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || " -_".contains(c))
+}
+
+pub fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(dir.join("layouts"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension()? == "json").then(|| path.file_stem()?.to_str().map(str::to_owned))?
+        })
+        .filter(|name| valid_name(name))
+        .collect();
+    names.sort();
+    names
 }
 
 /// What a dock can hold. Each is in one dock, or hidden.
@@ -360,9 +411,119 @@ impl Part {
 /// The folder the layout was last read from, which is where a change made
 /// by hand in the window is written. Nothing is written before a file was
 /// looked for there: a test that never loads one writes none.
-struct Home(PathBuf);
+struct Home {
+    dir: PathBuf,
+    choices: Choices,
+}
 
 impl Global for Home {}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct Choices {
+    active: Option<String>,
+    projects: BTreeMap<PathBuf, Option<String>>,
+}
+
+impl Choices {
+    fn read(dir: &Path) -> Result<Self, String> {
+        let text = read(&dir.join(CHOICES), true)?;
+        if settings::strip_comments(&text).trim().is_empty() {
+            return Ok(Self::default());
+        }
+        let choices: Self = serde_json::from_str(&settings::strip_comments(&text))
+            .map_err(|error| format!("{CHOICES}: {error}"))?;
+        if choices
+            .active
+            .iter()
+            .chain(choices.projects.values().flatten())
+            .any(|name| !valid_name(name))
+        {
+            return Err(format!("{CHOICES}: invalid layout name"));
+        }
+        Ok(choices)
+    }
+
+    fn select(dir: &Path, name: Option<String>, projects: Vec<PathBuf>) -> Result<Self, String> {
+        let mut choices = Self::read(dir)?;
+        choices.active = name.clone();
+        for project in projects {
+            choices.projects.insert(project, name.clone());
+        }
+        let text = serde_json::to_string_pretty(&choices).map_err(|e| e.to_string())?;
+        replace(&dir.join(CHOICES), &format!("{text}\n"))?;
+        Ok(choices)
+    }
+}
+
+/// Window ids let a global switch remember exactly the projects still
+/// open, without borrowing any workspace while one handles the command.
+#[derive(Default)]
+struct Projects(HashMap<gpui::WindowId, PathBuf>);
+impl Global for Projects {}
+
+#[derive(Default)]
+struct Failure(Option<String>);
+impl Global for Failure {}
+
+/// Changing layouts restores their open docks; an edit to the same file
+/// can still move an open panel with its tab, as it did before names.
+#[derive(Default)]
+struct Selection(u64);
+impl Global for Selection {}
+
+pub fn selection(cx: &App) -> u64 {
+    cx.try_global::<Selection>()
+        .map_or(0, |selection| selection.0)
+}
+
+fn selected(cx: &mut App) {
+    cx.default_global::<Selection>().0 += 1;
+}
+
+pub fn for_project(root: &Path, window: &Window, cx: &mut App) {
+    cx.default_global::<Projects>()
+        .0
+        .insert(window.window_handle().window_id(), root.to_path_buf());
+    let choice = cx
+        .try_global::<Home>()
+        .and_then(|home| home.choices.projects.get(root).cloned());
+    if let Some(name) = choice
+        && name != active(cx)
+    {
+        choose(name, cx);
+    }
+}
+
+pub fn choose(name: Option<String>, cx: &mut App) {
+    write(
+        Change::Choose {
+            name,
+            projects: open_projects(cx),
+        },
+        cx,
+    );
+}
+
+pub fn save_as(name: String, cx: &mut App) {
+    write(
+        Change::Save {
+            name,
+            layout: Box::new(Layout::get(cx).clone()),
+            projects: open_projects(cx),
+        },
+        cx,
+    );
+}
+
+fn open_projects(cx: &mut App) -> Vec<PathBuf> {
+    let windows = cx.windows();
+    let projects = cx.default_global::<Projects>();
+    projects
+        .0
+        .retain(|id, _| windows.iter().any(|window| window.window_id() == *id));
+    projects.0.values().cloned().collect()
+}
 
 /// Changes of ours that have not reached the file yet. They go one after
 /// another: each reads the file and puts one key in it, and two at once
@@ -603,20 +764,39 @@ pub fn file(layout: &Layout) -> String {
 /// Reads the file in `dir` and puts its layout in use. On a mistake the
 /// layout in use stays and the mistake is returned.
 pub fn reload_from(dir: &Path, cx: &mut App) -> Option<String> {
-    cx.set_global(Home(dir.to_path_buf()));
+    if cx.try_global::<Home>().is_none_or(|home| home.dir != dir) {
+        cx.set_global(Home {
+            dir: dir.to_path_buf(),
+            choices: Choices::default(),
+        });
+    }
     // While a write of ours is on its way the file is behind the window,
     // and read now it would take back what was just done by hand. It is
     // read when the last write is in.
     if cx.try_global::<Writes>().is_some_and(|w| w.pending > 0) {
-        return None;
+        return cx
+            .try_global::<Failure>()
+            .and_then(|failure| failure.0.clone());
     }
-    let source = std::fs::read_to_string(dir.join(FILE)).unwrap_or_default();
-    match parse(&source) {
-        Ok(layout) => {
-            if cx.try_global::<Layout>() != Some(&layout) {
+    let result = (|| {
+        let choices = Choices::read(dir)?;
+        let path = layout_path(dir, choices.active.as_deref());
+        let source = read(&path, choices.active.is_none())?;
+        let layout = parse_at(&path, &source)?;
+        let switched = cx.global::<Home>().choices.active != choices.active;
+        cx.global_mut::<Home>().choices = choices;
+        Ok((layout, switched))
+    })();
+    match result {
+        Ok((layout, switched)) => {
+            if switched {
+                selected(cx);
+            }
+            if switched || cx.try_global::<Layout>() != Some(&layout) {
                 cx.set_global(layout);
             }
-            None
+            cx.try_global::<Failure>()
+                .and_then(|failure| failure.0.clone())
         }
         Err(error) => {
             if cx.try_global::<Layout>().is_none() {
@@ -684,9 +864,10 @@ pub fn put(layout: Layout, cx: &mut App) {
 }
 
 /// The layout as the editor comes. The file is the truth, so it has to
-/// stop saying otherwise: it is put aside as `layout.json.old`, with all
-/// the user wrote in it.
+/// stop saying otherwise: the selected file is put aside with `.old`
+/// after its name, with all the user wrote in it.
 pub fn reset(cx: &mut App) {
+    selected(cx);
     cx.set_global(Layout::default());
     write(Change::Aside, cx);
 }
@@ -699,39 +880,125 @@ enum Change {
     Set(&'static str, serde_json::Value),
     /// Moves it out of the way.
     Aside,
+    Choose {
+        name: Option<String>,
+        projects: Vec<PathBuf>,
+    },
+    Save {
+        name: String,
+        layout: Box<Layout>,
+        projects: Vec<PathBuf>,
+    },
 }
 
 impl Change {
-    fn make(self, dir: &Path) {
-        let path = dir.join(FILE);
+    fn make(self, dir: &Path, path: &Path) -> Result<(), String> {
         match self {
             Change::Set(key, value) => {
-                let text = std::fs::read_to_string(&path)
-                    .ok()
-                    .filter(|text| !settings::strip_comments(text).trim().is_empty())
-                    .unwrap_or_else(|| "{\n}\n".into());
-                if parse(&text).is_err() {
-                    return;
-                }
-                let text = import::jsonc::set_key(&text, key, &value);
-                // Whole or not at all: the file is read as soon as it changes.
-                let fresh = dir.join(format!("{FILE}.new"));
-                if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&fresh, text).is_ok() {
-                    let _ = std::fs::rename(&fresh, &path);
-                }
+                let text = read(path, true)?;
+                parse_at(path, &text)?;
+                let text = if settings::strip_comments(&text).trim().is_empty() {
+                    "{\n}\n"
+                } else {
+                    &text
+                };
+                let text = import::jsonc::set_key(text, key, &value);
+                replace(path, &text)?;
             }
             Change::Aside => {
-                let _ = std::fs::rename(&path, dir.join(format!("{FILE}.old")));
+                match std::fs::rename(path, path.with_extension("json.old")) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(format!("{}: {error}", path.display())),
+                }
+                // A named layout remains selected, so it needs a file even
+                // when it now says only the editor's defaults.
+                if path != dir.join(FILE) {
+                    replace(path, &file(&Layout::default()))?;
+                }
+            }
+            Change::Choose { name, projects } => {
+                check_name(name.as_deref())?;
+                let path = layout_path(dir, name.as_deref());
+                parse_at(&path, &read(&path, name.is_none())?)?;
+                Choices::select(dir, name, projects)?;
+            }
+            Change::Save {
+                name,
+                layout,
+                projects,
+            } => {
+                check_name(Some(&name))?;
+                // Validate the choices before creating a file; a malformed
+                // state is left for the user to repair.
+                Choices::read(dir)?;
+                let path = layout_path(dir, Some(&name));
+                std::fs::create_dir_all(path.parent().unwrap())
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                use std::io::Write;
+                let mut target = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                target
+                    .write_all(file(&layout).as_bytes())
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                Choices::select(dir, Some(name), projects)?;
             }
         }
+        Ok(())
     }
+}
+
+fn check_name(name: Option<&str>) -> Result<(), String> {
+    if name.is_some_and(|name| !valid_name(name)) {
+        Err("layouts: use a name with letters, numbers, spaces, - or _".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn read(path: &Path, missing_ok: bool) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if missing_ok && error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(String::new())
+        }
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+fn parse_at(path: &Path, source: &str) -> Result<Layout, String> {
+    parse(source).map_err(|error| {
+        if path.file_name().is_some_and(|name| name == FILE) {
+            error
+        } else {
+            format!(
+                "{}: {}",
+                path.display(),
+                error.trim_start_matches("layout.json: ")
+            )
+        }
+    })
+}
+
+fn replace(path: &Path, text: &str) -> Result<(), String> {
+    let operation = || -> std::io::Result<()> {
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let fresh = path.with_extension("json.new");
+        std::fs::write(&fresh, text)?;
+        std::fs::rename(fresh, path)
+    };
+    operation().map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// Makes a change to the file, after the ones that were asked before it.
 fn write(change: Change, cx: &mut App) {
-    let Some(dir) = cx.try_global::<Home>().map(|home| home.0.clone()) else {
+    let Some(dir) = cx.try_global::<Home>().map(|home| home.dir.clone()) else {
         return;
     };
+    let path = path(cx);
     let writes = cx.default_global::<Writes>();
     writes.pending += 1;
     let before = writes.last.take();
@@ -741,15 +1008,28 @@ fn write(change: Change, cx: &mut App) {
             before.await;
         }
         let folder = dir.clone();
-        background.spawn(async move { change.make(&folder) }).await;
+        let result = background
+            .spawn(async move { change.make(&folder, &path) })
+            .await;
         let _ = cx.update(|cx| {
+            let error = result.err();
+            cx.set_global(Failure(error.clone()));
             let writes = cx.default_global::<Writes>();
             writes.pending = writes.pending.saturating_sub(1);
             // The file now says all that was done by hand, and whatever
             // the user saved in it meanwhile, which was not read then.
             if writes.pending == 0 {
-                reload_from(&dir, cx);
+                let error = reload_from(&dir, cx).or(error);
+                let errors = &mut cx.default_global::<settings::ConfigErrors>().0;
+                errors.retain(|error| {
+                    !error.contains("layout.json")
+                        && !error.contains("layouts.json")
+                        && !error.contains("/layouts/")
+                        && !error.starts_with("layouts:")
+                });
+                errors.extend(error);
             }
+            cx.refresh_windows();
         });
     });
     cx.default_global::<Writes>().last = Some(task);
@@ -758,6 +1038,174 @@ fn write(change: Change, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_layouts_keep_their_files_and_remember_projects() {
+        let dir = db::testing::dir("named-layouts");
+        let default = dir.join(FILE);
+        let original = "// common\n{\"left\":{\"width\":320}}\n";
+        std::fs::write(&default, original).unwrap();
+        let project = dir.join("project");
+        let second = dir.join("second");
+        let layout =
+            parse(r#"{ "right": { "panels": ["files"] }, "open": ["files", "git"] }"#).unwrap();
+        Change::Save {
+            name: "Review".into(),
+            layout: Box::new(layout.clone()),
+            projects: vec![project.clone(), second.clone()],
+        }
+        .make(&dir, &default)
+        .unwrap();
+        let named = layout_path(&dir, Some("Review"));
+        assert_eq!(parse(&read(&named, false).unwrap()).unwrap(), layout);
+        assert_eq!(std::fs::read_to_string(&default).unwrap(), original);
+        let choices = Choices::read(&dir).unwrap();
+        assert_eq!(choices.active.as_deref(), Some("Review"));
+        assert_eq!(choices.projects[&project].as_deref(), Some("Review"));
+        assert_eq!(choices.projects[&second].as_deref(), Some("Review"));
+        // An existing layout is never overwritten by Save as.
+        assert!(
+            Change::Save {
+                name: "Review".into(),
+                layout: Box::default(),
+                projects: Vec::new()
+            }
+            .make(&dir, &default)
+            .is_err()
+        );
+        assert_eq!(parse(&read(&named, false).unwrap()).unwrap(), layout);
+
+        // A change by hand belongs to the named file, the common one stays.
+        std::fs::write(&named, "// review\n{\"left\":{\"width\":400}}\n").unwrap();
+        Change::Set("open", serde_json::json!(["chat"]))
+            .make(&dir, &named)
+            .unwrap();
+        let text = read(&named, false).unwrap();
+        assert!(text.contains("// review"));
+        assert_eq!(parse(&text).unwrap().open, Some(vec![Panel::Chat]));
+        assert_eq!(std::fs::read_to_string(&default).unwrap(), original);
+        // A missing or broken choice leaves the selected layout and every
+        // project's record alone.
+        std::fs::write(dir.join("layouts/Broken.json"), "{broken").unwrap();
+        for name in ["Missing", "Broken", "../elsewhere", "Default"] {
+            assert!(
+                Change::Choose {
+                    name: Some(name.into()),
+                    projects: vec![project.clone()]
+                }
+                .make(&dir, &named)
+                .is_err()
+            );
+            assert_eq!(
+                Choices::read(&dir).unwrap().active.as_deref(),
+                Some("Review")
+            );
+        }
+        assert_eq!(names(&dir), ["Broken", "Review"]);
+        // Reset saves the original named file beside a new default layout.
+        Change::Aside.make(&dir, &named).unwrap();
+        assert_eq!(
+            read(&named.with_extension("json.old"), false).unwrap(),
+            text
+        );
+        assert_eq!(
+            parse(&read(&named, false).unwrap()).unwrap(),
+            Layout::default()
+        );
+        Change::Choose {
+            name: None,
+            projects: vec![project.clone()],
+        }
+        .make(&dir, &named)
+        .unwrap();
+        let choices = Choices::read(&dir).unwrap();
+        assert!(choices.active.is_none() && choices.projects[&project].is_none());
+        assert_eq!(choices.projects[&second].as_deref(), Some("Review"));
+    }
+
+    #[test]
+    fn a_named_layout_cannot_escape_its_folder_or_replace_another_file() {
+        for name in [
+            "",
+            "Default",
+            "default",
+            "..",
+            "../layout",
+            "/tmp/layout",
+            "dir/name",
+            "dir\\name",
+            "file.json",
+            " trailing ",
+            "\n",
+            "bad:thing",
+        ] {
+            assert!(!valid_name(name), "{name}");
+        }
+        for name in ["Review", "Debugging-2", "My layout", "Обзор", "read_only"] {
+            assert!(valid_name(name), "{name}");
+        }
+        let dir = db::testing::dir("layout-names");
+        std::fs::create_dir_all(dir.join("layouts/Folder.json")).unwrap();
+        for name in [
+            "Review.json",
+            "Debugging.json",
+            "Review.json.old",
+            "Review.json.new",
+            "Default.json",
+        ] {
+            std::fs::write(dir.join("layouts").join(name), "{}").unwrap();
+        }
+        assert_eq!(names(&dir), ["Debugging", "Review"]);
+        std::fs::write(dir.join(CHOICES), r#"{"active":"../settings"}"#).unwrap();
+        assert!(Choices::read(&dir).is_err());
+    }
+
+    #[gpui::test]
+    fn a_selected_named_layout_is_reloaded_when_its_file_is_saved(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = db::testing::dir("watched-named-layout");
+        Change::Save {
+            name: "Writing".into(),
+            layout: Box::default(),
+            projects: Vec::new(),
+        }
+        .make(&dir, &dir.join(FILE))
+        .unwrap();
+        cx.update(|cx| {
+            cx.set_global(crate::perf::Perf::new(std::time::Instant::now()));
+            settings::reload_from(&dir, cx);
+            settings::watch_dir(dir.clone(), cx);
+        });
+        let named = layout_path(&dir, Some("Writing"));
+        let wait = |cx: &mut gpui::TestAppContext, width: f32, broken: bool| {
+            for _ in 0..200 {
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(50));
+                cx.run_until_parked();
+                if cx.read(|cx| {
+                    Layout::get(cx).left.width == width
+                        && cx.global::<settings::ConfigErrors>().0.is_empty() != broken
+                }) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("named layout was not reloaded");
+        };
+        std::fs::write(&named, r#"{"left":{"width":450}}"#).unwrap();
+        wait(cx, 450., false);
+        std::fs::write(&named, "{broken").unwrap();
+        wait(cx, 450., true);
+        assert!(cx.read(|cx| {
+            cx.global::<settings::ConfigErrors>()
+                .0
+                .iter()
+                .any(|error| error.contains("Writing.json"))
+        }));
+        std::fs::write(&named, r#"{"left":{"width":500}}"#).unwrap();
+        wait(cx, 500., false);
+        assert_eq!(cx.read(active), Some("Writing".into()));
+    }
 
     #[test]
     fn a_layout_file_gives_sizes_and_the_rest_stay() {

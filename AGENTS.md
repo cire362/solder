@@ -81,6 +81,11 @@ Never guess a signature.
 - `Workspace` owns panes, tabs, the docks, modals and the find bar. Where
   the parts of the window are and how large is `Layout` (`layout.rs`), read
   from `layout.json`: do not write a size or a panel's place into the code.
+  A named layout uses `layouts/<name>.json` instead; `layout::path(cx)` names
+  the file in use. `layouts.json` remembers the shared choice and the one
+  each open project was left in. Saving, selecting and resetting a layout
+  use the same queue as a size change, so pending edits reach their original
+  file before another layout is selected.
   Each of the three docks shows one `Panel`, the terminals and the
   debugger included; which dock a panel is in is the layout's to say
   (`Workspace::show_panel`), never a field of its own, and one that has

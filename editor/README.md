@@ -954,6 +954,39 @@ the status bar, whatever it holds.
 `place` of `tab_bar` is where the tabs of the open files are: `top`, `bottom`
 or `none`. With none, files are changed by the keys and the file finder.
 
+**Workspace: Save layout** keeps the window as it is under a new name, in
+`~/.config/solder/layouts/<name>.json`, and selects it. An existing name is
+left alone. **Workspace: Switch layout** opens a searchable list of saved
+layouts; **Default** in that list is the original `layout.json`.
+
+While a named layout is selected, its file is the truth: dragging, panel
+menus and opening or closing docks write into it, **Open layout** opens it,
+and saving it by hand applies it. **Reset layout** puts that file aside as
+`<name>.json.old` and gives it the default layout. Switching waits for earlier
+changes to reach their file, so no change ends up in the wrong layout.
+
+One key can switch straight to a layout, without opening the list, in
+`keymap.json`:
+
+```json
+[
+  {
+    "context": "Workspace",
+    "bindings": {
+      "alt-shift-r": ["workspace::SwitchLayout", { "name": "Review" }],
+      "alt-shift-d": ["workspace::SwitchLayout", { "name": "Default" }]
+    }
+  }
+]
+```
+
+The current choice and the choice each project was left in are kept in
+`layouts.json`. A project opened again selects its saved layout. The layout
+is shared by all open windows: a switch changes them together and remembers
+it for every project still open. A project with no saved choice uses the
+current layout. Missing or broken layout files leave the last good layout
+in use and say what is wrong in the status bar.
+
 The text of the interface is set in `settings.json`, apart from the code's:
 
 ```json

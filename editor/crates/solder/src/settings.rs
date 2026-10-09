@@ -557,12 +557,13 @@ pub fn watch(cx: &mut App) {
 }
 
 /// Reads the config files in `dir` again whenever one of them is saved,
-/// a theme in its `themes` folder too.
+/// a theme or a named layout in its folder too.
 pub fn watch_dir(dir: PathBuf, cx: &mut App) {
     // The folder of themes is watched from the start, so that the first
     // theme put there is seen.
     let themes = dir.join("themes");
-    if std::fs::create_dir_all(&themes).is_err() {
+    let layouts = dir.join("layouts");
+    if std::fs::create_dir_all(&themes).is_err() || std::fs::create_dir_all(&layouts).is_err() {
         return;
     }
     let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
@@ -575,6 +576,9 @@ pub fn watch_dir(dir: PathBuf, cx: &mut App) {
     };
     if watcher.watch(&dir, RecursiveMode::NonRecursive).is_err()
         || watcher.watch(&themes, RecursiveMode::NonRecursive).is_err()
+        || watcher
+            .watch(&layouts, RecursiveMode::NonRecursive)
+            .is_err()
     {
         return;
     }

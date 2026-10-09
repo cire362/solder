@@ -252,12 +252,12 @@ not use.
 
 ## 9. An editor shaped by its user
 
-Where it stands: keys are the user's (`keymap.json`), and so are the colors
-(a theme file, 30 tokens). The rest is fixed in code: the sidebar is on the
-left and 390 px wide, the chat on the right, the terminal at the bottom, the
-sidebar's tabs and the status bar's items in one order, the interface font
-and its size, and the only icons are those of files, from an extension's
-icon theme; buttons and panels are words.
+Where it stands: the layout file sets the sizes, docks, panels and bars;
+panels move by hand too. Layouts have names and are remembered per project.
+The interface font, size and density are settings, and every color, corner
+radius and border width is a theme token. Keys are the user's (`keymap.json`).
+The only icons are those of files, from a Zed extension's icon theme;
+buttons and panels are still words.
 
 How it is built: `layout.json`, next to `settings.json`, is the truth and is
 read again when it is saved. Whatever is done by hand in the window (a border
@@ -296,9 +296,11 @@ file, so the two never disagree. It starts after the Zed items of phase 8.
       puts the file aside as `layout.json.old`
 
 ### Layouts by name
-- [ ] Several layouts kept by name (writing, review, debugging), switched by
+- [x] Several layouts kept by name (writing, review, debugging), switched by
       a command or a key; the one a project was left in is the one it opens
-      with
+      with. `layouts/<name>.json` is the selected layout's file, `layout.json`
+      is Default; all open windows share the choice and remember it for
+      their projects in `layouts.json`
 - [ ] Key layouts by name: the built-in one, the ones that follow other
       editors, and the user's own, switched by a command, with `keymap.json`
       still on top

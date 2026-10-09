@@ -40,6 +40,7 @@ mod inline_completion;
 mod inline_edit;
 mod key_prompts;
 mod layout;
+mod layout_picker;
 mod locations;
 mod lsp_store;
 mod mcp_store;

@@ -32,6 +32,7 @@ use crate::{
     go_to_line::GoToLine as GoToLineDelegate,
     inline_edit::{InlineEdit, InlineEditEvent},
     layout::{self, Item, Layout, Panel, Part, Place, TabBar, TabsAt},
+    layout_picker::{LayoutPicker, SwitchLayout},
     locations::{CodeActionPicker, LocationPicker, RenamePrompt},
     lsp_store::{LspStore, from_range},
     perf::{self, Perf},
@@ -72,6 +73,7 @@ actions!(
         OpenSettings,
         OpenKeymap,
         OpenLayout,
+        SaveLayout,
         ResetLayout,
         SplitRight,
         FocusNextPane,
@@ -265,6 +267,7 @@ pub struct Workspace {
     /// closing the dock takes the focus with it.
     dock_focus: [FocusHandle; 3],
     _layout: Subscription,
+    layout_selection: u64,
     /// A border being dragged: the part it sizes, where the pointer went
     /// down along the border's way, and the part's size then.
     resizing: Option<(Part, f32, f32)>,
@@ -311,6 +314,7 @@ impl Render for DraggedTab {
 
 impl Workspace {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        layout::for_project(&root, window, cx);
         let project = cx.new(|cx| Project::new(root.clone(), cx));
         let project_panel = cx.new(|cx| ProjectPanel::new(root.clone(), cx));
         let git = cx.new(|cx| GitStore::new(root.clone(), cx));
@@ -657,6 +661,7 @@ impl Workspace {
             bottom,
             dock_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
             _layout: cx.observe_global_in::<Layout>(window, Self::follow_layout),
+            layout_selection: layout::selection(cx),
             resizing: None,
             dock_menu: None,
             dragging: None,
@@ -1857,9 +1862,12 @@ impl Workspace {
     /// reach anything from there.
     fn follow_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let layout = Layout::get(cx).clone();
+        let selection = layout::selection(cx);
+        let switched = self.layout_selection != selection;
+        self.layout_selection = selection;
         let before = [self.left, self.right, self.bottom];
         for (index, place) in Place::ALL.into_iter().enumerate() {
-            let now = if layout.open.is_some() {
+            let now = if switched || layout.open.is_some() {
                 layout.open_in(place).filter(|panel| self.available(*panel))
             } else {
                 let here = before[index];
@@ -3399,7 +3407,33 @@ impl Workspace {
 
     fn open_layout(&mut self, _: &OpenLayout, window: &mut Window, cx: &mut Context<Self>) {
         let default = crate::layout::file(Layout::get(cx));
-        self.open_config_file(crate::layout::path(), default, window, cx);
+        self.open_config_file(crate::layout::path(cx), default, window, cx);
+    }
+
+    fn switch_layout(
+        &mut self,
+        action: &SwitchLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(name) = &action.name {
+            let name = (name != layout::DEFAULT_NAME).then(|| name.clone());
+            layout::choose(name, cx);
+        } else {
+            self.layout_picker(false, window, cx);
+        }
+    }
+
+    fn save_layout(&mut self, _: &SaveLayout, window: &mut Window, cx: &mut Context<Self>) {
+        self.layout_picker(true, window, cx);
+    }
+
+    fn layout_picker(&mut self, save: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_modal(window, cx, move |window, cx| {
+            let picker = Picker::new(LayoutPicker::new(save), window, cx);
+            LayoutPicker::load(window, cx);
+            picker
+        });
     }
 
     fn open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
@@ -4372,6 +4406,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::open_layout))
+            .on_action(cx.listener(Self::switch_layout))
+            .on_action(cx.listener(Self::save_layout))
             .on_action(cx.listener(Self::reset_layout))
             .on_action(cx.listener(Self::split_right))
             .on_action(cx.listener(Self::focus_next_pane))
@@ -11680,6 +11716,182 @@ brackets = [
             "{old}"
         );
         assert_eq!(layout(cx), Layout::default());
+    }
+
+    #[gpui::test]
+    fn a_named_layout_is_saved_switched_and_remembered_for_open_projects(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let root = db::testing::dir("ws-named-layout").canonicalize().unwrap();
+        let config = db::testing::dir("ws-named-layout-config");
+        let common = config.join("layout.json");
+        std::fs::write(
+            &common,
+            "// common\n{\"left\":{\"width\":310},\"open\":[\"files\"]}",
+        )
+        .unwrap();
+        let (ws, cx) = setup(cx, root.clone());
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        let wait = |cx: &mut VisualTestContext, name: Option<&str>| {
+            for _ in 0..200 {
+                cx.executor().advance_clock(Duration::from_millis(50));
+                cx.run_until_parked();
+                let ready = cx.read(|cx| {
+                    layout::active(cx).as_deref() == name
+                        && std::fs::read_to_string(layout::path(cx)).is_ok_and(|text| {
+                            layout::parse(&text).is_ok_and(|l| l == *Layout::get(cx))
+                        })
+                });
+                if ready {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("layout never became {name:?}");
+        };
+        // A pending panel change is part of the saved snapshot. Saving
+        // from the palette is a prompt; it never overwrites a named file.
+        cx.dispatch_action(ShowSearch);
+        cx.dispatch_action(SaveLayout);
+        cx.simulate_input("Review");
+        bounds_soon(cx, "layout-save");
+        cx.simulate_keystrokes("enter");
+        wait(cx, Some("Review"));
+        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+        let review = config.join("layouts/Review.json");
+        assert_eq!(cx.read(layout::path), review);
+        assert_eq!(
+            layout::parse(&std::fs::read_to_string(&review).unwrap())
+                .unwrap()
+                .open_in(Place::Left),
+            Some(Panel::Search)
+        );
+        let common_text = std::fs::read_to_string(&common).unwrap();
+        assert!(common_text.contains("// common"));
+
+        // The selected file is the truth, including edits by hand and
+        // Open Layout. The common layout is a separate one.
+        cx.dispatch_action(ShowGit);
+        wait(cx, Some("Review"));
+        assert_eq!(cx.read(|cx| ws.read(cx).left), Some(Panel::Git));
+        assert_eq!(std::fs::read_to_string(&common).unwrap(), common_text);
+        cx.update(|window, cx| window.focus(&ws.focus_handle(cx)));
+        cx.dispatch_action(OpenLayout);
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if active_path(&ws, cx) == Some(review.clone()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(active_path(&ws, cx), Some(review.clone()));
+        std::fs::write(&review, "// mine\n{\"right\":{\"panels\":[\"files\"],\"width\":420},\"open\":[\"files\",\"git\"]}").unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| ws.read(cx).right), Some(Panel::Files));
+
+        // Changing a panel, then selecting another layout immediately,
+        // finishes the first file before the selection takes effect.
+        cx.dispatch_action(ShowSearch);
+        cx.dispatch_action(SwitchLayout {
+            name: Some(layout::DEFAULT_NAME.into()),
+        });
+        wait(cx, None);
+        assert_eq!(cx.read(|cx| ws.read(cx).left), Some(Panel::Search));
+        let saved = layout::parse(&std::fs::read_to_string(&review).unwrap()).unwrap();
+        assert_eq!(saved.open_in(Place::Left), Some(Panel::Search));
+        assert_eq!(saved.open_in(Place::Right), Some(Panel::Files));
+        assert!(
+            std::fs::read_to_string(&review)
+                .unwrap()
+                .contains("// mine")
+        );
+
+        // The argument-bearing action can be bound to a key. With no
+        // argument it opens the searchable list instead.
+        std::fs::write(config.join("keymap.json"), r#"[{"context":"Workspace","bindings":{"alt-shift-r":["workspace::SwitchLayout",{"name":"Review"}]}}]"#).unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        cx.simulate_keystrokes("alt-shift-r");
+        wait(cx, Some("Review"));
+        cx.dispatch_action(SwitchLayout::default());
+        cx.simulate_input("Default");
+        bounds_soon(cx, "layout-choice-0");
+        cx.simulate_keystrokes("enter");
+        wait(cx, None);
+
+        // Every open window follows a switch and remembers it for its
+        // project. A window removed before another switch is left alone.
+        let second_root = db::testing::dir("ws-named-second").canonicalize().unwrap();
+        let second = cx.update(|_, cx| crate::open_workspace_window(second_root.clone(), None, cx));
+        cx.dispatch_action(SwitchLayout {
+            name: Some("Review".into()),
+        });
+        wait(cx, Some("Review"));
+        let second_dock = second.read_with(cx, |w, _| w.right).unwrap();
+        assert_eq!(second_dock, Some(Panel::Files));
+        let choices: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(config.join("layouts.json")).unwrap())
+                .unwrap();
+        assert_eq!(choices["projects"][root.to_str().unwrap()], "Review");
+        assert_eq!(choices["projects"][second_root.to_str().unwrap()], "Review");
+        second
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.dispatch_action(SwitchLayout {
+            name: Some(layout::DEFAULT_NAME.into()),
+        });
+        wait(cx, None);
+        let reopened =
+            cx.update(|_, cx| crate::open_workspace_window(second_root.clone(), None, cx));
+        wait(cx, Some("Review"));
+        assert_eq!(
+            reopened.read_with(cx, |w, _| w.right).unwrap(),
+            Some(Panel::Files)
+        );
+        reopened
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+
+        // A broken target reports its own name and keeps the current one.
+        std::fs::write(config.join("layouts/Broken.json"), "{bad").unwrap();
+        cx.dispatch_action(SwitchLayout {
+            name: Some("Broken".into()),
+        });
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if cx.read(|cx| {
+                cx.global::<settings::ConfigErrors>()
+                    .0
+                    .iter()
+                    .any(|e| e.contains("Broken.json"))
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(cx.read(layout::active), Some("Review".into()));
+        assert!(cx.read(|cx| {
+            cx.global::<settings::ConfigErrors>()
+                .0
+                .iter()
+                .any(|e| e.contains("Broken.json"))
+        }));
+        cx.dispatch_action(ResetLayout);
+        wait(cx, Some("Review"));
+        assert!(review.with_extension("json.old").exists());
+        assert_eq!(cx.read(|cx| Layout::get(cx).clone()), Layout::default());
+        // A layout without `open` restores its startup docks, including
+        // when its sizes and panels match the currently selected layout.
+        std::fs::write(&common, "{}").unwrap();
+        cx.dispatch_action(ToggleChat);
+        wait(cx, Some("Review"));
+        cx.dispatch_action(SwitchLayout {
+            name: Some(layout::DEFAULT_NAME.into()),
+        });
+        wait(cx, None);
+        assert_eq!(
+            cx.read(|cx| (ws.read(cx).left, ws.read(cx).right, ws.read(cx).bottom)),
+            (Some(Panel::Files), None, None)
+        );
     }
 
     #[gpui::test]
