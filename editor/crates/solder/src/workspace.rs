@@ -31,7 +31,7 @@ use crate::{
     git_store::{GitStore, GitStoreEvent},
     go_to_line::GoToLine as GoToLineDelegate,
     inline_edit::{InlineEdit, InlineEditEvent},
-    layout::{self, Layout, Part},
+    layout::{self, Layout, Panel, Part, Place},
     locations::{CodeActionPicker, LocationPicker, RenamePrompt},
     lsp_store::{LspStore, from_range},
     perf::{self, Perf},
@@ -189,18 +189,6 @@ pub enum Jump {
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SidebarTab {
-    Files,
-    Search,
-    Git,
-    Services,
-    Database,
-    Api,
-    Ai,
-    Extensions,
-}
-
 struct Modal {
     view: AnyView,
     type_id: TypeId,
@@ -244,12 +232,9 @@ pub struct Workspace {
     extensions_panel: Entity<crate::extensions_panel::ExtensionsPanel>,
     chat: Entity<crate::chat_panel::ChatPanel>,
     agent: Entity<crate::agent_panel::AgentPanel>,
-    /// The right dock shows the agent rather than the chat.
-    agent_shown: bool,
     /// Pushes started, for tests: the terminal running one may be gone.
     #[cfg(test)]
     pushes: usize,
-    chat_open: bool,
     inline_edit: Option<(Entity<InlineEdit>, Subscription)>,
     results: Entity<ResultsView>,
     /// The Results tab is in the dock (a query has run and it was not closed).
@@ -280,7 +265,14 @@ pub struct Workspace {
     panes: Vec<Pane>,
     active_pane: usize,
     recent: VecDeque<Arc<str>>,
-    sidebar: Option<SidebarTab>,
+    /// The panel each side dock shows; `None` for a dock that is closed.
+    /// Which dock a panel is in is the layout's to say.
+    left: Option<Panel>,
+    right: Option<Panel>,
+    /// Where the focus is when it is anywhere in the left or the right
+    /// dock, to know if closing a dock takes the focus with it.
+    dock_focus: [FocusHandle; 2],
+    _layout: Subscription,
     /// A border being dragged: the part it sizes, where the pointer went
     /// down along the border's way, and the part's size then.
     resizing: Option<(Part, f32, f32)>,
@@ -623,7 +615,12 @@ impl Workspace {
             panes: vec![Pane::default()],
             active_pane: 0,
             recent: VecDeque::new(),
-            sidebar: Some(SidebarTab::Files),
+            left: Some(Panel::Files),
+            right: None,
+            dock_focus: [cx.focus_handle(), cx.focus_handle()],
+            // A panel the layout moved to the other dock while it was
+            // shown goes there with it.
+            _layout: cx.observe_global::<Layout>(|this, cx| this.follow_layout(cx)),
             resizing: None,
             modal: None,
             terminals: Vec::new(),
@@ -641,10 +638,8 @@ impl Workspace {
             extensions_panel,
             chat,
             agent,
-            agent_shown: false,
             #[cfg(test)]
             pushes: 0,
-            chat_open: false,
             inline_edit: None,
             results,
             show_results: false,
@@ -1214,7 +1209,7 @@ impl Workspace {
     }
 
     fn show_git(&mut self, _: &ShowGit, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_sidebar(Some(SidebarTab::Git), cx);
+        self.set_sidebar(Some(Panel::Git), cx);
         self.git_panel.read(cx).focus_message(window, cx);
         self.git.update(cx, |g, cx| g.refresh_now(cx));
         cx.notify();
@@ -1435,33 +1430,104 @@ impl Workspace {
     }
 
     fn show_services(&mut self, _: &ShowServices, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_sidebar(Some(SidebarTab::Services), cx);
+        self.set_sidebar(Some(Panel::Services), cx);
         window.focus(&self.services.focus_handle(cx));
     }
 
     /// Changes the sidebar tab and tells panels that poll whether they are
     /// on screen.
-    fn set_sidebar(&mut self, tab: Option<SidebarTab>, cx: &mut Context<Self>) {
-        self.sidebar = tab;
-        let visible = tab == Some(SidebarTab::Services);
+    /// Whether `panel` is the one a dock shows now.
+    fn shown(&self, panel: Panel) -> bool {
+        self.left == Some(panel) || self.right == Some(panel)
+    }
+
+    /// The dock a panel shows in: the one the layout puts it in, or for a
+    /// hidden panel, which a command can still open, the one it comes in.
+    fn place_of(&self, panel: Panel, cx: &App) -> Place {
+        Layout::get(cx).place(panel).unwrap_or(panel.home())
+    }
+
+    fn dock(&mut self, place: Place) -> &mut Option<Panel> {
+        match place {
+            Place::Left => &mut self.left,
+            Place::Right => &mut self.right,
+        }
+    }
+
+    /// Closes a dock. If the focus was in it, the file in front takes it,
+    /// or with no file open the window itself: left on a field that is no
+    /// longer drawn, no key would reach anything.
+    fn close_dock(&mut self, place: Place, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dock(place).take().is_none() {
+            return;
+        }
+        if self.dock_focus[place as usize].contains_focused(window, cx) {
+            match self.active_editor() {
+                Some(editor) => window.focus(&editor.focus_handle(cx)),
+                None => window.focus(&self.focus_handle(cx)),
+            }
+        }
+        self.docks_changed(None, cx);
+    }
+
+    /// Shows `panel` in its dock, opening the dock if it was closed.
+    fn show_panel(&mut self, panel: Panel, cx: &mut Context<Self>) {
+        let place = self.place_of(panel, cx);
+        *self.dock(place) = Some(panel);
+        self.docks_changed(Some(panel), cx);
+    }
+
+    /// The left dock on a panel, or closed. A panel that lives in the
+    /// other dock is shown there.
+    fn set_sidebar(&mut self, tab: Option<Panel>, cx: &mut Context<Self>) {
+        match tab {
+            Some(panel) => self.show_panel(panel, cx),
+            None => {
+                self.left = None;
+                self.docks_changed(None, cx);
+            }
+        }
+    }
+
+    /// Tells the panels what the docks show now: the one that came into
+    /// view reads what it shows, and services stop watching when unseen.
+    fn docks_changed(&mut self, now: Option<Panel>, cx: &mut Context<Self>) {
+        let visible = self.shown(Panel::Services);
         self.services.update(cx, |s, cx| s.set_visible(visible, cx));
-        if tab == Some(SidebarTab::Database) {
-            self.database_panel.update(cx, |p, cx| p.shown(cx));
-        }
-        if tab == Some(SidebarTab::Api) {
-            self.api_panel.update(cx, |p, cx| p.shown(cx));
-        }
-        if tab == Some(SidebarTab::Ai) {
-            self.ai_panel.update(cx, |p, cx| p.shown(cx));
-        }
-        if tab == Some(SidebarTab::Extensions) {
-            self.extensions_panel.update(cx, |p, cx| p.shown(cx));
+        match now {
+            Some(Panel::Database) => self.database_panel.update(cx, |p, cx| p.shown(cx)),
+            Some(Panel::Api) => self.api_panel.update(cx, |p, cx| p.shown(cx)),
+            Some(Panel::Ai) => self.ai_panel.update(cx, |p, cx| p.shown(cx)),
+            Some(Panel::Extensions) => self.extensions_panel.update(cx, |p, cx| p.shown(cx)),
+            Some(Panel::Chat) => self.chat.update(cx, |c, cx| c.shown(cx)),
+            Some(Panel::Agent) => self.agent.update(cx, |a, cx| a.shown(cx)),
+            _ => {}
         }
         cx.notify();
     }
 
+    /// The layout changed. A panel a dock shows may now belong to the
+    /// other one: it is shown there. A dock that lost what it showed, and
+    /// got nothing in exchange, shows its first panel, or closes if it has
+    /// none.
+    fn follow_layout(&mut self, cx: &mut Context<Self>) {
+        let layout = Layout::get(cx).clone();
+        let (left, right) = (self.left, self.right);
+        let settle = |here: Option<Panel>, there: Option<Panel>, place: Place| {
+            // A hidden panel that is shown stays where it was opened.
+            let stays = here.filter(|p| layout.place(*p).is_none_or(|now| now == place));
+            let comes = there.filter(|p| layout.place(*p) == Some(place));
+            stays
+                .or(comes)
+                .or_else(|| here.and_then(|_| layout.side(place).panels.first().copied()))
+        };
+        self.left = settle(left, right, Place::Left);
+        self.right = settle(right, left, Place::Right);
+        self.docks_changed(None, cx);
+    }
+
     fn show_database(&mut self, _: &ShowDatabase, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_sidebar(Some(SidebarTab::Database), cx);
+        self.set_sidebar(Some(Panel::Database), cx);
         window.focus(&self.database_panel.focus_handle(cx));
     }
 
@@ -1824,15 +1890,14 @@ impl Workspace {
         self.show_right(true, window, cx);
     }
 
-    /// Opens the right dock on the chat or the agent and focuses its field.
+    /// Shows the chat or the agent, in the dock it is in, and focuses its
+    /// field.
     fn show_right(&mut self, agent: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.chat_open = true;
-        self.agent_shown = agent;
+        let panel = if agent { Panel::Agent } else { Panel::Chat };
+        self.show_panel(panel, cx);
         let input = if agent {
-            self.agent.update(cx, |a, cx| a.shown(cx));
             self.agent.read(cx).input()
         } else {
-            self.chat.update(cx, |c, cx| c.shown(cx));
             self.chat.read(cx).input()
         };
         window.focus(&input.focus_handle(cx));
@@ -1877,23 +1942,18 @@ impl Workspace {
     }
 
     fn toggle_chat(&mut self, _: &ToggleChat, window: &mut Window, cx: &mut Context<Self>) {
-        if self.agent_shown && self.chat_open {
+        // Its dock shows something else, or is closed: show the chat.
+        if !self.shown(Panel::Chat) {
             return self.show_right(false, window, cx);
         }
         let input = self.chat.read(cx).input();
-        if self.chat_open && !input.focus_handle(cx).is_focused(window) {
+        if !input.focus_handle(cx).is_focused(window) {
             // Open but elsewhere: go to it rather than close it.
             window.focus(&input.focus_handle(cx));
             return;
         }
-        self.chat_open = !self.chat_open;
-        if self.chat_open {
-            self.chat.update(cx, |c, cx| c.shown(cx));
-            window.focus(&input.focus_handle(cx));
-        } else if let Some(editor) = self.active_editor() {
-            window.focus(&editor.focus_handle(cx));
-        }
-        cx.notify();
+        let place = self.place_of(Panel::Chat, cx);
+        self.close_dock(place, window, cx);
     }
 
     /// The active file for the chat: its selection when there is one, else
@@ -1960,12 +2020,12 @@ impl Workspace {
     }
 
     fn show_ai(&mut self, _: &ShowAi, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_sidebar(Some(SidebarTab::Ai), cx);
+        self.set_sidebar(Some(Panel::Ai), cx);
         window.focus(&self.ai_panel.focus_handle(cx));
     }
 
     fn show_api(&mut self, _: &ShowApi, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_sidebar(Some(SidebarTab::Api), cx);
+        self.set_sidebar(Some(Panel::Api), cx);
         window.focus(&self.api_panel.focus_handle(cx));
     }
 
@@ -2262,7 +2322,7 @@ impl Workspace {
     }
 
     fn show_extensions(&mut self, _: &ShowExtensions, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_sidebar(Some(SidebarTab::Extensions), cx);
+        self.set_sidebar(Some(Panel::Extensions), cx);
         window.focus(&self.extensions_panel.focus_handle(cx));
     }
 
@@ -2552,7 +2612,7 @@ impl Workspace {
             })
             .collect();
         div()
-            .h(px(Layout::get(cx).dock.height))
+            .h(px(Layout::get(cx).bottom.height))
             .debug_selector(|| "dock".into())
             .flex_none()
             .flex()
@@ -2954,20 +3014,20 @@ impl Workspace {
     /// part it sizes is shown. A double click puts the size back.
     fn resize_handles(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         const GRIP: f32 = 6.;
-        let layout = Layout::get(cx);
+        let layout = Layout::get(cx).clone();
         let dock = self.dock_open && self.dock_has_tabs();
         let top = layout.title_bar.height;
-        let bottom = layout.status_bar.height + if dock { layout.dock.height } else { 0. };
+        let bottom = layout.status_bar.height + if dock { layout.bottom.height } else { 0. };
         let handle = |part: Part, cx: &mut Context<Self>| {
             div()
                 .id(match part {
-                    Part::Sidebar => "resize-sidebar",
-                    Part::Chat => "resize-chat",
-                    Part::Dock => "resize-dock",
+                    Part::Left => "resize-left",
+                    Part::Right => "resize-right",
+                    Part::Bottom => "resize-bottom",
                 })
                 .absolute()
                 .occlude()
-                .cursor(if part == Part::Dock {
+                .cursor(if part == Part::Bottom {
                     gpui::CursorStyle::ResizeUpDown
                 } else {
                     gpui::CursorStyle::ResizeLeftRight
@@ -2979,13 +3039,13 @@ impl Workspace {
                         if event.click_count >= 2 {
                             this.resizing = None;
                             let standard = Layout::default().size(part);
-                            cx.set_global(Layout::get(cx).with(part, standard));
+                            cx.set_global(Layout::get(cx).clone().with(part, standard));
                             layout::keep(part, cx);
                             cx.refresh_windows();
                             return;
                         }
                         let at = match part {
-                            Part::Dock => event.position.y,
+                            Part::Bottom => event.position.y,
                             _ => event.position.x,
                         };
                         this.resizing = Some((part, f32::from(at), Layout::get(cx).size(part)));
@@ -2993,32 +3053,32 @@ impl Workspace {
                 )
         };
         let mut handles = Vec::new();
-        if self.sidebar.is_some() {
+        if self.left.is_some() {
             handles.push(
-                handle(Part::Sidebar, cx)
-                    .debug_selector(|| "resize-sidebar".into())
+                handle(Part::Left, cx)
+                    .debug_selector(|| "resize-left".into())
                     .top(px(top))
                     .bottom(px(bottom))
-                    .left(px(layout.sidebar.width - GRIP / 2.))
+                    .left(px(layout.left.width - GRIP / 2.))
                     .w(px(GRIP))
                     .into_any_element(),
             );
         }
-        if self.chat_open {
+        if self.right.is_some() {
             handles.push(
-                handle(Part::Chat, cx)
-                    .debug_selector(|| "resize-chat".into())
+                handle(Part::Right, cx)
+                    .debug_selector(|| "resize-right".into())
                     .top(px(top))
                     .bottom(px(bottom))
-                    .right(px(layout.chat.width - GRIP / 2.))
+                    .right(px(layout.right.width - GRIP / 2.))
                     .w(px(GRIP))
                     .into_any_element(),
             );
         }
         if dock {
             handles.push(
-                handle(Part::Dock, cx)
-                    .debug_selector(|| "resize-dock".into())
+                handle(Part::Bottom, cx)
+                    .debug_selector(|| "resize-bottom".into())
                     .left_0()
                     .right_0()
                     .bottom(px(bottom - GRIP / 2.))
@@ -3041,12 +3101,12 @@ impl Workspace {
         // The sidebar grows to the right; the chat and the dock grow
         // towards the middle of the window, against the pointer's way.
         let moved = match part {
-            Part::Sidebar => f32::from(event.position.x) - from,
-            Part::Chat => from - f32::from(event.position.x),
-            Part::Dock => from - f32::from(event.position.y),
+            Part::Left => f32::from(event.position.x) - from,
+            Part::Right => from - f32::from(event.position.x),
+            Part::Bottom => from - f32::from(event.position.y),
         };
-        let layout = Layout::get(cx).with(part, size + moved);
-        if layout != Layout::get(cx) {
+        let layout = Layout::get(cx).clone().with(part, size + moved);
+        if layout != *Layout::get(cx) {
             cx.set_global(layout);
             cx.refresh_windows();
         }
@@ -3061,7 +3121,7 @@ impl Workspace {
     }
 
     fn open_layout(&mut self, _: &OpenLayout, window: &mut Window, cx: &mut Context<Self>) {
-        let default = crate::layout::file(&Layout::get(cx));
+        let default = crate::layout::file(Layout::get(cx));
         self.open_config_file(crate::layout::path(), default, window, cx);
     }
 
@@ -3262,13 +3322,13 @@ impl Workspace {
     }
 
     fn show_files(&mut self, _: &ShowFiles, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_sidebar(Some(SidebarTab::Files), cx);
+        self.set_sidebar(Some(Panel::Files), cx);
         window.focus(&self.project_panel.focus_handle(cx));
         cx.notify();
     }
 
     fn show_search(&mut self, _: &ShowSearch, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_sidebar(Some(SidebarTab::Search), cx);
+        self.set_sidebar(Some(Panel::Search), cx);
         let selected = self
             .active_editor()
             .and_then(|e| e.read(cx).selected_text(cx));
@@ -3277,13 +3337,15 @@ impl Workspace {
         cx.notify();
     }
 
-    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
-        let tab = match self.sidebar {
-            Some(_) => None,
-            None => Some(SidebarTab::Files),
-        };
-        self.set_sidebar(tab, cx);
-        cx.notify();
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, window: &mut Window, cx: &mut Context<Self>) {
+        if self.left.is_some() {
+            return self.close_dock(Place::Left, window, cx);
+        }
+        // Closed, it opens on the first panel it has.
+        if let Some(panel) = Layout::get(cx).left.panels.first().copied() {
+            self.left = Some(panel);
+            self.docks_changed(Some(panel), cx);
+        }
     }
 
     fn reveal_active_file(
@@ -3298,7 +3360,7 @@ impl Workspace {
         else {
             return;
         };
-        self.set_sidebar(Some(SidebarTab::Files), cx);
+        self.set_sidebar(Some(Panel::Files), cx);
         self.project_panel.update(cx, |p, cx| p.reveal(&path, cx));
         window.focus(&self.project_panel.focus_handle(cx));
         cx.notify();
@@ -3441,84 +3503,91 @@ impl Workspace {
             )
     }
 
-    fn render_sidebar(&self, tab: SidebarTab, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A dock at a side of the window: a tab for each panel the layout
+    /// puts in it, and the panel it shows.
+    fn render_side(&self, place: Place, tab: Panel, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let tab_button = |id: &'static str, label: &'static str, this_tab: SidebarTab| {
-            let active = tab == this_tab;
-            div()
-                .id(id)
-                .debug_selector(move || id.to_string())
-                .h(px(24.))
-                .px_1()
-                .flex()
-                .items_center()
-                .rounded(px(8.))
-                .text_size(UI_FONT_SIZE)
-                .text_color(if active { theme.fg } else { theme.fg_subtle })
-                .when(active, |d| d.bg(theme.bg_elev))
-                .hover(|d| d.text_color(theme.fg))
-                .child(label)
-                .on_click(cx.listener(move |this, _, window, cx| match this_tab {
-                    SidebarTab::Files => this.show_files(&ShowFiles, window, cx),
-                    SidebarTab::Search => this.show_search(&ShowSearch, window, cx),
-                    SidebarTab::Git => this.show_git(&ShowGit, window, cx),
-                    SidebarTab::Services => this.show_services(&ShowServices, window, cx),
-                    SidebarTab::Database => this.show_database(&ShowDatabase, window, cx),
-                    SidebarTab::Api => this.show_api(&ShowApi, window, cx),
-                    SidebarTab::Ai => this.show_ai(&ShowAi, window, cx),
-                    SidebarTab::Extensions => this.show_extensions(&ShowExtensions, window, cx),
-                }))
-        };
+        let layout = Layout::get(cx).clone();
+        let side = layout.side(place);
+        // A hidden panel a command opened has a tab for as long as it shows.
+        let mut panels = side.panels.clone();
+        if !panels.contains(&tab) {
+            panels.push(tab);
+        }
+        let tabs: Vec<_> = panels
+            .into_iter()
+            .map(|panel| {
+                let active = tab == panel;
+                div()
+                    .id(("panel", panel as usize))
+                    .debug_selector(move || format!("panel-{}", panel.id()))
+                    .flex_none()
+                    .h(px(24.))
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .rounded(px(8.))
+                    .text_size(UI_FONT_SIZE)
+                    .text_color(if active { theme.fg } else { theme.fg_subtle })
+                    .when(active, |d| d.bg(theme.bg_elev))
+                    .hover(|d| d.text_color(theme.fg))
+                    .child(panel.label())
+                    .on_click(cx.listener(move |this, _, window, cx| match panel {
+                        Panel::Files => this.show_files(&ShowFiles, window, cx),
+                        Panel::Search => this.show_search(&ShowSearch, window, cx),
+                        Panel::Git => this.show_git(&ShowGit, window, cx),
+                        Panel::Services => this.show_services(&ShowServices, window, cx),
+                        Panel::Database => this.show_database(&ShowDatabase, window, cx),
+                        Panel::Api => this.show_api(&ShowApi, window, cx),
+                        Panel::Ai => this.show_ai(&ShowAi, window, cx),
+                        Panel::Extensions => this.show_extensions(&ShowExtensions, window, cx),
+                        Panel::Chat => this.show_right(false, window, cx),
+                        Panel::Agent => this.show_right(true, window, cx),
+                    }))
+            })
+            .collect();
         div()
-            .w(px(Layout::get(cx).sidebar.width))
-            .debug_selector(|| "sidebar".into())
+            .w(px(side.width))
+            .debug_selector(move || match place {
+                Place::Left => "dock-left".into(),
+                Place::Right => "dock-right".into(),
+            })
+            .track_focus(&self.dock_focus[place as usize])
             .flex_none()
             .h_full()
             .flex()
             .flex_col()
-            .border_r_1()
+            .map(|d| match place {
+                Place::Left => d.border_r_1(),
+                Place::Right => d.border_l_1(),
+            })
             .border_color(theme.line)
             .bg(theme.bg_sunken)
             .child(
                 div()
                     .flex_none()
-                    .h(px(Layout::get(cx).tab_bar.height))
+                    .min_h(px(layout.tab_bar.height))
                     .px_2()
                     .flex()
+                    // More tabs than the dock is wide go on a second row.
+                    .flex_wrap()
                     .items_center()
                     .gap_1()
                     .border_b_1()
                     .border_color(theme.line)
-                    .child(tab_button("sidebar-files", "Files", SidebarTab::Files))
-                    .child(tab_button("sidebar-search", "Search", SidebarTab::Search))
-                    .child(tab_button("sidebar-git", "Git", SidebarTab::Git))
-                    .child(tab_button(
-                        "sidebar-services",
-                        "Services",
-                        SidebarTab::Services,
-                    ))
-                    .child(tab_button(
-                        "sidebar-database",
-                        "Database",
-                        SidebarTab::Database,
-                    ))
-                    .child(tab_button("sidebar-api", "API", SidebarTab::Api))
-                    .child(tab_button("sidebar-ai", "AI", SidebarTab::Ai))
-                    .child(tab_button(
-                        "sidebar-extensions",
-                        "Extensions",
-                        SidebarTab::Extensions,
-                    )),
+                    .children(tabs),
             )
             .child(div().flex_1().min_h_0().pt_1().map(|d| match tab {
-                SidebarTab::Files => d.child(self.project_panel.clone()),
-                SidebarTab::Search => d.child(self.project_search.clone()),
-                SidebarTab::Git => d.child(self.git_panel.clone()),
-                SidebarTab::Services => d.child(self.services.clone()),
-                SidebarTab::Database => d.child(self.database_panel.clone()),
-                SidebarTab::Api => d.child(self.api_panel.clone()),
-                SidebarTab::Ai => d.child(self.ai_panel.clone()),
-                SidebarTab::Extensions => d.child(self.extensions_panel.clone()),
+                Panel::Files => d.child(self.project_panel.clone()),
+                Panel::Search => d.child(self.project_search.clone()),
+                Panel::Git => d.child(self.git_panel.clone()),
+                Panel::Services => d.child(self.services.clone()),
+                Panel::Database => d.child(self.database_panel.clone()),
+                Panel::Api => d.child(self.api_panel.clone()),
+                Panel::Ai => d.child(self.ai_panel.clone()),
+                Panel::Extensions => d.child(self.extensions_panel.clone()),
+                Panel::Chat => d.child(self.chat.clone()),
+                Panel::Agent => d.child(self.agent.clone()),
             }))
     }
 
@@ -3886,64 +3955,12 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .children(self.sidebar.map(|tab| self.render_sidebar(tab, cx)))
+                    .children(self.left.map(|tab| self.render_side(Place::Left, tab, cx)))
                     .children(panes)
-                    .when(self.chat_open, |d| {
-                        let agent = self.agent_shown;
-                        let tab = |id: &'static str, label: &'static str, active: bool| {
-                            div()
-                                .id(id)
-                                .debug_selector(move || id.into())
-                                .h(px(24.))
-                                .px_1p5()
-                                .flex()
-                                .items_center()
-                                .rounded(px(8.))
-                                .text_size(UI_FONT_SIZE)
-                                .text_color(if active { theme.fg } else { theme.fg_subtle })
-                                .when(active, |d| d.bg(theme.bg_elev))
-                                .hover(|d| d.text_color(theme.fg))
-                                .child(label)
-                        };
-                        d.child(
-                            div()
-                                .w(px(Layout::get(cx).chat.width))
-                                .debug_selector(|| "chat".into())
-                                .flex_none()
-                                .h_full()
-                                .flex()
-                                .flex_col()
-                                .border_l_1()
-                                .border_color(theme.line)
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .px_2()
-                                        .py_1()
-                                        .flex()
-                                        .gap_1()
-                                        .border_b_1()
-                                        .border_color(theme.line)
-                                        .child(tab("right-chat", "Chat", !agent).on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.show_right(false, window, cx)
-                                            }),
-                                        ))
-                                        .child(tab("right-agent", "Agent", agent).on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.show_right(true, window, cx)
-                                            }),
-                                        )),
-                                )
-                                .child(div().flex_1().min_h_0().map(|d| {
-                                    if agent {
-                                        d.child(self.agent.clone())
-                                    } else {
-                                        d.child(self.chat.clone())
-                                    }
-                                })),
-                        )
-                    }),
+                    .children(
+                        self.right
+                            .map(|tab| self.render_side(Place::Right, tab, cx)),
+                    ),
             )
             .when(self.dock_open && self.dock_has_tabs(), |d| {
                 d.child(self.render_dock(cx))
@@ -4820,7 +4837,7 @@ mod tests {
         wait_for(cx, "detection", &|cx| services.read(cx).specs().len() == 2);
 
         cx.simulate_keystrokes("secondary-shift-s");
-        assert!(cx.read(|cx| ws.read(cx).sidebar == Some(SidebarTab::Services)));
+        assert!(cx.read(|cx| ws.read(cx).left == Some(Panel::Services)));
         cx.dispatch_action(RunStack);
         wait_for(cx, "port from the log", &|cx| {
             services.read(cx).ports("web") == [4321]
@@ -5877,7 +5894,7 @@ mod tests {
         // Nothing is read until the tab is opened.
         assert!(!cx.read(|cx| store.read(cx).detected()));
         cx.simulate_keystrokes("ctrl-shift-d");
-        assert!(cx.read(|cx| ws.read(cx).sidebar == Some(SidebarTab::Database)));
+        assert!(cx.read(|cx| ws.read(cx).left == Some(Panel::Database)));
         wait_for(cx, "detection", &|cx| store.read(cx).detected());
         // The file named in .env and found on disk is one connection.
         assert_eq!(cx.read(|cx| store.read(cx).connections().len()), 1);
@@ -9340,8 +9357,8 @@ brackets = [
 
         // The catalogs are asked when the tab is opened, not before.
         assert!(requests.lock().unwrap().is_empty());
-        click(cx, "sidebar-extensions");
-        assert!(cx.read(|cx| ws.read(cx).sidebar == Some(SidebarTab::Extensions)));
+        click(cx, "panel-extensions");
+        assert!(cx.read(|cx| ws.read(cx).left == Some(Panel::Extensions)));
         wait_for(cx, "the catalogs", &|cx| {
             let store = store.read(cx);
             !store.catalog(Origin::Zed).entries.is_empty() && store.catalog(Origin::VsCode).searched
@@ -9728,7 +9745,7 @@ brackets = [
         // this one installs Vue into it.
         assert_eq!(installed.languages[0].suffixes, ["dm", "Demofile"]);
         assert!(syntax::language_for_path(Path::new("notes.dm")).is_none());
-        assert!(cx.read(|cx| ws.read(cx).sidebar == Some(SidebarTab::Extensions)));
+        assert!(cx.read(|cx| ws.read(cx).left == Some(Panel::Extensions)));
 
         // The tab points to the Zed extension for the language and searches
         // for it.
@@ -10654,12 +10671,95 @@ brackets = [
     }
 
     #[gpui::test]
+    fn panels_are_in_the_docks_the_layout_puts_them_in(cx: &mut TestAppContext) {
+        let root = db::testing::dir("ws-docks").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        let config = db::testing::dir("ws-docks-config");
+        let (ws, cx) = setup(cx, root.clone());
+        let docks = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.read(|cx| (ws.read(cx).left, ws.read(cx).right))
+        };
+        let layout = |cx: &mut VisualTestContext, text: &str| {
+            std::fs::write(config.join("layout.json"), text).unwrap();
+            cx.update(|_, cx| settings::reload_from(&config, cx));
+            assert!(cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+        };
+        // As it comes: Files on the left, the right dock closed; the chat
+        // opens on the right and the agent takes its place there.
+        assert_eq!(docks(cx), (Some(Panel::Files), None));
+        cx.dispatch_action(ToggleChat);
+        assert_eq!(docks(cx), (Some(Panel::Files), Some(Panel::Chat)));
+        cx.dispatch_action(ShowAgent);
+        assert_eq!(docks(cx), (Some(Panel::Files), Some(Panel::Agent)));
+        cx.dispatch_action(ShowSearch);
+        assert_eq!(docks(cx), (Some(Panel::Search), Some(Panel::Agent)));
+
+        // The layout moves the agent and the chat to the left, Search and
+        // Files to the right, and hides API. What was shown goes with its
+        // panel: the agent is on the left now and Search on the right.
+        layout(
+            cx,
+            r#"{
+              "left": { "panels": ["agent", "chat", "services"] },
+              "right": { "panels": ["search", "files"] },
+              "hidden": ["api"]
+            }"#,
+        );
+        assert_eq!(docks(cx), (Some(Panel::Agent), Some(Panel::Search)));
+        // Each dock has a tab for each of its panels, in the file's order.
+        let tab = |cx: &mut VisualTestContext, panel: &'static str| bounds_soon(cx, panel);
+        let dock_left = bounds_soon(cx, "dock-left");
+        let dock_right = bounds_soon(cx, "dock-right");
+        let (agent, chat) = (tab(cx, "panel-agent"), tab(cx, "panel-chat"));
+        assert!(dock_left.contains(&agent.center()) && dock_left.contains(&chat.center()));
+        assert!(agent.left() < chat.left());
+        let (search, files) = (tab(cx, "panel-search"), tab(cx, "panel-files"));
+        assert!(dock_right.contains(&search.center()) && dock_right.contains(&files.center()));
+        assert!(search.left() < files.left());
+
+        // Commands and tabs open a panel where it is now.
+        cx.dispatch_action(ShowFiles);
+        assert_eq!(docks(cx), (Some(Panel::Agent), Some(Panel::Files)));
+        cx.simulate_click(chat.center(), gpui::Modifiers::default());
+        assert_eq!(docks(cx), (Some(Panel::Chat), Some(Panel::Files)));
+        // The chat's key closes the dock the chat is in, which is the
+        // left one, and opens it there again.
+        cx.dispatch_action(ToggleChat);
+        assert_eq!(docks(cx), (None, Some(Panel::Files)));
+        cx.dispatch_action(ToggleChat);
+        assert_eq!(docks(cx), (Some(Panel::Chat), Some(Panel::Files)));
+        // The sidebar's key closes the left dock and opens it on the
+        // first panel it has.
+        cx.dispatch_action(ToggleSidebar);
+        assert_eq!(docks(cx), (None, Some(Panel::Files)));
+        cx.dispatch_action(ToggleSidebar);
+        assert_eq!(docks(cx), (Some(Panel::Agent), Some(Panel::Files)));
+        // A hidden panel has no tab, and its command still opens it, in
+        // the dock it comes in, with a tab for as long as it shows.
+        assert!(cx.read(|cx| Layout::get(cx).place(Panel::Api).is_none()));
+        cx.dispatch_action(ShowApi);
+        assert_eq!(docks(cx), (Some(Panel::Api), Some(Panel::Files)));
+        let api = tab(cx, "panel-api");
+        assert!(dock_left.contains(&api.center()));
+
+        // Back to the layout it came with: Files returns to the left,
+        // where API is shown and stays; the right dock, which lost what it
+        // showed, shows the first panel it has.
+        layout(cx, "{}");
+        assert_eq!(docks(cx), (Some(Panel::Api), Some(Panel::Chat)));
+        cx.dispatch_action(ShowFiles);
+        cx.dispatch_action(ShowAgent);
+        assert_eq!(docks(cx), (Some(Panel::Files), Some(Panel::Agent)));
+    }
+
+    #[gpui::test]
     fn the_layout_file_sizes_the_window_and_a_mistake_keeps_the_last(cx: &mut TestAppContext) {
         let root = db::testing::dir("ws-layout").canonicalize().unwrap();
         std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
         let config = db::testing::dir("ws-layout-config");
         let (ws, cx) = setup(cx, root.clone());
-        ws.update_in(cx, |w, _, cx| w.set_sidebar(Some(SidebarTab::Files), cx));
+        ws.update_in(cx, |w, _, cx| w.set_sidebar(Some(Panel::Files), cx));
         // Where a part was last drawn, once the window has drawn again.
         let size = |cx: &mut VisualTestContext, part: &'static str| {
             cx.update(|window, _| window.refresh());
@@ -10675,45 +10775,45 @@ brackets = [
 
         // With no file the parts have the sizes they always had.
         reload(cx);
-        assert_eq!(size(cx, "sidebar").0, 390.);
+        assert_eq!(size(cx, "dock-left").0, 390.);
         assert_eq!(size(cx, "status-bar").1, 26.);
 
         // The file names two parts; the rest stay.
         std::fs::write(
             config.join("layout.json"),
-            "// narrower\n{ \"sidebar\": { \"width\": 300 }, \"status_bar\": { \"height\": 32 } }\n",
+            "// narrower\n{ \"left\": { \"width\": 300 }, \"status_bar\": { \"height\": 32 } }\n",
         )
         .unwrap();
         reload(cx);
         assert!(errors(cx).is_empty(), "{:?}", errors(cx));
-        assert_eq!(size(cx, "sidebar").0, 300.);
+        assert_eq!(size(cx, "dock-left").0, 300.);
         assert_eq!(size(cx, "status-bar").1, 32.);
-        assert_eq!(cx.read(Layout::get).dock.height, 280.);
+        assert_eq!(cx.read(|cx| Layout::get(cx).bottom.height), 280.);
 
         // A mistake in it is said, and the layout that was right stays.
         std::fs::write(
             config.join("layout.json"),
-            "{ \"sidebar\": { \"width\": \"wide\" } }",
+            "{ \"left\": { \"width\": \"wide\" } }",
         )
         .unwrap();
         reload(cx);
         let said = errors(cx);
         assert_eq!(said.len(), 1);
         assert!(said[0].starts_with("layout.json: "), "{said:?}");
-        assert_eq!(size(cx, "sidebar").0, 300.);
+        assert_eq!(size(cx, "dock-left").0, 300.);
 
         // Put right, the mistake is gone; taken away, so is the layout.
         std::fs::write(
             config.join("layout.json"),
-            "{ \"sidebar\": { \"width\": 2000 } }",
+            "{ \"left\": { \"width\": 2000 } }",
         )
         .unwrap();
         reload(cx);
         assert!(errors(cx).is_empty());
-        assert_eq!(cx.read(Layout::get).sidebar.width, 900.);
+        assert_eq!(cx.read(|cx| Layout::get(cx).left.width), 900.);
         std::fs::remove_file(config.join("layout.json")).unwrap();
         reload(cx);
-        assert_eq!(size(cx, "sidebar").0, 390.);
+        assert_eq!(size(cx, "dock-left").0, 390.);
         assert_eq!(size(cx, "status-bar").1, 26.);
 
         // A border is dragged: the part follows the pointer, and when it
@@ -10743,46 +10843,46 @@ brackets = [
             }
             panic!("layout.json never had {what}");
         };
-        let at = grip(cx, "resize-sidebar");
+        let at = grip(cx, "resize-left");
         cx.simulate_mouse_down(at, MouseButton::Left, none);
         cx.simulate_mouse_move(at + gpui::point(px(60.), px(5.)), MouseButton::Left, none);
-        assert_eq!(cx.read(Layout::get).sidebar.width, 450.);
-        assert_eq!(size(cx, "sidebar").0, 450.);
+        assert_eq!(cx.read(|cx| Layout::get(cx).left.width), 450.);
+        assert_eq!(size(cx, "dock-left").0, 450.);
         // Nothing is written while it is held.
         assert!(
             !std::fs::read_to_string(config.join("layout.json"))
                 .unwrap()
-                .contains("sidebar")
+                .contains("\"left\"")
         );
         cx.simulate_mouse_up(at + gpui::point(px(60.), px(5.)), MouseButton::Left, none);
-        let text = written(cx, "\"sidebar\"");
+        let text = written(cx, "\"left\"");
         assert!(
             text.contains("// mine") && text.contains("// lower"),
             "{text}"
         );
-        assert_eq!(layout::parse(&text).unwrap().sidebar.width, 450.);
+        assert_eq!(layout::parse(&text).unwrap().left.width, 450.);
         assert_eq!(layout::parse(&text).unwrap().tab_bar.height, 30.);
         // Moving the pointer with nothing held sizes nothing.
         cx.simulate_mouse_move(at + gpui::point(px(200.), px(0.)), None, none);
-        assert_eq!(cx.read(Layout::get).sidebar.width, 450.);
+        assert_eq!(cx.read(|cx| Layout::get(cx).left.width), 450.);
 
         // The chat's border is on its left: dragged left, the chat grows,
         // and no further than a window can show.
         ws.update(cx, |w, cx| {
-            w.chat_open = true;
+            w.right = Some(Panel::Chat);
             cx.notify();
         });
-        let at = grip(cx, "resize-chat");
+        let at = grip(cx, "resize-right");
         cx.simulate_mouse_down(at, MouseButton::Left, none);
         cx.simulate_mouse_move(at - gpui::point(px(40.), px(0.)), MouseButton::Left, none);
-        assert_eq!(cx.read(Layout::get).chat.width, 420.);
+        assert_eq!(cx.read(|cx| Layout::get(cx).right.width), 420.);
         cx.simulate_mouse_move(at + gpui::point(px(300.), px(0.)), MouseButton::Left, none);
-        assert_eq!(cx.read(Layout::get).chat.width, 200.);
+        assert_eq!(cx.read(|cx| Layout::get(cx).right.width), 200.);
         cx.simulate_mouse_up(at, MouseButton::Left, none);
-        written(cx, "\"chat\"");
+        written(cx, "\"right\"");
 
         // A double click on a border puts its part back, in the file too.
-        let at = grip(cx, "resize-sidebar");
+        let at = grip(cx, "resize-left");
         cx.simulate_event(MouseDownEvent {
             button: MouseButton::Left,
             position: at,
@@ -10790,10 +10890,10 @@ brackets = [
             click_count: 2,
             first_mouse: false,
         });
-        assert_eq!(cx.read(Layout::get).sidebar.width, 390.);
+        assert_eq!(cx.read(|cx| Layout::get(cx).left.width), 390.);
         let text = written(cx, "390");
-        assert_eq!(layout::parse(&text).unwrap().sidebar.width, 390.);
-        assert_eq!(layout::parse(&text).unwrap().chat.width, 200.);
+        assert_eq!(layout::parse(&text).unwrap().left.width, 390.);
+        assert_eq!(layout::parse(&text).unwrap().right.width, 200.);
     }
 
     #[gpui::test]

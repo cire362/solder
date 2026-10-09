@@ -6,8 +6,15 @@
 //! A file that cannot be read leaves the last layout that could, and says
 //! what is wrong where a mistake in `settings.json` is said. A size outside
 //! what a window can show is brought back to the nearest one that fits.
+//!
+//! There are three docks, left, right and bottom. The two at the sides
+//! hold panels, each with a tab: which panels a dock holds and in what
+//! order is the file's to say, and a panel can be hidden from both.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::LazyLock,
+};
 
 use gpui::{App, Global};
 use serde::{Deserialize, Serialize};
@@ -20,11 +27,91 @@ pub fn path() -> PathBuf {
     settings::config_dir().join(FILE)
 }
 
-/// A panel at the side of the window: its width.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// What a dock can hold. Each is in one dock, or hidden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Panel {
+    Files,
+    Search,
+    Git,
+    Services,
+    Database,
+    Api,
+    Ai,
+    Extensions,
+    Chat,
+    Agent,
+}
+
+/// A dock at a side of the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    Left,
+    Right,
+}
+
+impl Panel {
+    pub const ALL: [Panel; 10] = [
+        Panel::Files,
+        Panel::Search,
+        Panel::Git,
+        Panel::Services,
+        Panel::Database,
+        Panel::Api,
+        Panel::Ai,
+        Panel::Extensions,
+        Panel::Chat,
+        Panel::Agent,
+    ];
+
+    /// What its tab says.
+    pub fn label(self) -> &'static str {
+        match self {
+            Panel::Files => "Files",
+            Panel::Search => "Search",
+            Panel::Git => "Git",
+            Panel::Services => "Services",
+            Panel::Database => "Database",
+            Panel::Api => "API",
+            Panel::Ai => "AI",
+            Panel::Extensions => "Extensions",
+            Panel::Chat => "Chat",
+            Panel::Agent => "Agent",
+        }
+    }
+
+    /// Its name in the file, and in the names tests find its tab by.
+    pub fn id(self) -> &'static str {
+        match self {
+            Panel::Files => "files",
+            Panel::Search => "search",
+            Panel::Git => "git",
+            Panel::Services => "services",
+            Panel::Database => "database",
+            Panel::Api => "api",
+            Panel::Ai => "ai",
+            Panel::Extensions => "extensions",
+            Panel::Chat => "chat",
+            Panel::Agent => "agent",
+        }
+    }
+
+    /// The dock it is in when the file does not say.
+    pub fn home(self) -> Place {
+        match self {
+            Panel::Chat | Panel::Agent => Place::Right,
+            _ => Place::Left,
+        }
+    }
+}
+
+/// A dock at the side of the window: its width, and its panels in the
+/// order of their tabs.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Side {
     pub width: f32,
+    pub panels: Vec<Panel>,
 }
 
 /// A bar or a dock across the window: its height.
@@ -36,41 +123,62 @@ pub struct Across {
 
 // A part left out of the file has the size it always had; which one that
 // is depends on the part, so each is filled in by `Layout`'s own default.
-impl Default for Side {
-    fn default() -> Self {
-        Self { width: 0. }
-    }
-}
-
 impl Default for Across {
     fn default() -> Self {
         Self { height: 0. }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+// Each part left out of the file is read as nothing, not as what the
+// editor comes with: `fitted` then fills in sizes and puts the panels the
+// file does not name where they come, after the ones it does name. Read as
+// the standard layout, a dock left out would claim its panels back from
+// the dock the file moved them to.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Layout {
-    /// Files, Search, Git and the other tabs on the left.
-    pub sidebar: Side,
-    /// The chat and the agent on the right.
-    pub chat: Side,
+    /// The dock on the left: Files, Search, Git and the rest, as it comes.
+    #[serde(default)]
+    pub left: Side,
+    /// The dock on the right: the chat and the agent, as it comes.
+    #[serde(default)]
+    pub right: Side,
     /// The terminal, results and the debugger at the bottom.
-    pub dock: Across,
+    #[serde(default)]
+    pub bottom: Across,
+    #[serde(default)]
     pub title_bar: Across,
+    #[serde(default)]
     pub tab_bar: Across,
+    #[serde(default)]
     pub status_bar: Across,
+    /// Panels with no tab in any dock. A command still opens one.
+    #[serde(default)]
+    pub hidden: Vec<Panel>,
 }
 
 impl Default for Layout {
     fn default() -> Self {
+        let at = |place: Place| -> Vec<Panel> {
+            Panel::ALL
+                .into_iter()
+                .filter(|panel| panel.home() == place)
+                .collect()
+        };
         Self {
-            sidebar: Side { width: 390. },
-            chat: Side { width: 380. },
-            dock: Across { height: 280. },
+            left: Side {
+                width: 390.,
+                panels: at(Place::Left),
+            },
+            right: Side {
+                width: 380.,
+                panels: at(Place::Right),
+            },
+            bottom: Across { height: 280. },
             title_bar: Across { height: 38. },
             tab_bar: Across { height: 34. },
             status_bar: Across { height: 26. },
+            hidden: Vec::new(),
         }
     }
 }
@@ -80,18 +188,18 @@ impl Global for Layout {}
 /// A part whose border can be dragged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Part {
-    Sidebar,
-    Chat,
-    Dock,
+    Left,
+    Right,
+    Bottom,
 }
 
 impl Part {
     /// The part's name in the file.
     fn key(self) -> &'static str {
         match self {
-            Part::Sidebar => "sidebar",
-            Part::Chat => "chat",
-            Part::Dock => "dock",
+            Part::Left => "left",
+            Part::Right => "right",
+            Part::Bottom => "bottom",
         }
     }
 }
@@ -110,16 +218,36 @@ const DOCK: (f32, f32) = (100., 1200.);
 const BAR: (f32, f32) = (22., 64.);
 
 impl Layout {
-    pub fn get(cx: &App) -> Layout {
-        cx.try_global::<Layout>().copied().unwrap_or_default()
+    /// The layout in use: the file's, or the one the editor comes with.
+    pub fn get(cx: &App) -> &Layout {
+        static STANDARD: LazyLock<Layout> = LazyLock::new(Layout::default);
+        cx.try_global::<Layout>().unwrap_or(&STANDARD)
+    }
+
+    pub fn side(&self, place: Place) -> &Side {
+        match place {
+            Place::Left => &self.left,
+            Place::Right => &self.right,
+        }
+    }
+
+    /// The dock a panel's tab is in; `None` for a hidden one.
+    pub fn place(&self, panel: Panel) -> Option<Place> {
+        if self.left.panels.contains(&panel) {
+            Some(Place::Left)
+        } else if self.right.panels.contains(&panel) {
+            Some(Place::Right)
+        } else {
+            None
+        }
     }
 
     /// The size of a part that can be dragged: a width or a height.
     pub fn size(&self, part: Part) -> f32 {
         match part {
-            Part::Sidebar => self.sidebar.width,
-            Part::Chat => self.chat.width,
-            Part::Dock => self.dock.height,
+            Part::Left => self.left.width,
+            Part::Right => self.right.width,
+            Part::Bottom => self.bottom.height,
         }
     }
 
@@ -129,16 +257,45 @@ impl Layout {
         // dragged shut means the smallest.
         let size = size.max(1.);
         match part {
-            Part::Sidebar => self.sidebar.width = size,
-            Part::Chat => self.chat.width = size,
-            Part::Dock => self.dock.height = size,
+            Part::Left => self.left.width = size,
+            Part::Right => self.right.width = size,
+            Part::Bottom => self.bottom.height = size,
         }
         self.fitted()
     }
 
-    /// The same layout with every size one a window can show: a part left
-    /// out of the file, or given as nothing, gets the size it came with.
+    /// The same layout with every size one a window can show (a part left
+    /// out of the file, or given as nothing, gets the size it came with)
+    /// and every panel in one place: a panel named twice stays where it
+    /// was named first, a hidden one is in no dock, and one the file does
+    /// not name at all goes to the dock it comes in, after the others.
     fn fitted(mut self) -> Self {
+        let mut placed: Vec<Panel> = Vec::new();
+        let mut hidden: Vec<Panel> = Vec::new();
+        for panel in std::mem::take(&mut self.hidden) {
+            if !hidden.contains(&panel) {
+                hidden.push(panel);
+            }
+        }
+        for side in [&mut self.left, &mut self.right] {
+            side.panels.retain(|panel| {
+                let keep = !hidden.contains(panel) && !placed.contains(panel);
+                if keep {
+                    placed.push(*panel);
+                }
+                keep
+            });
+        }
+        for panel in Panel::ALL {
+            if !placed.contains(&panel) && !hidden.contains(&panel) {
+                match panel.home() {
+                    Place::Left => self.left.panels.push(panel),
+                    Place::Right => self.right.panels.push(panel),
+                }
+            }
+        }
+        self.hidden = hidden;
+
         let standard = Layout::default();
         let fit = |size: &mut f32, standard: f32, (least, most): (f32, f32)| {
             *size = if size.is_finite() && *size > 0. {
@@ -147,9 +304,9 @@ impl Layout {
                 standard
             };
         };
-        fit(&mut self.sidebar.width, standard.sidebar.width, SIDE);
-        fit(&mut self.chat.width, standard.chat.width, SIDE);
-        fit(&mut self.dock.height, standard.dock.height, DOCK);
+        fit(&mut self.left.width, standard.left.width, SIDE);
+        fit(&mut self.right.width, standard.right.width, SIDE);
+        fit(&mut self.bottom.height, standard.bottom.height, DOCK);
         fit(&mut self.title_bar.height, standard.title_bar.height, BAR);
         fit(&mut self.tab_bar.height, standard.tab_bar.height, BAR);
         fit(&mut self.status_bar.height, standard.status_bar.height, BAR);
@@ -207,9 +364,9 @@ pub fn keep(part: Part, cx: &mut App) {
     };
     let layout = Layout::get(cx);
     let value = match part {
-        Part::Sidebar => serde_json::to_value(layout.sidebar),
-        Part::Chat => serde_json::to_value(layout.chat),
-        Part::Dock => serde_json::to_value(layout.dock),
+        Part::Left => serde_json::to_value(&layout.left),
+        Part::Right => serde_json::to_value(&layout.right),
+        Part::Bottom => serde_json::to_value(layout.bottom),
     };
     let Ok(value) = value else { return };
     cx.background_executor()
@@ -243,27 +400,83 @@ mod tests {
         assert_eq!(parse("// only a comment\n{}").unwrap(), Layout::default());
         // One part named: the others are as they were.
         let layout =
-            parse(r#"{ "sidebar": { "width": 300 }, "dock": { "height": 420.4 } }"#).unwrap();
-        assert_eq!(layout.sidebar.width, 300.);
-        assert_eq!(layout.dock.height, 420.);
-        assert_eq!(layout.chat, Layout::default().chat);
+            parse(r#"{ "left": { "width": 300 }, "bottom": { "height": 420.4 } }"#).unwrap();
+        assert_eq!(layout.left.width, 300.);
+        assert_eq!(layout.left.panels, Layout::default().left.panels);
+        assert_eq!(layout.bottom.height, 420.);
+        assert_eq!(layout.right, Layout::default().right);
         assert_eq!(layout.status_bar, Layout::default().status_bar);
         // A size no window can show is brought to the nearest that fits,
         // and nothing at all is the size it came with.
         let odd = parse(
-            r#"{ "sidebar": { "width": 20 }, "chat": { "width": 5000 }, "tab_bar": { "height": 0 }, "status_bar": {} }"#,
+            r#"{ "left": { "width": 20 }, "right": { "width": 5000 }, "tab_bar": { "height": 0 }, "status_bar": {} }"#,
         )
         .unwrap();
-        assert_eq!(odd.sidebar.width, 200.);
-        assert_eq!(odd.chat.width, 900.);
+        assert_eq!(odd.left.width, 200.);
+        assert_eq!(odd.right.width, 900.);
         assert_eq!(odd.tab_bar, Layout::default().tab_bar);
         assert_eq!(odd.status_bar, Layout::default().status_bar);
         // A mistake names the file and where it is.
-        let error = parse(r#"{ "sidebar": { "width": "wide" } }"#).unwrap_err();
+        let error = parse(r#"{ "left": { "width": "wide" } }"#).unwrap_err();
         assert!(error.starts_with("layout.json: "), "{error}");
-        let error = parse(r#"{ "sidebars": {} }"#).unwrap_err();
-        assert!(error.contains("sidebars"), "{error}");
+        let error = parse(r#"{ "lefts": {} }"#).unwrap_err();
+        assert!(error.contains("lefts"), "{error}");
+        let error = parse(r#"{ "left": { "panels": ["nothing"] } }"#).unwrap_err();
+        assert!(error.contains("nothing"), "{error}");
         // What the editor writes is what it reads.
         assert_eq!(parse(&file(&layout)).unwrap(), layout);
+    }
+
+    #[test]
+    fn every_panel_is_in_one_dock_or_hidden() {
+        use Panel::*;
+        // As it comes: eight on the left, the chat and the agent on the
+        // right, none hidden.
+        let standard = Layout::default();
+        assert_eq!(
+            standard.left.panels,
+            [Files, Search, Git, Services, Database, Api, Ai, Extensions]
+        );
+        assert_eq!(standard.right.panels, [Chat, Agent]);
+        assert_eq!(standard.place(Git), Some(Place::Left));
+        assert_eq!(standard.place(Agent), Some(Place::Right));
+
+        // The file moves panels, orders them and hides one. A panel named
+        // twice stays where it was named first; a hidden one is in no
+        // dock even if a dock names it; the ones the file leaves out go
+        // where they come, after the ones it names.
+        let layout = parse(
+            r#"{
+              "left": { "panels": ["chat", "git", "files", "chat"] },
+              "right": { "panels": ["search", "git", "api"] },
+              "hidden": ["api", "ai", "api"]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            layout.left.panels,
+            [Chat, Git, Files, Services, Database, Extensions]
+        );
+        assert_eq!(layout.right.panels, [Search, Agent]);
+        assert_eq!(layout.hidden, [Api, Ai]);
+        assert_eq!(layout.place(Chat), Some(Place::Left));
+        assert_eq!(layout.place(Search), Some(Place::Right));
+        assert_eq!(layout.place(Api), None);
+        for panel in Panel::ALL {
+            let places = [&layout.left.panels, &layout.right.panels, &layout.hidden]
+                .iter()
+                .filter(|list| list.contains(&panel))
+                .count();
+            assert_eq!(places, 1, "{panel:?}");
+        }
+        // Written out and read again, it is the same.
+        assert_eq!(parse(&file(&layout)).unwrap(), layout);
+        // A dock can be emptied: everything it had is elsewhere.
+        let empty = parse(
+            r#"{ "right": { "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions", "chat", "agent"] } }"#,
+        )
+        .unwrap();
+        assert!(empty.left.panels.is_empty());
+        assert_eq!(empty.right.panels.len(), 10);
     }
 }

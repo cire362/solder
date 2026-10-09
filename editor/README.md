@@ -863,26 +863,44 @@ applied as soon as it is saved.
 
 ```json
 {
-  "sidebar": { "width": 390 },
-  "chat": { "width": 380 },
-  "dock": { "height": 280 },
+  "left": {
+    "width": 390,
+    "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions"]
+  },
+  "right": { "width": 380, "panels": ["chat", "agent"] },
+  "bottom": { "height": 280 },
   "title_bar": { "height": 38 },
   "tab_bar": { "height": 34 },
-  "status_bar": { "height": 26 }
+  "status_bar": { "height": 26 },
+  "hidden": []
 }
 ```
 
-A part left out has the size it came with. A size no window can show is
-brought to the nearest that fits (a side panel is 200 to 900 wide, the dock
-100 to 1200 high, a bar 22 to 64). A mistake in the file is said in the
-status bar, like one in `settings.json`, and the layout that was right stays.
-The same sizes can be set by hand: drag the border of the sidebar, the chat
-or the bottom dock. The part follows the pointer, and when the border is let
-go its size is written into the file, next to whatever else you wrote there,
-comments included. A double click on a border puts its part back to the size
-it came with. A file with a mistake in it is not written to.
+There are three docks. The two at the sides hold panels, each with a tab:
+`panels` says which a dock holds and in what order, so the chat can be on the
+left and the file tree on the right, or everything in one dock. A panel named
+in `hidden` has no tab; its command and its key still open it, in the dock it
+comes in, and its tab is there for as long as it shows. A panel the file does
+not name is where it comes, after the ones the file names. When more tabs
+are in a dock than it is wide, they go on a second row.
 
-The file holds sizes so far; places, order and what is hidden come next.
+Commands follow the panels: the chat's key opens and closes the dock the
+chat is in, and the sidebar's key the left one, on its first panel. When the
+file moves a panel that is showing, it shows in its new dock.
+
+A part left out has the size it came with. A size no window can show is
+brought to the nearest that fits (a side dock is 200 to 900 wide, the bottom
+one 100 to 1200 high, a bar 22 to 64). A mistake in the file is said in the
+status bar, like one in `settings.json`, and the layout that was right stays.
+
+The same sizes can be set by hand: drag the border of a dock. The dock
+follows the pointer, and when the border is let go its size is written into
+the file, next to whatever else you wrote there, comments included. A double
+click on a border puts its dock back to the size it came with. A file with a
+mistake in it is not written to.
+
+The bottom dock's own tabs (terminals, results, the debugger) are not in the
+file yet, and neither are the bars' items.
 
 ## Settings from another editor
 

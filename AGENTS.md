@@ -78,8 +78,12 @@ Never guess a signature.
 - Edits go through `Document::edit`/`apply_edits` with the `EntityId` of the
   **editor** that made them as `origin`. Passing the document's id made the
   editor move its own cursor twice; this bug happened once.
-- `Workspace` owns panes, tabs, the sidebar, modals, the terminal dock and
-  the find bar. Global state lives in `Settings`, `Theme`, `Perf` and
+- `Workspace` owns panes, tabs, the docks, modals and the find bar. Where
+  the parts of the window are and how large is `Layout` (`layout.rs`), read
+  from `layout.json`: do not write a size or a panel's place into the code.
+  A side dock shows one `Panel`; which dock a panel is in is the layout's
+  to say (`Workspace::show_panel`), never a field of its own. A change made
+  by hand in the window is written back to the file (`layout::keep`). Global state lives in `Settings`, `Theme`, `Perf` and
   `LspStore` (see `main.rs` for init order).
 - A document belongs to several language servers (`LspStore`): the one
   Solder knows for its language, then every one an installed extension
