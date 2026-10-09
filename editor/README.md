@@ -872,7 +872,8 @@ applied as soon as it is saved.
   "title_bar": { "height": 38 },
   "tab_bar": { "height": 34 },
   "status_bar": { "height": 26 },
-  "hidden": []
+  "hidden": [],
+  "open": ["files"]
 }
 ```
 
@@ -889,6 +890,13 @@ comes in, and its tab is there for as long as it shows. A panel the file does
 not name is where it comes, after the ones the file names. When more tabs
 are in a dock than it is wide, they go on a second row.
 
+`open` names the panel each dock has open, one a dock; a dock with none of
+its panels there is closed. Solder writes it whenever a dock is opened,
+closed or turned to another panel, so the window starts the way it was left.
+A dock left on the terminals, the debugger or an answer starts closed: they
+have nothing to show yet. Saved by hand, it opens and closes docks like any
+other change to the file. Left out, the left dock is open on its first panel.
+
 Commands follow the panels: the chat's key opens and closes the dock the
 chat is in, and the sidebar's key the left one, on its first panel. When the
 file moves a panel that is showing, it shows in its new dock.
@@ -904,8 +912,7 @@ the file, next to whatever else you wrote there, comments included. A double
 click on a border puts its dock back to the size it came with. A file with a
 mistake in it is not written to.
 
-The bars' items are not in the file yet, and neither is which panel each dock
-has open.
+The bars' items are not in the file yet.
 
 ## Settings from another editor
 

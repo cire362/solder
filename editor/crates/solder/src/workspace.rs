@@ -593,7 +593,19 @@ impl Workspace {
                 }
             }
         });
-        Self {
+        // The docks start on the panels they were left on. The terminals,
+        // the debugger and the answers have nothing to show yet, so a dock
+        // left on one of them starts closed.
+        let layout = Layout::get(cx);
+        let [left, right, bottom] = Place::ALL.map(|place| {
+            layout.open_in(place).filter(|panel| {
+                !matches!(
+                    panel,
+                    Panel::Terminal | Panel::Debug | Panel::Response | Panel::Results
+                )
+            })
+        });
+        let mut this = Self {
             focus_handle: cx.focus_handle(),
             project,
             project_panel,
@@ -602,12 +614,10 @@ impl Workspace {
             panes: vec![Pane::default()],
             active_pane: 0,
             recent: VecDeque::new(),
-            left: Some(Panel::Files),
-            right: None,
-            bottom: None,
+            left,
+            right,
+            bottom,
             dock_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
-            // A panel the layout moved to the other dock while it was
-            // shown goes there with it.
             _layout: cx.observe_global_in::<Layout>(window, Self::follow_layout),
             resizing: None,
             modal: None,
@@ -643,7 +653,11 @@ impl Workspace {
             file_diff: None,
             diff_task: None,
             diff_subscription: None,
+        };
+        for panel in [left, right, bottom] {
+            this.tell_panels(panel, cx);
         }
+        this
     }
 
     pub fn root(&self, cx: &App) -> PathBuf {
@@ -1490,10 +1504,9 @@ impl Workspace {
         }
     }
 
-    /// The dock a panel shows in: the one the layout puts it in, or for a
-    /// hidden panel, which a command can still open, the one it comes in.
+    /// The dock a panel shows in.
     fn place_of(&self, panel: Panel, cx: &App) -> Place {
-        Layout::get(cx).place(panel).unwrap_or(panel.home())
+        Layout::get(cx).dock_of(panel)
     }
 
     fn dock(&mut self, place: Place) -> &mut Option<Panel> {
@@ -1539,9 +1552,18 @@ impl Workspace {
         }
     }
 
+    /// The docks were changed by hand, or by what happened in the window:
+    /// the panels are told, and the file is, so that the window starts
+    /// the same way next time.
+    fn docks_changed(&mut self, now: Option<Panel>, cx: &mut Context<Self>) {
+        self.tell_panels(now, cx);
+        let open = [self.left, self.right, self.bottom];
+        layout::keep_open(open.into_iter().flatten().collect(), cx);
+    }
+
     /// Tells the panels what the docks show now: the one that came into
     /// view reads what it shows, and services stop watching when unseen.
-    fn docks_changed(&mut self, now: Option<Panel>, cx: &mut Context<Self>) {
+    fn tell_panels(&mut self, now: Option<Panel>, cx: &mut Context<Self>) {
         let visible = self.shown(Panel::Services);
         self.services.update(cx, |s, cx| s.set_visible(visible, cx));
         match now {
@@ -1556,29 +1578,35 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The layout changed. A panel a dock shows may now belong to
-    /// another: it is shown there. A dock that lost what it showed, and
-    /// got nothing in exchange, shows the first panel it has, or closes if
-    /// it has none. The keyboard does not stay in a panel that is no
-    /// longer shown: no key would reach anything from there.
+    /// The layout changed. Where the file says which panels are open,
+    /// those are: it is the truth, and it says so as soon as a dock was
+    /// touched once. Until then a panel that is shown goes with its tab to
+    /// the dock that got it, and a dock that lost what it showed, and got
+    /// nothing in exchange, shows the first panel it has. The keyboard
+    /// does not stay in a panel that is no longer shown: no key would
+    /// reach anything from there.
     fn follow_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let layout = Layout::get(cx).clone();
         let before = [self.left, self.right, self.bottom];
         for (index, place) in Place::ALL.into_iter().enumerate() {
-            let here = before[index];
-            // A hidden panel that is shown stays where it was opened.
-            let stays = here.filter(|p| layout.place(*p).is_none_or(|now| now == place));
-            let comes = before
-                .iter()
-                .enumerate()
-                .filter(|(other, _)| *other != index)
-                .find_map(|(_, shown)| shown.filter(|p| layout.place(*p) == Some(place)));
-            let first = layout
-                .panels(place)
-                .iter()
-                .copied()
-                .find(|panel| self.available(*panel));
-            let now = stays.or(comes).or(here.and(first));
+            let now = if layout.open.is_some() {
+                layout.open_in(place).filter(|panel| self.available(*panel))
+            } else {
+                let here = before[index];
+                // A hidden panel that is shown stays where it was opened.
+                let stays = here.filter(|p| layout.place(*p).is_none_or(|now| now == place));
+                let comes = before
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != index)
+                    .find_map(|(_, shown)| shown.filter(|p| layout.place(*p) == Some(place)));
+                let first = layout
+                    .panels(place)
+                    .iter()
+                    .copied()
+                    .find(|panel| self.available(*panel));
+                stays.or(comes).or(here.and(first))
+            };
             *self.dock(place) = now;
         }
         let lost = Panel::ALL.into_iter().any(|panel| {
@@ -1593,7 +1621,14 @@ impl Workspace {
                 None => window.focus(&self.focus_handle),
             }
         }
-        self.docks_changed(None, cx);
+        // A panel that came into view reads what it shows.
+        for (index, place) in Place::ALL.into_iter().enumerate() {
+            let now = *self.dock(place);
+            if now != before[index] {
+                self.tell_panels(now, cx);
+            }
+        }
+        self.tell_panels(None, cx);
     }
 
     fn show_database(&mut self, _: &ShowDatabase, window: &mut Window, cx: &mut Context<Self>) {
@@ -10893,6 +10928,92 @@ brackets = [
         assert_eq!(docks(cx), (Some(Panel::Files), None, Some(Panel::Search)));
         cx.dispatch_action(ShowAgent);
         assert_eq!(docks(cx).0, Some(Panel::Agent));
+    }
+
+    #[gpui::test]
+    fn the_window_starts_on_the_panels_it_was_left_on(cx: &mut TestAppContext) {
+        let root = db::testing::dir("ws-open").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        let config = db::testing::dir("ws-open-config");
+        let file = config.join("layout.json");
+        let (ws, cx) = setup(cx, root.clone());
+        let docks = |cx: &mut VisualTestContext, ws: &Entity<Workspace>| {
+            cx.run_until_parked();
+            cx.read(|cx| {
+                let ws = ws.read(cx);
+                (ws.left, ws.right, ws.bottom)
+            })
+        };
+        // The file once it says `open` is these panels.
+        let kept = |cx: &mut VisualTestContext, open: &[Panel]| {
+            for _ in 0..200 {
+                cx.run_until_parked();
+                let text = std::fs::read_to_string(&file).unwrap_or_default();
+                if layout::parse(&text).is_ok_and(|l| l.open.as_deref() == Some(open)) {
+                    return text;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("layout.json never had {open:?} open");
+        };
+        // The user's own file, which says nothing of what is open: the
+        // window is as it comes.
+        std::fs::write(
+            &file,
+            "// mine\n{\n  \"left\": { \"width\": 300 } // narrow\n}\n",
+        )
+        .unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert_eq!(docks(cx, &ws), (Some(Panel::Files), None, None));
+
+        // Search, and the chat right after: both are in the file, next to
+        // what the user wrote there, and neither write lost the other's.
+        cx.dispatch_action(ShowSearch);
+        cx.dispatch_action(ToggleChat);
+        let text = kept(cx, &[Panel::Search, Panel::Chat]);
+        assert!(
+            text.contains("// mine") && text.contains("// narrow"),
+            "{text}"
+        );
+        assert_eq!(layout::parse(&text).unwrap().left.width, 300.);
+        assert_eq!(
+            docks(cx, &ws),
+            (Some(Panel::Search), Some(Panel::Chat), None)
+        );
+        // A window opened now starts the same way.
+        let start = |cx: &mut VisualTestContext| {
+            let root = root.clone();
+            cx.update(|window, cx| cx.new(|cx| Workspace::new(root, window, cx)))
+        };
+        let second = start(cx);
+        assert_eq!(
+            docks(cx, &second),
+            (Some(Panel::Search), Some(Panel::Chat), None)
+        );
+        drop(second);
+
+        // A dock closed by hand stays closed, and a terminal that was
+        // open is not started again: its dock starts closed.
+        cx.dispatch_action(ToggleSidebar);
+        kept(cx, &[Panel::Chat]);
+        ws.update_in(cx, |w, _, cx| {
+            w.show_results = true;
+            w.show_panel(Panel::Results, cx);
+        });
+        kept(cx, &[Panel::Chat, Panel::Results]);
+        let third = start(cx);
+        assert_eq!(docks(cx, &third), (None, Some(Panel::Chat), None));
+        drop(third);
+
+        // The file is the truth. Saved with other panels open, the
+        // window follows; a panel with nothing to show does not open, and
+        // the file is left as it was saved.
+        let saved = r#"{ "open": ["agent", "terminal", "git"] }"#;
+        std::fs::write(&file, saved).unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert_eq!(docks(cx, &ws), (Some(Panel::Git), Some(Panel::Agent), None));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), saved);
+        assert!(cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
     }
 
     #[gpui::test]

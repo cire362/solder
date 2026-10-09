@@ -9,14 +9,15 @@
 //!
 //! There are three docks, left, right and bottom. Each holds panels, with
 //! a tab for each: which panels a dock holds and in what order is the
-//! file's to say, and a panel can be hidden from all of them.
+//! file's to say, and a panel can be hidden from all of them. Which panel
+//! each dock has open is there too, so the window starts as it was left.
 
 use std::{
     path::{Path, PathBuf},
     sync::LazyLock,
 };
 
-use gpui::{App, Global};
+use gpui::{App, Global, Task};
 use serde::{Deserialize, Serialize};
 
 use crate::settings;
@@ -189,6 +190,11 @@ pub struct Layout {
     /// Panels with no tab in any dock. A command still opens one.
     #[serde(default)]
     pub hidden: Vec<Panel>,
+    /// The panel each dock has open, one a dock at most; a dock with none
+    /// of its panels here is closed. Until the file says, the left dock is
+    /// open on its first panel and the others are closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<Vec<Panel>>,
 }
 
 impl Default for Layout {
@@ -216,6 +222,7 @@ impl Default for Layout {
             tab_bar: Across { height: 34. },
             status_bar: Across { height: 26. },
             hidden: Vec::new(),
+            open: None,
         }
     }
 }
@@ -248,6 +255,17 @@ struct Home(PathBuf);
 
 impl Global for Home {}
 
+/// Writes of ours that have not reached the file yet. They go one after
+/// another: each reads the file and puts one key in it, and two at once
+/// would lose one of the keys.
+#[derive(Default)]
+struct Writes {
+    last: Option<Task<()>>,
+    pending: usize,
+}
+
+impl Global for Writes {}
+
 /// The sizes each part may have. Below the first a part cannot hold what
 /// is in it; above the second it leaves no room for the rest.
 const SIDE: (f32, f32) = (200., 900.);
@@ -277,6 +295,26 @@ impl Layout {
             .find(|place| self.panels(*place).contains(&panel))
     }
 
+    /// The dock a panel shows in: the one its tab is in, or for a hidden
+    /// panel, which a command can still open, the one it comes in.
+    pub fn dock_of(&self, panel: Panel) -> Place {
+        self.place(panel).unwrap_or(panel.home())
+    }
+
+    /// The panel a dock has open: the one the file names, or as it comes.
+    pub fn open_in(&self, place: Place) -> Option<Panel> {
+        match &self.open {
+            Some(open) => open
+                .iter()
+                .copied()
+                .find(|panel| self.dock_of(*panel) == place),
+            None => match place {
+                Place::Left => self.left.panels.first().copied(),
+                Place::Right | Place::Bottom => None,
+            },
+        }
+    }
+
     /// The size of a part that can be dragged: a width or a height.
     pub fn size(&self, part: Part) -> f32 {
         match part {
@@ -303,7 +341,10 @@ impl Layout {
     /// out of the file, or given as nothing, gets the size it came with)
     /// and every panel in one place: a panel named twice stays where it
     /// was named first, a hidden one is in no dock, and one the file does
-    /// not name at all goes to the dock it comes in, after the others.
+    /// not name at all goes to the dock it comes in, after the others. Of
+    /// the panels named as open, the first of each dock is, and they are
+    /// kept in the order of the docks, so that the same window is always
+    /// written the same way.
     fn fitted(mut self) -> Self {
         let mut placed: Vec<Panel> = Vec::new();
         let mut hidden: Vec<Panel> = Vec::new();
@@ -335,6 +376,13 @@ impl Layout {
             }
         }
         self.hidden = hidden;
+        if let Some(open) = self.open.take() {
+            let mut docks = [None; 3];
+            for panel in open {
+                docks[self.dock_of(panel) as usize].get_or_insert(panel);
+            }
+            self.open = Some(docks.into_iter().flatten().collect());
+        }
 
         let standard = Layout::default();
         let fit = |size: &mut f32, standard: f32, (least, most): (f32, f32)| {
@@ -378,6 +426,12 @@ pub fn file(layout: &Layout) -> String {
 /// layout in use stays and the mistake is returned.
 pub fn reload_from(dir: &Path, cx: &mut App) -> Option<String> {
     cx.set_global(Home(dir.to_path_buf()));
+    // While a write of ours is on its way the file is behind the window,
+    // and read now it would take back what was just done by hand. It is
+    // read when the last write is in.
+    if cx.try_global::<Writes>().is_some_and(|w| w.pending > 0) {
+        return None;
+    }
     let source = std::fs::read_to_string(dir.join(FILE)).unwrap_or_default();
     match parse(&source) {
         Ok(layout) => {
@@ -395,38 +449,85 @@ pub fn reload_from(dir: &Path, cx: &mut App) -> Option<String> {
     }
 }
 
-/// Writes the size `part` has now into the file, leaving the rest of the
-/// file as the user wrote it. A file with a mistake in it is left alone:
-/// it is the user's to put right.
+/// Writes the size `part` has now into the file.
 pub fn keep(part: Part, cx: &mut App) {
-    let Some(dir) = cx.try_global::<Home>().map(|home| home.0.clone()) else {
-        return;
-    };
     let layout = Layout::get(cx);
     let value = match part {
         Part::Left => serde_json::to_value(&layout.left),
         Part::Right => serde_json::to_value(&layout.right),
         Part::Bottom => serde_json::to_value(&layout.bottom),
     };
-    let Ok(value) = value else { return };
-    cx.background_executor()
-        .spawn(async move {
-            let path = dir.join(FILE);
-            let text = std::fs::read_to_string(&path)
-                .ok()
-                .filter(|text| !settings::strip_comments(text).trim().is_empty())
-                .unwrap_or_else(|| "{\n}\n".into());
-            if parse(&text).is_err() {
-                return;
+    if let Ok(value) = value {
+        write(part.key(), value, cx);
+    }
+}
+
+/// The docks were opened, closed or turned to another panel by hand:
+/// `open` is what each shows now, and goes into the file.
+pub fn keep_open(open: Vec<Panel>, cx: &mut App) {
+    // Nothing is kept before a file was looked for: see `Home`.
+    if cx.try_global::<Home>().is_none() {
+        return;
+    }
+    let mut layout = Layout::get(cx).clone();
+    layout.open = Some(open);
+    let layout = layout.fitted();
+    if layout.open == Layout::get(cx).open {
+        return;
+    }
+    let Ok(value) = serde_json::to_value(&layout.open) else {
+        return;
+    };
+    cx.set_global(layout);
+    write("open", value, cx);
+}
+
+/// Puts one key into the file, leaving the rest of the file as the user
+/// wrote it. A file with a mistake in it is left alone: it is the user's
+/// to put right.
+fn write(key: &'static str, value: serde_json::Value, cx: &mut App) {
+    let Some(dir) = cx.try_global::<Home>().map(|home| home.0.clone()) else {
+        return;
+    };
+    let writes = cx.default_global::<Writes>();
+    writes.pending += 1;
+    let before = writes.last.take();
+    let background = cx.background_executor().clone();
+    let task = cx.spawn(async move |cx| {
+        if let Some(before) = before {
+            before.await;
+        }
+        let folder = dir.clone();
+        background
+            .spawn(async move {
+                let path = folder.join(FILE);
+                let text = std::fs::read_to_string(&path)
+                    .ok()
+                    .filter(|text| !settings::strip_comments(text).trim().is_empty())
+                    .unwrap_or_else(|| "{\n}\n".into());
+                if parse(&text).is_err() {
+                    return;
+                }
+                let text = import::jsonc::set_key(&text, key, &value);
+                // Whole or not at all: the file is read as soon as it changes.
+                let fresh = folder.join(format!("{FILE}.new"));
+                if std::fs::create_dir_all(&folder).is_ok() && std::fs::write(&fresh, text).is_ok()
+                {
+                    let _ = std::fs::rename(&fresh, &path);
+                }
+            })
+            .await;
+        let _ = cx.update(|cx| {
+            let writes = cx.default_global::<Writes>();
+            writes.pending = writes.pending.saturating_sub(1);
+            // The file now says all that was done by hand, and whatever
+            // the user saved in it meanwhile, which was not read then.
+            if writes.pending == 0 {
+                reload_from(&dir, cx);
             }
-            let text = import::jsonc::set_key(&text, part.key(), &value);
-            // Whole or not at all: the file is read as soon as it changes.
-            let fresh = dir.join(format!("{FILE}.new"));
-            if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&fresh, text).is_ok() {
-                let _ = std::fs::rename(&fresh, &path);
-            }
-        })
-        .detach();
+        });
+    });
+    cx.default_global::<Writes>().last = Some(task);
 }
 
 #[cfg(test)]
@@ -466,6 +567,49 @@ mod tests {
         assert!(error.contains("nothing"), "{error}");
         // What the editor writes is what it reads.
         assert_eq!(parse(&file(&layout)).unwrap(), layout);
+    }
+
+    #[test]
+    fn each_dock_has_one_panel_open_or_none() {
+        use Panel::*;
+        // Until the file says, the left dock is open on its first panel.
+        let standard = Layout::default();
+        assert_eq!(standard.open_in(Place::Left), Some(Files));
+        assert_eq!(standard.open_in(Place::Right), None);
+        assert_eq!(standard.open_in(Place::Bottom), None);
+        let moved = parse(r#"{ "left": { "panels": ["git", "files"] } }"#).unwrap();
+        assert_eq!(moved.open_in(Place::Left), Some(Git));
+        // What the editor writes for a window nobody touched has no word
+        // about it, so it goes on meaning that.
+        assert!(!file(&standard).contains("open"));
+
+        // The file names them in any order; the first of a dock is the
+        // one, and they are kept in the order of the docks.
+        let layout =
+            parse(r#"{ "open": ["terminal", "agent", "git", "chat", "files", "git"] }"#).unwrap();
+        assert_eq!(layout.open, Some(vec![Git, Agent, Terminal]));
+        assert_eq!(layout.open_in(Place::Left), Some(Git));
+        assert_eq!(layout.open_in(Place::Right), Some(Agent));
+        assert_eq!(layout.open_in(Place::Bottom), Some(Terminal));
+        assert_eq!(parse(&file(&layout)).unwrap(), layout);
+        // None named: every dock is closed, the left one too.
+        let closed = parse(r#"{ "open": [] }"#).unwrap();
+        assert_eq!(closed.open, Some(Vec::new()));
+        assert_eq!(closed.open_in(Place::Left), None);
+
+        // A panel is open in the dock its tab is in now, and a hidden one
+        // in the dock it comes in.
+        let layout = parse(
+            r#"{
+              "right": { "panels": ["files", "chat"] },
+              "hidden": ["search"],
+              "open": ["files", "search", "agent"]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(layout.open, Some(vec![Search, Files]));
+        assert_eq!(layout.open_in(Place::Left), Some(Search));
+        assert_eq!(layout.open_in(Place::Right), Some(Files));
     }
 
     #[test]

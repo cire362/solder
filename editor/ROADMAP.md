@@ -269,13 +269,14 @@ file, so the two never disagree. It starts after the Zed items of phase 8.
       dock, title bar, tab bar, status bar), read at start and when the file
       is saved. A mistake in it is reported like one in `settings.json`, and
       the last layout that was right stays
-- [~] Docks on the left, right and bottom, and any panel in any of them:
+- [x] Docks on the left, right and bottom, and any panel in any of them:
       Files, Search, Git, Services, Database, API, AI, Extensions, the chat,
       the agent, the terminal, the debugger. Their order in a dock, which
       are hidden, which one is open. Every dock holds any of the fourteen
       panels (the terminals, the debugger, the response and the results
-      with the ten of the sides), in the file's order, with hidden ones;
-      which panel is open is not kept between runs
+      with the ten of the sides), in the file's order, with hidden ones.
+      `open` names the panel each dock has open and is written when that
+      changes, so the window starts as it was left
 - [ ] The title bar and the status bar as lists of items: which are there, in
       what order, on which side. The tab bar: above or below the editor, or
       none
