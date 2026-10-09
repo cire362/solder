@@ -316,9 +316,9 @@ impl ExtensionsPanel {
         div()
             .flex_none()
             .px_1p5()
-            .rounded(px(6.))
+            .rounded(theme.shape.token)
             .bg(theme.bg)
-            .text_size(px(11.))
+            .text_size(crate::theme::text(11.))
             .text_color(color)
             .child(text)
             .into_any_element()
@@ -334,7 +334,7 @@ impl ExtensionsPanel {
         let heading = |text: &'static str| {
             div()
                 .pt_1()
-                .text_size(px(10.5))
+                .text_size(crate::theme::text(10.5))
                 .text_color(theme.fg_subtle)
                 .child(text)
         };
@@ -343,7 +343,7 @@ impl ExtensionsPanel {
             .flex_none()
             .max_h(px(280.))
             .overflow_y_scroll()
-            .border_t_1()
+            .border_t(theme.shape.border)
             .border_color(theme.line)
             .p_3()
             .flex()
@@ -888,7 +888,7 @@ impl Render for ExtensionsPanel {
                         .id(("extension", i))
                         .debug_selector(move || format!("extension-{i}"))
                         .w_full()
-                        .h(ROW)
+                        .h(crate::theme::row(ROW, cx))
                         .px_3()
                         .flex()
                         .items_center()
@@ -917,21 +917,21 @@ impl Render for ExtensionsPanel {
                                         .child(
                                             div()
                                                 .flex_none()
-                                                .text_size(px(11.))
+                                                .text_size(crate::theme::text(11.))
                                                 .text_color(theme.fg_subtle)
                                                 .child(source),
                                         )
                                         .child(
                                             div()
                                                 .flex_none()
-                                                .text_size(px(11.))
+                                                .text_size(crate::theme::text(11.))
                                                 .text_color(theme.fg_subtle)
                                                 .child(row.version),
                                         )
                                         .child(
                                             div()
                                                 .flex_none()
-                                                .text_size(px(11.))
+                                                .text_size(crate::theme::text(11.))
                                                 .text_color(theme.fg_subtle)
                                                 .child(downloads_of[i].clone()),
                                         ),
@@ -939,7 +939,7 @@ impl Render for ExtensionsPanel {
                                 .child(
                                     div()
                                         .truncate()
-                                        .text_size(px(11.5))
+                                        .text_size(crate::theme::text(11.5))
                                         .text_color(if row.failed {
                                             theme.error
                                         } else {
@@ -1040,7 +1040,7 @@ impl Render for ExtensionsPanel {
                     .flex_none()
                     .px_3()
                     .py_1()
-                    .text_size(px(11.5))
+                    .text_size(crate::theme::text(11.5))
                     .text_color(theme.error)
                     .child(failure)
             }))

@@ -448,13 +448,13 @@ impl ErdView {
             .flex()
             .items_center()
             .gap_2()
-            .border_b_1()
+            .border_b(theme.shape.border)
             .border_color(theme.line)
             .child(
                 div()
                     .flex_none()
                     .px_1p5()
-                    .rounded(px(6.))
+                    .rounded(theme.shape.token)
                     .bg(theme.bg_elev)
                     .text_color(theme.fg_muted)
                     .child(self.connection.clone()),
@@ -526,7 +526,7 @@ impl ErdView {
                 .flex()
                 .flex_col()
                 .gap_1p5()
-                .border_t_1()
+                .border_t(theme.shape.border)
                 .border_color(theme.line)
                 .bg(theme.bg_sunken)
                 .child(
@@ -618,7 +618,7 @@ impl ErdView {
                     .w(px(n.width * z))
                     .h(px(n.height() * z))
                     .rounded(px(8. * z))
-                    .border_1()
+                    .border(theme.shape.border)
                     .border_color(border)
                     .bg(theme.bg_elev)
                     .overflow_hidden()

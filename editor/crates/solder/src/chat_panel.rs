@@ -384,9 +384,9 @@ impl ChatPanel {
         let block = |lang: &str, lines: &[&str], n: usize| {
             let copy = lines.join("\n");
             div()
-                .rounded(px(8.))
+                .rounded(theme.shape.control)
                 .bg(theme.bg_sunken)
-                .border_1()
+                .border(theme.shape.border)
                 .border_color(theme.line)
                 .flex()
                 .flex_col()
@@ -399,14 +399,14 @@ impl ChatPanel {
                         .child(
                             div()
                                 .flex_1()
-                                .text_size(px(10.5))
+                                .text_size(crate::theme::text(10.5))
                                 .text_color(theme.fg_subtle)
                                 .child(lang.to_string()),
                         )
                         .child(
                             div()
                                 .id(SharedString::from(format!("chat-copy-{id}-{n}")))
-                                .text_size(px(10.5))
+                                .text_size(crate::theme::text(10.5))
                                 .text_color(theme.fg_subtle)
                                 .hover(|d| d.text_color(theme.fg))
                                 .child("copy")
@@ -420,7 +420,7 @@ impl ChatPanel {
                         .px_2()
                         .pb_1p5()
                         .font_family(crate::theme::CODE_FONT)
-                        .text_size(px(12.))
+                        .text_size(crate::theme::text(12.))
                         .text_color(theme.fg)
                         .children(lines.iter().map(|l| div().child(l.to_string())))
                         .into_any_element(),
@@ -460,7 +460,7 @@ impl ChatPanel {
         let Some(m) = self.messages.get(ix) else {
             return div().into_any_element();
         };
-        let small = UI_FONT_SIZE - px(1.);
+        let small = crate::theme::UI_FONT_SMALL;
         let body = div().flex().flex_col().gap_1p5();
         let body = match m.who {
             Who::User => body
@@ -468,7 +468,7 @@ impl ChatPanel {
                     div()
                         .px_2p5()
                         .py_1p5()
-                        .rounded(px(8.))
+                        .rounded(theme.shape.control)
                         .bg(theme.bg_elev)
                         .text_size(UI_FONT_SIZE)
                         .text_color(theme.fg)
@@ -476,7 +476,7 @@ impl ChatPanel {
                 )
                 .children(m.context.as_ref().map(|c| {
                     div()
-                        .text_size(px(10.5))
+                        .text_size(crate::theme::text(10.5))
                         .text_color(theme.fg_subtle)
                         .child(format!("with {c}"))
                 })),
@@ -511,7 +511,7 @@ impl ChatPanel {
                             d.child(
                                 div()
                                     .pl_2()
-                                    .border_l_1()
+                                    .border_l(theme.shape.border)
                                     .border_color(theme.line)
                                     .text_size(small)
                                     .text_color(theme.fg_subtle)
@@ -548,8 +548,8 @@ impl ChatPanel {
             .mx_2()
             .mb_2()
             .p_1()
-            .rounded(px(8.))
-            .border_1()
+            .rounded(theme.shape.control)
+            .border(theme.shape.border)
             .border_color(theme.line)
             .bg(theme.bg_elev)
             .flex()
@@ -560,7 +560,7 @@ impl ChatPanel {
             menu = menu.child(
                 div()
                     .p_2()
-                    .text_size(UI_FONT_SIZE - px(1.))
+                    .text_size(crate::theme::UI_FONT_SMALL)
                     .text_color(theme.fg_subtle)
                     .child("No models yet. Install one in the AI tab, start Ollama or LM Studio, or add a key."),
             );
@@ -570,7 +570,7 @@ impl ChatPanel {
                 div()
                     .px_2()
                     .pt_1()
-                    .text_size(px(10.5))
+                    .text_size(crate::theme::text(10.5))
                     .text_color(theme.fg_subtle)
                     .child(provider.name.to_uppercase()),
             );
@@ -584,7 +584,7 @@ impl ChatPanel {
                         .debug_selector(move || selector.clone())
                         .px_2()
                         .py_1()
-                        .rounded(px(6.))
+                        .rounded(theme.shape.token)
                         .text_size(UI_FONT_SIZE)
                         .text_color(if active { theme.accent } else { theme.fg })
                         .hover(|d| d.bg(theme.accent_soft))
@@ -652,7 +652,7 @@ impl Render for ChatPanel {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .border_b_1()
+                    .border_b(theme.shape.border)
                     .border_color(theme.line)
                     .child(
                         div()
@@ -662,7 +662,7 @@ impl Render for ChatPanel {
                             .min_w_0()
                             .px_2()
                             .py_1()
-                            .rounded(px(8.))
+                            .rounded(theme.shape.control)
                             .hover(|d| d.bg(theme.bg_elev))
                             .flex()
                             .items_center()
@@ -681,7 +681,7 @@ impl Render for ChatPanel {
                             .children(provider.map(|p| {
                                 div()
                                     .flex_none()
-                                    .text_size(px(11.))
+                                    .text_size(crate::theme::text(11.))
                                     .text_color(theme.fg_subtle)
                                     .child(p)
                             }))
@@ -708,7 +708,7 @@ impl Render for ChatPanel {
                 div()
                     .flex_none()
                     .p_2()
-                    .border_t_1()
+                    .border_t(theme.shape.border)
                     .border_color(theme.line)
                     .flex()
                     .flex_col()
@@ -741,7 +741,7 @@ impl Render for ChatPanel {
                                         div()
                                             .min_w_0()
                                             .truncate()
-                                            .text_size(px(10.5))
+                                            .text_size(crate::theme::text(10.5))
                                             .text_color(theme.fg_subtle)
                                             .child(status.to_string())
                                     }),

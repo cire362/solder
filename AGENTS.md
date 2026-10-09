@@ -78,8 +78,26 @@ Never guess a signature.
 - Edits go through `Document::edit`/`apply_edits` with the `EntityId` of the
   **editor** that made them as `origin`. Passing the document's id made the
   editor move its own cursor twice; this bug happened once.
-- `Workspace` owns panes, tabs, the sidebar, modals, the terminal dock and
-  the find bar. Global state lives in `Settings`, `Theme`, `Perf` and
+- `Workspace` owns panes, tabs, the docks, modals and the find bar. Where
+  the parts of the window are and how large is `Layout` (`layout.rs`), read
+  from `layout.json`: do not write a size or a panel's place into the code.
+  A named layout uses `layouts/<name>.json` instead; `layout::path(cx)` names
+  the file in use. `layouts.json` remembers the shared choice and the one
+  each open project was left in. Saving, selecting and resetting a layout
+  use the same queue as a size change, so pending edits reach their original
+  file before another layout is selected.
+  Each of the three docks shows one `Panel`, the terminals and the
+  debugger included; which dock a panel is in is the layout's to say
+  (`Workspace::show_panel`), never a field of its own, and one that has
+  nothing left to show leaves through `Workspace::panel_gone`. What the
+  title bar and the status bar say is `layout::Item`s, drawn by
+  `Workspace::bar_item`: a new thing to say there is a new item, not a
+  line in the bar's own code. A button on a bar is an item too
+  (`Item::Button`), and runs its command through `bar_commands::run`, the
+  same commands the palette and the keymap have. A change made
+  by hand in the window is written back to the file (`layout::keep` for a
+  size, `layout::put` for the rest): one key at a time and one write after another, and
+  the file is not read while a write of ours is on its way. Global state lives in `Settings`, `Theme`, `Perf` and
   `LspStore` (see `main.rs` for init order).
 - A document belongs to several language servers (`LspStore`): the one
   Solder knows for its language, then every one an installed extension
@@ -195,7 +213,15 @@ pattern for new widgets instead of calling `cx.propagate()` everywhere.
 ### Style
 
 - Colors come from `theme.rs` tokens, which mirror the website's
-  `globals.css`. Shapes: panels 16px, controls 8px, inline tokens 6px.
+  `globals.css`, the terminal's sixteen included: write no color outside
+  that file. Shapes are tokens too, never numbers: `theme.shape.panel`
+  (16px as it comes), `.control` (8px), `.token` (6px) for corners, and
+  `.border` (1px) for the lines between parts, as in
+  `.border_b(theme.shape.border)`.
+- Text sizes of the interface are rems, never pixels: `UI_FONT_SIZE`,
+  `UI_FONT_SMALL` or `theme::text(11.5)`, since a rem follows
+  `ui_font_size`. The height of a row of a list is `theme::row(ROW, cx)`,
+  which follows `ui_density`. Code is sized by `buffer_font_size` alone.
 - Comments explain why, not what. Match the density of the surrounding code.
 - User-facing strings are short and plain, with no em dashes.
 

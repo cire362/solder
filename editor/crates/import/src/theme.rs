@@ -14,7 +14,8 @@ use crate::jsonc;
 
 /// A theme as Solder keeps it in `themes/<name>.json`. Colors are
 /// `#rrggbb` or `#rrggbbaa`, keyed by the token's name in the editor
-/// (`bg`, `fg_muted`, `accent`, ...; `keyword`, `string`, ... for syntax).
+/// (`bg`, `fg_muted`, `accent`, ...; `keyword`, `string`, ... for syntax;
+/// `red`, `bright_blue`, ... for the terminal).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ThemeFile {
     pub name: String,
@@ -24,6 +25,12 @@ pub struct ThemeFile {
     pub colors: BTreeMap<String, String>,
     #[serde(default)]
     pub syntax: BTreeMap<String, String>,
+    /// The sixteen colors programs in the terminal ask for by number.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub terminal: BTreeMap<String, String>,
+    /// Shapes, in pixels: how round corners are and how wide borders.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shapes: BTreeMap<String, f32>,
 }
 
 pub const COLORS: &[&str] = &[
@@ -60,6 +67,34 @@ pub const SYNTAX: &[&str] = &[
     "punctuation",
     "variable",
     "tag",
+];
+
+/// The shapes a theme can set.
+pub const SHAPES: &[&str] = &[
+    "panel_radius",
+    "control_radius",
+    "token_radius",
+    "border_width",
+];
+
+/// The terminal's colors, in the order programs number them.
+pub const TERMINAL: &[&str] = &[
+    "black",
+    "red",
+    "green",
+    "yellow",
+    "blue",
+    "magenta",
+    "cyan",
+    "white",
+    "bright_black",
+    "bright_red",
+    "bright_green",
+    "bright_yellow",
+    "bright_blue",
+    "bright_magenta",
+    "bright_cyan",
+    "bright_white",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -176,6 +211,7 @@ const WHITE: Rgba = Rgba {
 struct Palette {
     colors: BTreeMap<&'static str, Rgba>,
     syntax: BTreeMap<&'static str, Rgba>,
+    terminal: BTreeMap<&'static str, Rgba>,
 }
 
 impl Palette {
@@ -282,6 +318,10 @@ impl Palette {
             appearance: if dark { "dark" } else { "light" }.into(),
             colors: hex(self.colors),
             syntax: hex(self.syntax),
+            // Only the ones the source has: the rest are the editor's.
+            terminal: hex(self.terminal),
+            // Neither editor's themes say anything of shapes.
+            shapes: BTreeMap::new(),
         })
     }
 }
@@ -485,6 +525,24 @@ pub fn from_vscode(name: &str, theme: &Value, ui_theme: Option<&str>) -> Option<
             palette.syntax.insert(token, color);
         }
     }
+    // `bright_red` is `terminal.ansiBrightRed` there.
+    for token in TERMINAL {
+        let key: String = token
+            .split('_')
+            .map(|word| {
+                let mut letters = word.chars();
+                letters.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().chain(letters).collect()
+                })
+            })
+            .collect();
+        if let Some(color) = colors[format!("terminal.ansi{key}").as_str()]
+            .as_str()
+            .and_then(Rgba::parse)
+        {
+            palette.terminal.insert(token, color);
+        }
+    }
     let appearance = match ui_theme.or(theme["type"].as_str()) {
         Some("vs-dark" | "hc-black" | "dark") => Some("dark"),
         Some("vs" | "hc-light" | "light") => Some("light"),
@@ -618,6 +676,14 @@ pub fn from_zed(theme: &Value) -> Option<ThemeFile> {
             palette.syntax.insert(token, color);
         }
     }
+    for token in TERMINAL {
+        if let Some(color) = style[format!("terminal.ansi.{token}").as_str()]
+            .as_str()
+            .and_then(Rgba::parse)
+        {
+            palette.terminal.insert(token, color);
+        }
+    }
     palette.finish(theme["name"].as_str()?, theme["appearance"].as_str())
 }
 
@@ -718,6 +784,8 @@ mod tests {
                 "editor.selectionBackground": "#44475A",
                 "editor.findMatchBackground": "#FFB86C80",
                 "editorError.foreground": "#FF5555",
+                "terminal.ansiRed": "#FF5555",
+                "terminal.ansiBrightBlue": "#D6ACFF",
             },
             "tokenColors": [
                 {"scope": ["keyword", "storage"], "settings": {"foreground": "#FF79C6"}},
@@ -766,6 +834,10 @@ mod tests {
         // Every token is there, so the file stands on its own.
         assert!(COLORS.iter().all(|t| file.colors.contains_key(*t)));
         assert!(SYNTAX.iter().all(|t| file.syntax.contains_key(*t)));
+        // The terminal's colors the theme has, and no others.
+        assert_eq!(file.terminal["red"], "#ff5555");
+        assert_eq!(file.terminal["bright_blue"], "#d6acff");
+        assert_eq!(file.terminal.len(), 2);
         // Without a background there is no theme.
         assert_eq!(from_vscode("x", &json!({"colors": {}}), None), None);
         // Light or dark is read off the background when nothing says.
@@ -788,6 +860,8 @@ mod tests {
                 "border": "#101014",
                 "editor.active_line.background": "#1e202e",
                 "created": "#9ece6a",
+                "terminal.ansi.green": "#73daca",
+                "terminal.ansi.bright_black": "#414868",
                 "players": [{"cursor": "#7c7f93", "selection": "#267ead3d"}],
                 "syntax": {
                     "keyword": {"color": "#bb9af7", "font_style": null},
@@ -815,6 +889,9 @@ mod tests {
         assert_eq!(file.syntax["keyword"], "#bb9af7");
         assert_eq!(file.syntax["string"], "#9ece6a");
         assert!(COLORS.iter().all(|t| file.colors.contains_key(*t)));
+        assert_eq!(file.terminal["green"], "#73daca");
+        assert_eq!(file.terminal["bright_black"], "#414868");
+        assert_eq!(file.terminal.len(), 2);
 
         // Line numbers too faint to read as text are not used for text.
         let mut faint = theme.clone();

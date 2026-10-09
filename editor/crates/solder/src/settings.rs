@@ -13,7 +13,7 @@ use gpui::{App, Font, Global, KeyBinding, Pixels, px};
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 
-use crate::theme::{CODE_FONT, Theme};
+use crate::theme::{CODE_FONT, Theme, Tokens, UI_FONT, UI_FONT_PX};
 
 /// `system`, `dark`, `light`, or the name of a theme in the `themes`
 /// folder next to `settings.json`.
@@ -57,9 +57,19 @@ pub struct Settings {
     /// The named theme, read when the settings are.
     #[serde(skip)]
     pub custom_theme: Option<Theme>,
+    /// Tokens set over the theme in use, whichever it is.
+    pub theme_overrides: ThemeOverrides,
     pub buffer_font_family: String,
     pub buffer_font_size: f32,
     pub buffer_line_height: f32,
+    /// The font of everything that is not code: panels, tabs, the bars.
+    pub ui_font_family: String,
+    /// Its size. The room around the text grows and shrinks with it.
+    pub ui_font_size: f32,
+    /// How tall the rows of lists are: `compact`, `default`, `comfortable`.
+    pub ui_density: Density,
+    /// Default, VS Code, JetBrains, or a file in `keymaps`.
+    pub key_layout: String,
     /// Indent width for files whose indentation cannot be detected.
     pub indent_size: usize,
     /// Latency, frame time and memory in the status bar.
@@ -158,14 +168,85 @@ pub struct ServerOverride {
     pub settings: Option<serde_json::Value>,
 }
 
+/// Tokens of a theme set in `settings.json`, as a theme file names them:
+/// `"accent": "#ff8800"`, and `syntax` and `terminal` for theirs.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeOverrides {
+    #[serde(skip_serializing_if = "Tokens::is_empty")]
+    pub syntax: Tokens,
+    #[serde(skip_serializing_if = "Tokens::is_empty")]
+    pub terminal: Tokens,
+    /// `control_radius`, `border_width` and the like, in pixels.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub shapes: BTreeMap<String, f32>,
+    #[serde(flatten)]
+    pub colors: Tokens,
+}
+
+impl ThemeOverrides {
+    /// What is wrong in them: a name that is no token, a value that is
+    /// no color. Such a line changes nothing, which is worth saying.
+    pub fn mistakes(&self) -> Vec<String> {
+        use import::theme::{COLORS, Rgba, SYNTAX, TERMINAL};
+        let mut mistakes = Vec::new();
+        for (tokens, known, of) in [
+            (&self.colors, COLORS, ""),
+            (&self.syntax, SYNTAX, "syntax."),
+            (&self.terminal, TERMINAL, "terminal."),
+        ] {
+            for (name, value) in tokens {
+                if !known.contains(&name.as_str()) {
+                    mistakes.push(format!(
+                        "settings.json: theme_overrides: no token \u{201c}{of}{name}\u{201d}"
+                    ));
+                } else if Rgba::parse(value).is_none() {
+                    mistakes.push(format!(
+                        "settings.json: theme_overrides: {of}{name}: \u{201c}{value}\u{201d} is not a color"
+                    ));
+                }
+            }
+        }
+        for name in self.shapes.keys() {
+            if !import::theme::SHAPES.contains(&name.as_str()) {
+                mistakes.push(format!(
+                    "settings.json: theme_overrides: no shape \u{201c}{name}\u{201d}"
+                ));
+            }
+        }
+        mistakes
+    }
+}
+
+/// How tall the rows of lists are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Density {
+    Compact,
+    #[default]
+    #[serde(rename = "default")]
+    Standard,
+    Comfortable,
+}
+
+/// The sizes the interface's text may have. Below the first it cannot be
+/// read; above the second a tab no longer holds its name.
+const UI_FONT_LEAST: f32 = 9.;
+const UI_FONT_MOST: f32 = 18.;
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: ThemeMode::System,
             custom_theme: None,
+            theme_overrides: ThemeOverrides::default(),
             buffer_font_family: CODE_FONT.to_string(),
             buffer_font_size: 13.,
             buffer_line_height: 20.,
+            ui_font_family: UI_FONT.to_string(),
+            ui_font_size: UI_FONT_PX,
+            ui_density: Density::Standard,
+            key_layout: crate::key_layout::DEFAULT.into(),
             indent_size: 4,
             show_performance_hud: true,
             language_servers: BTreeMap::new(),
@@ -195,6 +276,38 @@ impl Settings {
         px(self.buffer_line_height.max(self.buffer_font_size * 1.1))
     }
 
+    pub fn ui_font(&self) -> gpui::SharedString {
+        self.ui_font_family.clone().into()
+    }
+
+    /// The interface's text size, kept to what its rows can hold.
+    fn ui_scale(&self) -> f32 {
+        let size = if self.ui_font_size.is_finite() {
+            self.ui_font_size
+        } else {
+            UI_FONT_PX
+        };
+        size.clamp(UI_FONT_LEAST, UI_FONT_MOST) / UI_FONT_PX
+    }
+
+    /// What a rem is in a window: 16 pixels as it comes. Every text size
+    /// and most of the spacing of the interface is in rems.
+    pub fn rem_size(&self) -> Pixels {
+        px(16. * self.ui_scale())
+    }
+
+    /// How much taller than it comes a row of a list is: by the density,
+    /// and by the text when that is larger. Smaller text leaves rows as
+    /// they are; `compact` is what lowers them.
+    pub fn row_scale(&self) -> f32 {
+        let density = match self.ui_density {
+            Density::Compact => 0.85,
+            Density::Standard => 1.,
+            Density::Comfortable => 1.25,
+        };
+        density * self.ui_scale().max(1.)
+    }
+
     pub fn indent_unit(&self) -> &'static str {
         match self.indent_size {
             2 => "  ",
@@ -204,13 +317,17 @@ impl Settings {
     }
 
     pub fn theme(&self, appearance: gpui::WindowAppearance) -> Theme {
-        match (&self.theme, &self.custom_theme) {
+        let mut theme = match (&self.theme, &self.custom_theme) {
             (ThemeMode::Named(_), Some(theme)) => theme.clone(),
             (ThemeMode::Dark, _) => Theme::dark(),
             (ThemeMode::Light, _) => Theme::light(),
             // The system's, also for a named theme whose file is gone.
             _ => Theme::for_appearance(appearance),
-        }
+        };
+        let over = &self.theme_overrides;
+        theme.lay(&over.colors, &over.syntax, &over.terminal);
+        theme.shape.lay(&over.shapes);
+        theme
     }
 }
 
@@ -264,7 +381,7 @@ fn read_theme(dir: &Path, name: &str) -> Result<Theme, String> {
 }
 
 /// Drops `//` line comments so the files can be annotated (JSON with comments).
-fn strip_comments(source: &str) -> String {
+pub(crate) fn strip_comments(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     for line in source.lines() {
         let mut in_string = false;
@@ -395,6 +512,26 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+#[derive(Default)]
+struct KeyFiles {
+    imported: Vec<KeyBinding>,
+    personal: Vec<KeyBinding>,
+}
+impl Global for KeyFiles {}
+
+/// A named set arrives from the background. Use the newest personal and
+/// imported files, rather than a snapshot from when its read began.
+pub(crate) fn bind_key_files(selected: Vec<KeyBinding>, cx: &mut App) {
+    let files = cx.default_global::<KeyFiles>();
+    let imported = files.imported.clone();
+    let personal = files.personal.clone();
+    cx.clear_key_bindings();
+    bind_defaults(cx);
+    cx.bind_keys(imported);
+    cx.bind_keys(selected);
+    cx.bind_keys(personal);
+}
+
 /// Loads the config files and applies them. Safe to call again on change.
 pub fn reload(cx: &mut App) {
     reload_from(&config_dir(), cx);
@@ -402,6 +539,11 @@ pub fn reload(cx: &mut App) {
 
 /// `reload`, from the config folder given.
 pub fn reload_from(dir: &Path, cx: &mut App) {
+    // A selection writes the setting and its file together. Watching an
+    // intermediate save must not apply just half of that change.
+    if crate::key_layout::pending(cx) {
+        return;
+    }
     let mut errors = Vec::new();
     let mut settings = match parse_settings(&read(&dir.join("settings.json"))) {
         Ok(s) => s,
@@ -417,17 +559,24 @@ pub fn reload_from(dir: &Path, cx: &mut App) {
             Err(e) => errors.push(e),
         }
     }
+    errors.extend(settings.theme_overrides.mistakes());
     cx.global_mut::<crate::perf::Perf>().hud_visible = settings.show_performance_hud;
+    let key_layout = settings.key_layout.clone();
     cx.set_global(settings);
 
-    cx.clear_key_bindings();
-    bind_defaults(cx);
-    // Later bindings win: the defaults, what was imported, the user's own.
-    for file in [IMPORTED_KEYMAP, "keymap.json"] {
-        let (bindings, keymap_errors) = parse_keymap(file, &read(&dir.join(file)), cx);
-        cx.bind_keys(bindings);
-        errors.extend(keymap_errors);
-    }
+    // An explicit choice wins over an older import. Personal bindings
+    // remain above both, so choosing a set never discards them.
+    let (imported, keymap_errors) =
+        parse_keymap(IMPORTED_KEYMAP, &read(&dir.join(IMPORTED_KEYMAP)), cx);
+    errors.extend(keymap_errors);
+    let (personal, keymap_errors) =
+        parse_keymap("keymap.json", &read(&dir.join("keymap.json")), cx);
+    errors.extend(keymap_errors);
+    cx.set_global(KeyFiles { imported, personal });
+    let (bindings, keymap_errors) = crate::key_layout::reload_from(dir, &key_layout, cx);
+    bind_key_files(bindings, cx);
+    errors.extend(keymap_errors);
+    errors.extend(crate::layout::reload_from(dir, cx));
     for e in &errors {
         eprintln!("{e}");
     }
@@ -437,8 +586,21 @@ pub fn reload_from(dir: &Path, cx: &mut App) {
 
 /// Applies config changes as soon as the files are saved.
 pub fn watch(cx: &mut App) {
-    let dir = config_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
+    watch_dir(config_dir(), cx);
+}
+
+/// Reads the config files in `dir` again whenever one of them is saved,
+/// a theme, named layout or key layout in its folder too.
+pub fn watch_dir(dir: PathBuf, cx: &mut App) {
+    // The folder of themes is watched from the start, so that the first
+    // theme put there is seen.
+    let themes = dir.join("themes");
+    let layouts = dir.join("layouts");
+    let keymaps = dir.join("keymaps");
+    if [&themes, &layouts, &keymaps]
+        .into_iter()
+        .any(|dir| std::fs::create_dir_all(dir).is_err())
+    {
         return;
     }
     let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
@@ -449,7 +611,15 @@ pub fn watch(cx: &mut App) {
     }) else {
         return;
     };
-    if watcher.watch(&dir, RecursiveMode::NonRecursive).is_err() {
+    if watcher.watch(&dir, RecursiveMode::NonRecursive).is_err()
+        || watcher.watch(&themes, RecursiveMode::NonRecursive).is_err()
+        || watcher
+            .watch(&layouts, RecursiveMode::NonRecursive)
+            .is_err()
+        || watcher
+            .watch(&keymaps, RecursiveMode::NonRecursive)
+            .is_err()
+    {
         return;
     }
     cx.spawn(async move |cx| {
@@ -459,7 +629,7 @@ pub fn watch(cx: &mut App) {
                 .timer(Duration::from_millis(50))
                 .await;
             while rx.try_recv().is_ok() {}
-            if cx.update(reload).is_err() {
+            if cx.update(|cx| reload_from(&dir, cx)).is_err() {
                 break;
             }
         }
@@ -467,7 +637,7 @@ pub fn watch(cx: &mut App) {
     .detach();
 }
 
-pub const DEFAULT_KEYMAP: &str = r#"// Key bindings added here apply on top of the defaults.
+pub const DEFAULT_KEYMAP: &str = r#"// Key bindings added here apply on top of the selected key layout.
 // Run "Workspace: Toggle command palette" to see action names.
 [
   {
@@ -501,6 +671,30 @@ mod tests {
         assert_eq!(parse_settings("").unwrap(), Settings::default());
         let url = parse_settings("{ \"buffer_font_family\": \"a//b\" }").unwrap();
         assert_eq!(url.buffer_font_family, "a//b");
+        // The interface's text as it comes: a rem is 16 pixels, and rows
+        // are as tall as they were written.
+        assert_eq!(s.ui_font_family, UI_FONT);
+        assert_eq!((s.rem_size(), s.row_scale()), (px(16.), 1.));
+        // Larger text, and the rem and the rows grow with it; a size no
+        // row can hold is brought to the nearest that fits.
+        let large = parse_settings(r#"{ "ui_font_size": 15, "ui_font_family": "Inter" }"#).unwrap();
+        assert_eq!(large.ui_font(), "Inter");
+        assert_eq!(large.rem_size(), px(19.2));
+        assert_eq!(large.row_scale(), 1.2);
+        let huge = parse_settings(r#"{ "ui_font_size": 400 }"#).unwrap();
+        assert_eq!(huge.rem_size(), px(16. * 18. / 12.5));
+        // Smaller text leaves the rows alone: `compact` lowers them.
+        let small = parse_settings(r#"{ "ui_font_size": 10 }"#).unwrap();
+        assert_eq!((small.rem_size(), small.row_scale()), (px(12.8), 1.));
+        let compact = parse_settings(r#"{ "ui_density": "compact" }"#).unwrap();
+        assert_eq!(compact.row_scale(), 0.85);
+        let roomy = parse_settings(r#"{ "ui_density": "comfortable" }"#).unwrap();
+        assert_eq!(roomy.row_scale(), 1.25);
+        assert_eq!(
+            parse_settings(r#"{ "ui_density": "default" }"#).unwrap(),
+            Settings::default()
+        );
+        assert!(parse_settings(r#"{ "ui_density": "airy" }"#).is_err());
         // A context server's command in both of the forms Zed writes it.
         let servers = parse_settings(
             r#"{ "context_servers": {
@@ -520,6 +714,82 @@ mod tests {
         assert_eq!(servers["table"].variables()["A"], "b");
         assert!(!servers["table"].enabled);
         assert_eq!(servers["bare"].program(), None);
+    }
+
+    #[test]
+    fn tokens_are_set_over_the_theme_in_use() {
+        use gpui::{Hsla, WindowAppearance::Dark, rgb};
+        let settings = parse_settings(
+            r##"{
+              "theme": "light",
+              "theme_overrides": {
+                "accent": "#00ff88",
+                "syntax": { "comment": "#777777" },
+                "terminal": { "bright_red": "#ff0000" }
+              }
+            }"##,
+        )
+        .unwrap();
+        assert!(settings.theme_overrides.mistakes().is_empty());
+        // The theme in use with those three laid over it, and nothing
+        // else moved.
+        let theme = settings.theme(Dark);
+        let light = Theme::light();
+        assert_eq!(theme.accent, Hsla::from(rgb(0x00ff88)));
+        assert_eq!(theme.syntax.comment, Hsla::from(rgb(0x777777)));
+        assert_eq!(theme.terminal[9], Hsla::from(rgb(0xff0000)));
+        assert_eq!(
+            (theme.bg, theme.syntax.keyword),
+            (light.bg, light.syntax.keyword)
+        );
+        assert_eq!(theme.terminal[1], light.terminal[1]);
+        // Over the system's theme and a named one alike.
+        let system = parse_settings(r##"{ "theme_overrides": { "bg": "#000000" } }"##).unwrap();
+        assert_eq!(system.theme(Dark).bg, Hsla::from(rgb(0x000000)));
+        assert_eq!(system.theme(Dark).fg, Theme::dark().fg);
+
+        // A name that is no token and a value that is no color change
+        // nothing, and are said.
+        let wrong = parse_settings(
+            r##"{ "theme_overrides": {
+                "acent": "#00ff88", "fg": "red", "syntax": { "keyword": "#12" }, "terminal": { "pink": "#ff00ff" }
+            } }"##,
+        )
+        .unwrap();
+        assert_eq!(wrong.theme(Dark), Theme::dark());
+        let mistakes = wrong.theme_overrides.mistakes();
+        assert_eq!(mistakes.len(), 4, "{mistakes:?}");
+        assert!(
+            mistakes
+                .iter()
+                .all(|m| m.starts_with("settings.json: theme_overrides"))
+        );
+        assert!(mistakes.iter().any(|m| m.contains("acent")));
+        assert!(mistakes.iter().any(|m| m.contains("terminal.pink")));
+        assert!(
+            mistakes
+                .iter()
+                .any(|m| m.contains("syntax.keyword") && m.contains("not a color"))
+        );
+        // Nothing set is nothing written.
+        assert!(default_settings_file().contains("\"theme_overrides\": {}"));
+
+        // Shapes are set the same way, in pixels, and kept to what a
+        // window can draw.
+        let shaped = parse_settings(
+            r#"{ "theme_overrides": { "shapes": {
+                "control_radius": 2, "token_radius": 0, "border_width": 40, "corner": 3
+            } } }"#,
+        )
+        .unwrap();
+        let shape = shaped.theme(Dark).shape;
+        assert_eq!((shape.control, shape.token), (px(2.), px(0.)));
+        assert_eq!(shape.border, px(3.));
+        assert_eq!(shape.panel, crate::theme::Shapes::default().panel);
+        assert_eq!(shaped.theme(Dark).bg, Theme::dark().bg);
+        let mistakes = shaped.theme_overrides.mistakes();
+        assert_eq!(mistakes.len(), 1, "{mistakes:?}");
+        assert!(mistakes[0].contains("no shape") && mistakes[0].contains("corner"));
     }
 
     #[test]

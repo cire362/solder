@@ -219,12 +219,12 @@ impl DatabasePanel {
         let base = div()
             .id(ix)
             .w_full()
-            .h(ROW_HEIGHT)
+            .h(crate::theme::row(ROW_HEIGHT, cx))
             .px_2()
             .flex()
             .items_center()
             .gap_2()
-            .rounded(px(8.))
+            .rounded(theme.shape.control)
             .text_size(UI_FONT_SIZE)
             .overflow_hidden();
         match row {
@@ -234,7 +234,7 @@ impl DatabasePanel {
                 .into_any_element(),
             Row::Note(text, error) => base
                 .pl(px(26.))
-                .text_size(px(11.5))
+                .text_size(crate::theme::text(11.5))
                 .text_color(if *error { theme.error } else { theme.fg_subtle })
                 .child(div().truncate().child(text.clone()))
                 .into_any_element(),
@@ -272,7 +272,7 @@ impl DatabasePanel {
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::text(11.))
                             .text_color(theme.fg_subtle)
                             .child(conn.spec.engine.label()),
                     )
@@ -285,9 +285,9 @@ impl DatabasePanel {
                                 .id(("db-lock", i))
                                 .flex_none()
                                 .px_1()
-                                .rounded(px(6.))
+                                .rounded(theme.shape.token)
                                 .bg(theme.bg_elev)
-                                .text_size(px(10.5))
+                                .text_size(crate::theme::text(10.5))
                                 .text_color(if locked { theme.warning } else { theme.error })
                                 .hover(|d| d.bg(theme.line))
                                 // Unlocked lasts until quit; locking again is a restart.
@@ -310,7 +310,7 @@ impl DatabasePanel {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::text(11.))
                             .text_color(theme.fg_subtle)
                             .child(conn.spec.source.clone()),
                     )
@@ -336,8 +336,8 @@ impl DatabasePanel {
                                     .px_1p5()
                                     .flex()
                                     .items_center()
-                                    .rounded(px(6.))
-                                    .text_size(px(11.))
+                                    .rounded(theme.shape.token)
+                                    .text_size(crate::theme::text(11.))
                                     .text_color(theme.fg_subtle)
                                     .hover(|d| d.bg(theme.line).text_color(theme.fg))
                                     .child("Query")
@@ -358,8 +358,8 @@ impl DatabasePanel {
                                         .px_1p5()
                                         .flex()
                                         .items_center()
-                                        .rounded(px(6.))
-                                        .text_size(px(11.))
+                                        .rounded(theme.shape.token)
+                                        .text_size(crate::theme::text(11.))
                                         .text_color(theme.fg_subtle)
                                         .hover(|d| d.bg(theme.line).text_color(theme.fg))
                                         .child("Key")
@@ -383,8 +383,8 @@ impl DatabasePanel {
                                         .px_1p5()
                                         .flex()
                                         .items_center()
-                                        .rounded(px(6.))
-                                        .text_size(px(11.))
+                                        .rounded(theme.shape.token)
+                                        .text_size(crate::theme::text(11.))
                                         .text_color(theme.fg_subtle)
                                         .hover(|d| d.bg(theme.line).text_color(theme.fg))
                                         .child("Table")
@@ -406,8 +406,8 @@ impl DatabasePanel {
                                         .px_1p5()
                                         .flex()
                                         .items_center()
-                                        .rounded(px(6.))
-                                        .text_size(px(11.))
+                                        .rounded(theme.shape.token)
+                                        .text_size(crate::theme::text(11.))
                                         .text_color(theme.fg_subtle)
                                         .hover(|d| d.bg(theme.line).text_color(theme.fg))
                                         .child("ERD")
@@ -452,7 +452,7 @@ impl DatabasePanel {
                         div()
                             .flex_none()
                             .w(px(14.))
-                            .text_size(px(10.5))
+                            .text_size(crate::theme::text(10.5))
                             .text_color(theme.accent)
                             .font_family(crate::theme::CODE_FONT)
                             .child(glyph),
@@ -467,7 +467,7 @@ impl DatabasePanel {
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::text(11.))
                             .text_color(theme.fg_subtle)
                             .child(detail),
                     )
@@ -481,8 +481,8 @@ impl DatabasePanel {
                                 .px_1p5()
                                 .flex()
                                 .items_center()
-                                .rounded(px(6.))
-                                .text_size(px(11.))
+                                .rounded(theme.shape.token)
+                                .text_size(crate::theme::text(11.))
                                 .text_color(theme.fg_subtle)
                                 .hover(|d| d.bg(theme.line).text_color(theme.fg))
                                 .child("Structure")
@@ -509,7 +509,7 @@ impl DatabasePanel {
                 };
                 let column = &object.columns[*k];
                 base.pl(px(48.))
-                    .text_size(px(11.5))
+                    .text_size(crate::theme::text(11.5))
                     .child(
                         div()
                             .min_w_0()

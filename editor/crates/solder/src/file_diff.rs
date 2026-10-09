@@ -343,7 +343,9 @@ impl FileDiff {
             .h_full()
             .flex()
             .items_center()
-            .when(before, |cell| cell.border_r_1().border_color(theme.line))
+            .when(before, |cell| {
+                cell.border_r(theme.shape.border).border_color(theme.line)
+            })
             .when(row.changed && line.is_some(), |cell| {
                 cell.bg(color.opacity(0.1))
             })
@@ -600,7 +602,7 @@ impl Render for FileDiff {
                         .items_center()
                         .gap_2()
                         .flex_wrap()
-                        .border_b_1()
+                        .border_b(theme.shape.border)
                         .border_color(theme.line)
                         .bg(theme.bg_sunken)
                         .child(div().flex_1().min_w_0().truncate().child(name))
@@ -670,7 +672,7 @@ impl Render for FileDiff {
                                 .flex_none()
                                 .flex()
                                 .bg(theme.bg_elev)
-                                .border_b_1()
+                                .border_b(theme.shape.border)
                                 .border_color(theme.line)
                                 .child(heading(
                                     labels.0,

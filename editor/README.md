@@ -732,7 +732,7 @@ here.
 | From | Solder uses | Does not run here |
 |---|---|---|
 | A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, icon themes, its language servers, its debug adapters, its context servers | |
-| A VS Code extension | Themes (JSON), snippets | Its code, TextMate grammars, everything the code would add |
+| A VS Code extension | Themes (JSON), icon themes drawn with pictures, snippets | Its code, TextMate grammars, icon themes drawn with a font, everything the code would add |
 
 A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
 It is compiled on the first file that needs it and runs in wasmtime inside
@@ -784,6 +784,13 @@ the file's name and ending. Press **Use** on it in the Extensions tab, or
 name it in `settings.json` (`"icon_theme": "Catppuccin Mocha"`); with none
 named, the tree has no pictures. The pictures are the extension's own SVG
 files, read from its folder.
+
+An icon theme of a VS Code extension works the same way, under the name the
+extension shows it by. It says which picture goes with a file's name, its
+ending or its language, and with a folder's name, open or closed. If it draws
+some files differently on a light background, there is a second theme for
+that, with ` Light` after the name. A theme drawn with the letters of a font
+and not with pictures is listed among what does not run here.
 
 An extension may also paint the completions of its server: Vue's shows a
 property as a tag followed by its detail. Its answer is colored as code in
@@ -854,6 +861,238 @@ For an installed extension the tab has:
 
 These decisions are kept in `extensions/state.json`.
 
+## The layout of the window
+
+Where the parts of the window are and how large is a file,
+`~/.config/solder/layout.json`, next to `settings.json`. **Open Layout** in
+the command palette opens it, written out with what is in use now. It is
+applied as soon as it is saved.
+
+```json
+{
+  "left": {
+    "width": 390,
+    "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions"]
+  },
+  "right": { "width": 380, "panels": ["chat", "agent"] },
+  "bottom": { "height": 280, "panels": ["terminal", "debug", "response", "results"] },
+  "title_bar": { "height": 38, "left": ["project"], "right": [] },
+  "tab_bar": { "height": 34, "place": "top" },
+  "status_bar": {
+    "height": 26,
+    "left": ["position", "indent", "language", "problems", "activity", "connection"],
+    "right": ["plugins", "performance"]
+  },
+  "hidden": [],
+  "open": ["files"]
+}
+```
+
+There are three docks, and each holds panels, with a tab for each: `panels`
+says which a dock holds and in what order, so the chat can be on the left,
+the file tree on the right and the terminals beside the code, or everything
+in one dock. `terminal` is every terminal, each with a tab of its own, and
+the button that opens another. `debug`, `response` (the answer to an HTTP
+request) and `results` (of a query) have a tab only while they have something
+to show; when the last of them closes, or the last terminal ends, its dock
+shows the first panel it has left, or closes. A panel named
+in `hidden` has no tab; its command and its key still open it, in the dock it
+comes in, and its tab is there for as long as it shows. A panel the file does
+not name is where it comes, after the ones the file names. When more tabs
+are in a dock than it is wide, they go on a second row.
+
+`open` names the panel each dock has open, one a dock; a dock with none of
+its panels there is closed. Solder writes it whenever a dock is opened,
+closed or turned to another panel, so the window starts the way it was left.
+A dock left on the terminals, the debugger or an answer starts closed: they
+have nothing to show yet. Saved by hand, it opens and closes docks like any
+other change to the file. Left out, the left dock is open on its first panel.
+
+Commands follow the panels: the chat's key opens and closes the dock the
+chat is in, and the sidebar's key the left one, on its first panel. When the
+file moves a panel that is showing, it shows in its new dock.
+
+A part left out has the size it came with. A size no window can show is
+brought to the nearest that fits (a side dock is 200 to 900 wide, the bottom
+one 100 to 1200 high, a bar 22 to 64). A mistake in the file is said in the
+status bar, like one in `settings.json`, and the layout that was right stays.
+
+The same sizes can be set by hand: drag the border of a dock. The dock
+follows the pointer, and when the border is let go its size is written into
+the file, next to whatever else you wrote there, comments included. A double
+click on a border puts its dock back to the size it came with. A file with a
+mistake in it is not written to.
+
+So can the panels. Drag a tab onto another tab and it goes before it, in the
+same dock or another one; dropped anywhere else in a dock, it goes to the end
+of that dock's row. While a tab is held, a closed dock shows a strip at its
+edge of the window to drop it on. The terminals move together, by any of
+their tabs. A panel moved to another dock is shown there.
+
+The right button on a tab opens a menu: hide the panel, move it to another
+dock, bring a hidden one back into this dock, and **Reset layout**. That
+command, also in the command palette, puts the window back as it comes. Since
+the file is what says how the window is, the file is put aside, whole, as
+`layout.json.old`.
+
+The title bar and the status bar hold items, from the left end and from the
+right one: `left` and `right` say which and in what order. An item is in one
+place; one the file names nowhere is on no bar, and an end the file leaves out
+keeps the items it comes with.
+
+Drag an item onto another and it goes before it. Drop it on empty space at
+either end of either bar and it goes after that end's other items. An empty
+end still has room to drop one on. The right button on an item opens its
+menu: **Hide**, **Move to**, the hidden items to **Show**, and **Reset layout**.
+The right button on empty space opens the same list of hidden items, to bring
+one back there. Escape or a click outside closes the menu. Clickable items,
+such as the branch, keep their actions after moving.
+
+| Item | Says |
+|---|---|
+| `project` | the project's name |
+| `file` | the file in front, from the project's folder |
+| `branch` | the branch; a click opens the list of branches |
+| `position` | the line and column of the cursor, and how many cursors |
+| `indent` | spaces or tabs, and how many |
+| `language` | the language of the file |
+| `problems` | how many errors and warnings the file has |
+| `activity` | a language server starting, files being read |
+| `connection` | the database of a query file; a click picks another |
+| `plugins` | what plugins show; a click opens the Plugins window |
+| `performance` | the numbers of `show_performance_hud` |
+
+An item with nothing to say now is not drawn. `file` and `branch` are on no bar
+until the file puts them on one. A mistake in a config file is always said in
+the status bar, whatever it holds.
+
+Panel tabs, bar items and common command buttons have Phosphor icons next to
+their labels. The regular SVGs are embedded in the app under the MIT license;
+they need no icon files or network connection at run time. They use the text
+color of their control and scale with `ui_font_size`. File icons still come
+from the icon theme of a Zed or VS Code extension selected with `icon_theme`.
+
+An item of a bar is drawn as a word, an icon or both, and a bar can hold a
+button for any command. Both are under `items` in the layout file, by the
+item's name:
+
+```json
+{
+  "status_bar": { "left": ["position", "language"], "right": [{ "button": "term" }] },
+  "items": {
+    "position": { "display": "icon" },
+    "language": { "display": "text" },
+    "term": {
+      "label": "Terminal",
+      "icon": "terminal-window",
+      "command": "workspace::ToggleTerminal"
+    }
+  }
+}
+```
+
+`display` is `text`, `icon` or `both`, which is how an item comes. `icon` is
+one of the embedded icons by its Phosphor name (`gear`, `play`, `git-branch`,
+`magnifying-glass`, and the rest of the folder `assets/icons/phosphor`).
+`label` is the word it shows. `command` is what a click runs, written as in
+`keymap.json`: a command's name, `["name", arguments]` for one that takes
+them, or `{ "plugin": "...", "command": "..." }` for a plugin's command.
+
+A name under `items` that is no item of the editor's is a button, and a bar
+holds it as `{ "button": "name" }`. An item of the editor's own takes the same
+keys: with a `label` or a `command` it shows that word and runs that command
+in place of its own. An icon alone says what it is when the pointer rests on
+it.
+
+By hand, the menu of an item has **Text**, **Icon** and **Text and icon**,
+**Add command button**, which lists every command and puts a button for the
+chosen one at the end of that bar, and for a button **Remove button**. **Edit
+icon or command** opens the file. A button with no command, an icon that is
+not in the app or a command that does not exist is a mistake, said in the
+status bar, and the layout that was right stays.
+
+`place` of `tab_bar` is where the tabs of the open files are: `top`, `bottom`
+or `none`. With none, files are changed by the keys and the file finder.
+
+**Workspace: Save layout** keeps the window as it is under a new name, in
+`~/.config/solder/layouts/<name>.json`, and selects it. An existing name is
+left alone. **Workspace: Switch layout** opens a searchable list of saved
+layouts; **Default** in that list is the original `layout.json`.
+
+While a named layout is selected, its file is the truth: dragging, panel and
+bar menus and opening or closing docks write into it, **Open layout** opens it,
+and saving it by hand applies it. **Reset layout** puts that file aside as
+`<name>.json.old` and gives it the default layout. Switching waits for earlier
+changes to reach their file, so no change ends up in the wrong layout.
+
+One key can switch straight to a layout, without opening the list, in
+`keymap.json`:
+
+```json
+[
+  {
+    "context": "Workspace",
+    "bindings": {
+      "alt-shift-r": ["workspace::SwitchLayout", { "name": "Review" }],
+      "alt-shift-d": ["workspace::SwitchLayout", { "name": "Default" }]
+    }
+  }
+]
+```
+
+The current choice and the choice each project was left in are kept in
+`layouts.json`. A project opened again selects its saved layout. The layout
+is shared by all open windows: a switch changes them together and remembers
+it for every project still open. A project with no saved choice uses the
+current layout. Missing or broken layout files leave the last good layout
+in use and say what is wrong in the status bar.
+
+**Workspace: Switch key layout** chooses **Default**, **VS Code**,
+**JetBrains**, or a file in `~/.config/solder/keymaps/<name>.json`. The presets
+cover the commands Solder has, with the keys of the current platform. The
+choice is saved as `key_layout` in `settings.json` and applies to all windows.
+
+**Workspace: Save key layout** copies the selected set under a new name and
+selects it; an existing file is left alone. **Workspace: Open key layout**
+opens that file for editing. For a built-in set it asks for a copy's name
+first; run Open key layout again to edit the saved copy. Saving a key layout
+applies it immediately. Invalid bindings or a missing file keep the last
+good set and report the error in the status bar.
+
+Bindings apply in this order: Solder's defaults, `keymap-imported.json`, the
+selected set, then personal `keymap.json`. A saved copy contains only the
+selected set; personal and imported bindings keep their own files.
+**Workspace: Open keymap** still opens the personal file. A key can choose a
+set directly, for example in `keymap.json`:
+
+```json
+[
+  {
+    "context": "Workspace",
+    "bindings": {
+      "alt-shift-v": ["workspace::SwitchKeyLayout", { "name": "VS Code" }],
+      "alt-shift-d": ["workspace::SwitchKeyLayout", { "name": "Default" }]
+    }
+  }
+]
+```
+
+The text of the interface is set in `settings.json`, apart from the code's:
+
+```json
+{
+  "ui_font_family": "Inter",
+  "ui_font_size": 14,
+  "ui_density": "comfortable"
+}
+```
+
+`ui_font_size` is 12.5 as it comes and may be 9 to 18. The room around the
+text grows and shrinks with it, and the rows of lists grow with larger text so
+that a line always fits. `ui_density` is how tall those rows are: `compact`,
+`default` or `comfortable`. The bars keep the heights `layout.json` gives
+them.
+
 ## Settings from another editor
 
 On a first launch (no `~/.config/solder/settings.json` yet) Solder looks for VS
@@ -887,7 +1126,8 @@ Solder's tokens as hex colors, so it can be edited or written by hand:
   "name": "Night Owl",
   "appearance": "dark",
   "colors": { "bg": "#011627", "fg": "#d6deeb", "accent": "#7e57c2" },
-  "syntax": { "keyword": "#c792ea", "string": "#ecc48d" }
+  "syntax": { "keyword": "#c792ea", "string": "#ecc48d" },
+  "terminal": { "red": "#ef5350", "bright_blue": "#82aaff" }
 }
 ```
 
@@ -896,6 +1136,43 @@ theme, the workbench colors and the TextMate rules are laid over those tokens;
 what the theme does not say (or says in a way that would not read here, like a
 border in its brightest color) is worked out from its background and text.
 Snippets, Vim configs and JetBrains color schemes are not imported.
+
+Every color in the window is one of these tokens: 21 in `colors`, 9 in `syntax`
+and the 16 of `terminal`, which are the colors programs there ask for by number
+(`black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, and each
+with `bright_` before it). A theme from VS Code or Zed brings the terminal
+colors it has.
+
+A theme's file is applied as soon as it is saved, so a theme can be written
+with the window in view. To change a few tokens without a file of your own, set
+them in `settings.json`, over whichever theme is in use:
+
+```json
+{
+  "theme": "dark",
+  "theme_overrides": {
+    "accent": "#00c2a8",
+    "syntax": { "comment": "#7a7a85" },
+    "terminal": { "red": "#ff5f56" }
+  }
+}
+```
+
+A name that is no token, or a value that is no color, changes nothing and is
+said in the status bar.
+
+A theme sets shapes next to its colors, in pixels, in its file or in
+`theme_overrides`:
+
+```json
+"shapes": { "panel_radius": 16, "control_radius": 8, "token_radius": 6, "border_width": 1 }
+```
+
+`control_radius` is the corners of buttons, fields, tabs and rows;
+`token_radius` of what sits inside a line, like a key or an item of a menu;
+`panel_radius` of windows over the editor and cards. `border_width` is the
+lines between the parts of the window, 0 to 3. The room around text is not a
+theme's: it follows `ui_font_size`.
 
 ## Measured so far
 

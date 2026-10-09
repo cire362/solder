@@ -184,7 +184,7 @@ impl DebugPanel {
     fn render_toolbar(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let store = self.store.read(cx);
         let state = store.state.clone();
-        let small = UI_FONT_SIZE - px(1.);
+        let small = crate::theme::UI_FONT_SMALL;
         let mut bar = div()
             .flex_none()
             .h(px(36.))
@@ -192,7 +192,7 @@ impl DebugPanel {
             .flex()
             .items_center()
             .gap_1p5()
-            .border_b_1()
+            .border_b(theme.shape.border)
             .border_color(theme.line);
         let config = self.configs.get(self.selected).map(|c| c.name.clone());
         match &state {
@@ -207,8 +207,8 @@ impl DebugPanel {
                             .h(px(26.))
                             .flex()
                             .items_center()
-                            .rounded(px(8.))
-                            .border_1()
+                            .rounded(theme.shape.control)
+                            .border(theme.shape.border)
                             .border_color(theme.line)
                             .hover(|d| d.bg(theme.bg_elev))
                             .text_size(UI_FONT_SIZE)
@@ -303,8 +303,8 @@ impl DebugPanel {
             .mx_2()
             .mt_1()
             .p_1()
-            .rounded(px(8.))
-            .border_1()
+            .rounded(theme.shape.control)
+            .border(theme.shape.border)
             .border_color(theme.line)
             .bg(theme.bg_elev)
             .flex()
@@ -313,7 +313,7 @@ impl DebugPanel {
             menu = menu.child(
                 div()
                     .p_2()
-                    .text_size(UI_FONT_SIZE - px(1.))
+                    .text_size(crate::theme::UI_FONT_SMALL)
                     .text_color(theme.fg_subtle)
                     .child("Open a .js or .ts file, or add scripts to package.json."),
             );
@@ -325,7 +325,7 @@ impl DebugPanel {
                     .debug_selector(move || format!("debug-config-{i}"))
                     .px_2()
                     .py_1()
-                    .rounded(px(6.))
+                    .rounded(theme.shape.token)
                     .text_size(UI_FONT_SIZE)
                     .text_color(if i == self.selected {
                         theme.accent
@@ -352,7 +352,7 @@ impl DebugPanel {
                 .id(id)
                 .debug_selector(move || id.into())
                 .px_1()
-                .text_size(px(10.5))
+                .text_size(crate::theme::text(10.5))
                 .text_color(if active { theme.fg } else { theme.fg_subtle })
                 .hover(|d| d.text_color(theme.fg))
                 .child(label)
@@ -399,7 +399,7 @@ impl DebugPanel {
                 .flex_1()
                 .px_2()
                 .pt_1()
-                .text_size(px(12.))
+                .text_size(crate::theme::text(12.))
                 .text_color(theme.fg_subtle)
                 .child("Requests and SQL queries of a Node run show up here.")
                 .into_any_element();
@@ -438,19 +438,19 @@ impl DebugPanel {
                         .id(("debug-timeline-row", i))
                         .debug_selector(move || format!("debug-timeline-{i}"))
                         .w_full()
-                        .h(ROW)
+                        .h(crate::theme::row(ROW, cx))
                         .px_2()
                         .flex()
                         .items_center()
                         .gap_2()
-                        .text_size(px(12.))
+                        .text_size(crate::theme::text(12.))
                         .hover(|d| d.bg(theme.bg_elev))
                         .when(e.parent.is_some(), |d| d.pl(px(22.)))
                         .child(
                             div()
                                 .w(px(28.))
                                 .flex_none()
-                                .text_size(px(10.5))
+                                .text_size(crate::theme::text(10.5))
                                 .text_color(badge_color)
                                 .child(badge),
                         )
@@ -514,7 +514,7 @@ impl DebugPanel {
             .px_2()
             .pt_1p5()
             .pb_0p5()
-            .text_size(px(10.5))
+            .text_size(crate::theme::text(10.5))
             .text_color(theme.fg_subtle)
             .child(label)
             .into_any_element()
@@ -596,7 +596,7 @@ impl Render for DebugPanel {
                             .h_full()
                             .flex()
                             .flex_col()
-                            .border_r_1()
+                            .border_r(theme.shape.border)
                             .border_color(theme.line)
                             .child(Self::header("CALL STACK", &theme))
                             .child(
@@ -614,12 +614,12 @@ impl Render for DebugPanel {
                                                     .debug_selector(move || {
                                                         format!("debug-frame-{i}")
                                                     })
-                                                    .h(ROW)
+                                                    .h(crate::theme::row(ROW, cx))
                                                     .px_2()
                                                     .flex()
                                                     .items_center()
                                                     .gap_2()
-                                                    .text_size(px(12.))
+                                                    .text_size(crate::theme::text(12.))
                                                     .when(selected, |d| d.bg(theme.accent_soft))
                                                     .hover(|d| d.bg(theme.bg_elev))
                                                     .child(
@@ -661,7 +661,7 @@ impl Render for DebugPanel {
                             .h_full()
                             .flex()
                             .flex_col()
-                            .border_r_1()
+                            .border_r(theme.shape.border)
                             .border_color(theme.line)
                             .child(Self::header("VARIABLES", &theme))
                             .child(
@@ -679,13 +679,13 @@ impl Render for DebugPanel {
                                                     .debug_selector(move || {
                                                         format!("debug-var-{i}")
                                                     })
-                                                    .h(ROW)
+                                                    .h(crate::theme::row(ROW, cx))
                                                     .pl(px(8. + 14. * v.depth as f32))
                                                     .pr_2()
                                                     .flex()
                                                     .items_center()
                                                     .gap_1()
-                                                    .text_size(px(12.))
+                                                    .text_size(crate::theme::text(12.))
                                                     .font_family(crate::theme::CODE_FONT)
                                                     .hover(|d| d.bg(theme.bg_elev))
                                                     .child(
@@ -771,12 +771,12 @@ impl Render for DebugPanel {
                                                         text.clone().into()
                                                     };
                                                     div()
-                                                        .h(ROW)
+                                                        .h(crate::theme::row(ROW, cx))
                                                         .px_2()
                                                         .flex()
                                                         .items_center()
                                                         .font_family(crate::theme::CODE_FONT)
-                                                        .text_size(px(12.))
+                                                        .text_size(crate::theme::text(12.))
                                                         .text_color(color)
                                                         .child(div().truncate().child(shown))
                                                 })
@@ -789,7 +789,7 @@ impl Render for DebugPanel {
                                     div()
                                         .flex_none()
                                         .p_1p5()
-                                        .border_t_1()
+                                        .border_t(theme.shape.border)
                                         .border_color(theme.line)
                                         .flex()
                                         .key_context("DebugConsole")

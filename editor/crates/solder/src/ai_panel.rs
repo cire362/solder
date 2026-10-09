@@ -121,7 +121,7 @@ impl AiPanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let store = self.store.read(cx);
-        let small = UI_FONT_SIZE - px(1.);
+        let small = crate::theme::UI_FONT_SMALL;
         let entity = self.store.clone();
         let panel = cx.entity();
         let mut list = div().flex().flex_col().gap_0p5().px_1p5();
@@ -204,7 +204,7 @@ impl AiPanel {
                     })
                     .px_2()
                     .py_1p5()
-                    .rounded(px(8.))
+                    .rounded(theme.shape.control)
                     .hover(|d| d.bg(theme.bg_elev))
                     .flex()
                     .flex_col()
@@ -228,7 +228,7 @@ impl AiPanel {
                     .child(
                         div()
                             .truncate()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::text(11.))
                             .text_color(status.1)
                             .child(match key_note {
                                 Some(note) => format!("{} · {note}", status.0),
@@ -390,7 +390,7 @@ impl AiPanel {
     /// The context servers of the settings and how each is doing. They
     /// start with an agent task, so before the first one all of them wait.
     fn render_servers(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let small = UI_FONT_SIZE - px(1.);
+        let small = crate::theme::UI_FONT_SMALL;
         let configured = McpStore::listed(cx);
         let store = McpStore::global(cx);
         let store = store.read(cx);
@@ -466,7 +466,7 @@ impl AiPanel {
             .gap_1p5()
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(crate::theme::text(11.))
                     .text_color(theme.fg_subtle)
                     .child("REVIEW BEFORE PUSH"),
             )
@@ -478,7 +478,7 @@ impl AiPanel {
                     .child(
                         div()
                             .flex_1()
-                            .text_size(UI_FONT_SIZE - px(1.))
+                            .text_size(crate::theme::UI_FONT_SMALL)
                             .text_color(theme.fg_subtle)
                             .child("Push in the Git tab first has the chat model read what it sends; problems stop the push until you decide."),
                     )
@@ -495,7 +495,7 @@ impl AiPanel {
     /// Which model suggests code while typing, and whether it does.
     fn render_completions(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let store = self.store.read(cx);
-        let small = UI_FONT_SIZE - px(1.);
+        let small = crate::theme::UI_FONT_SMALL;
         let current = store.roles.get(&Role::Completion).cloned();
         let label = current
             .as_ref()
@@ -510,7 +510,7 @@ impl AiPanel {
             .gap_1p5()
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(crate::theme::text(11.))
                     .text_color(theme.fg_subtle)
                     .child("COMPLETIONS"),
             )
@@ -527,8 +527,8 @@ impl AiPanel {
                             .min_w_0()
                             .px_2()
                             .py_1()
-                            .rounded(px(8.))
-                            .border_1()
+                            .rounded(theme.shape.control)
+                            .border(theme.shape.border)
                             .border_color(theme.line)
                             .hover(|d| d.bg(theme.bg_elev))
                             .truncate()
@@ -557,8 +557,8 @@ impl AiPanel {
         if self.completion_picker {
             let mut menu = div()
                 .p_1()
-                .rounded(px(8.))
-                .border_1()
+                .rounded(theme.shape.control)
+                .border(theme.shape.border)
                 .border_color(theme.line)
                 .bg(theme.bg_elev)
                 .flex()
@@ -568,7 +568,7 @@ impl AiPanel {
                     div()
                         .px_2()
                         .pt_1()
-                        .text_size(px(10.5))
+                        .text_size(crate::theme::text(10.5))
                         .text_color(theme.fg_subtle)
                         .child(provider.name.to_uppercase()),
                 );
@@ -582,7 +582,7 @@ impl AiPanel {
                             .debug_selector(move || selector.clone())
                             .px_2()
                             .py_1()
-                            .rounded(px(6.))
+                            .rounded(theme.shape.token)
                             .text_size(UI_FONT_SIZE)
                             .text_color(if active { theme.accent } else { theme.fg })
                             .hover(|d| d.bg(theme.accent_soft))
@@ -658,12 +658,12 @@ impl AiPanel {
         div()
             .h(px(4.))
             .w_full()
-            .rounded(px(6.))
+            .rounded(theme.shape.token)
             .bg(theme.bg_sunken)
             .child(
                 div()
                     .h_full()
-                    .rounded(px(6.))
+                    .rounded(theme.shape.token)
                     .bg(theme.accent)
                     .w(gpui::relative(fraction.unwrap_or(0.).clamp(0., 1.))),
             )
@@ -671,7 +671,7 @@ impl AiPanel {
 
     fn render_benchmark(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
-        let small = UI_FONT_SIZE - px(1.);
+        let small = crate::theme::UI_FONT_SMALL;
         let mut block = div().px_3().pb_3().flex().flex_col().gap_2();
         if let Some(step) = &store.benchmark {
             let (label, fraction) = match step {
@@ -769,9 +769,9 @@ impl AiPanel {
         div()
             .flex_none()
             .px_1()
-            .rounded(px(6.))
+            .rounded(theme.shape.token)
             .bg(theme.bg_sunken)
-            .text_size(px(10.5))
+            .text_size(crate::theme::text(10.5))
             .text_color(color)
             .child(label)
     }
@@ -831,7 +831,7 @@ impl AiPanel {
                 .child(
                     div()
                         .w(px(36.))
-                        .text_size(px(11.))
+                        .text_size(crate::theme::text(11.))
                         .text_color(theme.fg_muted)
                         .child(fraction.map_or("...".to_string(), |f| format!("{:.0}%", f * 100.))),
                 )
@@ -849,7 +849,7 @@ impl AiPanel {
                 .into_any_element()
         } else if verifying {
             div()
-                .text_size(px(11.))
+                .text_size(crate::theme::text(11.))
                 .text_color(theme.fg_subtle)
                 .child("Measuring...")
                 .into_any_element()
@@ -929,12 +929,12 @@ impl AiPanel {
                     .id(("ai-model", ix))
                     .debug_selector(move || format!("ai-model-{ix}"))
                     .group("ai-model")
-                    .h(ROW_HEIGHT)
+                    .h(crate::theme::row(ROW_HEIGHT, cx))
                     .px_2()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .rounded(px(8.))
+                    .rounded(theme.shape.control)
                     .hover(|d| d.bg(theme.bg_elev))
                     .when(!c.fits && !installed, |d| d.opacity(0.55))
                     .child(
@@ -972,7 +972,7 @@ impl AiPanel {
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(11.))
+                                    .text_size(crate::theme::text(11.))
                                     .text_color(theme.fg_subtle)
                                     .child(detail),
                             )
@@ -1094,7 +1094,7 @@ impl Render for AiPanel {
                     div()
                         .px_3()
                         .pb_2()
-                        .text_size(UI_FONT_SIZE - px(1.))
+                        .text_size(crate::theme::UI_FONT_SMALL)
                         .text_color(theme.error)
                         .child(e)
                 }))
@@ -1103,7 +1103,7 @@ impl Render for AiPanel {
         }
         let add = self.render_add(window, &theme, cx);
         let store = self.store.read(cx);
-        let small = UI_FONT_SIZE - px(1.);
+        let small = crate::theme::UI_FONT_SMALL;
         let header = match &store.hardware {
             None => div()
                 .px_3()

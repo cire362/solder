@@ -481,7 +481,7 @@ impl StructureView {
         div()
             .pt_4()
             .pb_1p5()
-            .text_size(px(11.5))
+            .text_size(crate::theme::text(11.5))
             .text_color(theme.fg_subtle)
             .child(title)
     }
@@ -494,7 +494,7 @@ impl StructureView {
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(6.))
+            .rounded(theme.shape.token)
             .text_color(theme.fg_subtle)
             .hover(|d| d.bg(theme.line).text_color(theme.error))
             .child("×")
@@ -543,7 +543,7 @@ impl StructureView {
                 .when(c.auto, |d| {
                     d.child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::text(11.))
                             .text_color(theme.fg_subtle)
                             .child("auto"),
                     )
@@ -551,7 +551,7 @@ impl StructureView {
                 .when(c.original.is_none(), |d| {
                     d.child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::text(11.))
                             .text_color(theme.accent)
                             .child("new"),
                     )
@@ -808,13 +808,13 @@ impl Render for StructureView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .border_b_1()
+                    .border_b(theme.shape.border)
                     .border_color(theme.line)
                     .child(
                         div()
                             .flex_none()
                             .px_1p5()
-                            .rounded(px(6.))
+                            .rounded(theme.shape.token)
                             .bg(theme.bg_elev)
                             .text_color(theme.fg_muted)
                             .child(self.connection.clone()),

@@ -589,7 +589,8 @@ impl Editor {
         )?;
         let theme = cx.theme().clone();
         let count = menu.filtered.len();
-        let height = COMPLETION_ROW_HEIGHT * count.min(COMPLETION_ROWS) as f32 + px(8.);
+        let row = crate::theme::row(COMPLETION_ROW_HEIGHT, cx);
+        let height = row * count.min(COMPLETION_ROWS) as f32 + px(8.);
         let list = uniform_list(
             "completions",
             count,
@@ -623,13 +624,13 @@ impl Editor {
                         };
                         div()
                             .id(ix)
-                            .h(COMPLETION_ROW_HEIGHT)
+                            .h(row)
                             .mx_1()
                             .px_1p5()
                             .flex()
                             .items_center()
                             .gap_2()
-                            .rounded(px(6.))
+                            .rounded(theme.shape.token)
                             .when(ix == menu.selected, |d| d.bg(theme.accent_soft))
                             .child(div().w(px(14.)).flex_none().text_color(color).child(badge))
                             .child(div().flex_none().text_color(theme.fg).child(text))
@@ -639,7 +640,7 @@ impl Editor {
                                     .min_w_0()
                                     .truncate()
                                     .text_right()
-                                    .text_size(px(11.))
+                                    .text_size(crate::theme::text(11.))
                                     .text_color(theme.fg_subtle)
                                     .child(detail),
                             )
@@ -671,12 +672,12 @@ impl Editor {
                             .occlude()
                             .w(px(440.))
                             .bg(theme.bg_elev)
-                            .border_1()
+                            .border(theme.shape.border)
                             .border_color(theme.line)
-                            .rounded(px(8.))
+                            .rounded(theme.shape.control)
                             .shadow_lg()
                             .font_family(settings.buffer_font_family.clone())
-                            .text_size(px(12.5))
+                            .text_size(crate::theme::text(12.5))
                             .child(list),
                     ),
             )
@@ -804,10 +805,10 @@ impl Editor {
             HoverBlock::Code(code) => div()
                 .px_2()
                 .py_1p5()
-                .rounded(px(6.))
+                .rounded(theme.shape.token)
                 .bg(theme.bg_sunken)
                 .font_family(code_font.clone())
-                .text_size(px(12.))
+                .text_size(crate::theme::text(12.))
                 .text_color(theme.fg)
                 .child(code.clone()),
             HoverBlock::Text(text) => div().text_color(theme.fg_muted).child(text.clone()),
@@ -830,9 +831,9 @@ impl Editor {
                             .flex_col()
                             .gap_2()
                             .bg(theme.bg_elev)
-                            .border_1()
+                            .border(theme.shape.border)
                             .border_color(theme.line)
-                            .rounded(px(8.))
+                            .rounded(theme.shape.control)
                             .shadow_lg()
                             .text_size(UI_FONT_SIZE)
                             .children(blocks),
@@ -1242,12 +1243,12 @@ impl Editor {
                             .px_2()
                             .py_1()
                             .bg(theme.bg_elev)
-                            .border_1()
+                            .border(theme.shape.border)
                             .border_color(theme.line)
-                            .rounded(px(8.))
+                            .rounded(theme.shape.control)
                             .shadow_lg()
                             .font_family(settings.buffer_font_family.clone())
-                            .text_size(px(12.))
+                            .text_size(crate::theme::text(12.))
                             .text_color(theme.fg_muted)
                             .child(
                                 gpui::StyledText::new(SharedString::from(hint.label.clone()))

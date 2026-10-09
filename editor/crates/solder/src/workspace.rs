@@ -8,9 +8,10 @@ use std::{
 };
 
 use gpui::{
-    AnyView, App, Context, DismissEvent, Entity, EntityId, FocusHandle, Focusable, KeyBinding,
-    ManagedView, MouseButton, PathPromptOptions, PromptLevel, SharedString, Subscription, Task,
-    Window, WindowControlArea, actions, deferred, div, prelude::*, px,
+    AnyElement, AnyView, App, Context, DismissEvent, Entity, EntityId, FocusHandle, Focusable,
+    KeyBinding, ManagedView, MouseButton, MouseDownEvent, MouseMoveEvent, PathPromptOptions,
+    Pixels, Point, PromptLevel, SharedString, Subscription, Task, Window, WindowControlArea,
+    actions, anchored, deferred, div, prelude::*, px,
 };
 
 use crate::{
@@ -30,6 +31,9 @@ use crate::{
     git_store::{GitStore, GitStoreEvent},
     go_to_line::GoToLine as GoToLineDelegate,
     inline_edit::{InlineEdit, InlineEditEvent},
+    key_layout_picker::{KeyLayoutPicker, SwitchKeyLayout},
+    layout::{self, BarEnd, Display, Item, Layout, Panel, Part, Place, TabBar, TabsAt},
+    layout_picker::{LayoutPicker, SwitchLayout},
     locations::{CodeActionPicker, LocationPicker, RenamePrompt},
     lsp_store::{LspStore, from_range},
     perf::{self, Perf},
@@ -42,7 +46,7 @@ use crate::{
     services_panel::{RunStack, ServicesEvent, ServicesPanel, StopAll},
     settings::{self, Settings},
     terminal::{Terminal, TerminalCommand, TerminalEvent},
-    theme::{ActiveTheme, UI_FONT, UI_FONT_SIZE},
+    theme::{ActiveTheme, UI_FONT_SIZE},
 };
 
 actions!(
@@ -69,6 +73,11 @@ actions!(
         OpenFolder,
         OpenSettings,
         OpenKeymap,
+        OpenLayout,
+        SaveLayout,
+        SaveKeyLayout,
+        OpenKeyLayout,
+        ResetLayout,
         SplitRight,
         FocusNextPane,
         FocusPrevPane,
@@ -158,21 +167,6 @@ pub fn bind_keys(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
 
-const SIDEBAR_WIDTH: f32 = 390.;
-
-/// The bottom dock's tab in front.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DockView {
-    Terminal,
-    Results,
-    Response,
-    Debug,
-}
-const CHAT_WIDTH: f32 = 380.;
-const TITLEBAR_HEIGHT: f32 = 38.;
-const TAB_BAR_HEIGHT: f32 = 34.;
-const STATUS_HEIGHT: f32 = 26.;
-const DOCK_HEIGHT: f32 = 280.;
 const RECENT_LIMIT: usize = 20;
 
 /// Where to put the cursor after opening a file.
@@ -191,18 +185,6 @@ pub enum Jump {
         range: lsp::types::Range,
         encoding: lsp::Encoding,
     },
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SidebarTab {
-    Files,
-    Search,
-    Git,
-    Services,
-    Database,
-    Api,
-    Ai,
-    Extensions,
 }
 
 struct Modal {
@@ -248,18 +230,13 @@ pub struct Workspace {
     extensions_panel: Entity<crate::extensions_panel::ExtensionsPanel>,
     chat: Entity<crate::chat_panel::ChatPanel>,
     agent: Entity<crate::agent_panel::AgentPanel>,
-    /// The right dock shows the agent rather than the chat.
-    agent_shown: bool,
     /// Pushes started, for tests: the terminal running one may be gone.
     #[cfg(test)]
     pushes: usize,
-    chat_open: bool,
     inline_edit: Option<(Entity<InlineEdit>, Subscription)>,
     results: Entity<ResultsView>,
     /// The Results tab is in the dock (a query has run and it was not closed).
     show_results: bool,
-    /// What the dock shows: the active terminal or one of its other tabs.
-    dock_view: DockView,
     /// The last HTTP response, the dock's Response tab.
     response: Entity<crate::response::ResponseView>,
     show_response: bool,
@@ -284,17 +261,116 @@ pub struct Workspace {
     panes: Vec<Pane>,
     active_pane: usize,
     recent: VecDeque<Arc<str>>,
-    sidebar: Option<SidebarTab>,
+    /// The panel each dock shows; `None` for a dock that is closed. Which
+    /// dock a panel is in is the layout's to say.
+    left: Option<Panel>,
+    right: Option<Panel>,
+    bottom: Option<Panel>,
+    /// Where the focus is when it is anywhere in a dock, to know if
+    /// closing the dock takes the focus with it.
+    dock_focus: [FocusHandle; 3],
+    _layout: Subscription,
+    layout_selection: u64,
+    /// A border being dragged: the part it sizes, where the pointer went
+    /// down along the border's way, and the part's size then.
+    resizing: Option<(Part, f32, f32)>,
+    /// The menu of a dock: where it opened, the dock, and the panel whose
+    /// tab was under the pointer, if one was.
+    dock_menu: Option<(Point<Pixels>, Place, Option<Panel>)>,
+    bar_menu: Option<(Point<Pixels>, BarEnd, Option<Item>)>,
+    /// The panel whose tab is being dragged. A closed dock has a place to
+    /// drop it on for as long as it is.
+    dragging: Option<Panel>,
     modal: Option<Modal>,
     terminals: Vec<(Entity<Terminal>, Subscription)>,
     active_terminal: usize,
-    dock_open: bool,
     _subscriptions: Vec<Subscription>,
     _hud_tick: Task<()>,
 }
 
+/// What an item of a layout menu does.
+type MenuRun = Box<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
+
+/// A panel's tab while it is dragged to another place.
+#[derive(Clone, Copy)]
+struct DraggedPanel(Panel);
+
+/// What follows the pointer then.
+struct DraggedTab(Panel);
+
+#[derive(Clone)]
+struct DraggedItem(Item);
+
+struct DraggedBarItem(Item);
+
+struct BarPart {
+    text: String,
+    id: Option<(&'static str, usize)>,
+    color: Option<gpui::Hsla>,
+    action: Option<Box<dyn gpui::Action>>,
+}
+
+impl BarPart {
+    fn render(self, clickable: bool, theme: &crate::theme::Theme) -> AnyElement {
+        let d = div()
+            .when_some(self.color, |d, color| d.text_color(color))
+            .child(self.text);
+        match self.action.filter(|_| clickable) {
+            Some(action) => d
+                .id(self.id.unwrap())
+                .px_1p5()
+                .rounded(theme.shape.token)
+                .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+                .into_any_element(),
+            None => d.into_any_element(),
+        }
+    }
+}
+
+impl Render for DraggedBarItem {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .h(crate::theme::row(px(24.), cx))
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded(theme.shape.control)
+            .bg(theme.bg_elev)
+            .border(theme.shape.border)
+            .border_color(theme.line)
+            .text_size(UI_FONT_SIZE)
+            .text_color(theme.fg)
+            .gap_1p5()
+            .child(crate::icons::draw(crate::icons::item(&self.0)))
+            .child(self.0.label().to_owned())
+    }
+}
+
+impl Render for DraggedTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .h(px(24.))
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded(theme.shape.control)
+            .bg(theme.bg_elev)
+            .border(theme.shape.border)
+            .border_color(theme.line)
+            .text_size(UI_FONT_SIZE)
+            .text_color(theme.fg)
+            .gap_1p5()
+            .child(crate::icons::draw(crate::icons::panel(self.0)))
+            .child(self.0.label())
+    }
+}
+
 impl Workspace {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        layout::for_project(&root, window, cx);
         let project = cx.new(|cx| Project::new(root.clone(), cx));
         let project_panel = cx.new(|cx| ProjectPanel::new(root.clone(), cx));
         let git = cx.new(|cx| GitStore::new(root.clone(), cx));
@@ -342,8 +418,7 @@ impl Workspace {
                     // The window whose project holds the file shows it.
                     if path.starts_with(this.root(cx)) {
                         this.show_debug = true;
-                        this.dock_view = DockView::Debug;
-                        this.dock_open = true;
+                        this.show_panel(Panel::Debug, cx);
                         this.open_path(
                             path.clone(),
                             Some(Jump::Point {
@@ -453,8 +528,7 @@ impl Workspace {
                         this.results
                             .update(cx, |r, cx| r.browse(connection, engine, spec, cx));
                         this.show_results = true;
-                        this.dock_view = DockView::Results;
-                        this.dock_open = true;
+                        this.show_panel(Panel::Results, cx);
                         cx.notify();
                     }
                     DatabasePanelEvent::Structure {
@@ -476,8 +550,7 @@ impl Workspace {
                                 workspace
                                     .update(cx, |ws, cx| {
                                         ws.show_results = true;
-                                        ws.dock_view = DockView::Results;
-                                        ws.dock_open = true;
+                                        ws.show_panel(Panel::Results, cx);
                                         cx.notify();
                                     })
                                     .ok();
@@ -583,10 +656,12 @@ impl Workspace {
                 cx.set_global(theme);
                 window.refresh();
             }),
-            // Settings changed: the theme mode may have too.
+            // Settings changed: the theme mode may have too, and the size
+            // of the interface's text.
             cx.observe_global_in::<Settings>(window, |_, window, cx| {
                 let theme = Settings::get(cx).theme(window.appearance());
                 cx.set_global(theme);
+                window.set_rem_size(Settings::get(cx).rem_size());
                 window.refresh();
             }),
         ];
@@ -615,7 +690,20 @@ impl Workspace {
                 }
             }
         });
-        Self {
+        window.set_rem_size(Settings::get(cx).rem_size());
+        // The docks start on the panels they were left on. The terminals,
+        // the debugger and the answers have nothing to show yet, so a dock
+        // left on one of them starts closed.
+        let layout = Layout::get(cx);
+        let [left, right, bottom] = Place::ALL.map(|place| {
+            layout.open_in(place).filter(|panel| {
+                !matches!(
+                    panel,
+                    Panel::Terminal | Panel::Debug | Panel::Response | Panel::Results
+                )
+            })
+        });
+        let mut this = Self {
             focus_handle: cx.focus_handle(),
             project,
             project_panel,
@@ -624,11 +712,19 @@ impl Workspace {
             panes: vec![Pane::default()],
             active_pane: 0,
             recent: VecDeque::new(),
-            sidebar: Some(SidebarTab::Files),
+            left,
+            right,
+            bottom,
+            dock_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
+            _layout: cx.observe_global_in::<Layout>(window, Self::follow_layout),
+            layout_selection: layout::selection(cx),
+            resizing: None,
+            dock_menu: None,
+            bar_menu: None,
+            dragging: None,
             modal: None,
             terminals: Vec::new(),
             active_terminal: 0,
-            dock_open: false,
             _subscriptions: subscriptions,
             _hud_tick: hud_tick,
             git,
@@ -641,14 +737,11 @@ impl Workspace {
             extensions_panel,
             chat,
             agent,
-            agent_shown: false,
             #[cfg(test)]
             pushes: 0,
-            chat_open: false,
             inline_edit: None,
             results,
             show_results: false,
-            dock_view: DockView::Terminal,
             response,
             show_response: false,
             plugins,
@@ -662,7 +755,11 @@ impl Workspace {
             file_diff: None,
             diff_task: None,
             diff_subscription: None,
+        };
+        for panel in [left, right, bottom] {
+            this.tell_panels(panel, cx);
         }
+        this
     }
 
     pub fn root(&self, cx: &App) -> PathBuf {
@@ -1214,7 +1311,7 @@ impl Workspace {
     }
 
     fn show_git(&mut self, _: &ShowGit, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_sidebar(Some(SidebarTab::Git), cx);
+        self.set_sidebar(Some(Panel::Git), cx);
         self.git_panel.read(cx).focus_message(window, cx);
         self.git.update(cx, |g, cx| g.refresh_now(cx));
         cx.notify();
@@ -1387,8 +1484,7 @@ impl Workspace {
         );
         self.terminals.push((terminal.clone(), subscription));
         self.active_terminal = self.terminals.len() - 1;
-        self.dock_view = DockView::Terminal;
-        self.dock_open = true;
+        self.show_panel(Panel::Terminal, cx);
         if focus {
             window.focus(&terminal.focus_handle(cx));
         }
@@ -1427,41 +1523,600 @@ impl Workspace {
     ) {
         if let Some(ix) = self.terminals.iter().position(|(t, _)| t == terminal) {
             self.active_terminal = ix;
-            self.dock_view = DockView::Terminal;
-            self.dock_open = true;
+            self.show_panel(Panel::Terminal, cx);
             window.focus(&terminal.focus_handle(cx));
             cx.notify();
         }
     }
 
     fn show_services(&mut self, _: &ShowServices, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_sidebar(Some(SidebarTab::Services), cx);
+        self.set_sidebar(Some(Panel::Services), cx);
         window.focus(&self.services.focus_handle(cx));
     }
 
-    /// Changes the sidebar tab and tells panels that poll whether they are
-    /// on screen.
-    fn set_sidebar(&mut self, tab: Option<SidebarTab>, cx: &mut Context<Self>) {
-        self.sidebar = tab;
-        let visible = tab == Some(SidebarTab::Services);
+    /// Whether `panel` is the one a dock shows now.
+    fn shown(&self, panel: Panel) -> bool {
+        [self.left, self.right, self.bottom].contains(&Some(panel))
+    }
+
+    /// Whether a panel has a tab now. Results, the last response and the
+    /// debugger have one only while they have something to show, and the
+    /// terminals while there is one.
+    fn available(&self, panel: Panel) -> bool {
+        match panel {
+            Panel::Terminal => !self.terminals.is_empty(),
+            Panel::Results => self.show_results,
+            Panel::Response => self.show_response,
+            Panel::Debug => self.show_debug,
+            _ => true,
+        }
+    }
+
+    /// A panel has nothing left to show. The dock that showed it shows
+    /// the first of its panels that has, or closes.
+    fn panel_gone(&mut self, panel: Panel, cx: &mut Context<Self>) {
+        for place in Place::ALL {
+            if *self.dock(place) == Some(panel) {
+                let next = Layout::get(cx)
+                    .panels(place)
+                    .iter()
+                    .copied()
+                    .find(|other| *other != panel && self.available(*other));
+                *self.dock(place) = next;
+                self.docks_changed(next, cx);
+            }
+        }
+    }
+
+    /// Where the keyboard goes in a panel.
+    fn panel_focus(&self, panel: Panel, cx: &App) -> Option<FocusHandle> {
+        Some(match panel {
+            Panel::Files => self.project_panel.focus_handle(cx),
+            Panel::Search => self.project_search.focus_handle(cx),
+            Panel::Git => self.git_panel.focus_handle(cx),
+            Panel::Services => self.services.focus_handle(cx),
+            Panel::Database => self.database_panel.focus_handle(cx),
+            Panel::Api => self.api_panel.focus_handle(cx),
+            Panel::Ai => self.ai_panel.focus_handle(cx),
+            Panel::Extensions => self.extensions_panel.focus_handle(cx),
+            Panel::Chat => self.chat.focus_handle(cx),
+            Panel::Agent => self.agent.focus_handle(cx),
+            Panel::Debug => self.debug_panel.focus_handle(cx),
+            Panel::Response => self.response.focus_handle(cx),
+            Panel::Results => self.results.focus_handle(cx),
+            Panel::Terminal => {
+                let (terminal, _) = self.terminals.get(self.active_terminal)?;
+                terminal.focus_handle(cx)
+            }
+        })
+    }
+
+    /// The focus was in a panel that is gone. What its dock shows now
+    /// takes it, or the file in front if the dock closed: left on what is
+    /// no longer drawn, no key would reach anything.
+    fn focus_dock(&mut self, place: Place, window: &mut Window, cx: &mut Context<Self>) {
+        let shown = *self.dock(place);
+        match (
+            shown.and_then(|panel| self.panel_focus(panel, cx)),
+            self.active_editor(),
+        ) {
+            (Some(handle), _) => window.focus(&handle),
+            (None, Some(editor)) => window.focus(&editor.focus_handle(cx)),
+            (None, None) => window.focus(&self.focus_handle),
+        }
+    }
+
+    /// The keyboard is not left in a panel no dock shows: no key would
+    /// reach anything from there. The file in front takes it.
+    fn rescue_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let lost = Panel::ALL.into_iter().any(|panel| {
+            !self.shown(panel)
+                && self
+                    .panel_focus(panel, cx)
+                    .is_some_and(|focus| focus.contains_focused(window, cx))
+        });
+        if lost {
+            match self.active_editor() {
+                Some(editor) => window.focus(&editor.focus_handle(cx)),
+                None => window.focus(&self.focus_handle),
+            }
+        }
+    }
+
+    /// Puts a panel's tab in the dock `to` by hand, before the tab of
+    /// `before` or after the dock's others. In a dock it was not in, it
+    /// is shown, and the dock it left goes on with what it has.
+    fn put_panel(
+        &mut self,
+        panel: Panel,
+        to: Place,
+        before: Option<Panel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dragging = None;
+        let from = Layout::get(cx).place(panel);
+        let shown_in = Place::ALL
+            .into_iter()
+            .find(|place| *self.dock(*place) == Some(panel));
+        if shown_in.is_some_and(|place| place != to) {
+            self.panel_gone(panel, cx);
+        }
+        layout::put(Layout::get(cx).clone().moved(panel, to, before), cx);
+        if from != Some(to) && self.available(panel) {
+            self.show_panel(panel, cx);
+        }
+        self.rescue_focus(window, cx);
+        cx.notify();
+    }
+
+    /// Takes a panel's tab out of the docks. Its command still opens it.
+    fn hide_panel(&mut self, panel: Panel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shown(panel) {
+            self.panel_gone(panel, cx);
+        }
+        layout::put(Layout::get(cx).clone().hiding(panel), cx);
+        self.rescue_focus(window, cx);
+        cx.notify();
+    }
+
+    /// The window as it comes: the layout, and what the docks show.
+    fn reset_layout(&mut self, _: &ResetLayout, window: &mut Window, cx: &mut Context<Self>) {
+        self.dock_menu = None;
+        self.bar_menu = None;
+        layout::reset(cx);
+        for place in Place::ALL {
+            *self.dock(place) = Layout::get(cx).open_in(place);
+        }
+        self.rescue_focus(window, cx);
+        self.tell_panels(None, cx);
+    }
+
+    /// A tab of a dock as the hand takes it: the right button opens the
+    /// dock's menu on it, and it is dragged to another place, where it
+    /// goes before the tab it is dropped on.
+    fn held(
+        &self,
+        place: Place,
+        panel: Panel,
+        key: usize,
+        tab: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (over, round) = (cx.theme().accent_soft, cx.theme().shape.control);
+        let workspace = cx.weak_entity();
+        div()
+            .id(("dock-tab", key))
+            .flex_none()
+            .rounded(round)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.dock_menu = Some((event.position, place, Some(panel)));
+                    this.bar_menu = None;
+                    // The row of tabs would open its own, with no panel.
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_drag(DraggedPanel(panel), move |dragged, _, _, cx| {
+                let panel = dragged.0;
+                workspace
+                    .update(cx, |this, cx| {
+                        this.dragging = Some(panel);
+                        cx.notify();
+                    })
+                    .ok();
+                cx.new(|_| DraggedTab(panel))
+            })
+            .drag_over::<DraggedPanel>(move |style, dragged, _, _| {
+                if dragged.0 == panel {
+                    style
+                } else {
+                    style.bg(over)
+                }
+            })
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedPanel, window, cx| {
+                    this.put_panel(dragged.0, place, Some(panel), window, cx)
+                }),
+            )
+            .child(tab)
+            .into_any_element()
+    }
+
+    /// Where a dragged tab is dropped to open a dock that is closed.
+    fn drop_zone(&self, place: Place, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        div()
+            .debug_selector(move || format!("drop-{}", place.id()))
+            .flex_none()
+            .bg(theme.bg_sunken)
+            .border_color(theme.line)
+            .map(|d| match place {
+                Place::Left => d.w(px(36.)).h_full().border_r(theme.shape.border),
+                Place::Right => d.w(px(36.)).h_full().border_l(theme.shape.border),
+                Place::Bottom => d.h(px(36.)).w_full().border_t(theme.shape.border),
+            })
+            .drag_over::<DraggedPanel>(move |style, _, _, _| style.bg(theme.accent_soft))
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedPanel, window, cx| {
+                    this.put_panel(dragged.0, place, None, window, cx)
+                }),
+            )
+            .into_any_element()
+    }
+
+    fn menu_item(id: String, label: String, run: MenuRun, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let selector = id.clone();
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || selector.clone())
+            .h(crate::theme::row(px(26.), cx))
+            .flex_none()
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded(theme.shape.token)
+            .text_size(UI_FONT_SIZE)
+            .text_color(theme.fg)
+            .hover(|d| d.bg(theme.accent_soft))
+            .child(label)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.dock_menu = None;
+                this.bar_menu = None;
+                run(this, window, cx);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    fn menu_surface(
+        position: Point<Pixels>,
+        items: Vec<AnyElement>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        deferred(
+            anchored().position(position).snap_to_window().child(
+                div()
+                    .id("layout-menu")
+                    .occlude()
+                    .w(crate::theme::text(240.))
+                    .max_h(window.viewport_size().height)
+                    .overflow_y_scroll()
+                    .p_1()
+                    .flex()
+                    .flex_col()
+                    .bg(theme.bg_elev)
+                    .border(theme.shape.border)
+                    .border_color(theme.line)
+                    .rounded(theme.shape.control)
+                    .shadow_lg()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.dock_menu = None;
+                        this.bar_menu = None;
+                        cx.notify();
+                    }))
+                    .children(items),
+            ),
+        )
+    }
+
+    /// The menu of a dock: what can be done with the tab it was opened
+    /// on, and the hidden panels, to bring one back into this dock.
+    fn render_dock_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let (position, place, panel) = self.dock_menu?;
+        let theme = cx.theme().clone();
+        let layout = Layout::get(cx).clone();
+        let item =
+            |id, label, cx: &mut Context<Self>, run: MenuRun| Self::menu_item(id, label, run, cx);
+        let separator = || {
+            div()
+                .my_1()
+                .h(theme.shape.border)
+                .bg(theme.line)
+                .into_any_element()
+        };
+        let mut items: Vec<AnyElement> = Vec::new();
+        if let Some(panel) = panel {
+            if layout.place(panel).is_some() {
+                items.push(item(
+                    "menu-hide".into(),
+                    format!("Hide {}", panel.label()),
+                    cx,
+                    Box::new(move |this, window, cx| this.hide_panel(panel, window, cx)),
+                ));
+            }
+            for to in Place::ALL {
+                if layout.place(panel) != Some(to) {
+                    items.push(item(
+                        format!("menu-move-{}", to.id()),
+                        format!("Move to {} dock", to.id()),
+                        cx,
+                        Box::new(move |this, window, cx| {
+                            this.put_panel(panel, to, None, window, cx)
+                        }),
+                    ));
+                }
+            }
+            items.push(separator());
+        }
+        for hidden in layout.hidden.iter().copied() {
+            items.push(item(
+                format!("menu-show-{}", hidden.id()),
+                format!("Show {}", hidden.label()),
+                cx,
+                Box::new(move |this, window, cx| this.put_panel(hidden, place, None, window, cx)),
+            ));
+        }
+        if !layout.hidden.is_empty() {
+            items.push(separator());
+        }
+        items.push(item(
+            "menu-reset".into(),
+            "Reset layout".into(),
+            cx,
+            Box::new(|this, window, cx| this.reset_layout(&ResetLayout, window, cx)),
+        ));
+        Some(Self::menu_surface(position, items, window, cx))
+    }
+
+    fn render_bar_menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (position, end, selected) = self.bar_menu.clone()?;
+        let theme = cx.theme().clone();
+        let layout = Layout::get(cx).clone();
+        let separator = || {
+            div()
+                .my_1()
+                .h(theme.shape.border)
+                .bg(theme.line)
+                .into_any_element()
+        };
+        let mut items = Vec::new();
+        if let Some(item) = selected {
+            let hidden = item.clone();
+            items.push(Self::menu_item(
+                "bar-menu-hide".into(),
+                format!(
+                    "Hide {}",
+                    layout.style(&item).label.as_deref().unwrap_or(item.label())
+                ),
+                Box::new(move |_, _, cx| {
+                    layout::put(Layout::get(cx).clone().hiding_item(hidden.clone()), cx);
+                }),
+                cx,
+            ));
+            for to in BarEnd::ALL {
+                if layout.item_place(&item) != Some(to) {
+                    let item = item.clone();
+                    items.push(Self::menu_item(
+                        format!("bar-menu-move-{}", to.id()),
+                        format!("Move to {}", to.label()),
+                        Box::new(move |_, _, cx| {
+                            layout::put(
+                                Layout::get(cx).clone().moved_item(item.clone(), to, None),
+                                cx,
+                            );
+                        }),
+                        cx,
+                    ));
+                }
+            }
+            items.push(separator());
+            for (display, id, label) in [
+                (Display::Text, "text", "Text"),
+                (Display::Icon, "icon", "Icon"),
+                (Display::Both, "both", "Text and icon"),
+            ] {
+                let item = item.clone();
+                items.push(Self::menu_item(
+                    format!("bar-menu-{id}"),
+                    label.into(),
+                    Box::new(move |_, _, cx| {
+                        layout::put(Layout::get(cx).clone().styled(&item, display), cx);
+                    }),
+                    cx,
+                ));
+            }
+            items.push(Self::menu_item(
+                "bar-menu-edit".into(),
+                "Edit icon or command".into(),
+                Box::new(|this, window, cx| {
+                    this.open_layout(&OpenLayout, window, cx);
+                }),
+                cx,
+            ));
+            if let Item::Button { button } = &item {
+                let button = button.clone();
+                items.push(Self::menu_item(
+                    "bar-menu-remove".into(),
+                    "Remove button".into(),
+                    Box::new(move |_, _, cx| {
+                        layout::put(Layout::get(cx).clone().without_button(&button), cx);
+                    }),
+                    cx,
+                ));
+            }
+            items.push(separator());
+        }
+        for hidden in layout.named_items() {
+            if layout.item_place(&hidden).is_none() {
+                items.push(Self::menu_item(
+                    format!("bar-menu-show-{}", hidden.id()),
+                    format!(
+                        "Show {}",
+                        layout
+                            .style(&hidden)
+                            .label
+                            .as_deref()
+                            .unwrap_or(hidden.label())
+                    ),
+                    Box::new(move |_, _, cx| {
+                        layout::put(
+                            Layout::get(cx)
+                                .clone()
+                                .moved_item(hidden.clone(), end, None),
+                            cx,
+                        );
+                    }),
+                    cx,
+                ));
+            }
+        }
+        items.push(separator());
+        items.push(Self::menu_item(
+            "bar-menu-add".into(),
+            "Add command button".into(),
+            Box::new(move |this, window, cx| {
+                let commands =
+                    crate::bar_commands::Commands::new(end, this.plugins.clone(), window, cx);
+                this.toggle_modal(window, cx, move |window, cx| {
+                    Picker::new(commands, window, cx)
+                });
+            }),
+            cx,
+        ));
+        items.push(Self::menu_item(
+            "bar-menu-reset".into(),
+            "Reset layout".into(),
+            Box::new(|this, window, cx| this.reset_layout(&ResetLayout, window, cx)),
+            cx,
+        ));
+        Some(Self::menu_surface(position, items, window, cx))
+    }
+
+    /// The dock a panel shows in.
+    fn place_of(&self, panel: Panel, cx: &App) -> Place {
+        Layout::get(cx).dock_of(panel)
+    }
+
+    fn dock(&mut self, place: Place) -> &mut Option<Panel> {
+        match place {
+            Place::Left => &mut self.left,
+            Place::Right => &mut self.right,
+            Place::Bottom => &mut self.bottom,
+        }
+    }
+
+    /// Closes a dock. If the focus was in it, the file in front takes it,
+    /// or with no file open the window itself: left on a field that is no
+    /// longer drawn, no key would reach anything.
+    fn close_dock(&mut self, place: Place, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dock(place).take().is_none() {
+            return;
+        }
+        if self.dock_focus[place as usize].contains_focused(window, cx) {
+            match self.active_editor() {
+                Some(editor) => window.focus(&editor.focus_handle(cx)),
+                None => window.focus(&self.focus_handle(cx)),
+            }
+        }
+        self.docks_changed(None, cx);
+    }
+
+    /// Shows `panel` in its dock, opening the dock if it was closed.
+    fn show_panel(&mut self, panel: Panel, cx: &mut Context<Self>) {
+        let place = self.place_of(panel, cx);
+        *self.dock(place) = Some(panel);
+        self.docks_changed(Some(panel), cx);
+    }
+
+    /// The left dock on a panel, or closed. A panel that lives in the
+    /// other dock is shown there.
+    fn set_sidebar(&mut self, tab: Option<Panel>, cx: &mut Context<Self>) {
+        match tab {
+            Some(panel) => self.show_panel(panel, cx),
+            None => {
+                self.left = None;
+                self.docks_changed(None, cx);
+            }
+        }
+    }
+
+    /// The docks were changed by hand, or by what happened in the window:
+    /// the panels are told, and the file is, so that the window starts
+    /// the same way next time.
+    fn docks_changed(&mut self, now: Option<Panel>, cx: &mut Context<Self>) {
+        self.tell_panels(now, cx);
+        let open = [self.left, self.right, self.bottom];
+        layout::keep_open(open.into_iter().flatten().collect(), cx);
+    }
+
+    /// Tells the panels what the docks show now: the one that came into
+    /// view reads what it shows, and services stop watching when unseen.
+    fn tell_panels(&mut self, now: Option<Panel>, cx: &mut Context<Self>) {
+        let visible = self.shown(Panel::Services);
         self.services.update(cx, |s, cx| s.set_visible(visible, cx));
-        if tab == Some(SidebarTab::Database) {
-            self.database_panel.update(cx, |p, cx| p.shown(cx));
-        }
-        if tab == Some(SidebarTab::Api) {
-            self.api_panel.update(cx, |p, cx| p.shown(cx));
-        }
-        if tab == Some(SidebarTab::Ai) {
-            self.ai_panel.update(cx, |p, cx| p.shown(cx));
-        }
-        if tab == Some(SidebarTab::Extensions) {
-            self.extensions_panel.update(cx, |p, cx| p.shown(cx));
+        match now {
+            Some(Panel::Database) => self.database_panel.update(cx, |p, cx| p.shown(cx)),
+            Some(Panel::Api) => self.api_panel.update(cx, |p, cx| p.shown(cx)),
+            Some(Panel::Ai) => self.ai_panel.update(cx, |p, cx| p.shown(cx)),
+            Some(Panel::Extensions) => self.extensions_panel.update(cx, |p, cx| p.shown(cx)),
+            Some(Panel::Chat) => self.chat.update(cx, |c, cx| c.shown(cx)),
+            Some(Panel::Agent) => self.agent.update(cx, |a, cx| a.shown(cx)),
+            _ => {}
         }
         cx.notify();
     }
 
+    /// The layout changed. Where the file says which panels are open,
+    /// those are: it is the truth, and it says so as soon as a dock was
+    /// touched once. Until then a panel that is shown goes with its tab to
+    /// the dock that got it, and a dock that lost what it showed, and got
+    /// nothing in exchange, shows the first panel it has. The keyboard
+    /// does not stay in a panel that is no longer shown: no key would
+    /// reach anything from there.
+    fn follow_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let layout = Layout::get(cx).clone();
+        let selection = layout::selection(cx);
+        let switched = self.layout_selection != selection;
+        self.layout_selection = selection;
+        if switched {
+            self.dock_menu = None;
+            self.bar_menu = None;
+        }
+        let before = [self.left, self.right, self.bottom];
+        for (index, place) in Place::ALL.into_iter().enumerate() {
+            let now = if switched || layout.open.is_some() {
+                layout.open_in(place).filter(|panel| self.available(*panel))
+            } else {
+                let here = before[index];
+                // A hidden panel that is shown stays where it was opened.
+                let stays = here.filter(|p| layout.place(*p).is_none_or(|now| now == place));
+                let comes = before
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != index)
+                    .find_map(|(_, shown)| shown.filter(|p| layout.place(*p) == Some(place)));
+                let first = layout
+                    .panels(place)
+                    .iter()
+                    .copied()
+                    .find(|panel| self.available(*panel));
+                stays.or(comes).or(here.and(first))
+            };
+            *self.dock(place) = now;
+        }
+        self.rescue_focus(window, cx);
+        // A panel that came into view reads what it shows.
+        for (index, place) in Place::ALL.into_iter().enumerate() {
+            let now = *self.dock(place);
+            if now != before[index] {
+                self.tell_panels(now, cx);
+            }
+        }
+        self.tell_panels(None, cx);
+    }
+
     fn show_database(&mut self, _: &ShowDatabase, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_sidebar(Some(SidebarTab::Database), cx);
+        self.set_sidebar(Some(Panel::Database), cx);
         window.focus(&self.database_panel.focus_handle(cx));
     }
 
@@ -1485,8 +2140,7 @@ impl Workspace {
         self.results
             .update(cx, |r, cx| r.run(connection, query, cx));
         self.show_results = true;
-        self.dock_view = DockView::Results;
-        self.dock_open = true;
+        self.show_panel(Panel::Results, cx);
         if focus {
             window.focus(&self.results.focus_handle(cx));
         }
@@ -1729,8 +2383,7 @@ impl Workspace {
                         this.results
                             .update(cx, |r, cx| r.browse(connection, engine, spec, cx));
                         this.show_results = true;
-                        this.dock_view = DockView::Results;
-                        this.dock_open = true;
+                        this.show_panel(Panel::Results, cx);
                         cx.notify();
                     }
                     ErdEvent::Structure(object) => {
@@ -1824,15 +2477,14 @@ impl Workspace {
         self.show_right(true, window, cx);
     }
 
-    /// Opens the right dock on the chat or the agent and focuses its field.
+    /// Shows the chat or the agent, in the dock it is in, and focuses its
+    /// field.
     fn show_right(&mut self, agent: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.chat_open = true;
-        self.agent_shown = agent;
+        let panel = if agent { Panel::Agent } else { Panel::Chat };
+        self.show_panel(panel, cx);
         let input = if agent {
-            self.agent.update(cx, |a, cx| a.shown(cx));
             self.agent.read(cx).input()
         } else {
-            self.chat.update(cx, |c, cx| c.shown(cx));
             self.chat.read(cx).input()
         };
         window.focus(&input.focus_handle(cx));
@@ -1877,23 +2529,18 @@ impl Workspace {
     }
 
     fn toggle_chat(&mut self, _: &ToggleChat, window: &mut Window, cx: &mut Context<Self>) {
-        if self.agent_shown && self.chat_open {
+        // Its dock shows something else, or is closed: show the chat.
+        if !self.shown(Panel::Chat) {
             return self.show_right(false, window, cx);
         }
         let input = self.chat.read(cx).input();
-        if self.chat_open && !input.focus_handle(cx).is_focused(window) {
+        if !input.focus_handle(cx).is_focused(window) {
             // Open but elsewhere: go to it rather than close it.
             window.focus(&input.focus_handle(cx));
             return;
         }
-        self.chat_open = !self.chat_open;
-        if self.chat_open {
-            self.chat.update(cx, |c, cx| c.shown(cx));
-            window.focus(&input.focus_handle(cx));
-        } else if let Some(editor) = self.active_editor() {
-            window.focus(&editor.focus_handle(cx));
-        }
-        cx.notify();
+        let place = self.place_of(Panel::Chat, cx);
+        self.close_dock(place, window, cx);
     }
 
     /// The active file for the chat: its selection when there is one, else
@@ -1960,12 +2607,12 @@ impl Workspace {
     }
 
     fn show_ai(&mut self, _: &ShowAi, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_sidebar(Some(SidebarTab::Ai), cx);
+        self.set_sidebar(Some(Panel::Ai), cx);
         window.focus(&self.ai_panel.focus_handle(cx));
     }
 
     fn show_api(&mut self, _: &ShowApi, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_sidebar(Some(SidebarTab::Api), cx);
+        self.set_sidebar(Some(Panel::Api), cx);
         window.focus(&self.api_panel.focus_handle(cx));
     }
 
@@ -2018,8 +2665,7 @@ impl Workspace {
             cx.notify();
         });
         self.show_response = true;
-        self.dock_view = DockView::Response;
-        self.dock_open = true;
+        self.show_panel(Panel::Response, cx);
         cx.notify();
     }
 
@@ -2165,23 +2811,6 @@ impl Workspace {
         .detach();
     }
 
-    /// The tab in front once another closes.
-    fn fallback_dock_view(&self) -> DockView {
-        if self.show_debug {
-            DockView::Debug
-        } else if self.show_results {
-            DockView::Results
-        } else if self.show_response {
-            DockView::Response
-        } else {
-            DockView::Terminal
-        }
-    }
-
-    fn dock_has_tabs(&self) -> bool {
-        !self.terminals.is_empty() || self.show_results || self.show_response || self.show_debug
-    }
-
     // ---------------------------------------------------------------- debug
 
     /// The Debug tab in front, with what can be debugged read again for the
@@ -2193,8 +2822,7 @@ impl Workspace {
         self.debug_panel
             .update(cx, |p, cx| p.refresh_configs(file, start, cx));
         self.show_debug = true;
-        self.dock_view = DockView::Debug;
-        self.dock_open = true;
+        self.show_panel(Panel::Debug, cx);
         cx.notify();
     }
 
@@ -2262,7 +2890,7 @@ impl Workspace {
     }
 
     fn show_extensions(&mut self, _: &ShowExtensions, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_sidebar(Some(SidebarTab::Extensions), cx);
+        self.set_sidebar(Some(Panel::Extensions), cx);
         window.focus(&self.extensions_panel.focus_handle(cx));
     }
 
@@ -2297,12 +2925,16 @@ impl Workspace {
     }
 
     fn close_debug(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_focused = self
+            .debug_panel
+            .focus_handle(cx)
+            .contains_focused(window, cx);
+        let place = self.place_of(Panel::Debug, cx);
         self.show_debug = false;
-        self.dock_view = self.fallback_dock_view();
-        if !self.dock_has_tabs() {
-            self.dock_open = false;
+        self.panel_gone(Panel::Debug, cx);
+        if was_focused {
+            self.focus_dock(place, window, cx);
         }
-        let _ = window;
         cx.notify();
     }
 
@@ -2311,7 +2943,7 @@ impl Workspace {
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active = self.dock_view == DockView::Debug;
+        let active = self.shown(Panel::Debug);
         let paused = self.debug.read(cx).state == crate::debug::State::Paused;
         div()
             .id("debug-tab")
@@ -2322,18 +2954,18 @@ impl Workspace {
             .flex()
             .items_center()
             .gap_1p5()
-            .rounded(px(8.))
+            .rounded(theme.shape.control)
             .text_size(UI_FONT_SIZE)
             .text_color(if active { theme.fg } else { theme.fg_subtle })
             .when(active, |d| d.bg(theme.bg_elev))
             .hover(|d| d.text_color(theme.fg))
             .on_click(cx.listener(|this, _, _, cx| {
-                this.dock_view = DockView::Debug;
-                cx.notify();
+                this.show_panel(Panel::Debug, cx);
             }))
             .when(paused, |d| {
                 d.child(div().size(px(6.)).rounded(px(3.)).bg(theme.warning))
             })
+            .child(crate::icons::draw(crate::icons::panel(Panel::Debug)))
             .child("Debug")
             .child(
                 div()
@@ -2342,7 +2974,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(6.))
+                    .rounded(theme.shape.token)
                     .hover(|d| d.bg(theme.line))
                     .child("×")
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -2354,16 +2986,11 @@ impl Workspace {
 
     fn close_response(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let was_focused = self.response.focus_handle(cx).contains_focused(window, cx);
+        let place = self.place_of(Panel::Response, cx);
         self.show_response = false;
-        self.dock_view = self.fallback_dock_view();
-        if !self.dock_has_tabs() {
-            self.dock_open = false;
-        }
+        self.panel_gone(Panel::Response, cx);
         if was_focused {
-            match self.active_editor() {
-                Some(e) => window.focus(&e.focus_handle(cx)),
-                None => window.focus(&self.focus_handle),
-            }
+            self.focus_dock(place, window, cx);
         }
         cx.notify();
     }
@@ -2373,8 +3000,7 @@ impl Workspace {
     pub fn send_request(&mut self, request: rest::Request, cx: &mut Context<Self>) {
         self.response.update(cx, |r, cx| r.send(request, cx));
         self.show_response = true;
-        self.dock_view = DockView::Response;
-        self.dock_open = true;
+        self.show_panel(Panel::Response, cx);
         cx.notify();
     }
 
@@ -2398,20 +3024,11 @@ impl Workspace {
 
     fn close_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let was_focused = self.results.focus_handle(cx).contains_focused(window, cx);
+        let place = self.place_of(Panel::Results, cx);
         self.show_results = false;
-        self.dock_view = self.fallback_dock_view();
-        if !self.dock_has_tabs() {
-            self.dock_open = false;
-        }
+        self.panel_gone(Panel::Results, cx);
         if was_focused {
-            match (
-                self.terminals.get(self.active_terminal),
-                self.active_editor(),
-            ) {
-                (Some((t, _)), _) => window.focus(&t.focus_handle(cx)),
-                (None, Some(e)) => window.focus(&e.focus_handle(cx)),
-                (None, None) => window.focus(&self.focus_handle),
-            }
+            self.focus_dock(place, window, cx);
         }
         cx.notify();
     }
@@ -2428,27 +3045,14 @@ impl Workspace {
         let was_focused = terminal.focus_handle(cx).contains_focused(window, cx);
         drop(self.terminals.remove(ix));
         if self.terminals.is_empty() {
-            self.dock_open = self.dock_open && self.dock_has_tabs();
-            self.dock_view = self.fallback_dock_view();
             self.active_terminal = 0;
+            self.panel_gone(Panel::Terminal, cx);
         } else {
             self.active_terminal = self.active_terminal.min(self.terminals.len() - 1);
         }
         if was_focused {
-            match (
-                self.terminals.get(self.active_terminal),
-                self.active_editor(),
-            ) {
-                _ if self.dock_view == DockView::Results => {
-                    window.focus(&self.results.focus_handle(cx))
-                }
-                _ if self.dock_view == DockView::Response => {
-                    window.focus(&self.response.focus_handle(cx))
-                }
-                (Some((t, _)), _) => window.focus(&t.focus_handle(cx)),
-                (None, Some(e)) => window.focus(&e.focus_handle(cx)),
-                (None, None) => window.focus(&self.focus_handle),
-            }
+            let place = self.place_of(Panel::Terminal, cx);
+            self.focus_dock(place, window, cx);
         }
         cx.notify();
     }
@@ -2471,19 +3075,15 @@ impl Workspace {
                 self.spawn_terminal(command, window, cx);
             }
             Some(t)
-                if self.dock_open
-                    && self.dock_view == DockView::Terminal
+                if self.shown(Panel::Terminal)
                     && t.focus_handle(cx).contains_focused(window, cx) =>
             {
-                self.dock_open = false;
-                if let Some(e) = self.active_editor() {
-                    window.focus(&e.focus_handle(cx));
-                }
-                cx.notify();
+                // The dock the terminals are in, wherever that is.
+                let place = self.place_of(Panel::Terminal, cx);
+                self.close_dock(place, window, cx);
             }
             Some(t) => {
-                self.dock_open = true;
-                self.dock_view = DockView::Terminal;
+                self.show_panel(Panel::Terminal, cx);
                 window.focus(&t.focus_handle(cx));
                 cx.notify();
             }
@@ -2495,14 +3095,16 @@ impl Workspace {
         self.spawn_terminal(command, window, cx);
     }
 
-    fn render_dock(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A tab for each terminal, and the button that opens another. They
+    /// are in whichever dock the layout puts the terminals in.
+    fn terminal_tabs(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let theme = cx.theme().clone();
-        let tabs: Vec<_> = self
+        let mut tabs: Vec<AnyElement> = self
             .terminals
             .iter()
             .enumerate()
             .map(|(ix, (terminal, _))| {
-                let active = ix == self.active_terminal && self.dock_view == DockView::Terminal;
+                let active = ix == self.active_terminal && self.shown(Panel::Terminal);
                 let close = terminal.clone();
                 div()
                     .id(("terminal-tab", ix))
@@ -2512,19 +3114,20 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .rounded(px(8.))
+                    .rounded(theme.shape.control)
                     .text_size(UI_FONT_SIZE)
                     .text_color(if active { theme.fg } else { theme.fg_subtle })
                     .when(active, |d| d.bg(theme.bg_elev))
                     .hover(|d| d.text_color(theme.fg))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.active_terminal = ix;
-                        this.dock_view = DockView::Terminal;
+                        this.show_panel(Panel::Terminal, cx);
                         if let Some((t, _)) = this.terminals.get(ix) {
                             window.focus(&t.focus_handle(cx));
                         }
                         cx.notify();
                     }))
+                    .child(crate::icons::draw(crate::icons::panel(Panel::Terminal)))
                     .child({
                         let t = terminal.read(cx);
                         match (t.exited, t.exit_code) {
@@ -2541,7 +3144,7 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(6.))
+                            .rounded(theme.shape.token)
                             .hover(|d| d.bg(theme.line))
                             .child("×")
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -2549,67 +3152,28 @@ impl Workspace {
                                 this.remove_terminal(&close, window, cx);
                             })),
                     )
+                    .into_any_element()
             })
             .collect();
-        div()
-            .h(px(DOCK_HEIGHT))
-            .flex_none()
-            .flex()
-            .flex_col()
-            .border_t_1()
-            .border_color(theme.line)
-            .child(
-                div()
-                    .h(px(32.))
-                    .flex_none()
-                    .px_1p5()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .bg(theme.bg_sunken)
-                    .border_b_1()
-                    .border_color(theme.line)
-                    .when(self.show_debug, |d| {
-                        d.child(self.render_debug_tab(&theme, cx))
-                    })
-                    .when(self.show_response, |d| {
-                        d.child(self.render_response_tab(&theme, cx))
-                    })
-                    .when(self.show_results, |d| {
-                        d.child(self.render_results_tab(&theme, cx))
-                    })
-                    .children(tabs)
-                    .child(
-                        div()
-                            .id("terminal-new")
-                            .size(px(24.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(8.))
-                            .text_color(theme.fg_subtle)
-                            .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                            .child("+")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.new_terminal(&NewTerminal, window, cx)
-                            })),
-                    ),
-            )
-            .child(div().flex_1().min_h_0().map(|d| {
-                if self.dock_view == DockView::Debug {
-                    d.child(self.debug_panel.clone())
-                } else if self.dock_view == DockView::Response {
-                    d.child(self.response.clone())
-                } else if self.dock_view == DockView::Results {
-                    d.child(self.results.clone())
-                } else {
-                    d.children(
-                        self.terminals
-                            .get(self.active_terminal)
-                            .map(|(t, _)| t.clone()),
-                    )
-                }
-            }))
+        tabs.push(
+            div()
+                .id("terminal-new")
+                .debug_selector(|| "terminal-new".into())
+                .flex_none()
+                .size(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(theme.shape.control)
+                .text_color(theme.fg_subtle)
+                .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                .child("+")
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.new_terminal(&NewTerminal, window, cx)),
+                )
+                .into_any_element(),
+        );
+        tabs
     }
 
     fn render_results_tab(
@@ -2617,25 +3181,27 @@ impl Workspace {
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active = self.dock_view == DockView::Results;
+        let active = self.shown(Panel::Results);
         div()
             .id("results-tab")
+            .debug_selector(|| "results-tab".into())
             .h(px(24.))
             .pl_2p5()
             .pr_1()
             .flex()
             .items_center()
             .gap_1p5()
-            .rounded(px(8.))
+            .rounded(theme.shape.control)
             .text_size(UI_FONT_SIZE)
             .text_color(if active { theme.fg } else { theme.fg_subtle })
             .when(active, |d| d.bg(theme.bg_elev))
             .hover(|d| d.text_color(theme.fg))
             .on_click(cx.listener(|this, _, window, cx| {
-                this.dock_view = DockView::Results;
+                this.show_panel(Panel::Results, cx);
                 window.focus(&this.results.focus_handle(cx));
                 cx.notify();
             }))
+            .child(crate::icons::draw(crate::icons::panel(Panel::Results)))
             .child("Results")
             .child(
                 div()
@@ -2644,7 +3210,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(6.))
+                    .rounded(theme.shape.token)
                     .hover(|d| d.bg(theme.line))
                     .child("×")
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -2659,7 +3225,7 @@ impl Workspace {
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active = self.dock_view == DockView::Response;
+        let active = self.shown(Panel::Response);
         div()
             .id("response-tab")
             .h(px(24.))
@@ -2668,16 +3234,17 @@ impl Workspace {
             .flex()
             .items_center()
             .gap_1p5()
-            .rounded(px(8.))
+            .rounded(theme.shape.control)
             .text_size(UI_FONT_SIZE)
             .text_color(if active { theme.fg } else { theme.fg_subtle })
             .when(active, |d| d.bg(theme.bg_elev))
             .hover(|d| d.text_color(theme.fg))
             .on_click(cx.listener(|this, _, window, cx| {
-                this.dock_view = DockView::Response;
+                this.show_panel(Panel::Response, cx);
                 window.focus(&this.response.focus_handle(cx));
                 cx.notify();
             }))
+            .child(crate::icons::draw(crate::icons::panel(Panel::Response)))
             .child("Response")
             .child(
                 div()
@@ -2686,7 +3253,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(6.))
+                    .rounded(theme.shape.token)
                     .hover(|d| d.bg(theme.line))
                     .child("×")
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -2949,6 +3516,182 @@ impl Workspace {
         self.open_config_file(settings::keymap_path(), default, window, cx);
     }
 
+    /// The borders that can be dragged: a strip over each, as long as the
+    /// part it sizes is shown. A double click puts the size back.
+    fn resize_handles(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        const GRIP: f32 = 6.;
+        let layout = Layout::get(cx).clone();
+        let dock = self.bottom.is_some();
+        let top = layout.title_bar.height;
+        let bottom = layout.status_bar.height + if dock { layout.bottom.height } else { 0. };
+        let handle = |part: Part, cx: &mut Context<Self>| {
+            div()
+                .id(match part {
+                    Part::Left => "resize-left",
+                    Part::Right => "resize-right",
+                    Part::Bottom => "resize-bottom",
+                })
+                .absolute()
+                .occlude()
+                .cursor(if part == Part::Bottom {
+                    gpui::CursorStyle::ResizeUpDown
+                } else {
+                    gpui::CursorStyle::ResizeLeftRight
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        if event.click_count >= 2 {
+                            this.resizing = None;
+                            let standard = Layout::default().size(part);
+                            cx.set_global(Layout::get(cx).clone().with(part, standard));
+                            layout::keep(part, cx);
+                            cx.refresh_windows();
+                            return;
+                        }
+                        let at = match part {
+                            Part::Bottom => event.position.y,
+                            _ => event.position.x,
+                        };
+                        this.resizing = Some((part, f32::from(at), Layout::get(cx).size(part)));
+                    }),
+                )
+        };
+        let mut handles = Vec::new();
+        if self.left.is_some() {
+            handles.push(
+                handle(Part::Left, cx)
+                    .debug_selector(|| "resize-left".into())
+                    .top(px(top))
+                    .bottom(px(bottom))
+                    .left(px(layout.left.width - GRIP / 2.))
+                    .w(px(GRIP))
+                    .into_any_element(),
+            );
+        }
+        if self.right.is_some() {
+            handles.push(
+                handle(Part::Right, cx)
+                    .debug_selector(|| "resize-right".into())
+                    .top(px(top))
+                    .bottom(px(bottom))
+                    .right(px(layout.right.width - GRIP / 2.))
+                    .w(px(GRIP))
+                    .into_any_element(),
+            );
+        }
+        if dock {
+            handles.push(
+                handle(Part::Bottom, cx)
+                    .debug_selector(|| "resize-bottom".into())
+                    .left_0()
+                    .right_0()
+                    .bottom(px(bottom - GRIP / 2.))
+                    .h(px(GRIP))
+                    .into_any_element(),
+            );
+        }
+        handles
+    }
+
+    /// The pointer moved with a border held: the part follows it. The
+    /// file is written once, when the border is let go.
+    fn resize_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((part, from, size)) = self.resizing else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            return self.resize_end(cx);
+        }
+        // The sidebar grows to the right; the chat and the dock grow
+        // towards the middle of the window, against the pointer's way.
+        let moved = match part {
+            Part::Left => f32::from(event.position.x) - from,
+            Part::Right => from - f32::from(event.position.x),
+            Part::Bottom => from - f32::from(event.position.y),
+        };
+        let layout = Layout::get(cx).clone().with(part, size + moved);
+        if layout != *Layout::get(cx) {
+            cx.set_global(layout);
+            cx.refresh_windows();
+        }
+    }
+
+    fn resize_end(&mut self, cx: &mut Context<Self>) {
+        if let Some((part, _, size)) = self.resizing.take()
+            && Layout::get(cx).size(part) != size
+        {
+            layout::keep(part, cx);
+        }
+    }
+
+    fn open_layout(&mut self, _: &OpenLayout, window: &mut Window, cx: &mut Context<Self>) {
+        let default = crate::layout::file(Layout::get(cx));
+        self.open_config_file(crate::layout::path(cx), default, window, cx);
+    }
+
+    fn switch_layout(
+        &mut self,
+        action: &SwitchLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(name) = &action.name {
+            let name = (name != layout::DEFAULT_NAME).then(|| name.clone());
+            layout::choose(name, cx);
+        } else {
+            self.layout_picker(false, window, cx);
+        }
+    }
+
+    fn save_layout(&mut self, _: &SaveLayout, window: &mut Window, cx: &mut Context<Self>) {
+        self.layout_picker(true, window, cx);
+    }
+
+    fn switch_key_layout(
+        &mut self,
+        action: &SwitchKeyLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(name) = &action.name {
+            crate::key_layout::choose(name.clone(), cx);
+        } else {
+            self.key_layout_picker(false, window, cx);
+        }
+    }
+
+    fn save_key_layout(&mut self, _: &SaveKeyLayout, window: &mut Window, cx: &mut Context<Self>) {
+        self.key_layout_picker(true, window, cx);
+    }
+
+    fn open_key_layout(&mut self, _: &OpenKeyLayout, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = crate::key_layout::path(cx) {
+            self.open_path(path, None, window, cx);
+        } else {
+            // Built-in sets are copied first, so editing one cannot change
+            // what Default or another editor's preset means.
+            self.key_layout_picker(true, window, cx);
+        }
+    }
+
+    fn key_layout_picker(&mut self, save: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_modal(window, cx, move |window, cx| {
+            let picker = Picker::new(KeyLayoutPicker::new(save), window, cx);
+            KeyLayoutPicker::load(window, cx);
+            picker
+        });
+    }
+
+    fn layout_picker(&mut self, save: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_modal(window, cx, move |window, cx| {
+            let picker = Picker::new(LayoutPicker::new(save), window, cx);
+            LayoutPicker::load(window, cx);
+            picker
+        });
+    }
+
     fn open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
         let answer = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -3146,13 +3889,13 @@ impl Workspace {
     }
 
     fn show_files(&mut self, _: &ShowFiles, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_sidebar(Some(SidebarTab::Files), cx);
+        self.set_sidebar(Some(Panel::Files), cx);
         window.focus(&self.project_panel.focus_handle(cx));
         cx.notify();
     }
 
     fn show_search(&mut self, _: &ShowSearch, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_sidebar(Some(SidebarTab::Search), cx);
+        self.set_sidebar(Some(Panel::Search), cx);
         let selected = self
             .active_editor()
             .and_then(|e| e.read(cx).selected_text(cx));
@@ -3161,13 +3904,21 @@ impl Workspace {
         cx.notify();
     }
 
-    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
-        let tab = match self.sidebar {
-            Some(_) => None,
-            None => Some(SidebarTab::Files),
-        };
-        self.set_sidebar(tab, cx);
-        cx.notify();
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, window: &mut Window, cx: &mut Context<Self>) {
+        if self.left.is_some() {
+            return self.close_dock(Place::Left, window, cx);
+        }
+        // Closed, it opens on the first panel it has.
+        let first = Layout::get(cx)
+            .left
+            .panels
+            .iter()
+            .copied()
+            .find(|panel| self.available(*panel));
+        if let Some(panel) = first {
+            self.left = Some(panel);
+            self.docks_changed(Some(panel), cx);
+        }
     }
 
     fn reveal_active_file(
@@ -3182,7 +3933,7 @@ impl Workspace {
         else {
             return;
         };
-        self.set_sidebar(Some(SidebarTab::Files), cx);
+        self.set_sidebar(Some(Panel::Files), cx);
         self.project_panel.update(cx, |p, cx| p.reveal(&path, cx));
         window.focus(&self.project_panel.focus_handle(cx));
         cx.notify();
@@ -3237,7 +3988,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .rounded(px(8.))
+                    .rounded(theme.shape.control)
                     .text_size(UI_FONT_SIZE)
                     .text_color(if active && is_active_pane {
                         theme.fg
@@ -3247,7 +3998,9 @@ impl Workspace {
                         theme.fg_subtle
                     })
                     .when(active, |d| {
-                        d.bg(theme.bg_elev).border_1().border_color(theme.line)
+                        d.bg(theme.bg_elev)
+                            .border(theme.shape.border)
+                            .border_color(theme.line)
                     })
                     .hover(|d| d.text_color(theme.fg))
                     .on_mouse_down(
@@ -3277,7 +4030,7 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(6.))
+                            .rounded(theme.shape.token)
                             .text_color(theme.fg_subtle)
                             .hover(|d| d.bg(theme.line).text_color(theme.fg))
                             .child(if dirty { "●" } else { "×" })
@@ -3288,34 +4041,50 @@ impl Workspace {
                     )
             })
             .collect();
+        let TabBar {
+            height,
+            place: tabs_at,
+        } = Layout::get(cx).tab_bar;
+        let mut tab_bar = (tabs_at != TabsAt::None).then(|| {
+            div()
+                .id(("tab-bar", p))
+                .debug_selector(move || format!("tab-bar-{p}"))
+                .h(px(height))
+                .flex_none()
+                .px_1p5()
+                .flex()
+                .items_center()
+                .gap_1()
+                .overflow_x_scroll()
+                .map(|d| match tabs_at {
+                    TabsAt::Bottom => d.border_t(theme.shape.border),
+                    _ => d.border_b(theme.shape.border),
+                })
+                .border_color(theme.line)
+                .bg(theme.bg_sunken)
+                .children(tabs)
+        });
         div()
             .flex_1()
             .min_w_0()
             .h_full()
             .flex()
             .flex_col()
-            .when(p > 0, |d| d.border_l_1().border_color(theme.line))
-            .child(
-                div()
-                    .id(("tab-bar", p))
-                    .h(px(TAB_BAR_HEIGHT))
-                    .flex_none()
-                    .px_1p5()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .overflow_x_scroll()
-                    .border_b_1()
-                    .border_color(theme.line)
-                    .bg(theme.bg_sunken)
-                    .children(tabs),
-            )
+            .when(p > 0, |d| {
+                d.border_l(theme.shape.border).border_color(theme.line)
+            })
+            .children(if tabs_at == TabsAt::Top {
+                tab_bar.take()
+            } else {
+                None
+            })
             .when(search_visible, |d| d.child(self.search_bar.clone()))
             .when(is_active_pane, |pane| {
                 pane.children(self.inline_edit.as_ref().map(|(panel, _)| panel.clone()))
             })
             .child(
                 div()
+                    .debug_selector(move || format!("pane-body-{p}"))
                     .flex_1()
                     .min_h_0()
                     .map(|d| match pane.active_editor() {
@@ -3323,217 +4092,546 @@ impl Workspace {
                         None => d.child(self.render_empty(window, cx)),
                     }),
             )
+            // Below the file, if that is where the layout puts them.
+            .children(tab_bar)
     }
 
-    fn render_sidebar(&self, tab: SidebarTab, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A dock: a tab for each panel the layout puts in it that has
+    /// something to show, and the panel it shows.
+    fn render_dock(&self, place: Place, tab: Panel, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let tab_button = |id: &'static str, label: &'static str, this_tab: SidebarTab| {
-            let active = tab == this_tab;
-            div()
-                .id(id)
-                .debug_selector(move || id.to_string())
-                .h(px(24.))
-                .px_1()
-                .flex()
-                .items_center()
-                .rounded(px(8.))
-                .text_size(UI_FONT_SIZE)
-                .text_color(if active { theme.fg } else { theme.fg_subtle })
-                .when(active, |d| d.bg(theme.bg_elev))
-                .hover(|d| d.text_color(theme.fg))
-                .child(label)
-                .on_click(cx.listener(move |this, _, window, cx| match this_tab {
-                    SidebarTab::Files => this.show_files(&ShowFiles, window, cx),
-                    SidebarTab::Search => this.show_search(&ShowSearch, window, cx),
-                    SidebarTab::Git => this.show_git(&ShowGit, window, cx),
-                    SidebarTab::Services => this.show_services(&ShowServices, window, cx),
-                    SidebarTab::Database => this.show_database(&ShowDatabase, window, cx),
-                    SidebarTab::Api => this.show_api(&ShowApi, window, cx),
-                    SidebarTab::Ai => this.show_ai(&ShowAi, window, cx),
-                    SidebarTab::Extensions => this.show_extensions(&ShowExtensions, window, cx),
-                }))
-        };
+        let layout = Layout::get(cx).clone();
+        // A hidden panel a command opened has a tab for as long as it shows.
+        let mut panels = layout.panels(place).to_vec();
+        if !panels.contains(&tab) {
+            panels.push(tab);
+        }
+        let mut tabs: Vec<AnyElement> = Vec::new();
+        for panel in panels {
+            let key = panel as usize;
+            match panel {
+                // Each terminal's tab is the terminals' as far as the
+                // layout goes: they move together.
+                Panel::Terminal => {
+                    for (ix, tab) in self.terminal_tabs(cx).into_iter().enumerate() {
+                        tabs.push(self.held(place, panel, 100 + ix, tab, cx));
+                    }
+                }
+                Panel::Debug if self.show_debug => {
+                    let tab = self.render_debug_tab(&theme, cx).into_any_element();
+                    tabs.push(self.held(place, panel, key, tab, cx));
+                }
+                Panel::Response if self.show_response => {
+                    let tab = self.render_response_tab(&theme, cx).into_any_element();
+                    tabs.push(self.held(place, panel, key, tab, cx));
+                }
+                Panel::Results if self.show_results => {
+                    let tab = self.render_results_tab(&theme, cx).into_any_element();
+                    tabs.push(self.held(place, panel, key, tab, cx));
+                }
+                Panel::Debug | Panel::Response | Panel::Results => {}
+                _ => {
+                    let active = tab == panel;
+                    let label = div()
+                        .id(("panel", panel as usize))
+                        .debug_selector(move || format!("panel-{}", panel.id()))
+                        .flex_none()
+                        .h(px(24.))
+                        .px_1()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .rounded(theme.shape.control)
+                        .text_size(UI_FONT_SIZE)
+                        .text_color(if active { theme.fg } else { theme.fg_subtle })
+                        .when(active, |d| d.bg(theme.bg_elev))
+                        .hover(|d| d.text_color(theme.fg))
+                        .child(crate::icons::draw(crate::icons::panel(panel)))
+                        .child(panel.label())
+                        .on_click(cx.listener(move |this, _, window, cx| match panel {
+                            Panel::Files => this.show_files(&ShowFiles, window, cx),
+                            Panel::Search => this.show_search(&ShowSearch, window, cx),
+                            Panel::Git => this.show_git(&ShowGit, window, cx),
+                            Panel::Services => this.show_services(&ShowServices, window, cx),
+                            Panel::Database => this.show_database(&ShowDatabase, window, cx),
+                            Panel::Api => this.show_api(&ShowApi, window, cx),
+                            Panel::Ai => this.show_ai(&ShowAi, window, cx),
+                            Panel::Extensions => this.show_extensions(&ShowExtensions, window, cx),
+                            Panel::Chat => this.show_right(false, window, cx),
+                            Panel::Agent => this.show_right(true, window, cx),
+                            _ => {}
+                        }))
+                        .into_any_element();
+                    tabs.push(self.held(place, panel, key, label, cx));
+                }
+            }
+        }
         div()
-            .w(px(SIDEBAR_WIDTH))
+            .debug_selector(move || match place {
+                Place::Left => "dock-left".into(),
+                Place::Right => "dock-right".into(),
+                Place::Bottom => "dock-bottom".into(),
+            })
+            .track_focus(&self.dock_focus[place as usize])
             .flex_none()
-            .h_full()
             .flex()
             .flex_col()
-            .border_r_1()
             .border_color(theme.line)
-            .bg(theme.bg_sunken)
+            // A tab from another dock dropped anywhere in this one comes
+            // to the end of its row.
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedPanel, window, cx| {
+                    if Layout::get(cx).place(dragged.0) != Some(place) {
+                        this.put_panel(dragged.0, place, None, window, cx);
+                    }
+                }),
+            )
+            .map(|d| match place {
+                Place::Left => d
+                    .w(px(layout.left.width))
+                    .h_full()
+                    .border_r(theme.shape.border)
+                    .bg(theme.bg_sunken),
+                Place::Right => d
+                    .w(px(layout.right.width))
+                    .h_full()
+                    .border_l(theme.shape.border)
+                    .bg(theme.bg_sunken),
+                Place::Bottom => d.h(px(layout.bottom.height)).border_t(theme.shape.border),
+            })
             .child(
                 div()
                     .flex_none()
-                    .h(px(TAB_BAR_HEIGHT))
+                    .min_h(px(layout.tab_bar.height))
                     .px_2()
                     .flex()
+                    // More tabs than the dock is wide go on a second row.
+                    .flex_wrap()
                     .items_center()
                     .gap_1()
-                    .border_b_1()
+                    .bg(theme.bg_sunken)
+                    .border_b(theme.shape.border)
                     .border_color(theme.line)
-                    .child(tab_button("sidebar-files", "Files", SidebarTab::Files))
-                    .child(tab_button("sidebar-search", "Search", SidebarTab::Search))
-                    .child(tab_button("sidebar-git", "Git", SidebarTab::Git))
-                    .child(tab_button(
-                        "sidebar-services",
-                        "Services",
-                        SidebarTab::Services,
-                    ))
-                    .child(tab_button(
-                        "sidebar-database",
-                        "Database",
-                        SidebarTab::Database,
-                    ))
-                    .child(tab_button("sidebar-api", "API", SidebarTab::Api))
-                    .child(tab_button("sidebar-ai", "AI", SidebarTab::Ai))
-                    .child(tab_button(
-                        "sidebar-extensions",
-                        "Extensions",
-                        SidebarTab::Extensions,
-                    )),
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.dock_menu = Some((event.position, place, None));
+                            this.bar_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .on_drop(
+                        cx.listener(move |this, dragged: &DraggedPanel, window, cx| {
+                            this.put_panel(dragged.0, place, None, window, cx)
+                        }),
+                    )
+                    .children(tabs),
             )
-            .child(div().flex_1().min_h_0().pt_1().map(|d| match tab {
-                SidebarTab::Files => d.child(self.project_panel.clone()),
-                SidebarTab::Search => d.child(self.project_search.clone()),
-                SidebarTab::Git => d.child(self.git_panel.clone()),
-                SidebarTab::Services => d.child(self.services.clone()),
-                SidebarTab::Database => d.child(self.database_panel.clone()),
-                SidebarTab::Api => d.child(self.api_panel.clone()),
-                SidebarTab::Ai => d.child(self.ai_panel.clone()),
-                SidebarTab::Extensions => d.child(self.extensions_panel.clone()),
+            .child(div().flex_1().min_h_0().map(|d| {
+                match tab {
+                    Panel::Files => d.pt_1().child(self.project_panel.clone()),
+                    Panel::Search => d.pt_1().child(self.project_search.clone()),
+                    Panel::Git => d.pt_1().child(self.git_panel.clone()),
+                    Panel::Services => d.pt_1().child(self.services.clone()),
+                    Panel::Database => d.pt_1().child(self.database_panel.clone()),
+                    Panel::Api => d.pt_1().child(self.api_panel.clone()),
+                    Panel::Ai => d.pt_1().child(self.ai_panel.clone()),
+                    Panel::Extensions => d.pt_1().child(self.extensions_panel.clone()),
+                    Panel::Chat => d.pt_1().child(self.chat.clone()),
+                    Panel::Agent => d.pt_1().child(self.agent.clone()),
+                    Panel::Debug => d.child(self.debug_panel.clone()),
+                    Panel::Response => d.child(self.response.clone()),
+                    Panel::Results => d.child(self.results.clone()),
+                    Panel::Terminal => d.children(
+                        self.terminals
+                            .get(self.active_terminal)
+                            .map(|(t, _)| t.clone()),
+                    ),
+                }
             }))
+    }
+
+    /// What is in front, as the window's title says it: the file, or the
+    /// view that took its place, or with neither the project's folder.
+    fn front_title(&self, cx: &App) -> String {
+        self.structure
+            .as_ref()
+            .map(|(view, _)| format!("Structure of {}", view.read(cx).title(cx)))
+            .or_else(|| {
+                self.erd
+                    .as_ref()
+                    .map(|(view, _)| format!("Diagram of {}", view.read(cx).connection))
+            })
+            .or_else(|| {
+                self.file_diff
+                    .as_ref()
+                    .map(|view| view.read(cx).path.display().to_string())
+            })
+            .or_else(|| {
+                self.active_editor().and_then(|editor| {
+                    editor
+                        .read(cx)
+                        .path(cx)
+                        .map(|path| path.display().to_string())
+                })
+            })
+            .unwrap_or_else(|| self.root(cx).display().to_string())
+    }
+
+    /// What an item of a bar shows now, in as many pieces as it has to
+    /// say; none while it has nothing to say.
+    fn bar_item(&self, item: &Item, cx: &mut Context<Self>) -> Vec<BarPart> {
+        let theme = cx.theme().clone();
+        let says = |text: String| BarPart {
+            text,
+            id: None,
+            color: None,
+            action: None,
+        };
+        // The wrapper of the whole item keeps the window from being
+        // dragged, while these parts keep their own click actions.
+        let does = |id: (&'static str, usize),
+                    text: String,
+                    color: gpui::Hsla,
+                    action: Box<dyn gpui::Action>| {
+            BarPart {
+                text,
+                id: Some(id),
+                color: Some(color),
+                action: Some(action),
+            }
+        };
+        // A file in front has a cursor, an indent and a language; a diff
+        // in its place has none of them.
+        let editor = match self.file_diff {
+            Some(_) => None,
+            None => self.active_editor(),
+        };
+        match item {
+            Item::Project => {
+                let root = self.root(cx);
+                let name = root.file_name().map_or_else(
+                    || root.display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                vec![says(name)]
+            }
+            Item::File => {
+                let title = self.front_title(cx);
+                let root = self.root(cx);
+                // Inside the project, the way from its folder is enough.
+                let short = Path::new(&title)
+                    .strip_prefix(&root)
+                    .ok()
+                    .filter(|rest| !rest.as_os_str().is_empty())
+                    .map(|rest| rest.display().to_string());
+                vec![says(short.unwrap_or(title))]
+            }
+            Item::Branch => {
+                let branch = self.git.read(cx).status().branch.clone();
+                branch
+                    .map(|branch| {
+                        does(
+                            ("item-branch", 0),
+                            branch,
+                            theme.fg_muted,
+                            Box::new(git_panel::SwitchBranch),
+                        )
+                    })
+                    .into_iter()
+                    .collect()
+            }
+            Item::Position => {
+                if self.file_diff.is_some() {
+                    return vec![says("Git diff".into()), says("Read-only".into())];
+                }
+                let Some(editor) = editor else {
+                    return Vec::new();
+                };
+                let e = editor.read(cx);
+                let (line, col, cursors) = e.cursor_position(cx);
+                let mut parts = vec![says(format!("Ln {line}, Col {col}"))];
+                if cursors > 1 {
+                    parts.push(says(format!("{cursors} cursors")));
+                }
+                if e.doc(cx).is_read_only() {
+                    parts.push(says("Read-only".into()));
+                }
+                parts
+            }
+            Item::Indent => editor
+                .map(|e| says(e.read(cx).doc(cx).indent_label().to_string()))
+                .into_iter()
+                .collect(),
+            Item::Language => editor
+                .map(|e| {
+                    let name = e.read(cx).doc(cx).language_name();
+                    says(name.unwrap_or("Plain text").to_string())
+                })
+                .into_iter()
+                .collect(),
+            Item::Problems => editor
+                .and_then(|e| {
+                    let (errors, warnings) =
+                        crate::editor_lsp::diagnostic_counts(e.read(cx).doc(cx));
+                    crate::editor_lsp::status_text(errors, warnings)
+                })
+                .map(|text| says(text.to_string()))
+                .into_iter()
+                .collect(),
+            Item::Activity => {
+                let mut parts = Vec::new();
+                if let Some(status) =
+                    LspStore::global(cx).and_then(|s| s.read(cx).status().cloned())
+                {
+                    parts.push(says(status.to_string()));
+                }
+                if self.project.read(cx).is_scanning() {
+                    parts.push(says("Indexing files...".into()));
+                }
+                parts
+            }
+            Item::Connection => {
+                let connection = self.active_editor().and_then(|e| {
+                    let path = e.read(cx).path(cx)?;
+                    let store = self.database.read(cx);
+                    match store.binding(path) {
+                        Some(name) => Some(name.to_string()),
+                        None => {
+                            database::query_file_engines(path).map(|_| "No connection".to_string())
+                        }
+                    }
+                });
+                connection
+                    .map(|name| {
+                        does(
+                            ("status-connection", 0),
+                            name,
+                            theme.fg_muted,
+                            Box::new(SelectConnection),
+                        )
+                    })
+                    .into_iter()
+                    .collect()
+            }
+            // What plugins show, and a notice when one is slow; both open
+            // the Plugins window.
+            Item::Plugins => {
+                let plugins = self.plugins.read(cx);
+                let mut items: Vec<(String, bool)> = plugins
+                    .status
+                    .values()
+                    .map(|text| (text.to_string(), false))
+                    .collect();
+                match plugins.slow().as_slice() {
+                    [] => {}
+                    [name] => items.push((format!("Slow plugin: {name}"), true)),
+                    names => items.push((format!("{} slow plugins", names.len()), true)),
+                }
+                items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (text, slow))| {
+                        let color = if slow { theme.warning } else { theme.fg_muted };
+                        does(("status-plugin", i), text, color, Box::new(ShowPlugins))
+                    })
+                    .collect()
+            }
+            Item::Performance => {
+                let perf = cx.global::<Perf>();
+                let mut parts = Vec::new();
+                if perf.hud_visible {
+                    if let Some((p50, p99)) = perf.input_p50_p99() {
+                        parts.push(says(format!(
+                            "input {} ms, p99 {}",
+                            perf::ms(p50),
+                            perf::ms(p99)
+                        )));
+                    }
+                    if let Some((p50, _)) = perf.frame_p50_p99() {
+                        parts.push(says(format!("frame {} ms", perf::ms(p50))));
+                    }
+                    if let Some(bytes) = perf::resident_memory() {
+                        parts.push(says(format!("{} MB", bytes / (1024 * 1024))));
+                    }
+                    if let Some(start) = perf.first_frame {
+                        parts.push(says(format!("start {} ms", perf::ms(start))));
+                    }
+                }
+                parts
+            }
+            Item::Button { .. } => vec![says(
+                Layout::get(cx)
+                    .style(item)
+                    .label
+                    .as_deref()
+                    .unwrap_or(item.label())
+                    .to_owned(),
+            )],
+        }
+    }
+
+    /// Items are dropped before the one under the pointer. Even an empty
+    /// end has room to append one or to bring one back through its menu.
+    fn bar_end(&self, end: BarEnd, items: &[Item], cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let children: Vec<_> = items
+            .iter()
+            .filter_map(|item| {
+                let parts = self.bar_item(item, cx);
+                if parts.is_empty() {
+                    return None;
+                }
+                let style = Layout::get(cx).style(item).clone();
+                let default_action = parts
+                    .first()
+                    .and_then(|part| part.action.as_ref())
+                    .map(|action| action.boxed_clone());
+                let tooltip = parts
+                    .iter()
+                    .map(|part| part.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let icon = style
+                    .icon
+                    .as_deref()
+                    .and_then(crate::icons::named)
+                    .unwrap_or_else(|| crate::icons::item(item));
+                let whole = style.command.is_some()
+                    || style.display == Display::Icon
+                    || style.label.is_some();
+                let content: Vec<_> = if style.display == Display::Icon {
+                    Vec::new()
+                } else if let Some(label) = style.label {
+                    vec![div().child(label).into_any_element()]
+                } else {
+                    parts
+                        .into_iter()
+                        .map(|part| part.render(!whole, &theme))
+                        .collect()
+                };
+                let id = item.id().to_owned();
+                let menu_item = item.clone();
+                let over_item = item.clone();
+                let drop_item = item.clone();
+                Some(
+                    div()
+                        .id(SharedString::from(format!("bar-item-{id}")))
+                        .debug_selector(move || format!("item-{id}"))
+                        .occlude()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.dock_menu = None;
+                                this.bar_menu =
+                                    Some((event.position, end, Some(menu_item.clone())));
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        )
+                        .on_drag(DraggedItem(item.clone()), |dragged, _, _, cx| {
+                            cx.new(|_| DraggedBarItem(dragged.0.clone()))
+                        })
+                        .drag_over::<DraggedItem>(move |style, dragged, _, _| {
+                            if dragged.0 == over_item {
+                                style
+                            } else {
+                                style.bg(theme.accent_soft)
+                            }
+                        })
+                        .on_drop(cx.listener(move |_, dragged: &DraggedItem, _, cx| {
+                            layout::put(
+                                Layout::get(cx).clone().moved_item(
+                                    dragged.0.clone(),
+                                    end,
+                                    Some(drop_item.clone()),
+                                ),
+                                cx,
+                            );
+                        }))
+                        .when(style.display != Display::Text, |d| {
+                            d.child(crate::icons::draw(icon))
+                        })
+                        .child(div().flex().items_center().gap_4().children(content))
+                        .when(whole, |d| {
+                            d.hover(|d| d.bg(theme.line).text_color(theme.fg)).on_click(
+                                move |_, window, cx| {
+                                    if let Some(command) = &style.command {
+                                        crate::bar_commands::run(command, window, cx);
+                                    } else if let Some(action) = &default_action {
+                                        window.dispatch_action(action.boxed_clone(), cx);
+                                    }
+                                },
+                            )
+                        })
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| crate::ui::Tooltip(tooltip.clone())).into()
+                        })
+                        .into_any_element(),
+                )
+            })
+            .collect();
+        // Config errors stay visible even when their own layout is empty.
+        let error = (end == BarEnd::StatusLeft)
+            .then(|| {
+                cx.try_global::<settings::ConfigErrors>()
+                    .and_then(|e| e.0.first().cloned())
+            })
+            .flatten();
+        div()
+            .id(("bar-end", end as usize))
+            .debug_selector(move || format!("bar-{}", end.id()))
+            .flex_grow()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .items_center()
+            .gap_4()
+            .when(end.is_right(), |d| d.justify_end())
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.dock_menu = None;
+                    this.bar_menu = Some((event.position, end, None));
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .drag_over::<DraggedItem>(move |style, _, _, _| style.bg(theme.accent_soft))
+            .on_drop(cx.listener(move |_, dragged: &DraggedItem, _, cx| {
+                layout::put(
+                    Layout::get(cx)
+                        .clone()
+                        .moved_item(dragged.0.clone(), end, None),
+                    cx,
+                );
+            }))
+            .children(children)
+            .children(error.map(|e| div().truncate().text_color(theme.error).child(e)))
     }
 
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let mut left: Vec<String> = Vec::new();
-        if self.file_diff.is_some() {
-            left.push("Git diff".into());
-            left.push("Read-only".into());
-        } else if let Some(editor) = self.active_editor() {
-            let e = editor.read(cx);
-            let doc = e.doc(cx);
-            let (line, col, cursors) = e.cursor_position(cx);
-            left.push(format!("Ln {line}, Col {col}"));
-            if cursors > 1 {
-                left.push(format!("{cursors} cursors"));
-            }
-            if doc.is_read_only() {
-                left.push("Read-only".into());
-            }
-            left.push(doc.indent_label().to_string());
-            left.push(doc.language_name().unwrap_or("Plain text").to_string());
-            let (errors, warnings) = crate::editor_lsp::diagnostic_counts(doc);
-            if let Some(text) = crate::editor_lsp::status_text(errors, warnings) {
-                left.push(text.to_string());
-            }
-        }
-        if let Some(status) = LspStore::global(cx).and_then(|s| s.read(cx).status().cloned()) {
-            left.push(status.to_string());
-        }
-        if self.project.read(cx).is_scanning() {
-            left.push("Indexing files...".into());
-        }
-        let config_error = cx
-            .try_global::<settings::ConfigErrors>()
-            .and_then(|e| e.0.first().cloned());
-
-        let perf = cx.global::<Perf>();
-        let mut right: Vec<String> = Vec::new();
-        if perf.hud_visible {
-            if let Some((p50, p99)) = perf.input_p50_p99() {
-                right.push(format!("input {} ms, p99 {}", perf::ms(p50), perf::ms(p99)));
-            }
-            if let Some((p50, _)) = perf.frame_p50_p99() {
-                right.push(format!("frame {} ms", perf::ms(p50)));
-            }
-            if let Some(bytes) = perf::resident_memory() {
-                right.push(format!("{} MB", bytes / (1024 * 1024)));
-            }
-            if let Some(start) = perf.first_frame {
-                right.push(format!("start {} ms", perf::ms(start)));
-            }
-        }
-
-        let connection = self.active_editor().and_then(|e| {
-            let path = e.read(cx).path(cx)?;
-            let store = self.database.read(cx);
-            match store.binding(path) {
-                Some(name) => Some(name.to_string()),
-                None => database::query_file_engines(path).map(|_| "No connection".to_string()),
-            }
-        });
-        // What plugins show, and a notice when one is slow; both open the
-        // Plugins window.
-        let plugins = self.plugins.read(cx);
-        let mut plugin_items: Vec<(String, bool)> = plugins
-            .status
-            .values()
-            .map(|text| (text.to_string(), false))
-            .collect();
-        match plugins.slow().as_slice() {
-            [] => {}
-            [name] => plugin_items.push((format!("Slow plugin: {name}"), true)),
-            names => plugin_items.push((format!("{} slow plugins", names.len()), true)),
-        }
-        let item = |text: String| div().child(text);
+        let bar = Layout::get(cx).status_bar.clone();
         div()
-            .h(px(STATUS_HEIGHT))
+            .h(px(bar.height))
+            .debug_selector(|| "status-bar".into())
             .flex_none()
             .flex()
             .items_center()
             .justify_between()
             .px_3()
-            .border_t_1()
+            .border_t(theme.shape.border)
             .border_color(theme.line)
             .bg(theme.bg_sunken)
-            .text_size(px(11.5))
+            .text_size(crate::theme::text(11.5))
             .text_color(theme.fg_subtle)
-            .child(
-                div()
-                    .flex()
-                    .gap_4()
-                    .min_w_0()
-                    .children(left.into_iter().map(item))
-                    .children(connection.map(|name| {
-                        div()
-                            .id("status-connection")
-                            .px_1p5()
-                            .rounded(px(6.))
-                            .text_color(theme.fg_muted)
-                            .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                            .child(name)
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(SelectConnection), cx)
-                            })
-                    }))
-                    .children(
-                        config_error.map(|e| div().truncate().text_color(theme.error).child(e)),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .gap_4()
-                    .children(
-                        plugin_items
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, (text, slow))| {
-                                div()
-                                    .id(("status-plugin", i))
-                                    .text_color(if slow { theme.warning } else { theme.fg_muted })
-                                    .hover(|d| d.text_color(theme.fg))
-                                    .child(text)
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(Box::new(ShowPlugins), cx)
-                                    })
-                            }),
-                    )
-                    .children(right.into_iter().map(item)),
-            )
+            .child(self.bar_end(BarEnd::StatusLeft, bar.left(), cx))
+            .child(self.bar_end(BarEnd::StatusRight, bar.right(), cx))
     }
 
     fn render_empty(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3617,35 +4715,22 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let root = self.root(cx);
-        let project_name = root.file_name().map_or_else(
-            || root.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        );
-        let title = self
-            .structure
-            .as_ref()
-            .map(|(view, _)| format!("Structure of {}", view.read(cx).title(cx)))
-            .or_else(|| {
-                self.erd
-                    .as_ref()
-                    .map(|(view, _)| format!("Diagram of {}", view.read(cx).connection))
-            })
-            .or_else(|| {
-                self.file_diff
-                    .as_ref()
-                    .map(|view| view.read(cx).path.display().to_string())
-            })
-            .or_else(|| {
-                self.active_editor().and_then(|editor| {
-                    editor
-                        .read(cx)
-                        .path(cx)
-                        .map(|path| path.display().to_string())
-                })
-            })
-            .unwrap_or_else(|| root.display().to_string());
+        // A tab let go anywhere is no longer dragged.
+        if self.dragging.is_some() && !cx.has_active_drag() {
+            self.dragging = None;
+        }
+        // While one is, a closed dock has a place to drop it on.
+        let zone = |this: &Self, place: Place, cx: &mut Context<Self>| {
+            let closed = match place {
+                Place::Left => this.left.is_none(),
+                Place::Right => this.right.is_none(),
+                Place::Bottom => this.bottom.is_none(),
+            };
+            (closed && this.dragging.is_some()).then(|| this.drop_zone(place, cx))
+        };
+        let title = self.front_title(cx);
         window.set_window_title(&title);
+        let title_bar = Layout::get(cx).title_bar.clone();
         let special: Option<AnyView> = self
             .structure
             .as_ref()
@@ -3669,6 +4754,16 @@ impl Render for Workspace {
         div()
             .id("workspace")
             .key_context("Workspace")
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape"
+                    && (this.bar_menu.is_some() || this.dock_menu.is_some())
+                {
+                    this.bar_menu = None;
+                    this.dock_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::next_tab))
@@ -3691,6 +4786,13 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::open_keymap))
+            .on_action(cx.listener(Self::open_layout))
+            .on_action(cx.listener(Self::switch_layout))
+            .on_action(cx.listener(Self::save_layout))
+            .on_action(cx.listener(Self::switch_key_layout))
+            .on_action(cx.listener(Self::save_key_layout))
+            .on_action(cx.listener(Self::open_key_layout))
+            .on_action(cx.listener(Self::reset_layout))
             .on_action(cx.listener(Self::split_right))
             .on_action(cx.listener(Self::focus_next_pane))
             .on_action(cx.listener(Self::focus_prev_pane))
@@ -3735,19 +4837,20 @@ impl Render for Workspace {
             .flex()
             .flex_col()
             .bg(theme.bg)
-            .font_family(UI_FONT)
+            .font_family(Settings::get(cx).ui_font())
             .text_color(theme.fg)
             .child(
                 div()
                     .id("titlebar")
-                    .h(px(TITLEBAR_HEIGHT))
+                    .debug_selector(|| "title-bar".into())
+                    .h(px(title_bar.height))
                     .flex_none()
                     .flex()
                     .items_center()
                     // Room for the macOS traffic lights.
                     .pl(px(if cfg!(target_os = "macos") { 84. } else { 12. }))
                     .pr_3()
-                    .border_b_1()
+                    .border_b(theme.shape.border)
                     .border_color(theme.line)
                     .bg(theme.bg_sunken)
                     .text_size(UI_FONT_SIZE)
@@ -3760,80 +4863,46 @@ impl Render for Workspace {
                             window.start_window_move();
                         }
                     })
-                    .child(project_name),
+                    .child(self.bar_end(BarEnd::TitleLeft, title_bar.left(), cx))
+                    .child(self.bar_end(BarEnd::TitleRight, title_bar.right(), cx)),
             )
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .children(self.sidebar.map(|tab| self.render_sidebar(tab, cx)))
+                    .children(self.left.map(|tab| self.render_dock(Place::Left, tab, cx)))
+                    .children(zone(self, Place::Left, cx))
                     .children(panes)
-                    .when(self.chat_open, |d| {
-                        let agent = self.agent_shown;
-                        let tab = |id: &'static str, label: &'static str, active: bool| {
-                            div()
-                                .id(id)
-                                .debug_selector(move || id.into())
-                                .h(px(24.))
-                                .px_1p5()
-                                .flex()
-                                .items_center()
-                                .rounded(px(8.))
-                                .text_size(UI_FONT_SIZE)
-                                .text_color(if active { theme.fg } else { theme.fg_subtle })
-                                .when(active, |d| d.bg(theme.bg_elev))
-                                .hover(|d| d.text_color(theme.fg))
-                                .child(label)
-                        };
-                        d.child(
-                            div()
-                                .w(px(CHAT_WIDTH))
-                                .flex_none()
-                                .h_full()
-                                .flex()
-                                .flex_col()
-                                .border_l_1()
-                                .border_color(theme.line)
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .px_2()
-                                        .py_1()
-                                        .flex()
-                                        .gap_1()
-                                        .border_b_1()
-                                        .border_color(theme.line)
-                                        .child(tab("right-chat", "Chat", !agent).on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.show_right(false, window, cx)
-                                            }),
-                                        ))
-                                        .child(tab("right-agent", "Agent", agent).on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.show_right(true, window, cx)
-                                            }),
-                                        )),
-                                )
-                                .child(div().flex_1().min_h_0().map(|d| {
-                                    if agent {
-                                        d.child(self.agent.clone())
-                                    } else {
-                                        d.child(self.chat.clone())
-                                    }
-                                })),
-                        )
-                    }),
+                    .children(zone(self, Place::Right, cx))
+                    .children(
+                        self.right
+                            .map(|tab| self.render_dock(Place::Right, tab, cx)),
+                    ),
             )
-            .when(self.dock_open && self.dock_has_tabs(), |d| {
-                d.child(self.render_dock(cx))
-            })
+            .children(zone(self, Place::Bottom, cx))
+            .children(
+                self.bottom
+                    .map(|tab| self.render_dock(Place::Bottom, tab, cx)),
+            )
+            .children(self.render_dock_menu(window, cx))
+            .children(self.render_bar_menu(window, cx))
             .child(self.render_status(cx))
+            .children(self.resize_handles(cx))
+            .on_mouse_move(cx.listener(Self::resize_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.resize_end(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.resize_end(cx)),
+            )
             .children(self.modal.as_ref().map(|modal| {
                 deferred(
                     div()
                         .absolute()
-                        .top(px(TITLEBAR_HEIGHT + 24.))
+                        .top(px(Layout::get(cx).title_bar.height + 24.))
                         .left_0()
                         .right_0()
                         .flex()
@@ -4264,7 +5333,7 @@ mod tests {
         wait(cx, "terminal to close", &|cx| {
             ws.read(cx).terminals.is_empty()
         });
-        assert!(!cx.read(|cx| ws.read(cx).dock_open));
+        assert!(cx.read(|cx| ws.read(cx).bottom.is_none()));
     }
 
     fn git_fixture(name: &str) -> PathBuf {
@@ -4690,7 +5759,7 @@ mod tests {
         wait_for(cx, "detection", &|cx| services.read(cx).specs().len() == 2);
 
         cx.simulate_keystrokes("secondary-shift-s");
-        assert!(cx.read(|cx| ws.read(cx).sidebar == Some(SidebarTab::Services)));
+        assert!(cx.read(|cx| ws.read(cx).left == Some(Panel::Services)));
         cx.dispatch_action(RunStack);
         wait_for(cx, "port from the log", &|cx| {
             services.read(cx).ports("web") == [4321]
@@ -5435,7 +6504,7 @@ mod tests {
         });
         let results = cx.read(|cx| ws.read(cx).results.clone());
         wait_for(cx, "browse", &|cx| {
-            results.read(cx).query.contains("FROM \"users\"") && ws.read(cx).dock_open
+            results.read(cx).query.contains("FROM \"users\"") && ws.read(cx).bottom.is_some()
         });
 
         // Search: Enter selects and centers the first match.
@@ -5631,8 +6700,7 @@ mod tests {
         // As opening it from the Database tab does: show the Results tab.
         ws.update(cx, |ws, cx| {
             ws.show_results = true;
-            ws.dock_view = DockView::Results;
-            ws.dock_open = true;
+            ws.show_panel(Panel::Results, cx);
             cx.notify();
         });
         cx.update(|window, cx| window.focus(&results.focus_handle(cx)));
@@ -5747,7 +6815,7 @@ mod tests {
         // Nothing is read until the tab is opened.
         assert!(!cx.read(|cx| store.read(cx).detected()));
         cx.simulate_keystrokes("ctrl-shift-d");
-        assert!(cx.read(|cx| ws.read(cx).sidebar == Some(SidebarTab::Database)));
+        assert!(cx.read(|cx| ws.read(cx).left == Some(Panel::Database)));
         wait_for(cx, "detection", &|cx| store.read(cx).detected());
         // The file named in .env and found on disk is one connection.
         assert_eq!(cx.read(|cx| store.read(cx).connections().len()), 1);
@@ -5767,7 +6835,7 @@ mod tests {
         );
         cx.read(|cx| {
             let ws = ws.read(cx);
-            assert!(ws.dock_open && ws.show_results && ws.dock_view == DockView::Results);
+            assert!(ws.show_results && ws.bottom == Some(Panel::Results));
         });
 
         cx.update(|window, cx| window.focus(&results.focus_handle(cx)));
@@ -5793,7 +6861,7 @@ mod tests {
             &|cx| matches!(&results.read(cx).state, State::Failed(e) if e.contains("nope")),
         );
         ws.update_in(cx, |ws, window, cx| ws.close_results(window, cx));
-        assert!(!cx.read(|cx| ws.read(cx).dock_open));
+        assert!(cx.read(|cx| ws.read(cx).bottom.is_none()));
     }
 
     /// A server that answers every request with its method, path and body
@@ -5896,7 +6964,7 @@ mod tests {
         assert_eq!(json["method"], "POST");
         assert_eq!(json["path"], "/users");
         assert_eq!(json["body"], "{\"name\": \"Ada\"}");
-        assert!(cx.read(|cx| ws.read(cx).dock_view == DockView::Response && ws.read(cx).dock_open));
+        assert!(cx.read(|cx| ws.read(cx).bottom == Some(Panel::Response)));
 
         // A request that names a variable nobody defines says which one.
         let editor_text = active_text(&ws, cx);
@@ -6867,7 +7935,7 @@ mod tests {
             let _ = window.draw(cx);
         });
         let bounds = cx.debug_bounds("inline-edit").unwrap();
-        assert!(bounds.bottom() <= px(320. - STATUS_HEIGHT), "{bounds:?}");
+        assert!(bounds.bottom() <= px(320. - 26.), "{bounds:?}");
         assert!(bounds.right() <= px(480.), "{bounds:?}");
         assert!(cx.debug_bounds("edit-apply").is_none());
     }
@@ -8458,7 +9526,7 @@ mod tests {
             cx.read(|cx| store.read(cx).lines(&app).cloned()),
             Some([(2, true)].into())
         );
-        assert_eq!(cx.read(|cx| ws.read(cx).dock_view), DockView::Debug);
+        assert_eq!(cx.read(|cx| ws.read(cx).bottom), Some(Panel::Debug));
         assert_eq!(active_path(&ws, cx), Some(app.clone()));
 
         // Variables, and an object opened one level.
@@ -8972,6 +10040,130 @@ mod tests {
     }
 
     #[gpui::test]
+    fn key_layouts_switch_copy_and_keep_personal_overrides(cx: &mut TestAppContext) {
+        use crate::key_layout;
+        let root = fixture("key-layouts");
+        let config = db::testing::dir("ws-key-layouts");
+        std::fs::write(
+            config.join("settings.json"),
+            "// mine\n{\"buffer_font_size\":16}\n",
+        )
+        .unwrap();
+        std::fs::write(config.join(settings::IMPORTED_KEYMAP), r#"[{"context":"Editor && mode == full","bindings":{"ctrl-alt-d":"editor::SelectLine"}}]"#).unwrap();
+        std::fs::create_dir_all(config.join("keymaps")).unwrap();
+        let custom = config.join("keymaps/Review.json");
+        std::fs::write(&custom, r#"[{"context":"Editor && mode == full","bindings":{"ctrl-alt-d":"editor::DuplicateLine"}}]"#).unwrap();
+        std::fs::write(config.join("keymap.json"), r#"[{"context":"Workspace","bindings":{"alt-shift-r":["workspace::SwitchKeyLayout",{"name":"Review"}],"alt-shift-d":["workspace::SwitchKeyLayout",{"name":"Default"}]}}]"#).unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(root.join("keys.txt")), "one\ntwo", None, window, cx)
+        });
+        let wait = |cx: &mut VisualTestContext, name: &str| {
+            wait_for(cx, "the selected keys", &|cx| {
+                !key_layout::pending(cx) && key_layout::active(cx) == name
+            });
+            cx.run_until_parked();
+        };
+        cx.simulate_keystrokes("alt-shift-r");
+        wait(cx, "Review");
+        cx.simulate_keystrokes("ctrl-alt-d");
+        assert_eq!(active_text(&ws, cx), "one\none\ntwo");
+        // A full-editor binding leaves Enter to a picker's parent.
+        cx.dispatch_action(SwitchKeyLayout::default());
+        cx.simulate_input("VS Code");
+        bounds_soon(cx, "key-layout-choice-0");
+        cx.simulate_keystrokes("enter");
+        wait(cx, key_layout::VSCODE);
+        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+        cx.simulate_keystrokes("alt-shift-down");
+        assert_eq!(active_text(&ws, cx), "one\none\none\ntwo");
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        editor.update(cx, |e, cx| e.select_range(0..4, cx));
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(active_text(&ws, cx), "one\none\ntwo");
+        cx.dispatch_action(SaveKeyLayout);
+        cx.simulate_input("My keys");
+        bounds_soon(cx, "key-layout-save");
+        cx.simulate_keystrokes("enter");
+        wait(cx, "My keys");
+        let copied = std::fs::read_to_string(config.join("keymaps/My keys.json")).unwrap();
+        assert_eq!(
+            copied,
+            import::keymap::to_json(&import::keymap::vscode_preset(cfg!(target_os = "macos")))
+        );
+        assert!(
+            std::fs::read_to_string(config.join("settings.json"))
+                .unwrap()
+                .starts_with("// mine\n")
+        );
+        assert_eq!(cx.read(|cx| Settings::get(cx).buffer_font_size), 16.);
+
+        // The user's own assignment wins over the selected file, which
+        // in turn wins over the old imported assignment.
+        cx.simulate_keystrokes("alt-shift-r");
+        wait(cx, "Review");
+        std::fs::write(config.join("keymap.json"), r#"[{"context":"Editor && mode == full","bindings":{"ctrl-alt-d":"editor::SelectLine"}}]"#).unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        cx.simulate_keystrokes("ctrl-alt-d backspace");
+        assert_eq!(active_text(&ws, cx), "one\ntwo");
+        // A partial invalid map is rejected as a whole. Its last good
+        // keys remain active, and the file is left for the user to fix.
+        std::fs::write(config.join("keymap.json"), "[]").unwrap();
+        std::fs::write(
+            &custom,
+            r#"[{"bindings":{"ctrl-alt-d":"editor::SelectLine","ctrl-alt-x":"no::SuchAction"}}]"#,
+        )
+        .unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        wait_for(cx, "the rejected key file", &|cx| {
+            !cx.global::<settings::ConfigErrors>().0.is_empty()
+        });
+        assert!(!cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+        editor.update(cx, |e, cx| e.select_range(0..0, cx));
+        cx.simulate_keystrokes("ctrl-alt-d");
+        assert_eq!(active_text(&ws, cx), "one\none\ntwo");
+        // Two immediate selections are serialized; the last one wins
+        // both in the app and after reading the settings again.
+        cx.dispatch_action(SwitchKeyLayout {
+            name: Some(key_layout::JETBRAINS.into()),
+        });
+        cx.dispatch_action(SwitchKeyLayout {
+            name: Some(key_layout::DEFAULT.into()),
+        });
+        wait(cx, key_layout::DEFAULT);
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert_eq!(
+            cx.read(|cx| Settings::get(cx).key_layout.clone()),
+            key_layout::DEFAULT
+        );
+        editor.update(cx, |e, cx| e.select_range(0..0, cx));
+        cx.simulate_keystrokes("ctrl-alt-d backspace");
+        assert_eq!(active_text(&ws, cx), "one\ntwo");
+        let before = std::fs::read_to_string(config.join("settings.json")).unwrap();
+        cx.dispatch_action(SwitchKeyLayout {
+            name: Some("Missing".into()),
+        });
+        wait(cx, key_layout::DEFAULT);
+        assert_eq!(
+            std::fs::read_to_string(config.join("settings.json")).unwrap(),
+            before
+        );
+        assert!(!cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+        cx.dispatch_action(SwitchKeyLayout {
+            name: Some("My keys".into()),
+        });
+        wait(cx, "My keys");
+        assert!(cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+        cx.dispatch_action(OpenKeyLayout);
+        wait_for(cx, "the selected key file", &|cx| {
+            ws.read(cx).active_editor().unwrap().read(cx).path(cx)
+                == Some(config.join("keymaps/My keys.json").as_path())
+        });
+    }
+
+    #[gpui::test]
     fn a_plugin_written_in_typescript_runs_like_any_other(cx: &mut TestAppContext) {
         let (_root, data, store, ws, cx) = plugin_setup(cx, "plugin-ts", |plugins| {
             plugin::testing::install_script(&plugin::testing::word_count_ts(), plugins);
@@ -9210,8 +10402,8 @@ brackets = [
 
         // The catalogs are asked when the tab is opened, not before.
         assert!(requests.lock().unwrap().is_empty());
-        click(cx, "sidebar-extensions");
-        assert!(cx.read(|cx| ws.read(cx).sidebar == Some(SidebarTab::Extensions)));
+        click(cx, "panel-extensions");
+        assert!(cx.read(|cx| ws.read(cx).left == Some(Panel::Extensions)));
         wait_for(cx, "the catalogs", &|cx| {
             let store = store.read(cx);
             !store.catalog(Origin::Zed).entries.is_empty() && store.catalog(Origin::VsCode).searched
@@ -9598,7 +10790,31 @@ brackets = [
         // this one installs Vue into it.
         assert_eq!(installed.languages[0].suffixes, ["dm", "Demofile"]);
         assert!(syntax::language_for_path(Path::new("notes.dm")).is_none());
-        assert!(cx.read(|cx| ws.read(cx).sidebar == Some(SidebarTab::Extensions)));
+        assert!(cx.read(|cx| ws.read(cx).left == Some(Panel::Extensions)));
+
+        // Its icon theme is drawn with pictures, so it is one Solder has:
+        // the tab offers it, and chosen, files get its pictures. The one
+        // drawn with a font is among what does not work here.
+        assert!(installed.missing.iter().any(|m| m.contains("icon theme")));
+        let icons = |cx: &App| {
+            cx.try_global::<crate::file_icons::FileIcons>()
+                .and_then(|icons| icons.0.as_ref().map(|theme| theme.name.clone()))
+        };
+        assert_eq!(cx.read(|cx| icons(cx)), None);
+        bounds_soon(cx, "extension-icons-0");
+        // Chosen as its button does; the button is below what a window
+        // of the test shows of so long a list.
+        store.update(cx, |store, cx| {
+            store.use_icon_theme("Acme Icons".into(), cx)
+        });
+        wait_for(cx, "the icon theme", &|cx| {
+            icons(cx).as_deref() == Some("Acme Icons")
+        });
+        let picture = |cx: &mut VisualTestContext, name: &str| {
+            cx.read(|cx| crate::file_icons::file(Path::new(name), cx).is_some())
+        };
+        assert!(picture(cx, "src/main.rs") && picture(cx, "Dockerfile"));
+        assert!(cx.read(|cx| crate::file_icons::folder(Path::new("src"), true, cx).is_some()));
 
         // The tab points to the Zed extension for the language and searches
         // for it.
@@ -10521,6 +11737,1173 @@ brackets = [
         extensions.update(cx, |s, cx| s.set_off(Origin::Zed, "ruby", true, cx));
         let none = cx.read(|cx| extensions.read(cx).debuggers_for("Ruby"));
         assert!(none.is_empty());
+    }
+
+    #[gpui::test]
+    fn panels_are_in_the_docks_the_layout_puts_them_in(cx: &mut TestAppContext) {
+        let root = db::testing::dir("ws-docks").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        let config = db::testing::dir("ws-docks-config");
+        let (ws, cx) = setup(cx, root.clone());
+        let docks = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.read(|cx| (ws.read(cx).left, ws.read(cx).right))
+        };
+        let layout = |cx: &mut VisualTestContext, text: &str| {
+            std::fs::write(config.join("layout.json"), text).unwrap();
+            cx.update(|_, cx| settings::reload_from(&config, cx));
+            assert!(cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+        };
+        // As it comes: Files on the left, the right dock closed; the chat
+        // opens on the right and the agent takes its place there.
+        assert_eq!(docks(cx), (Some(Panel::Files), None));
+        cx.dispatch_action(ToggleChat);
+        assert_eq!(docks(cx), (Some(Panel::Files), Some(Panel::Chat)));
+        cx.dispatch_action(ShowAgent);
+        assert_eq!(docks(cx), (Some(Panel::Files), Some(Panel::Agent)));
+        cx.dispatch_action(ShowSearch);
+        assert_eq!(docks(cx), (Some(Panel::Search), Some(Panel::Agent)));
+
+        // The layout moves the agent and the chat to the left, Search and
+        // Files to the right, and hides API. What was shown goes with its
+        // panel: the agent is on the left now and Search on the right.
+        layout(
+            cx,
+            r#"{
+              "left": { "panels": ["agent", "chat", "services"] },
+              "right": { "panels": ["search", "files"] },
+              "hidden": ["api"]
+            }"#,
+        );
+        assert_eq!(docks(cx), (Some(Panel::Agent), Some(Panel::Search)));
+        // Each dock has a tab for each of its panels, in the file's order.
+        let tab = |cx: &mut VisualTestContext, panel: &'static str| bounds_soon(cx, panel);
+        let dock_left = bounds_soon(cx, "dock-left");
+        let dock_right = bounds_soon(cx, "dock-right");
+        let (agent, chat) = (tab(cx, "panel-agent"), tab(cx, "panel-chat"));
+        assert!(dock_left.contains(&agent.center()) && dock_left.contains(&chat.center()));
+        assert!(agent.left() < chat.left());
+        let (search, files) = (tab(cx, "panel-search"), tab(cx, "panel-files"));
+        assert!(dock_right.contains(&search.center()) && dock_right.contains(&files.center()));
+        assert!(search.left() < files.left());
+
+        // Commands and tabs open a panel where it is now.
+        cx.dispatch_action(ShowFiles);
+        assert_eq!(docks(cx), (Some(Panel::Agent), Some(Panel::Files)));
+        cx.simulate_click(chat.center(), gpui::Modifiers::default());
+        assert_eq!(docks(cx), (Some(Panel::Chat), Some(Panel::Files)));
+        // The chat's key closes the dock the chat is in, which is the
+        // left one, and opens it there again.
+        cx.dispatch_action(ToggleChat);
+        assert_eq!(docks(cx), (None, Some(Panel::Files)));
+        cx.dispatch_action(ToggleChat);
+        assert_eq!(docks(cx), (Some(Panel::Chat), Some(Panel::Files)));
+        // The sidebar's key closes the left dock and opens it on the
+        // first panel it has.
+        cx.dispatch_action(ToggleSidebar);
+        assert_eq!(docks(cx), (None, Some(Panel::Files)));
+        cx.dispatch_action(ToggleSidebar);
+        assert_eq!(docks(cx), (Some(Panel::Agent), Some(Panel::Files)));
+        // A hidden panel has no tab, and its command still opens it, in
+        // the dock it comes in, with a tab for as long as it shows.
+        assert!(cx.read(|cx| Layout::get(cx).place(Panel::Api).is_none()));
+        cx.dispatch_action(ShowApi);
+        assert_eq!(docks(cx), (Some(Panel::Api), Some(Panel::Files)));
+        let api = tab(cx, "panel-api");
+        assert!(dock_left.contains(&api.center()));
+
+        // Back to the layout it came with: Files returns to the left,
+        // where API is shown and stays; the right dock, which lost what it
+        // showed, shows the first panel it has.
+        layout(cx, "{}");
+        assert_eq!(docks(cx), (Some(Panel::Api), Some(Panel::Chat)));
+        cx.dispatch_action(ShowFiles);
+        cx.dispatch_action(ShowAgent);
+        assert_eq!(docks(cx), (Some(Panel::Files), Some(Panel::Agent)));
+    }
+
+    #[gpui::test]
+    fn terminals_and_results_are_panels_of_any_dock_too(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let root = db::testing::dir("ws-docks-low").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        let config = db::testing::dir("ws-docks-low-config");
+        let (ws, cx) = setup(cx, root.clone());
+        let docks = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.read(|cx| {
+                let ws = ws.read(cx);
+                (ws.left, ws.right, ws.bottom)
+            })
+        };
+        // Where a tab is once the window has drawn it inside `dock`: a
+        // tab that moved is still remembered where it was last.
+        let inside = |cx: &mut VisualTestContext, dock: &'static str, tab: &'static str| {
+            for _ in 0..200 {
+                cx.update(|window, _| window.refresh());
+                cx.run_until_parked();
+                if let (Some(dock), Some(tab)) = (cx.debug_bounds(dock), cx.debug_bounds(tab))
+                    && dock.contains(&tab.center())
+                {
+                    return tab;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("no {tab} in {dock}");
+        };
+        // As it comes, the bottom dock is closed until something is in
+        // it: a terminal opens it, and results come in front there.
+        assert_eq!(docks(cx), (Some(Panel::Files), None, None));
+        let terminal = ws
+            .update_in(cx, |w, window, cx| {
+                let command = TerminalCommand {
+                    program: Some("/bin/sh".into()),
+                    cwd: root.clone(),
+                    ..Default::default()
+                };
+                w.spawn_terminal(command, window, cx)
+            })
+            .expect("terminal starts");
+        assert_eq!(docks(cx).2, Some(Panel::Terminal));
+        ws.update_in(cx, |w, window, cx| {
+            w.show_results = true;
+            w.show_panel(Panel::Results, cx);
+            window.focus(&w.results.focus_handle(cx));
+        });
+        assert_eq!(docks(cx).2, Some(Panel::Results));
+        inside(cx, "dock-bottom", "terminal-new");
+        inside(cx, "dock-bottom", "results-tab");
+
+        // The layout puts the terminals on the right, alone, results on
+        // the left and Search at the bottom. Files stays in front on the
+        // left; the bottom dock lost what it showed and shows Search. The
+        // keyboard was in the results, which no dock shows now, and is
+        // not left there.
+        std::fs::write(
+            config.join("layout.json"),
+            r#"{
+              "left": { "panels": ["files", "results", "chat", "agent"] },
+              "right": { "panels": ["terminal"] },
+              "bottom": { "panels": ["search"] }
+            }"#,
+        )
+        .unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert!(cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+        assert_eq!(docks(cx), (Some(Panel::Files), None, Some(Panel::Search)));
+        inside(cx, "dock-bottom", "panel-search");
+        assert!(cx.update(|window, cx| {
+            !ws.read(cx)
+                .results
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+        }));
+
+        // The terminal's key opens the dock the terminals are in now, and
+        // their tabs are there.
+        cx.dispatch_action(ToggleTerminal);
+        assert_eq!(
+            docks(cx),
+            (
+                Some(Panel::Files),
+                Some(Panel::Terminal),
+                Some(Panel::Search)
+            )
+        );
+        inside(cx, "dock-right", "terminal-new");
+        // The tab of the results is on the left, and shows them there.
+        let results = inside(cx, "dock-left", "results-tab");
+        cx.simulate_click(results.center(), gpui::Modifiers::default());
+        assert_eq!(docks(cx).0, Some(Panel::Results));
+        // Closed, they leave the dock to the first panel it has.
+        ws.update_in(cx, |w, window, cx| w.close_results(window, cx));
+        assert_eq!(docks(cx).0, Some(Panel::Files));
+        assert!(cx.read(|cx| !ws.read(cx).available(Panel::Results)));
+
+        // The key again, with the keyboard in the terminal, closes that
+        // dock; once more opens it. The last terminal to end closes it,
+        // since the dock has nothing else, and the keyboard is not left
+        // in it.
+        ws.update_in(cx, |_, window, cx| window.focus(&terminal.focus_handle(cx)));
+        cx.dispatch_action(ToggleTerminal);
+        assert_eq!(docks(cx).1, None);
+        cx.dispatch_action(ToggleTerminal);
+        assert_eq!(docks(cx).1, Some(Panel::Terminal));
+        cx.simulate_input("exit");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the terminal to end", &|cx| {
+            ws.read(cx).terminals.is_empty()
+        });
+        assert_eq!(docks(cx), (Some(Panel::Files), None, Some(Panel::Search)));
+        cx.dispatch_action(ShowAgent);
+        assert_eq!(docks(cx).0, Some(Panel::Agent));
+    }
+
+    #[gpui::test]
+    fn a_theme_file_is_applied_as_it_is_saved(cx: &mut TestAppContext) {
+        use gpui::{Hsla, rgb};
+        cx.executor().allow_parking();
+        let root = db::testing::dir("ws-theme-live").canonicalize().unwrap();
+        let config = db::testing::dir("ws-theme-live-config")
+            .canonicalize()
+            .unwrap();
+        let theme_file = |bg: &str| {
+            format!(
+                r##"{{ "name": "Mine", "appearance": "dark",
+                      "colors": {{ "bg": "{bg}", "accent": "#112233" }},
+                      "terminal": {{ "red": "#ff0000" }},
+                      "shapes": {{ "control_radius": 3, "border_width": 2 }} }}"##
+            )
+        };
+        std::fs::create_dir_all(config.join("themes")).unwrap();
+        std::fs::write(config.join("themes/mine.json"), theme_file("#101010")).unwrap();
+        std::fs::write(
+            config.join("settings.json"),
+            r##"{ "theme": "Mine", "theme_overrides": { "accent": "#00ff88" } }"##,
+        )
+        .unwrap();
+        let (_ws, cx) = setup(cx, root);
+        cx.update(|_, cx| {
+            settings::reload_from(&config, cx);
+            settings::watch_dir(config.clone(), cx);
+        });
+        cx.run_until_parked();
+        // The theme of the file, with the token of the settings over it.
+        let theme = |cx: &App| cx.global::<crate::theme::Theme>().clone();
+        assert_eq!(cx.read(theme).bg, Hsla::from(rgb(0x101010)));
+        assert_eq!(cx.read(theme).terminal[1], Hsla::from(rgb(0xff0000)));
+        assert_eq!(cx.read(theme).accent, Hsla::from(rgb(0x00ff88)));
+        // Its shapes too; the ones it leaves out are the editor's.
+        let shape = cx.read(theme).shape;
+        assert_eq!((shape.control, shape.border), (px(3.), px(2.)));
+        assert_eq!(shape.token, px(6.));
+        assert_eq!(cx.read(theme).fg, crate::theme::Theme::dark().fg);
+
+        // The theme's file is saved with another background: the window
+        // has it without anything else being touched.
+        std::fs::write(config.join("themes/mine.json"), theme_file("#202020")).unwrap();
+        wait_for(cx, "the saved theme", &|cx| {
+            theme(cx).bg == Hsla::from(rgb(0x202020))
+        });
+        assert_eq!(cx.read(theme).accent, Hsla::from(rgb(0x00ff88)));
+        // And the settings, with the token taken back: the theme's own.
+        std::fs::write(config.join("settings.json"), r#"{ "theme": "Mine" }"#).unwrap();
+        wait_for(cx, "the theme's own accent", &|cx| {
+            theme(cx).accent == Hsla::from(rgb(0x112233))
+        });
+    }
+
+    #[gpui::test]
+    fn the_interface_has_the_font_size_and_density_of_the_settings(cx: &mut TestAppContext) {
+        let root = db::testing::dir("ws-ui-font").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        let config = db::testing::dir("ws-ui-font-config");
+        let (ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "the tree", &|cx| {
+            !ws.read(cx).project.read(cx).is_scanning()
+        });
+        let settings = |cx: &mut VisualTestContext, text: &str| {
+            std::fs::write(config.join("settings.json"), text).unwrap();
+            cx.update(|_, cx| settings::reload_from(&config, cx));
+            assert!(cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+        };
+        // The height of a row of the file tree as it is drawn now, and
+        // what a rem is in the window.
+        let row = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            let row = cx.debug_bounds("file-row-0").expect("a row of the tree");
+            (
+                f32::from(row.size.height),
+                cx.update(|window, _| window.rem_size()),
+            )
+        };
+        // As it comes.
+        assert_eq!(row(cx), (24., px(16.)));
+        // Rows lower and taller by the density; the text is the same.
+        settings(cx, r#"{ "ui_density": "compact" }"#);
+        assert_eq!(row(cx), (20., px(16.)));
+        settings(cx, r#"{ "ui_density": "comfortable" }"#);
+        assert_eq!(row(cx), (30., px(16.)));
+        // Larger text: everything sized in rems grows, and rows with it,
+        // so that a line still fits.
+        settings(cx, r#"{ "ui_font_size": 15 }"#);
+        assert_eq!(row(cx), (29., px(19.2)));
+        // Back as it came when the file says nothing.
+        settings(cx, "{}");
+        assert_eq!(row(cx), (24., px(16.)));
+    }
+
+    #[gpui::test]
+    fn the_bars_show_the_items_the_layout_names(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let root = git_fixture("ws-bars");
+        let config = db::testing::dir("ws-bars-config");
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(root.join("a.txt")), "one\ntwo\n", None, window, cx)
+        });
+        wait_for(cx, "the branch", &|cx| {
+            ws.read(cx).git.read(cx).status().branch.is_some()
+        });
+        // Where something is in the window as it is drawn now.
+        let at = |cx: &mut VisualTestContext, selector: &'static str| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("no {selector}"))
+        };
+        let layout = |cx: &mut VisualTestContext, text: &str| {
+            std::fs::write(config.join("layout.json"), text).unwrap();
+            cx.update(|_, cx| settings::reload_from(&config, cx));
+            assert!(cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+        };
+        // Whether an item has something to say now.
+        let says = |cx: &mut VisualTestContext, item: Item| {
+            ws.update(cx, |w, cx| !w.bar_item(&item, cx).is_empty())
+        };
+
+        // As they come: the project's name in the title bar, the cursor,
+        // the indent and the language at the left of the status bar, in
+        // that order. The tabs are above the file.
+        let (title, status) = (at(cx, "title-bar"), at(cx, "status-bar"));
+        assert!(title.contains(&at(cx, "item-project").center()));
+        let (position, indent) = (at(cx, "item-position"), at(cx, "item-indent"));
+        let language = at(cx, "item-language");
+        assert!(status.contains(&position.center()) && status.contains(&language.center()));
+        assert!(position.left() < indent.left() && indent.left() < language.left());
+        let (tabs, body) = (at(cx, "tab-bar-0"), at(cx, "pane-body-0"));
+        assert_eq!(tabs.top(), title.bottom());
+        assert_eq!(body.top(), tabs.bottom());
+        assert_eq!(body.bottom(), status.top());
+        // An item with nothing to say is not drawn: no query file is in
+        // front, and no file has a problem.
+        assert!(!says(cx, Item::Connection) && !says(cx, Item::Problems));
+        assert!(says(cx, Item::Branch) && says(cx, Item::File));
+
+        // The file names them. The cursor goes to the right of the title
+        // bar, the branch and the file's name come to the status bar,
+        // the language to its right end, and the tabs below the file.
+        layout(
+            cx,
+            r#"{
+              "title_bar": { "right": ["position"] },
+              "status_bar": { "left": ["branch", "file"], "right": ["language"] },
+              "tab_bar": { "place": "bottom" }
+            }"#,
+        );
+        let position = at(cx, "item-position");
+        assert!(title.contains(&position.center()));
+        assert!(position.left() > at(cx, "item-project").right());
+        let (branch, file) = (at(cx, "item-branch"), at(cx, "item-file"));
+        assert!(status.contains(&branch.center()) && status.contains(&file.center()));
+        assert!(branch.left() < file.left());
+        assert!(at(cx, "item-language").left() > file.right());
+        let (tabs, body) = (at(cx, "tab-bar-0"), at(cx, "pane-body-0"));
+        assert_eq!(body.top(), title.bottom());
+        assert_eq!(tabs.top(), body.bottom());
+        assert_eq!(tabs.bottom(), status.top());
+        // The branch opens the list of branches.
+        cx.simulate_click(branch.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        cx.simulate_keystrokes("escape");
+
+        // No tabs at all: the file has the whole height between the bars.
+        layout(cx, r#"{ "tab_bar": { "place": "none" } }"#);
+        let body = at(cx, "pane-body-0");
+        assert_eq!(body.top(), title.bottom());
+        assert_eq!(body.bottom(), status.top());
+        assert!(cx.read(|cx| Layout::get(cx).status_bar.left().contains(&Item::Position)));
+    }
+
+    #[gpui::test]
+    fn an_item_is_drawn_as_asked_and_a_button_runs_its_command(cx: &mut TestAppContext) {
+        use Item::*;
+        use layout::{Command, Display};
+        let root = db::testing::dir("ws-bar-buttons").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        let config = db::testing::dir("ws-bar-buttons-config");
+        let file = config.join("layout.json");
+        std::fs::write(&file, "// mine\n{}\n").unwrap();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(root.join("notes.txt")), "plain\n", None, window, cx)
+        });
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        let none = gpui::Modifiers::default();
+        let at = |cx: &mut VisualTestContext, selector: &'static str| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            bounds_soon(cx, selector).center()
+        };
+        let click = |cx: &mut VisualTestContext, selector: &'static str| {
+            let point = at(cx, selector);
+            cx.simulate_click(point, none);
+            cx.run_until_parked();
+        };
+        let menu = |cx: &mut VisualTestContext, selector: &'static str, option: &'static str| {
+            let point = at(cx, selector);
+            cx.simulate_mouse_down(point, MouseButton::Right, none);
+            cx.simulate_mouse_up(point, MouseButton::Right, none);
+            cx.run_until_parked();
+            click(cx, option);
+        };
+        let layout = |cx: &mut VisualTestContext| cx.read(|cx| Layout::get(cx).clone());
+        let left = |cx: &mut VisualTestContext| cx.read(|cx| ws.read(cx).left);
+        let button = Button {
+            button: "button-1".into(),
+        };
+
+        // The menu of an item says how it is drawn.
+        assert_eq!(layout(cx).style(&Position).display, Display::Both);
+        menu(cx, "item-position", "bar-menu-icon");
+        assert_eq!(layout(cx).style(&Position).display, Display::Icon);
+        menu(cx, "item-position", "bar-menu-text");
+        assert_eq!(layout(cx).style(&Position).display, Display::Text);
+
+        // And adds a button for a command, chosen from all of them, at
+        // the end of the bar the menu was opened on.
+        menu(cx, "item-position", "bar-menu-add");
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        cx.simulate_input("toggle sidebar");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+        let made = layout(cx).style(&button).clone();
+        assert_eq!(made.label.as_deref(), Some("Toggle sidebar"));
+        assert_eq!(
+            made.command,
+            Some(Command::Action("workspace::ToggleSidebar".into()))
+        );
+        assert_eq!(layout(cx).item_place(&button), Some(BarEnd::StatusLeft));
+        // It runs the command, as an icon alone too.
+        assert_eq!(left(cx), Some(Panel::Files));
+        click(cx, "item-button-1");
+        assert_eq!(left(cx), None);
+        menu(cx, "item-button-1", "bar-menu-icon");
+        assert_eq!(layout(cx).style(&button).display, Display::Icon);
+        click(cx, "item-button-1");
+        assert_eq!(left(cx), Some(Panel::Files));
+        // All of it is in the file, next to what the user wrote there.
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if std::fs::read_to_string(&file)
+                .is_ok_and(|s| layout::parse(&s).is_ok_and(|read| read == layout(cx)))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(layout::parse(&saved).unwrap(), layout(cx));
+        assert!(
+            saved.contains("// mine") && saved.contains("button-1"),
+            "{saved}"
+        );
+
+        // The file gives an item of the editor's own another word and
+        // another command: the language now opens Search.
+        std::fs::write(
+            &file,
+            r#"{ "items": { "language": { "label": "Find", "command": "workspace::ShowSearch" } } }"#,
+        )
+        .unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert!(cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+        click(cx, "item-language");
+        assert_eq!(left(cx), Some(Panel::Search));
+        // A command that is none is a mistake, and the layout stays.
+        let before = layout(cx);
+        std::fs::write(
+            &file,
+            r#"{ "items": { "language": { "command": "workspace::Nope" } } }"#,
+        )
+        .unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        let errors = cx.read(|cx| cx.global::<settings::ConfigErrors>().0.clone());
+        assert!(errors.iter().any(|e| e.contains("language")), "{errors:?}");
+        assert_eq!(layout(cx), before);
+
+        // A button is removed from its menu: off the bar and out of the
+        // file, not hidden.
+        std::fs::write(&file, saved).unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert_eq!(layout(cx).item_place(&button), Some(BarEnd::StatusLeft));
+        menu(cx, "item-button-1", "bar-menu-remove");
+        assert_eq!(layout(cx).item_place(&button), None);
+        assert!(!layout(cx).items.contains_key("button-1"));
+    }
+
+    #[gpui::test]
+    fn bar_items_are_dragged_and_restored_in_the_selected_layout(cx: &mut TestAppContext) {
+        use BarEnd::*;
+        use Item::*;
+        cx.executor().allow_parking();
+        let root = git_fixture("ws-bar-hand");
+        let config = db::testing::dir("ws-bar-hand-config");
+        let common = config.join("layout.json");
+        let original = "// default stays here\n{}\n";
+        std::fs::write(&common, original).unwrap();
+        std::fs::create_dir_all(config.join("layouts")).unwrap();
+        let named = config.join("layouts/Review.json");
+        std::fs::write(
+            &named,
+            r#"// review
+        {
+          "title_bar": { "left": ["project"], "right": [] },
+          "status_bar": { "left": ["position", "indent", "language", "problems"], "right": [] },
+          "tab_bar": { "place": "bottom" }
+        }"#,
+        )
+        .unwrap();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(root.join("a.txt")), "one\ntwo\n", None, window, cx)
+        });
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        cx.dispatch_action(SwitchLayout {
+            name: Some("Review".into()),
+        });
+        wait_for(cx, "Review selected", &|cx| {
+            layout::active(cx).as_deref() == Some("Review")
+        });
+        wait_for(cx, "the branch", &|cx| {
+            ws.read(cx).git.read(cx).status().branch.is_some()
+        });
+        let none = gpui::Modifiers::default();
+        let at = |cx: &mut VisualTestContext, selector: &'static str| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            bounds_soon(cx, selector).center()
+        };
+        let open = |cx: &mut VisualTestContext, selector: &'static str| {
+            let point = at(cx, selector);
+            cx.simulate_mouse_down(point, MouseButton::Right, none);
+            cx.simulate_mouse_up(point, MouseButton::Right, none);
+            cx.run_until_parked();
+        };
+        let menu = |cx: &mut VisualTestContext, selector: &'static str, option: &'static str| {
+            open(cx, selector);
+            let point = at(cx, option);
+            cx.simulate_click(point, none);
+            cx.run_until_parked();
+        };
+        let drag = |cx: &mut VisualTestContext, from: &'static str, to: &'static str| {
+            let from = at(cx, from);
+            cx.simulate_mouse_down(from, MouseButton::Left, none);
+            cx.simulate_mouse_move(from + gpui::point(px(6.), px(0.)), MouseButton::Left, none);
+            let to = at(cx, to);
+            cx.simulate_mouse_move(to, MouseButton::Left, none);
+            cx.simulate_mouse_up(to, MouseButton::Left, none);
+            cx.run_until_parked();
+        };
+        let layout = |cx: &mut VisualTestContext| cx.read(|cx| Layout::get(cx).clone());
+
+        menu(cx, "item-position", "bar-menu-move-title-right");
+        assert_eq!(layout(cx).item_place(Position), Some(TitleRight));
+        menu(cx, "item-project", "bar-menu-hide");
+        assert_eq!(layout(cx).item_place(Project), None);
+        assert!(cx.read(|cx| ws.read(cx).bar_menu.is_none()));
+        // The now empty end still has a menu and can bring it back.
+        menu(cx, "bar-title-left", "bar-menu-show-project");
+        assert_eq!(layout(cx).items(TitleLeft), [Project]);
+        menu(cx, "item-language", "bar-menu-move-status-right");
+        assert_eq!(layout(cx).items(StatusRight), [Language]);
+
+        drag(cx, "item-project", "item-position");
+        assert_eq!(layout(cx).items(TitleRight), [Project, Position]);
+        drag(cx, "item-position", "bar-status-left");
+        assert_eq!(layout(cx).items(StatusLeft), [Indent, Problems, Position]);
+        drag(cx, "item-indent", "bar-title-left");
+        assert_eq!(layout(cx).items(TitleLeft), [Indent]);
+        drag(cx, "item-language", "item-position");
+        assert_eq!(layout(cx).items(StatusLeft), [Problems, Language, Position]);
+        assert!(layout(cx).items(StatusRight).is_empty());
+        let before = layout(cx);
+        drag(cx, "item-project", "item-project");
+        assert_eq!(layout(cx), before);
+        assert_eq!(layout(cx).item_place(Problems), Some(StatusLeft));
+        assert!(ws.update(cx, |w, cx| w.bar_item(&Problems, cx).is_empty()));
+
+        open(cx, "item-indent");
+        cx.simulate_keystrokes("escape");
+        assert!(cx.read(|cx| ws.read(cx).bar_menu.is_none()));
+        open(cx, "bar-status-right");
+        let outside = at(cx, "pane-body-0");
+        cx.simulate_click(outside, none);
+        assert!(cx.read(|cx| ws.read(cx).bar_menu.is_none()));
+        // A clickable item keeps its action after moving and does not
+        // open its picker while it is being dragged instead.
+        menu(cx, "bar-status-right", "bar-menu-show-branch");
+        drag(cx, "item-branch", "bar-title-left");
+        assert_eq!(layout(cx).items(TitleLeft), [Indent, Branch]);
+        drag(cx, "item-branch", "item-indent");
+        assert_eq!(layout(cx).items(TitleLeft), [Branch, Indent]);
+        let before = layout(cx);
+        drag(cx, "item-branch", "pane-body-0");
+        assert_eq!(layout(cx), before);
+        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+        let branch = at(cx, "item-branch");
+        cx.simulate_click(branch, none);
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        cx.simulate_keystrokes("escape");
+
+        // Both bars were edited quickly. Every write reaches the named
+        // file, leaving the tab placement and the Default file alone.
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if std::fs::read_to_string(&named)
+                .is_ok_and(|s| layout::parse(&s).is_ok_and(|read| read == layout(cx)))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let saved = std::fs::read_to_string(&named).unwrap();
+        assert_eq!(layout::parse(&saved).unwrap(), layout(cx));
+        assert!(saved.contains("// review"));
+        assert_eq!(layout(cx).tab_bar.place, TabsAt::Bottom);
+        assert_eq!(std::fs::read_to_string(&common).unwrap(), original);
+        open(cx, "item-branch");
+        cx.dispatch_action(SwitchLayout {
+            name: Some(layout::DEFAULT_NAME.into()),
+        });
+        wait_for(cx, "Default selected", &|cx| layout::active(cx).is_none());
+        assert!(cx.read(|cx| ws.read(cx).bar_menu.is_none()));
+        cx.dispatch_action(SwitchLayout {
+            name: Some("Review".into()),
+        });
+        wait_for(cx, "Review restored", &|cx| {
+            layout::active(cx).as_deref() == Some("Review")
+        });
+        assert_eq!(layout(cx), layout::parse(&saved).unwrap());
+    }
+
+    #[gpui::test]
+    fn tabs_of_the_docks_are_moved_and_hidden_by_hand(cx: &mut TestAppContext) {
+        use Panel::*;
+        let root = db::testing::dir("ws-hand").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        let config = db::testing::dir("ws-hand-config");
+        let file = config.join("layout.json");
+        std::fs::write(&file, "// mine\n{\n}\n").unwrap();
+        let (ws, cx) = setup(cx, root.clone());
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        let none = gpui::Modifiers::default();
+        // Where something is in the window as it is drawn now: what was
+        // drawn once is remembered where it was.
+        let at = |cx: &mut VisualTestContext, selector: &'static str| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("no {selector}"))
+                .center()
+        };
+        let menu = |cx: &mut VisualTestContext, tab: &'static str, item: &'static str| {
+            let tab = at(cx, tab);
+            cx.simulate_mouse_down(tab, MouseButton::Right, none);
+            cx.simulate_mouse_up(tab, MouseButton::Right, none);
+            let item = at(cx, item);
+            cx.simulate_click(item, none);
+            cx.run_until_parked();
+        };
+        let drag = |cx: &mut VisualTestContext, tab: &'static str, to: &'static str| {
+            let from = at(cx, tab);
+            cx.simulate_mouse_down(from, MouseButton::Left, none);
+            cx.simulate_mouse_move(from + gpui::point(px(6.), px(0.)), MouseButton::Left, none);
+            // Where it goes may be drawn only now that a tab is held.
+            let to = at(cx, to);
+            cx.simulate_mouse_move(to, MouseButton::Left, none);
+            cx.simulate_mouse_up(to, MouseButton::Left, none);
+            cx.run_until_parked();
+        };
+        let layout = |cx: &mut VisualTestContext| cx.read(|cx| Layout::get(cx).clone());
+        let docks = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.read(|cx| {
+                let ws = ws.read(cx);
+                (ws.left, ws.right, ws.bottom)
+            })
+        };
+        // The file once all that was done has reached it.
+        let written = |cx: &mut VisualTestContext| {
+            for _ in 0..200 {
+                cx.run_until_parked();
+                let text = std::fs::read_to_string(&file).unwrap_or_default();
+                if layout::parse(&text).is_ok_and(|read| read == layout(cx)) {
+                    return text;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("layout.json never said what the window shows");
+        };
+
+        // The menu of a tab hides its panel: Files, which was in front,
+        // leaves the dock to the next panel it has.
+        menu(cx, "panel-files", "menu-hide");
+        assert_eq!(layout(cx).hidden, [Files]);
+        assert_eq!(layout(cx).left.panels[0], Search);
+        assert_eq!(docks(cx), (Some(Search), None, None));
+        assert!(cx.read(|cx| ws.read(cx).dock_menu.is_none()));
+        // Its command still opens it, and the menu of any tab of a dock
+        // brings it back into that dock, where it is shown.
+        menu(cx, "panel-git", "menu-show-files");
+        assert!(layout(cx).hidden.is_empty());
+        assert_eq!(layout(cx).left.panels.last(), Some(&Files));
+        assert_eq!(docks(cx), (Some(Files), None, None));
+        // To another dock, which opens on it.
+        menu(cx, "panel-git", "menu-move-right");
+        assert_eq!(layout(cx).right.panels, [Chat, Agent, Git]);
+        assert_eq!(docks(cx), (Some(Files), Some(Git), None));
+        let text = written(cx);
+        assert!(text.contains("// mine"), "{text}");
+
+        // A tab dragged onto another of its dock goes before it.
+        drag(cx, "panel-files", "panel-database");
+        assert_eq!(
+            layout(cx).left.panels,
+            [Search, Services, Files, Database, Api, Ai, Extensions]
+        );
+        assert_eq!(docks(cx).0, Some(Files));
+        // Onto a tab of another dock: before it there, and shown there.
+        drag(cx, "panel-api", "panel-agent");
+        assert_eq!(layout(cx).right.panels, [Chat, Api, Agent, Git]);
+        assert_eq!(docks(cx), (Some(Files), Some(Api), None));
+        // A closed dock has a place to drop a tab on while one is held,
+        // and opens on what is dropped there.
+        drag(cx, "panel-search", "drop-bottom");
+        assert_eq!(layout(cx).bottom.panels.last(), Some(&Search));
+        assert_eq!(docks(cx), (Some(Files), Some(Api), Some(Search)));
+        assert!(cx.read(|cx| ws.read(cx).dragging.is_none()));
+        // The tab in front dragged away: its dock shows what it has left.
+        drag(cx, "panel-files", "panel-search");
+        assert_eq!(docks(cx), (Some(Services), Some(Api), Some(Files)));
+        written(cx);
+
+        // Reset: the window as it comes, and the file put aside whole.
+        cx.dispatch_action(ResetLayout);
+        assert_eq!(docks(cx), (Some(Files), None, None));
+        assert_eq!(layout(cx), Layout::default());
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if !file.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!file.exists());
+        let old = std::fs::read_to_string(config.join("layout.json.old")).unwrap();
+        assert!(
+            old.contains("// mine") && old.contains("\"hidden\""),
+            "{old}"
+        );
+        assert_eq!(layout(cx), Layout::default());
+    }
+
+    #[gpui::test]
+    fn a_named_layout_is_saved_switched_and_remembered_for_open_projects(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let root = db::testing::dir("ws-named-layout").canonicalize().unwrap();
+        let config = db::testing::dir("ws-named-layout-config");
+        let common = config.join("layout.json");
+        std::fs::write(
+            &common,
+            "// common\n{\"left\":{\"width\":310},\"open\":[\"files\"]}",
+        )
+        .unwrap();
+        let (ws, cx) = setup(cx, root.clone());
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        let wait = |cx: &mut VisualTestContext, name: Option<&str>| {
+            for _ in 0..200 {
+                cx.executor().advance_clock(Duration::from_millis(50));
+                cx.run_until_parked();
+                let ready = cx.read(|cx| {
+                    layout::active(cx).as_deref() == name
+                        && std::fs::read_to_string(layout::path(cx)).is_ok_and(|text| {
+                            layout::parse(&text).is_ok_and(|l| l == *Layout::get(cx))
+                        })
+                });
+                if ready {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("layout never became {name:?}");
+        };
+        // A pending panel change is part of the saved snapshot. Saving
+        // from the palette is a prompt; it never overwrites a named file.
+        cx.dispatch_action(ShowSearch);
+        cx.dispatch_action(SaveLayout);
+        cx.simulate_input("Review");
+        bounds_soon(cx, "layout-save");
+        cx.simulate_keystrokes("enter");
+        wait(cx, Some("Review"));
+        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+        let review = config.join("layouts/Review.json");
+        assert_eq!(cx.read(layout::path), review);
+        assert_eq!(
+            layout::parse(&std::fs::read_to_string(&review).unwrap())
+                .unwrap()
+                .open_in(Place::Left),
+            Some(Panel::Search)
+        );
+        let common_text = std::fs::read_to_string(&common).unwrap();
+        assert!(common_text.contains("// common"));
+
+        // The selected file is the truth, including edits by hand and
+        // Open Layout. The common layout is a separate one.
+        cx.dispatch_action(ShowGit);
+        wait(cx, Some("Review"));
+        assert_eq!(cx.read(|cx| ws.read(cx).left), Some(Panel::Git));
+        assert_eq!(std::fs::read_to_string(&common).unwrap(), common_text);
+        cx.update(|window, cx| window.focus(&ws.focus_handle(cx)));
+        cx.dispatch_action(OpenLayout);
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if active_path(&ws, cx) == Some(review.clone()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(active_path(&ws, cx), Some(review.clone()));
+        std::fs::write(&review, "// mine\n{\"right\":{\"panels\":[\"files\"],\"width\":420},\"open\":[\"files\",\"git\"]}").unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| ws.read(cx).right), Some(Panel::Files));
+
+        // Changing a panel, then selecting another layout immediately,
+        // finishes the first file before the selection takes effect.
+        cx.dispatch_action(ShowSearch);
+        cx.dispatch_action(SwitchLayout {
+            name: Some(layout::DEFAULT_NAME.into()),
+        });
+        wait(cx, None);
+        assert_eq!(cx.read(|cx| ws.read(cx).left), Some(Panel::Search));
+        let saved = layout::parse(&std::fs::read_to_string(&review).unwrap()).unwrap();
+        assert_eq!(saved.open_in(Place::Left), Some(Panel::Search));
+        assert_eq!(saved.open_in(Place::Right), Some(Panel::Files));
+        assert!(
+            std::fs::read_to_string(&review)
+                .unwrap()
+                .contains("// mine")
+        );
+
+        // The argument-bearing action can be bound to a key. With no
+        // argument it opens the searchable list instead.
+        std::fs::write(config.join("keymap.json"), r#"[{"context":"Workspace","bindings":{"alt-shift-r":["workspace::SwitchLayout",{"name":"Review"}]}}]"#).unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        cx.simulate_keystrokes("alt-shift-r");
+        wait(cx, Some("Review"));
+        cx.dispatch_action(SwitchLayout::default());
+        cx.simulate_input("Default");
+        bounds_soon(cx, "layout-choice-0");
+        cx.simulate_keystrokes("enter");
+        wait(cx, None);
+
+        // Every open window follows a switch and remembers it for its
+        // project. A window removed before another switch is left alone.
+        let second_root = db::testing::dir("ws-named-second").canonicalize().unwrap();
+        let second = cx.update(|_, cx| crate::open_workspace_window(second_root.clone(), None, cx));
+        cx.dispatch_action(SwitchLayout {
+            name: Some("Review".into()),
+        });
+        wait(cx, Some("Review"));
+        let second_dock = second.read_with(cx, |w, _| w.right).unwrap();
+        assert_eq!(second_dock, Some(Panel::Files));
+        let choices: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(config.join("layouts.json")).unwrap())
+                .unwrap();
+        assert_eq!(choices["projects"][root.to_str().unwrap()], "Review");
+        assert_eq!(choices["projects"][second_root.to_str().unwrap()], "Review");
+        second
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.dispatch_action(SwitchLayout {
+            name: Some(layout::DEFAULT_NAME.into()),
+        });
+        wait(cx, None);
+        let reopened =
+            cx.update(|_, cx| crate::open_workspace_window(second_root.clone(), None, cx));
+        wait(cx, Some("Review"));
+        assert_eq!(
+            reopened.read_with(cx, |w, _| w.right).unwrap(),
+            Some(Panel::Files)
+        );
+        reopened
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+
+        // A broken target reports its own name and keeps the current one.
+        std::fs::write(config.join("layouts/Broken.json"), "{bad").unwrap();
+        cx.dispatch_action(SwitchLayout {
+            name: Some("Broken".into()),
+        });
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if cx.read(|cx| {
+                cx.global::<settings::ConfigErrors>()
+                    .0
+                    .iter()
+                    .any(|e| e.contains("Broken.json"))
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(cx.read(layout::active), Some("Review".into()));
+        assert!(cx.read(|cx| {
+            cx.global::<settings::ConfigErrors>()
+                .0
+                .iter()
+                .any(|e| e.contains("Broken.json"))
+        }));
+        cx.dispatch_action(ResetLayout);
+        wait(cx, Some("Review"));
+        assert!(review.with_extension("json.old").exists());
+        assert_eq!(cx.read(|cx| Layout::get(cx).clone()), Layout::default());
+        // A layout without `open` restores its startup docks, including
+        // when its sizes and panels match the currently selected layout.
+        std::fs::write(&common, "{}").unwrap();
+        cx.dispatch_action(ToggleChat);
+        wait(cx, Some("Review"));
+        cx.dispatch_action(SwitchLayout {
+            name: Some(layout::DEFAULT_NAME.into()),
+        });
+        wait(cx, None);
+        assert_eq!(
+            cx.read(|cx| (ws.read(cx).left, ws.read(cx).right, ws.read(cx).bottom)),
+            (Some(Panel::Files), None, None)
+        );
+    }
+
+    #[gpui::test]
+    fn the_window_starts_on_the_panels_it_was_left_on(cx: &mut TestAppContext) {
+        let root = db::testing::dir("ws-open").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        let config = db::testing::dir("ws-open-config");
+        let file = config.join("layout.json");
+        let (ws, cx) = setup(cx, root.clone());
+        let docks = |cx: &mut VisualTestContext, ws: &Entity<Workspace>| {
+            cx.run_until_parked();
+            cx.read(|cx| {
+                let ws = ws.read(cx);
+                (ws.left, ws.right, ws.bottom)
+            })
+        };
+        // The file once it says `open` is these panels.
+        let kept = |cx: &mut VisualTestContext, open: &[Panel]| {
+            for _ in 0..200 {
+                cx.run_until_parked();
+                let text = std::fs::read_to_string(&file).unwrap_or_default();
+                if layout::parse(&text).is_ok_and(|l| l.open.as_deref() == Some(open)) {
+                    return text;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("layout.json never had {open:?} open");
+        };
+        // The user's own file, which says nothing of what is open: the
+        // window is as it comes.
+        std::fs::write(
+            &file,
+            "// mine\n{\n  \"left\": { \"width\": 300 } // narrow\n}\n",
+        )
+        .unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert_eq!(docks(cx, &ws), (Some(Panel::Files), None, None));
+
+        // Search, and the chat right after: both are in the file, next to
+        // what the user wrote there, and neither write lost the other's.
+        cx.dispatch_action(ShowSearch);
+        cx.dispatch_action(ToggleChat);
+        let text = kept(cx, &[Panel::Search, Panel::Chat]);
+        assert!(
+            text.contains("// mine") && text.contains("// narrow"),
+            "{text}"
+        );
+        assert_eq!(layout::parse(&text).unwrap().left.width, 300.);
+        assert_eq!(
+            docks(cx, &ws),
+            (Some(Panel::Search), Some(Panel::Chat), None)
+        );
+        // A window opened now starts the same way.
+        let start = |cx: &mut VisualTestContext| {
+            let root = root.clone();
+            cx.update(|window, cx| cx.new(|cx| Workspace::new(root, window, cx)))
+        };
+        let second = start(cx);
+        assert_eq!(
+            docks(cx, &second),
+            (Some(Panel::Search), Some(Panel::Chat), None)
+        );
+        drop(second);
+
+        // A dock closed by hand stays closed, and a terminal that was
+        // open is not started again: its dock starts closed.
+        cx.dispatch_action(ToggleSidebar);
+        kept(cx, &[Panel::Chat]);
+        ws.update_in(cx, |w, _, cx| {
+            w.show_results = true;
+            w.show_panel(Panel::Results, cx);
+        });
+        kept(cx, &[Panel::Chat, Panel::Results]);
+        let third = start(cx);
+        assert_eq!(docks(cx, &third), (None, Some(Panel::Chat), None));
+        drop(third);
+
+        // The file is the truth. Saved with other panels open, the
+        // window follows; a panel with nothing to show does not open, and
+        // the file is left as it was saved.
+        let saved = r#"{ "open": ["agent", "terminal", "git"] }"#;
+        std::fs::write(&file, saved).unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert_eq!(docks(cx, &ws), (Some(Panel::Git), Some(Panel::Agent), None));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), saved);
+        assert!(cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+    }
+
+    #[gpui::test]
+    fn the_layout_file_sizes_the_window_and_a_mistake_keeps_the_last(cx: &mut TestAppContext) {
+        let root = db::testing::dir("ws-layout").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        let config = db::testing::dir("ws-layout-config");
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, _, cx| w.set_sidebar(Some(Panel::Files), cx));
+        // Where a part was last drawn, once the window has drawn again.
+        let size = |cx: &mut VisualTestContext, part: &'static str| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            let bounds = cx.debug_bounds(part).unwrap_or_else(|| panic!("no {part}"));
+            (f32::from(bounds.size.width), f32::from(bounds.size.height))
+        };
+        let reload =
+            |cx: &mut VisualTestContext| cx.update(|_, cx| settings::reload_from(&config, cx));
+        let errors = |cx: &mut VisualTestContext| {
+            cx.read(|cx| cx.global::<settings::ConfigErrors>().0.clone())
+        };
+
+        // With no file the parts have the sizes they always had.
+        reload(cx);
+        assert_eq!(size(cx, "dock-left").0, 390.);
+        assert_eq!(size(cx, "status-bar").1, 26.);
+
+        // The file names two parts; the rest stay.
+        std::fs::write(
+            config.join("layout.json"),
+            "// narrower\n{ \"left\": { \"width\": 300 }, \"status_bar\": { \"height\": 32 } }\n",
+        )
+        .unwrap();
+        reload(cx);
+        assert!(errors(cx).is_empty(), "{:?}", errors(cx));
+        assert_eq!(size(cx, "dock-left").0, 300.);
+        assert_eq!(size(cx, "status-bar").1, 32.);
+        assert_eq!(cx.read(|cx| Layout::get(cx).bottom.height), 280.);
+
+        // A mistake in it is said, and the layout that was right stays.
+        std::fs::write(
+            config.join("layout.json"),
+            "{ \"left\": { \"width\": \"wide\" } }",
+        )
+        .unwrap();
+        reload(cx);
+        let said = errors(cx);
+        assert_eq!(said.len(), 1);
+        assert!(said[0].starts_with("layout.json: "), "{said:?}");
+        assert_eq!(size(cx, "dock-left").0, 300.);
+
+        // Put right, the mistake is gone; taken away, so is the layout.
+        std::fs::write(
+            config.join("layout.json"),
+            "{ \"left\": { \"width\": 2000 } }",
+        )
+        .unwrap();
+        reload(cx);
+        assert!(errors(cx).is_empty());
+        assert_eq!(cx.read(|cx| Layout::get(cx).left.width), 900.);
+        std::fs::remove_file(config.join("layout.json")).unwrap();
+        reload(cx);
+        assert_eq!(size(cx, "dock-left").0, 390.);
+        assert_eq!(size(cx, "status-bar").1, 26.);
+
+        // A border is dragged: the part follows the pointer, and when it
+        // is let go its size is in the file, among what the user wrote.
+        std::fs::write(
+            config.join("layout.json"),
+            "// mine\n{\n  \"tab_bar\": { \"height\": 30 } // lower\n}\n",
+        )
+        .unwrap();
+        reload(cx);
+        let none = gpui::Modifiers::default();
+        let grip = |cx: &mut VisualTestContext, part: &'static str| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.debug_bounds(part)
+                .unwrap_or_else(|| panic!("no {part}"))
+                .center()
+        };
+        let written = |cx: &mut VisualTestContext, what: &str| {
+            for _ in 0..200 {
+                cx.run_until_parked();
+                let text = std::fs::read_to_string(config.join("layout.json")).unwrap_or_default();
+                if text.contains(what) {
+                    return text;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("layout.json never had {what}");
+        };
+        let at = grip(cx, "resize-left");
+        cx.simulate_mouse_down(at, MouseButton::Left, none);
+        cx.simulate_mouse_move(at + gpui::point(px(60.), px(5.)), MouseButton::Left, none);
+        assert_eq!(cx.read(|cx| Layout::get(cx).left.width), 450.);
+        assert_eq!(size(cx, "dock-left").0, 450.);
+        // Nothing is written while it is held.
+        assert!(
+            !std::fs::read_to_string(config.join("layout.json"))
+                .unwrap()
+                .contains("\"left\"")
+        );
+        cx.simulate_mouse_up(at + gpui::point(px(60.), px(5.)), MouseButton::Left, none);
+        let text = written(cx, "\"left\"");
+        assert!(
+            text.contains("// mine") && text.contains("// lower"),
+            "{text}"
+        );
+        assert_eq!(layout::parse(&text).unwrap().left.width, 450.);
+        assert_eq!(layout::parse(&text).unwrap().tab_bar.height, 30.);
+        // Moving the pointer with nothing held sizes nothing.
+        cx.simulate_mouse_move(at + gpui::point(px(200.), px(0.)), None, none);
+        assert_eq!(cx.read(|cx| Layout::get(cx).left.width), 450.);
+
+        // The chat's border is on its left: dragged left, the chat grows,
+        // and no further than a window can show.
+        ws.update(cx, |w, cx| {
+            w.right = Some(Panel::Chat);
+            cx.notify();
+        });
+        let at = grip(cx, "resize-right");
+        cx.simulate_mouse_down(at, MouseButton::Left, none);
+        cx.simulate_mouse_move(at - gpui::point(px(40.), px(0.)), MouseButton::Left, none);
+        assert_eq!(cx.read(|cx| Layout::get(cx).right.width), 420.);
+        cx.simulate_mouse_move(at + gpui::point(px(300.), px(0.)), MouseButton::Left, none);
+        assert_eq!(cx.read(|cx| Layout::get(cx).right.width), 200.);
+        cx.simulate_mouse_up(at, MouseButton::Left, none);
+        written(cx, "\"right\"");
+
+        // A double click on a border puts its part back, in the file too.
+        let at = grip(cx, "resize-left");
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: at,
+            modifiers: none,
+            click_count: 2,
+            first_mouse: false,
+        });
+        assert_eq!(cx.read(|cx| Layout::get(cx).left.width), 390.);
+        let text = written(cx, "390");
+        assert_eq!(layout::parse(&text).unwrap().left.width, 390.);
+        assert_eq!(layout::parse(&text).unwrap().right.width, 200.);
     }
 
     #[gpui::test]

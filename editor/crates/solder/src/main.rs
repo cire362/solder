@@ -7,6 +7,7 @@ mod ai_providers;
 mod ai_review;
 mod ai_store;
 mod api_panel;
+mod bar_commands;
 mod buffer_search;
 mod chat_panel;
 mod command_palette;
@@ -33,12 +34,17 @@ mod git;
 mod git_panel;
 mod git_store;
 mod go_to_line;
+mod icons;
 mod import_settings;
 mod import_view;
 mod indent;
 mod inline_completion;
 mod inline_edit;
+mod key_layout;
+mod key_layout_picker;
 mod key_prompts;
+mod layout;
+mod layout_picker;
 mod locations;
 mod lsp_store;
 mod mcp_store;
@@ -104,38 +110,40 @@ fn main() {
         Some((path, String::from_utf8_lossy(&bytes).into_owned()))
     });
 
-    Application::new().run(move |cx: &mut App| {
-        cx.set_global(Perf::new(started));
-        settings::reload(cx);
-        settings::watch(cx);
-        lsp_store::init(cx);
+    Application::new()
+        .with_assets(icons::Assets)
+        .run(move |cx: &mut App| {
+            cx.set_global(Perf::new(started));
+            settings::reload(cx);
+            settings::watch(cx);
+            lsp_store::init(cx);
 
-        let window = open_workspace_window(root, initial, cx);
-        window
-            .update(cx, |_, window, _| {
-                window.on_next_frame(move |_, cx| {
-                    let perf = cx.global_mut::<Perf>();
-                    let elapsed = perf.process_start.elapsed();
-                    perf.first_frame = Some(elapsed);
-                    if bench_startup {
-                        println!("first_frame_ms={:.1}", elapsed.as_secs_f64() * 1000.0);
-                        cx.quit();
-                    }
-                });
-            })
-            .ok();
-        if std::env::var_os("SOLDER_BENCH_TYPING").is_some() {
-            bench_typing(window, cx);
-        }
-
-        cx.on_window_closed(|cx| {
-            if cx.windows().is_empty() {
-                cx.quit();
+            let window = open_workspace_window(root, initial, cx);
+            window
+                .update(cx, |_, window, _| {
+                    window.on_next_frame(move |_, cx| {
+                        let perf = cx.global_mut::<Perf>();
+                        let elapsed = perf.process_start.elapsed();
+                        perf.first_frame = Some(elapsed);
+                        if bench_startup {
+                            println!("first_frame_ms={:.1}", elapsed.as_secs_f64() * 1000.0);
+                            cx.quit();
+                        }
+                    });
+                })
+                .ok();
+            if std::env::var_os("SOLDER_BENCH_TYPING").is_some() {
+                bench_typing(window, cx);
             }
-        })
-        .detach();
-        cx.activate(true);
-    });
+
+            cx.on_window_closed(|cx| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            cx.activate(true);
+        });
 }
 
 /// Opens a window on `root`, optionally with a file already loaded.

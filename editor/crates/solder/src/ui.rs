@@ -5,7 +5,26 @@ use gpui::{
     AnyView, ClickEvent, Div, ElementId, Hsla, SharedString, Stateful, Window, div, prelude::*, px,
 };
 
-use crate::theme::{Theme, UI_FONT_SIZE};
+use crate::theme::{ActiveTheme, Theme, UI_FONT_SIZE};
+
+pub struct Tooltip(pub String);
+
+impl gpui::Render for Tooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .max_w(crate::theme::text(400.))
+            .px_2()
+            .py_1()
+            .rounded(theme.shape.control)
+            .border(theme.shape.border)
+            .border_color(theme.line)
+            .bg(theme.bg_elev)
+            .text_color(theme.fg)
+            .text_size(UI_FONT_SIZE)
+            .child(self.0.clone())
+    }
+}
 
 /// A bordered box around a single-line editor.
 pub fn text_field(editor: impl Into<AnyView>, focused: bool, theme: &Theme) -> Div {
@@ -16,8 +35,8 @@ pub fn text_field(editor: impl Into<AnyView>, focused: bool, theme: &Theme) -> D
         .px_2()
         .flex()
         .items_center()
-        .rounded(px(8.))
-        .border_1()
+        .rounded(theme.shape.control)
+        .border(theme.shape.border)
         .border_color(if focused { theme.accent } else { theme.line })
         .bg(theme.bg)
         .child(editor.into())
@@ -42,8 +61,8 @@ pub fn toggle(
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(6.))
-        .text_size(px(11.5))
+        .rounded(theme.shape.token)
+        .text_size(crate::theme::text(11.5))
         .font_family(crate::theme::CODE_FONT)
         .text_color(if active {
             theme.accent
@@ -64,6 +83,8 @@ pub fn button(
     theme: &Theme,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> Stateful<Div> {
+    let label = label.into();
+    let icon = crate::icons::button(&label);
     let (bg, fg): (Hsla, Hsla) = if primary {
         (theme.accent, theme.accent_fg)
     } else {
@@ -77,14 +98,16 @@ pub fn button(
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(8.))
-        .border_1()
+        .gap_1p5()
+        .rounded(theme.shape.control)
+        .border(theme.shape.border)
         .border_color(theme.line)
         .bg(bg)
         .text_size(UI_FONT_SIZE)
         .text_color(fg)
         .hover(|d| d.opacity(0.9))
         .active(|d| d.opacity(0.8))
-        .child(label.into())
+        .children(icon.map(crate::icons::draw))
+        .child(label)
         .on_click(on_click)
 }

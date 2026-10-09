@@ -1,10 +1,15 @@
-//! Icon themes of Zed extensions: which picture goes with which file.
+//! Icon themes of extensions: which picture goes with which file.
 //!
 //! A theme names kinds of files (`rust`, `image`, `lock`) and gives each a
 //! picture. Which file is of which kind it may say itself, by whole name or
 //! by ending; for the rest there is the table at the end of this file, so
 //! that a theme that only draws the kinds Zed knows works without saying
 //! more.
+//!
+//! A theme of a VS Code extension is read into the same thing. It names
+//! its pictures once (`iconDefinitions`) and then says which goes with a
+//! file's name, its ending or its language. A language is a kind here:
+//! the table knows which endings are `rust` or `python`.
 
 use std::{
     collections::HashMap,
@@ -31,6 +36,9 @@ pub struct IconTheme {
     /// The picture of each kind. Shared, since every row that shows a file
     /// of the kind hands the path to what draws it.
     icons: HashMap<String, Arc<Path>>,
+    /// Names are looked up in small letters: a VS Code theme writes
+    /// `dockerfile` and means `Dockerfile` too.
+    folds: bool,
 }
 
 impl IconTheme {
@@ -53,7 +61,11 @@ impl IconTheme {
     }
 
     fn of_kind(&self, key: &str) -> Option<&Arc<Path>> {
-        let own = self.stems.get(key).or_else(|| self.suffixes.get(key));
+        let folded = self.folded(key);
+        let own = self
+            .stems
+            .get(folded.as_ref())
+            .or_else(|| self.suffixes.get(folded.as_ref()));
         if let Some(icon) = own.and_then(|kind| self.icons.get(kind)) {
             return Some(icon);
         }
@@ -62,11 +74,21 @@ impl IconTheme {
         kinds(key).iter().find_map(|kind| self.icons.get(*kind))
     }
 
+    /// `name` as this theme's own tables have it. Nothing is made for a
+    /// name that is in small letters already, which most are.
+    fn folded<'a>(&self, name: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.folds && name.chars().any(char::is_uppercase) {
+            name.to_lowercase().into()
+        } else {
+            name.into()
+        }
+    }
+
     /// The picture for a folder called `name`, open or closed.
     pub fn folder(&self, name: &str, open: bool) -> Option<&Arc<Path>> {
         let state = usize::from(open);
         self.named_folders
-            .get(name)
+            .get(self.folded(name).as_ref())
             .and_then(|folder| folder[state].as_ref())
             .or(self.folder[state].as_ref())
     }
@@ -79,6 +101,158 @@ fn inside(dir: &Path, relative: &str) -> Option<PathBuf> {
         .components()
         .all(|c| matches!(c, std::path::Component::Normal(_)));
     plain.then(|| dir.join(relative))
+}
+
+/// A path a VS Code theme names, from the folder its file is in, if it
+/// stays inside the extension. These themes keep their pictures beside
+/// that folder: `./../icons/rust.svg`.
+fn inside_from(dir: &Path, from: &Path, relative: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut path = from.to_path_buf();
+    for part in Path::new(relative).components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !path.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(name) => path.push(name),
+            _ => return None,
+        }
+    }
+    path.starts_with(dir).then_some(path)
+}
+
+/// The names Zed's kinds have where a VS Code language is called
+/// something else.
+const LANGUAGE_KINDS: &[(&str, &str)] = &[
+    ("typescriptreact", "react"),
+    ("javascriptreact", "react"),
+    ("shellscript", "terminal"),
+    ("dockerfile", "docker"),
+    ("plaintext", "document"),
+    ("git-commit", "vcs"),
+    ("ignore", "vcs"),
+    ("scss", "sass"),
+    ("properties", "settings"),
+];
+
+/// What one table of a VS Code theme gives: for each name in it, in
+/// small letters, the picture's own name and the picture. A name given a
+/// picture the theme does not have is left out.
+fn table(value: &Value, pictures: &HashMap<&str, Arc<Path>>) -> Vec<(String, String, Arc<Path>)> {
+    value
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, id)| {
+            let id = id.as_str()?;
+            Some((
+                name.to_lowercase(),
+                id.to_string(),
+                pictures.get(id)?.clone(),
+            ))
+        })
+        .collect()
+}
+
+/// Lays one part of a VS Code theme over `theme`: the whole of it, or
+/// what it draws differently on a light background.
+fn lay_vscode(theme: &mut IconTheme, part: &Value, pictures: &HashMap<&str, Arc<Path>>) {
+    let picture = |value: &Value| pictures.get(value.as_str()?).cloned();
+    if let Some(icon) = picture(&part["file"]) {
+        theme.icons.insert("default".into(), icon);
+    }
+    // An open folder with no picture of its own is drawn closed.
+    if let Some(icon) = picture(&part["folder"]) {
+        theme.folder = [Some(icon.clone()), Some(icon)];
+    }
+    if let Some(icon) = picture(&part["folderExpanded"]) {
+        theme.folder[1] = Some(icon);
+    }
+    for (name, _, icon) in table(&part["folderNames"], pictures) {
+        theme
+            .named_folders
+            .insert(name, [Some(icon.clone()), Some(icon)]);
+    }
+    for (name, _, icon) in table(&part["folderNamesExpanded"], pictures) {
+        theme.named_folders.entry(name).or_default()[1] = Some(icon);
+    }
+    // A picture's own name is kept apart from the names of kinds, which
+    // the languages below use: `def:rust` is not `rust`.
+    for (name, id, icon) in table(&part["fileNames"], pictures) {
+        let kind = format!("def:{id}");
+        theme.icons.insert(kind.clone(), icon);
+        theme.stems.insert(name, kind);
+    }
+    for (name, id, icon) in table(&part["fileExtensions"], pictures) {
+        let kind = format!("def:{id}");
+        theme.icons.insert(kind.clone(), icon);
+        theme.suffixes.insert(name, kind);
+    }
+    for (language, _, icon) in table(&part["languageIds"], pictures) {
+        let kind = LANGUAGE_KINDS
+            .iter()
+            .find(|(theirs, _)| *theirs == language)
+            .map_or(language.as_str(), |(_, ours)| ours);
+        // The first of two languages that are one kind here keeps it.
+        theme.icons.entry(kind.to_string()).or_insert(icon);
+    }
+}
+
+/// The themes in one file of a VS Code extension unpacked in `dir`, under
+/// the name the extension gives the file: one, and a second for a light
+/// background if the file draws some things differently there. A file
+/// that cannot be read holds none, and neither does one that draws with a
+/// font and not with pictures.
+pub fn read_vscode(dir: &Path, file: &Path, name: &str) -> Vec<IconTheme> {
+    // The file itself is inside the extension, by a path with no way
+    // back out in it: `dir/../x` begins with `dir` too.
+    let within = file.strip_prefix(dir).is_ok_and(|rest| {
+        rest.components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    });
+    let (Some(from), Some(source)) = (
+        file.parent().filter(|_| within),
+        std::fs::read_to_string(file)
+            .ok()
+            .and_then(|source| jsonc::parse(&source).ok()),
+    ) else {
+        return Vec::new();
+    };
+    let pictures: HashMap<&str, Arc<Path>> = source["iconDefinitions"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(id, definition)| {
+            let path = inside_from(dir, from, definition["iconPath"].as_str()?)?;
+            Some((id.as_str(), path.into()))
+        })
+        .collect();
+    let name = name.trim();
+    if pictures.is_empty() || name.is_empty() {
+        return Vec::new();
+    }
+    let mut dark = IconTheme {
+        name: name.to_string(),
+        dark: true,
+        folds: true,
+        ..Default::default()
+    };
+    lay_vscode(&mut dark, &source, &pictures);
+    let mut themes = vec![dark];
+    if source["light"]
+        .as_object()
+        .is_some_and(|part| !part.is_empty())
+    {
+        let mut light = themes[0].clone();
+        light.name = format!("{name} Light");
+        light.dark = false;
+        lay_vscode(&mut light, &source["light"], &pictures);
+        themes.push(light);
+    }
+    themes
 }
 
 /// The themes in one file of an extension unpacked in `dir`. A file that
@@ -128,6 +302,7 @@ pub fn read(dir: &Path, file: &Path) -> Vec<IconTheme> {
                     .flatten()
                     .filter_map(|(kind, icon)| Some((kind.clone(), picture(&icon["path"])?)))
                     .collect(),
+                folds: false,
             })
         })
         .collect()
@@ -227,7 +402,80 @@ fn kinds(key: &str) -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{scratch, write};
+    use crate::testing::{VSCODE_ICON_THEME, scratch, write};
+
+    #[test]
+    fn a_vscode_theme_gives_each_file_its_picture() {
+        let dir = scratch("vscode-icons").join("extension");
+        let file = dir.join("dist/icons.json");
+        write(&file, VSCODE_ICON_THEME);
+        write(&dir.join("../outside.svg"), "<svg/>");
+        let themes = read_vscode(&dir, &file, " Acme Icons ");
+        // One theme, and the same for a light background.
+        let names: Vec<_> = themes.iter().map(|t| (t.name.as_str(), t.dark)).collect();
+        assert_eq!(names, [("Acme Icons", true), ("Acme Icons Light", false)]);
+        let icon = |theme: &IconTheme, name: &str| {
+            let path = theme.file(name).unwrap();
+            path.strip_prefix(&dir)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        let dark = &themes[0];
+        // By the language of the file, which is a kind here: the theme
+        // says `rust`, and the table knows which endings that is. Two
+        // languages that are one kind here share its picture.
+        assert_eq!(icon(dark, "main.rs"), "icons/rust.svg");
+        assert_eq!(icon(dark, "app.ts"), "icons/ts.svg");
+        assert_eq!(icon(dark, "App.tsx"), "icons/ts.svg");
+        // By the longest ending, and by the whole name in any letters.
+        assert_eq!(icon(dark, "app.test.ts"), "icons/test.svg");
+        assert_eq!(icon(dark, "Dockerfile"), "icons/docker.svg");
+        assert_eq!(icon(dark, "dockerfile"), "icons/docker.svg");
+        // Any other file; also one whose picture is outside the
+        // extension, or is a letter of a font.
+        assert_eq!(icon(dark, "notes.txt"), "icons/file.svg");
+        assert_eq!(icon(dark, "Cargo.lock"), "icons/file.svg");
+        assert_eq!(icon(dark, "a.woff"), "icons/file.svg");
+
+        let folder = |name: &str, open: bool| {
+            let path = dark.folder(name, open).unwrap();
+            path.strip_prefix(&dir)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(folder("lib", false), "icons/folder.svg");
+        assert_eq!(folder("lib", true), "icons/folder-open.svg");
+        assert_eq!(folder("src", false), "icons/src.svg");
+        assert_eq!(folder("SRC", true), "icons/src-open.svg");
+        // A folder named with a picture the theme does not have.
+        assert_eq!(folder("docs", true), "icons/folder-open.svg");
+
+        // On a light background: what it draws differently, and the rest
+        // as before.
+        let light = &themes[1];
+        assert_eq!(icon(light, "notes.txt"), "icons/light.svg");
+        assert_eq!(icon(light, "Dockerfile"), "icons/light.svg");
+        assert_eq!(icon(light, "main.rs"), "icons/rust.svg");
+        assert_eq!(light.folder("src", false), dark.folder("src", false));
+
+        // A theme drawn with a font holds no pictures, and so is none;
+        // nor is a file outside the extension, or one that is no theme.
+        let font = dir.join("dist/font.json");
+        write(
+            &font,
+            r#"{"iconDefinitions": {"_file": {"fontCharacter": "\\E001"}}, "file": "_file"}"#,
+        );
+        assert!(read_vscode(&dir, &font, "Font").is_empty());
+        let outside = dir.join("../theme.json");
+        write(&outside, VSCODE_ICON_THEME);
+        assert!(read_vscode(&dir, &outside, "Outside").is_empty());
+        assert!(read_vscode(&dir, &dir.join("missing.json"), "Missing").is_empty());
+        assert!(read_vscode(&dir, &file, "  ").is_empty());
+    }
 
     #[test]
     fn a_theme_gives_each_file_the_picture_of_its_kind() {

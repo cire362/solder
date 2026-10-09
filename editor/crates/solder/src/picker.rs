@@ -175,7 +175,8 @@ impl<D: PickerDelegate> Render for Picker<D> {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let count = self.delegate.match_count();
-        let list_height = ROW_HEIGHT * count.clamp(1, MAX_VISIBLE_ROWS) as f32;
+        let row = crate::theme::row(ROW_HEIGHT, cx);
+        let list_height = row * count.clamp(1, MAX_VISIBLE_ROWS) as f32;
         div()
             .key_context("Picker")
             .on_action(cx.listener(Self::select_prev))
@@ -188,22 +189,22 @@ impl<D: PickerDelegate> Render for Picker<D> {
             .flex()
             .flex_col()
             .bg(theme.bg_elev)
-            .border_1()
+            .border(theme.shape.border)
             .border_color(theme.line)
-            .rounded(px(16.))
+            .rounded(theme.shape.panel)
             .shadow_lg()
             .overflow_hidden()
             .child(
                 div()
                     .px_4()
                     .py_3()
-                    .border_b_1()
+                    .border_b(theme.shape.border)
                     .border_color(theme.line)
                     .child(self.query.clone()),
             )
             .child(if count == 0 {
                 div()
-                    .h(ROW_HEIGHT + px(8.))
+                    .h(row + px(8.))
                     .px_4()
                     .flex()
                     .items_center()
@@ -223,12 +224,12 @@ impl<D: PickerDelegate> Render for Picker<D> {
                                     this.delegate.render_match(ix, ix == selected, window, cx);
                                 div()
                                     .id(ix)
-                                    .h(ROW_HEIGHT)
+                                    .h(row)
                                     .mx_1p5()
                                     .px_2p5()
                                     .flex()
                                     .items_center()
-                                    .rounded(px(8.))
+                                    .rounded(theme.shape.control)
                                     .when(ix == selected, |d| d.bg(cx.theme().accent_soft))
                                     .on_mouse_down(
                                         MouseButton::Left,

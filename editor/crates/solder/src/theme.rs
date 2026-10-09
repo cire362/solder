@@ -5,6 +5,9 @@
 use gpui::{App, Global, Hsla, WindowAppearance, px, rgb, rgba};
 use syntax::HighlightKind;
 
+/// Tokens by name, each a color as a theme file writes it.
+pub type Tokens = std::collections::BTreeMap<String, String>;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
     pub bg: Hsla,
@@ -29,6 +32,55 @@ pub struct Theme {
     pub conflict_ours: Hsla,
     pub conflict_theirs: Hsla,
     pub syntax: SyntaxColors,
+    /// The sixteen colors programs in the terminal ask for by number, in
+    /// the order of `import::theme::TERMINAL`.
+    pub terminal: [Hsla; 16],
+    pub shape: Shapes,
+}
+
+/// The shapes of the window, which a theme sets next to its colors.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shapes {
+    /// How round the corners of a panel are: a window over the editor, a
+    /// card.
+    pub panel: gpui::Pixels,
+    /// Of a control: a button, a field, a tab, a row of a list.
+    pub control: gpui::Pixels,
+    /// Of what sits inside a line: a key, a badge, an item of a menu.
+    pub token: gpui::Pixels,
+    /// How wide the lines between the parts of the window are.
+    pub border: gpui::Pixels,
+}
+
+impl Default for Shapes {
+    /// The site's: panels 16, controls 8, inline tokens 6.
+    fn default() -> Self {
+        Self {
+            panel: px(16.),
+            control: px(8.),
+            token: px(6.),
+            border: px(1.),
+        }
+    }
+}
+
+impl Shapes {
+    /// Sets the shapes these name, each kept to what a window can draw:
+    /// a corner no rounder than a row is tall, a border one can still see
+    /// through. A name that is no shape changes nothing.
+    pub fn lay(&mut self, shapes: &std::collections::BTreeMap<String, f32>) {
+        let slots: [(&str, &mut gpui::Pixels, f32); 4] = [
+            ("panel_radius", &mut self.panel, 24.),
+            ("control_radius", &mut self.control, 12.),
+            ("token_radius", &mut self.token, 12.),
+            ("border_width", &mut self.border, 3.),
+        ];
+        for (key, slot, most) in slots {
+            if let Some(size) = shapes.get(key).filter(|size| size.is_finite()) {
+                *slot = px(size.clamp(0., most));
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -96,6 +148,13 @@ impl Theme {
                 variable: rgb(0xc4c4cc).into(),
                 tag: rgb(0xe8743f).into(),
             },
+            // The site's zinc tones.
+            terminal: [
+                0x27272a, 0xf87171, 0x86efac, 0xfbbf24, 0x93c5fd, 0xd8b4fe, 0x67e8f9, 0xd4d4d8,
+                0x52525b, 0xfca5a5, 0xbbf7d0, 0xfde68a, 0xbfdbfe, 0xe9d5ff, 0xa5f3fc, 0xfafafa,
+            ]
+            .map(|color| rgb(color).into()),
+            shape: Shapes::default(),
         }
     }
 
@@ -133,6 +192,12 @@ impl Theme {
                 variable: rgb(0x3f3f46).into(),
                 tag: rgb(0xb24a1c).into(),
             },
+            terminal: [
+                0x18181b, 0xdc2626, 0x15803d, 0xb45309, 0x1d4ed8, 0x7e22ce, 0x0e7490, 0x52525b,
+                0x71717a, 0xef4444, 0x16a34a, 0xca8a04, 0x2563eb, 0x9333ea, 0x0891b2, 0x27272a,
+            ]
+            .map(|color| rgb(color).into()),
+            shape: Shapes::default(),
         }
     }
 
@@ -144,56 +209,68 @@ impl Theme {
         } else {
             Self::dark()
         };
-        let color = |map: &std::collections::BTreeMap<String, String>, key: &str| {
+        theme.lay(&file.colors, &file.syntax, &file.terminal);
+        theme.shape.lay(&file.shapes);
+        theme
+    }
+
+    /// Sets the tokens these name. A name that is no token, or a value
+    /// that is no color, changes nothing.
+    pub fn lay(&mut self, colors: &Tokens, syntax: &Tokens, terminal: &Tokens) {
+        let color = |map: &Tokens, key: &str| {
             let c = import::theme::Rgba::parse(map.get(key)?)?;
             let packed = u32::from_be_bytes([c.r, c.g, c.b, c.a]);
             Some(Hsla::from(rgba(packed)))
         };
-        let colors: [(&str, &mut Hsla); 21] = [
-            ("bg", &mut theme.bg),
-            ("bg_elev", &mut theme.bg_elev),
-            ("bg_sunken", &mut theme.bg_sunken),
-            ("fg", &mut theme.fg),
-            ("fg_muted", &mut theme.fg_muted),
-            ("fg_subtle", &mut theme.fg_subtle),
-            ("line", &mut theme.line),
-            ("accent", &mut theme.accent),
-            ("accent_soft", &mut theme.accent_soft),
-            ("accent_fg", &mut theme.accent_fg),
-            ("selection", &mut theme.selection),
-            ("active_line", &mut theme.active_line),
-            ("search_match", &mut theme.search_match),
-            ("search_active", &mut theme.search_active),
-            ("bracket", &mut theme.bracket),
-            ("error", &mut theme.error),
-            ("warning", &mut theme.warning),
-            ("git_added", &mut theme.git_added),
-            ("git_modified", &mut theme.git_modified),
-            ("conflict_ours", &mut theme.conflict_ours),
-            ("conflict_theirs", &mut theme.conflict_theirs),
+        let slots: [(&str, &mut Hsla); 21] = [
+            ("bg", &mut self.bg),
+            ("bg_elev", &mut self.bg_elev),
+            ("bg_sunken", &mut self.bg_sunken),
+            ("fg", &mut self.fg),
+            ("fg_muted", &mut self.fg_muted),
+            ("fg_subtle", &mut self.fg_subtle),
+            ("line", &mut self.line),
+            ("accent", &mut self.accent),
+            ("accent_soft", &mut self.accent_soft),
+            ("accent_fg", &mut self.accent_fg),
+            ("selection", &mut self.selection),
+            ("active_line", &mut self.active_line),
+            ("search_match", &mut self.search_match),
+            ("search_active", &mut self.search_active),
+            ("bracket", &mut self.bracket),
+            ("error", &mut self.error),
+            ("warning", &mut self.warning),
+            ("git_added", &mut self.git_added),
+            ("git_modified", &mut self.git_modified),
+            ("conflict_ours", &mut self.conflict_ours),
+            ("conflict_theirs", &mut self.conflict_theirs),
         ];
-        for (key, slot) in colors {
-            if let Some(found) = color(&file.colors, key) {
+        for (key, slot) in slots {
+            if let Some(found) = color(colors, key) {
                 *slot = found;
             }
         }
-        let syntax: [(&str, &mut Hsla); 9] = [
-            ("keyword", &mut theme.syntax.keyword),
-            ("string", &mut theme.syntax.string),
-            ("function", &mut theme.syntax.function),
-            ("type", &mut theme.syntax.r#type),
-            ("comment", &mut theme.syntax.comment),
-            ("number", &mut theme.syntax.number),
-            ("punctuation", &mut theme.syntax.punctuation),
-            ("variable", &mut theme.syntax.variable),
-            ("tag", &mut theme.syntax.tag),
+        let slots: [(&str, &mut Hsla); 9] = [
+            ("keyword", &mut self.syntax.keyword),
+            ("string", &mut self.syntax.string),
+            ("function", &mut self.syntax.function),
+            ("type", &mut self.syntax.r#type),
+            ("comment", &mut self.syntax.comment),
+            ("number", &mut self.syntax.number),
+            ("punctuation", &mut self.syntax.punctuation),
+            ("variable", &mut self.syntax.variable),
+            ("tag", &mut self.syntax.tag),
         ];
-        for (key, slot) in syntax {
-            if let Some(found) = color(&file.syntax, key) {
+        for (key, slot) in slots {
+            if let Some(found) = color(syntax, key) {
                 *slot = found;
             }
         }
-        theme
+        for (key, slot) in import::theme::TERMINAL.iter().zip(&mut self.terminal) {
+            if let Some(found) = color(terminal, key) {
+                *slot = found;
+            }
+        }
     }
 
     pub fn for_appearance(appearance: WindowAppearance) -> Self {
@@ -233,4 +310,26 @@ pub const UI_FONT: &str = if cfg!(target_os = "macos") {
     "Cantarell"
 };
 
-pub const UI_FONT_SIZE: gpui::Pixels = px(12.5);
+/// The size of the interface's text as it comes, in pixels.
+pub const UI_FONT_PX: f32 = 12.5;
+
+/// A text size of the interface: `size` pixels while `ui_font_size` is as
+/// it comes. Sizes are in rems and a rem follows that setting, so the
+/// text and the room around it grow and shrink together.
+pub const fn text(size: f32) -> gpui::Rems {
+    gpui::Rems(size / 16.)
+}
+
+pub const UI_FONT_SIZE: gpui::Rems = text(UI_FONT_PX);
+/// One step smaller, for what stands next to a label.
+pub const UI_FONT_SMALL: gpui::Rems = text(UI_FONT_PX - 1.);
+
+/// The height of a row of a list: `base` as it comes, lower or taller by
+/// `ui_density`, and grown with the interface's text so that a line of it
+/// always fits.
+pub fn row(base: gpui::Pixels, cx: &gpui::App) -> gpui::Pixels {
+    let scale = cx
+        .try_global::<crate::settings::Settings>()
+        .map_or(1., crate::settings::Settings::row_scale);
+    px((f32::from(base) * scale).round())
+}

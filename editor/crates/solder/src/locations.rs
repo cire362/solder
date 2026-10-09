@@ -163,7 +163,7 @@ impl PickerDelegate for LocationPicker {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(11.5))
+                    .text_size(crate::theme::text(11.5))
                     .text_color(theme.fg_subtle)
                     .child(row.preview.clone()),
             )

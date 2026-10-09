@@ -124,6 +124,34 @@ pub fn svg(name: &str) -> String {
     )
 }
 
+/// An icon theme as a VS Code extension writes one.
+pub const VSCODE_ICON_THEME: &str = r#"{
+  // Pictures are named once, then given to files.
+  "iconDefinitions": {
+    "_file": { "iconPath": "./../icons/file.svg" },
+    "_folder": { "iconPath": "../icons/folder.svg" },
+    "_folder_open": { "iconPath": "../icons/folder-open.svg" },
+    "_src": { "iconPath": "../icons/src.svg" },
+    "_src_open": { "iconPath": "../icons/src-open.svg" },
+    "rust": { "iconPath": "../icons/rust.svg" },
+    "_ts": { "iconPath": "../icons/ts.svg" },
+    "_docker": { "iconPath": "../icons/docker.svg" },
+    "_test": { "iconPath": "../icons/test.svg" },
+    "_light": { "iconPath": "../icons/light.svg" },
+    "_font": { "fontCharacter": "\\E001" },
+    "_outside": { "iconPath": "../../outside.svg" }
+  },
+  "file": "_file",
+  "folder": "_folder",
+  "folderExpanded": "_folder_open",
+  "folderNames": { "src": "_src", "docs": "_missing" },
+  "folderNamesExpanded": { "src": "_src_open" },
+  "fileExtensions": { "test.ts": "_test", "lock": "_outside", "woff": "_font" },
+  "fileNames": { "dockerfile": "_docker" },
+  "languageIds": { "rust": "rust", "typescript": "_ts", "typescriptreact": "_ts" },
+  "light": { "file": "_light", "fileNames": { "dockerfile": "_light" } }
+}"#;
+
 pub const ZED_THEME: &str = r##"{"name":"Demo","author":"a","themes":[
         {"name":"Demo Dark","appearance":"dark","style":{"background":"#101014","editor.background":"#101014","text":"#e0e0e6","syntax":{"keyword":{"color":"#ff8800"}}}},
         {"name":"Demo Light","appearance":"light","style":{"background":"#fafafa","editor.background":"#fafafa","text":"#202020","syntax":{}}}
@@ -234,11 +262,41 @@ pub fn vscode_extension(dir: &Path) {
       {"id": "demo", "aliases": ["Demo Lang"], "extensions": [".dm"], "filenames": ["Demofile"], "configuration": "./language.json"}
     ],
     "grammars": [{"language": "demo", "scopeName": "source.demo", "path": "./demo.tmLanguage.json"}],
+    "iconThemes": [
+      {"id": "acme-icons", "label": "%icons%", "path": "./dist/icons.json"},
+      {"id": "acme-font", "label": "Acme Font", "path": "./dist/font.json"}
+    ],
     "keybindings": [{"command": "demo.run", "key": "ctrl+r"}]
   }
 }"#,
     );
-    write(&dir.join("package.nls.json"), r#"{"title": "Acme Demo"}"#);
+    write(
+        &dir.join("package.nls.json"),
+        r#"{"title": "Acme Demo", "icons": "Acme Icons"}"#,
+    );
+    // Pictures beside the folder of the theme's file, as such themes
+    // keep them.
+    write(&dir.join("dist/icons.json"), VSCODE_ICON_THEME);
+    for name in [
+        "file",
+        "folder",
+        "folder-open",
+        "src",
+        "src-open",
+        "rust",
+        "ts",
+        "docker",
+        "test",
+        "light",
+    ] {
+        write(&dir.join(format!("icons/{name}.svg")), &svg(name));
+    }
+    // One drawn with a font has no pictures to take.
+    write(
+        &dir.join("dist/font.json"),
+        r#"{"fonts": [{"id": "f", "src": [{"path": "./f.woff", "format": "woff"}]}],
+            "iconDefinitions": {"_file": {"fontCharacter": "\\E001"}}, "file": "_file"}"#,
+    );
     write(
         &dir.join("themes/dark.json"),
         r##"{"name":"Acme Dark","type":"dark","colors":{"editor.background":"#101014","editor.foreground":"#e0e0e6"},"tokenColors":[{"scope":"keyword","settings":{"foreground":"#ff8800"}}]}"##,

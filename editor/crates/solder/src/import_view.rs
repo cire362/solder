@@ -287,14 +287,14 @@ impl ImportView {
             .flex_none()
             .size(px(14.))
             .rounded(px(4.))
-            .border_1()
+            .border(theme.shape.border)
             .border_color(if checked { theme.accent } else { theme.line })
             .when(checked, |d| d.bg(theme.accent))
             .when(!enabled, |d| d.opacity(0.4))
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(10.))
+            .text_size(crate::theme::text(10.))
             .text_color(theme.accent_fg)
             .when(checked, |d| d.child("✓"))
             .into_any_element()
@@ -327,17 +327,17 @@ impl Render for ImportView {
             range
                 .map(|i| match rows[i].clone() {
                     Row::Header(text) => div()
-                        .h(ROW)
+                        .h(crate::theme::row(ROW, cx))
                         .px_3()
                         .flex()
                         .items_end()
                         .pb_1()
-                        .text_size(px(10.5))
+                        .text_size(crate::theme::text(10.5))
                         .text_color(theme.fg_subtle)
                         .child(text)
                         .into_any_element(),
                     Row::Note(text) => div()
-                        .h(ROW)
+                        .h(crate::theme::row(ROW, cx))
                         .px_3()
                         .flex()
                         .items_center()
@@ -357,7 +357,7 @@ impl Render for ImportView {
                             .id(("import-item", i))
                             .debug_selector(move || format!("import-item-{i}"))
                             .w_full()
-                            .h(ROW)
+                            .h(crate::theme::row(ROW, cx))
                             .px_3()
                             .flex()
                             .items_center()
@@ -392,7 +392,7 @@ impl Render for ImportView {
                 })
                 .collect()
         })
-        .h(ROW * count.clamp(1, 13) as f32);
+        .h(crate::theme::row(ROW, cx) * count.clamp(1, 13) as f32);
 
         let tabs = self.plans.iter().enumerate().map(|(i, plan)| {
             let active = i == self.source;
@@ -403,7 +403,7 @@ impl Render for ImportView {
                 .px_2()
                 .flex()
                 .items_center()
-                .rounded(px(8.))
+                .rounded(theme.shape.control)
                 .text_size(UI_FONT_SIZE)
                 .text_color(if active { theme.fg } else { theme.fg_subtle })
                 .when(active, |d| d.bg(theme.bg_elev))
@@ -424,8 +424,8 @@ impl Render for ImportView {
             .w(px(560.))
             .flex()
             .flex_col()
-            .rounded(px(16.))
-            .border_1()
+            .rounded(theme.shape.panel)
+            .border(theme.shape.border)
             .border_color(theme.line)
             .bg(theme.bg)
             .overflow_hidden()
@@ -437,7 +437,7 @@ impl Render for ImportView {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .border_b_1()
+                    .border_b(theme.shape.border)
                     .border_color(theme.line)
                     .child(
                         div()
@@ -475,7 +475,7 @@ impl Render for ImportView {
                         .flex()
                         .items_center()
                         .gap_3()
-                        .border_t_1()
+                        .border_t(theme.shape.border)
                         .border_color(theme.line)
                         .child(
                             ui::button("import-apply", "Import", true, &theme, {
@@ -488,7 +488,7 @@ impl Render for ImportView {
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .text_size(px(11.5))
+                                .text_size(crate::theme::text(11.5))
                                 .text_color(match &status {
                                     Some((_, true)) => theme.error,
                                     Some(_) => theme.fg,

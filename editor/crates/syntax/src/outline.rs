@@ -23,6 +23,16 @@ pub fn outline(
     limit: usize,
     cancelled: impl Fn() -> bool,
 ) -> Vec<Symbol> {
+    with_budget(path, source, limit, cancelled, Duration::from_millis(25))
+}
+
+fn with_budget(
+    path: &Path,
+    source: &str,
+    limit: usize,
+    cancelled: impl Fn() -> bool,
+    budget: Duration,
+) -> Vec<Symbol> {
     if limit == 0 || cancelled() {
         return Vec::new();
     }
@@ -32,7 +42,10 @@ pub fn outline(
     let Some(mut parser) = super::new_parser(&language) else {
         return Vec::new();
     };
-    let deadline = Instant::now() + Duration::from_millis(25);
+    // Lazy queries can take longer to compile than the outline's whole
+    // budget. That one-time load must not leave the first outline empty.
+    let rules = language.rules();
+    let deadline = Instant::now() + budget;
     let mut read = |offset: usize, _| source.as_bytes().get(offset..).unwrap_or_default();
     let mut stop = |_: &ParseState| {
         if cancelled() || Instant::now() >= deadline {
@@ -47,7 +60,7 @@ pub fn outline(
     };
     let mut symbols = Vec::new();
     // An extension's language says what its declarations are in a query.
-    if let Some(outline) = &language.rules().outline {
+    if let Some(outline) = &rules.outline {
         let text = |node: Node<'_>| node.utf8_text(source.as_bytes()).ok();
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&outline.query, tree.root_node(), source.as_bytes());
@@ -244,7 +257,15 @@ mod tests {
             ),
         ];
         for (path, source, names) in cases {
-            let symbols = outline(Path::new(path), source, 16, || false);
+            // Declaration correctness must not depend on how much CPU
+            // concurrent tests or compiler jobs leave this thread.
+            let symbols = with_budget(
+                Path::new(path),
+                source,
+                16,
+                || false,
+                Duration::from_secs(2),
+            );
             assert_eq!(
                 symbols
                     .iter()
@@ -262,9 +283,19 @@ mod tests {
     fn limits_cancellation_and_computed_names() {
         let path = Path::new("app.js");
         let source = "function first() {}\nfunction second() {}\nclass App { ['PRIVATE']() {} }";
-        assert_eq!(outline(path, source, 1, || false).len(), 1);
+        assert_eq!(
+            with_budget(path, source, 1, || false, Duration::from_secs(2)).len(),
+            1
+        );
         assert!(outline(path, source, 16, || true).is_empty());
-        assert!(!format!("{:?}", outline(path, source, 16, || false)).contains("PRIVATE"));
+        assert!(
+            !format!(
+                "{:?}",
+                with_budget(path, source, 16, || false, Duration::from_secs(2))
+            )
+            .contains("PRIVATE")
+        );
+        assert!(with_budget(path, source, 16, || false, Duration::ZERO).is_empty());
         assert!(outline(Path::new("data.json"), "{\"PRIVATE\": 1}", 16, || false).is_empty());
     }
 }

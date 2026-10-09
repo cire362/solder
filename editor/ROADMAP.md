@@ -6,7 +6,8 @@ Phase 8 goes past what the website promises: it is what it takes for an
 extension made for Zed or VS Code to be installed with one button and work
 as it does in the editor it was made for. Phase 9 makes the window the
 user's own: where every panel and button is, how it looks and which keys
-drive it.
+drive it. Phase 10 is what an editor used all day is expected to have and
+this one does not have yet.
 
 Status: `[x]` done, `[~]` partial, `[ ]` not started.
 
@@ -207,7 +208,9 @@ to build them.
 - [ ] Language configuration: brackets, pairs that close themselves, comments,
       indentation rules, and which files are which language
 - [ ] Themes in the old `.tmTheme` format
-- [ ] Icon themes, through the same file icons as Zed's
+- [x] Icon themes, through the same file icons as Zed's: the ones drawn
+      with pictures, by a file's name, ending and language and a folder's
+      name. One drawn with a font is said not to run here
 - [ ] The settings an extension declares, with their defaults, in
       `settings.json`
 - [ ] Debuggers an extension declares with a program to start, in the
@@ -251,12 +254,14 @@ not use.
 
 ## 9. An editor shaped by its user
 
-Where it stands: keys are the user's (`keymap.json`), and so are the colors
-(a theme file, 34 tokens). The rest is fixed in code: the sidebar is on the
-left and 390 px wide, the chat on the right, the terminal at the bottom, the
-sidebar's tabs and the status bar's items in one order, the interface font
-and its size, and the only icons are those of files, from an extension's
-icon theme; buttons and panels are words.
+Where it stands: the layout file sets the sizes, docks, panels and bars;
+panels move by hand too. Layouts have names and are remembered per project.
+The interface font, size and density are settings, and every color, corner
+radius and border width is a theme token. Key layouts have names too, with
+the user's own bindings (`keymap.json`) on top.
+Phosphor icons are embedded for buttons, panels and bars, an item of a bar is
+a word, an icon or both, and a button runs any command. File icons come from
+the icon theme of a Zed or VS Code extension.
 
 How it is built: `layout.json`, next to `settings.json`, is the truth and is
 read again when it is saved. Whatever is done by hand in the window (a border
@@ -264,50 +269,133 @@ dragged, a tab moved, a button hidden from its menu) is written to the same
 file, so the two never disagree. It starts after the Zed items of phase 8.
 
 ### The layout file
-- [ ] `layout.json`: the sizes that are constants today (sidebar, chat,
-      terminal dock, title bar, tab bar, status bar), read at start and when
-      the file is saved. A mistake in it is reported like one in
-      `settings.json`, and the last layout that was right stays
-- [ ] Docks on the left, right and bottom, and any panel in any of them:
+- [x] `layout.json`: the sizes that were constants (sidebar, chat, terminal
+      dock, title bar, tab bar, status bar), read at start and when the file
+      is saved. A mistake in it is reported like one in `settings.json`, and
+      the last layout that was right stays
+- [x] Docks on the left, right and bottom, and any panel in any of them:
       Files, Search, Git, Services, Database, API, AI, Extensions, the chat,
       the agent, the terminal, the debugger. Their order in a dock, which
-      are hidden, which one is open
-- [ ] The title bar and the status bar as lists of items: which are there, in
+      are hidden, which one is open. Every dock holds any of the fourteen
+      panels (the terminals, the debugger, the response and the results
+      with the ten of the sides), in the file's order, with hidden ones.
+      `open` names the panel each dock has open and is written when that
+      changes, so the window starts as it was left
+- [x] The title bar and the status bar as lists of items: which are there, in
       what order, on which side. The tab bar: above or below the editor, or
-      none
-- [ ] An item is drawn as a word, an icon or both, and its command and icon
-      can be changed, so a button for any command can be put on a bar
-- [ ] The interface font, its size and how dense rows are, in
-      `settings.json`
+      none. Eleven items, two of them new (`file`, `branch`)
+- [x] An item is drawn as a word, an icon or both, and its command and icon
+      can be changed, so a button for any command can be put on a bar.
+      `items` in the layout file, by the item's name; a name that is no
+      item of the editor's is a button. The menu of an item sets how it is
+      drawn and adds or removes a button; the icon and the command of one
+      are changed in the file
+- [x] The interface font, its size and how dense rows are, in
+      `settings.json` (`ui_font_family`, `ui_font_size`, `ui_density`)
 
 ### By hand
-- [ ] Borders are dragged to resize; a double click puts a size back
-- [ ] A panel's tab is dragged to another place in its dock or to another
-      dock; an item of a bar is dragged along it or to the other bar
-- [ ] A menu on every panel tab and bar item: hide, move to, and the list of
-      what is hidden, to bring it back
-- [ ] A command that puts the layout back as it came
+- [x] Borders are dragged to resize; a double click puts a size back
+- [x] A panel's tab is dragged to another place in its dock or to another
+      dock, onto a closed dock too. A bar item is dragged before another
+      or appended at either end of either bar, even an empty end
+- [x] A menu on every panel tab and bar item: hide, move to, and the list of
+      what is hidden, to bring it back. An empty bar end has the menu too;
+      menus close on Escape, an outside click or a layout switch
+- [x] A command that puts the layout back as it came: Reset Layout, which
+      puts the file aside as `layout.json.old`
 
 ### Layouts by name
-- [ ] Several layouts kept by name (writing, review, debugging), switched by
+- [x] Several layouts kept by name (writing, review, debugging), switched by
       a command or a key; the one a project was left in is the one it opens
-      with
-- [ ] Key layouts by name: the built-in one, the ones that follow other
+      with. `layouts/<name>.json` is the selected layout's file, `layout.json`
+      is Default; all open windows share the choice and remember it for
+      their projects in `layouts.json`
+- [x] Key layouts by name: the built-in one, the ones that follow other
       editors, and the user's own, switched by a command, with `keymap.json`
-      still on top
+      still on top. Default, VS Code, JetBrains and `keymaps/<name>.json`,
+      copied, selected and opened through commands; the choice is a
+      setting shared by the windows. Invalid saves keep the last good keys
 
 ### Themes
-- [ ] Every color in the window comes from a token a theme can set: the ones
-      still written in code become tokens
-- [ ] Shapes as tokens next to colors: the radii, the spacing, the width of
-      borders
-- [ ] A theme file is applied as it is saved, and any token can be set in
-      `settings.json` on top of the theme in use
+- [x] Every color in the window comes from a token a theme can set: the ones
+      still written in code become tokens. They were the terminal's sixteen;
+      themes from VS Code and Zed bring theirs
+- [~] Shapes as tokens next to colors: the radii, the spacing, the width of
+      borders. The radii and the width of borders are (`shapes` in a theme
+      file and in `theme_overrides`). Spacing is not a theme's: it is in
+      rems like the text, so it follows `ui_font_size`, and a token of its
+      own would need every text size to know of it
+- [x] A theme file is applied as it is saved, and any token can be set in
+      `settings.json` on top of the theme in use (`theme_overrides`)
 
 ### Icons
-- [ ] A set of icons of Solder's own for buttons, panels and the bars
+- [x] A set of icons of Solder's own for buttons, panels and the bars
       (Phosphor, MIT, drawn from files kept in the app, so nothing is
-      downloaded)
-- [~] File icons in the tree and on tabs from the icon themes of Zed and
+      downloaded). Forty-four regular SVGs are embedded, inherit the text
+      color and scale with the interface font; panel tabs, bar items and
+      common command buttons use them
+- [x] File icons in the tree and on tabs from the icon themes of Zed and
       VS Code extensions (the items of phase 8), chosen in `settings.json`.
-      Zed's are in; VS Code's are not yet
+      VS Code's are read into the same icon theme as Zed's
+
+## 10. What a daily editor has
+
+Taken on 2026-10-09 from the checklist of another editor's rewrite, read
+against what Solder has: these are the parts it lacked. Each block is one
+update. They come after phase 9, in this order unless one is needed sooner.
+
+### The editor
+- [ ] Folding of blocks, indent guides, lines wrapped at the window's edge
+- [ ] Selection by column (a rectangle of cursors)
+- [ ] Tabs and cursors restored when a project is opened again; pinned tabs;
+      the tab closed last opened again (`cmd-shift-t`)
+- [ ] Unsaved text kept aside as it is typed and offered back after a crash
+- [ ] Line endings and encoding of a file kept as they were; files too large
+      to edit opened for reading, with the reason said
+
+### Symbols and problems
+- [ ] Symbols of the file (`cmd-shift-o`) and of the project (`cmd-t`), from
+      the language server, painted as an extension says (`labels-for-symbols`)
+- [ ] A Structure panel: the file's outline, from the server or from the
+      language's outline query
+- [ ] A Problems panel: every diagnostic of the project, by file
+- [ ] The other places a symbol is used lit up; go to implementations;
+      breadcrumbs with the path and the symbol under the cursor
+
+### Git history
+- [ ] The history as a graph, the history of one file, blame in the gutter
+- [ ] Stash and fetch
+- [ ] A check before a commit: keys and secrets in what is staged stop it
+- [ ] A commit message proposed by the model from what is staged
+- [ ] The pull request of the branch and the state of its checks, through `gh`
+
+### Tests and running
+- [ ] A tree of the project's tests: run one, see what failed, go to its line
+- [ ] Breakpoints with a condition, and ones that only write to the console
+- [ ] Python under the debugger (debugpy), now that an adapter is only
+      something to start
+
+### The terminal
+- [ ] `file:line:column` in the output opens in the editor
+- [ ] Search in what scrolled by; the dock split in two
+- [ ] A command that failed offered to the model to fix
+
+### Windows and the way in
+- [ ] A first window with the projects opened last, open a folder, clone
+- [ ] Several windows, a project in each, the set restored
+- [ ] Markdown shown next to its source; pictures shown as pictures
+- [ ] A log of errors with rotation, and a report of a crash at the next start
+- [ ] The interface in Russian as well as English
+
+### Projects that are somewhere else
+- [ ] A project on a server over SSH: files, terminal, Git, search and
+      language servers there (needs an SSH client, a dependency to decide on)
+- [ ] Dev containers: `devcontainer.json`, with terminals, services and the
+      agent inside
+
+Left out on purpose: notebooks, a list of servers and deploys (far from an
+editor for what they cost), settings synced through a folder (they are files
+already), and moving data over from an Electron version (there is none).
+Accessibility through the system's own tree and installers with updates
+are wanted, but the first waits for GPUI and the second is publishing, which
+is decided apart.

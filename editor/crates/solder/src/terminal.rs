@@ -613,18 +613,11 @@ impl Render for Terminal {
 
 // ---------------------------------------------------------------- colors
 
-/// ANSI palette in the site's zinc tones, plus the 256-color cube.
-fn palette_color(index: usize, dark: bool) -> Hsla {
-    const DARK: [u32; 16] = [
-        0x27272a, 0xf87171, 0x86efac, 0xfbbf24, 0x93c5fd, 0xd8b4fe, 0x67e8f9, 0xd4d4d8, 0x52525b,
-        0xfca5a5, 0xbbf7d0, 0xfde68a, 0xbfdbfe, 0xe9d5ff, 0xa5f3fc, 0xfafafa,
-    ];
-    const LIGHT: [u32; 16] = [
-        0x18181b, 0xdc2626, 0x15803d, 0xb45309, 0x1d4ed8, 0x7e22ce, 0x0e7490, 0x52525b, 0x71717a,
-        0xef4444, 0x16a34a, 0xca8a04, 0x2563eb, 0x9333ea, 0x0891b2, 0x27272a,
-    ];
+/// The color a program asks for by number: the theme's sixteen, then the
+/// 256-color cube and the greys, which are the same in every theme.
+fn palette_color(index: usize, theme: &[Hsla; 16]) -> Hsla {
     match index {
-        0..16 => rgb(if dark { DARK[index] } else { LIGHT[index] }).into(),
+        0..16 => theme[index],
         16..232 => {
             let i = index - 16;
             let level = |v: usize| if v == 0 { 0 } else { 55 + v as u32 * 40 };
@@ -643,14 +636,14 @@ fn resolve_color(
     overrides: &alacritty_terminal::term::color::Colors,
     fg: Hsla,
     bg: Hsla,
-    dark: bool,
+    palette: &[Hsla; 16],
 ) -> Hsla {
     let from_rgb =
         |c: Rgb| -> Hsla { rgb(((c.r as u32) << 16) | ((c.g as u32) << 8) | c.b as u32).into() };
     match color {
         Color::Spec(c) => from_rgb(c),
         Color::Indexed(i) => {
-            overrides[i as usize].map_or_else(|| palette_color(i as usize, dark), from_rgb)
+            overrides[i as usize].map_or_else(|| palette_color(i as usize, palette), from_rgb)
         }
         Color::Named(named) => {
             if let Some(c) = overrides[named as usize] {
@@ -664,11 +657,11 @@ fn resolve_color(
                 n => {
                     let i = n as usize;
                     if i < 16 {
-                        palette_color(i, dark)
+                        palette_color(i, palette)
                     } else if (NamedColor::DimBlack as usize..=NamedColor::DimWhite as usize)
                         .contains(&i)
                     {
-                        palette_color(i - NamedColor::DimBlack as usize, dark).opacity(0.7)
+                        palette_color(i - NamedColor::DimBlack as usize, palette).opacity(0.7)
                     } else {
                         fg
                     }
@@ -738,7 +731,7 @@ impl Element for TerminalElement {
     ) -> TerminalPrepaint {
         let settings = Settings::get(cx).clone();
         let theme = cx.theme().clone();
-        let dark = theme.bg.l < 0.5;
+        let palette = theme.terminal;
         let focused = self.terminal.read(cx).focus_handle.is_focused(window);
         let font = settings.buffer_font();
         let font_size = settings.buffer_font_size();
@@ -774,8 +767,8 @@ impl Element for TerminalElement {
                 continue;
             }
             let (mut fg, mut bg) = (
-                resolve_color(cell.fg, colors, fg_default, bg_default, dark),
-                resolve_color(cell.bg, colors, fg_default, bg_default, dark),
+                resolve_color(cell.fg, colors, fg_default, bg_default, &palette),
+                resolve_color(cell.bg, colors, fg_default, bg_default, &palette),
             );
             if cell.flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
@@ -983,9 +976,16 @@ mod tests {
 
     #[test]
     fn palette_covers_all_indices() {
-        assert_eq!(palette_color(1, true), rgb(0xf87171).into());
-        assert_eq!(palette_color(16, true), rgb(0x000000).into());
-        assert_eq!(palette_color(231, true), rgb(0xffffff).into());
-        assert_eq!(palette_color(255, true), rgb(0xeeeeee).into());
+        // The first sixteen are the theme's; the rest are every theme's.
+        let (dark, light) = (
+            crate::theme::Theme::dark().terminal,
+            crate::theme::Theme::light().terminal,
+        );
+        assert_eq!(palette_color(1, &dark), rgb(0xf87171).into());
+        assert_eq!(palette_color(1, &light), rgb(0xdc2626).into());
+        assert_eq!(palette_color(15, &dark), rgb(0xfafafa).into());
+        assert_eq!(palette_color(16, &dark), rgb(0x000000).into());
+        assert_eq!(palette_color(231, &light), rgb(0xffffff).into());
+        assert_eq!(palette_color(255, &dark), rgb(0xeeeeee).into());
     }
 }

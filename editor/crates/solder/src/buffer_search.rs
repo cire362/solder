@@ -410,7 +410,7 @@ impl Render for BufferSearchBar {
             .gap_1p5()
             .px_3()
             .py_2()
-            .border_b_1()
+            .border_b(theme.shape.border)
             .border_color(theme.line)
             .bg(theme.bg_sunken)
             .child(
@@ -455,7 +455,7 @@ impl Render for BufferSearchBar {
                         div()
                             .w(px(96.))
                             .flex_none()
-                            .text_size(px(11.5))
+                            .text_size(crate::theme::text(11.5))
                             .truncate()
                             .text_color(if self.error.is_some() {
                                 theme.error

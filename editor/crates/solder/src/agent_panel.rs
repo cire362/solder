@@ -255,7 +255,7 @@ impl AgentPanel {
         let Some(entry) = task.read(cx).entries.get(ix).cloned() else {
             return div().into_any_element();
         };
-        let small = UI_FONT_SIZE - px(1.);
+        let small = crate::theme::UI_FONT_SMALL;
         let body = match entry {
             Entry::Text(text) => div()
                 .text_size(UI_FONT_SIZE)
@@ -264,7 +264,7 @@ impl AgentPanel {
             Entry::Note(text) => div()
                 .px_2()
                 .py_1()
-                .rounded(px(8.))
+                .rounded(theme.shape.control)
                 .bg(theme.bg_elev)
                 .text_size(small)
                 .text_color(theme.fg_muted)
@@ -304,10 +304,10 @@ impl AgentPanel {
                     d.child(
                         div()
                             .p_2()
-                            .rounded(px(8.))
+                            .rounded(theme.shape.control)
                             .bg(theme.bg_sunken)
                             .font_family(crate::theme::CODE_FONT)
-                            .text_size(px(11.))
+                            .text_size(crate::theme::text(11.))
                             .text_color(theme.fg_muted)
                             .children(output.lines().take(200).map(|l| div().child(l.to_string()))),
                     )
@@ -326,20 +326,20 @@ impl AgentPanel {
         if task.plan.is_empty() {
             return None;
         }
-        let small = UI_FONT_SIZE - px(1.);
+        let small = crate::theme::UI_FONT_SMALL;
         let mut block = div()
             .mx_2()
             .mb_2()
             .p_2()
-            .rounded(px(8.))
-            .border_1()
+            .rounded(theme.shape.control)
+            .border(theme.shape.border)
             .border_color(theme.line)
             .flex()
             .flex_col()
             .gap_1()
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(crate::theme::text(11.))
                     .text_color(theme.fg_subtle)
                     .child("PLAN"),
             );
@@ -422,7 +422,7 @@ impl AgentPanel {
     fn render_action(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let task_entity = self.task.clone()?;
         let task = task_entity.read(cx);
-        let small = UI_FONT_SIZE - px(1.);
+        let small = crate::theme::UI_FONT_SMALL;
         match &task.status {
             Status::AwaitingApproval {
                 command,
@@ -440,8 +440,8 @@ impl AgentPanel {
                         .mx_2()
                         .mb_2()
                         .p_2()
-                        .rounded(px(8.))
-                        .border_1()
+                        .rounded(theme.shape.control)
+                        .border(theme.shape.border)
                         .border_color(theme.warning)
                         .flex()
                         .flex_col()
@@ -450,10 +450,10 @@ impl AgentPanel {
                         .child(
                             div()
                                 .p_1p5()
-                                .rounded(px(6.))
+                                .rounded(theme.shape.token)
                                 .bg(theme.bg_sunken)
                                 .font_family(crate::theme::CODE_FONT)
-                                .text_size(px(11.5))
+                                .text_size(crate::theme::text(11.5))
                                 .text_color(theme.fg)
                                 .child(command.clone()),
                         )
@@ -502,8 +502,8 @@ impl AgentPanel {
                     .mx_2()
                     .mb_2()
                     .p_2()
-                    .rounded(px(8.))
-                    .border_1()
+                    .rounded(theme.shape.control)
+                    .border(theme.shape.border)
                     .border_color(theme.line)
                     .flex()
                     .flex_col()
@@ -519,7 +519,7 @@ impl AgentPanel {
                 block = block.child(
                     div()
                         .pt_1()
-                        .text_size(px(11.))
+                        .text_size(crate::theme::text(11.))
                         .text_color(theme.fg_subtle)
                         .child(match task.changes.len() {
                             0 => "NO CHANGES".to_string(),
@@ -539,7 +539,7 @@ impl AgentPanel {
                             .id(("agent-change", i))
                             .debug_selector(move || format!("agent-change-{i}"))
                             .px_1()
-                            .rounded(px(6.))
+                            .rounded(theme.shape.token)
                             .flex()
                             .gap_1p5()
                             .text_size(small)
@@ -607,7 +607,7 @@ impl Focusable for AgentPanel {
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let small = UI_FONT_SIZE - px(1.);
+        let small = crate::theme::UI_FONT_SMALL;
         let status = self.task_status(cx);
         let model = {
             let s = self.store.read(cx);
@@ -660,7 +660,7 @@ impl Render for AgentPanel {
                     .flex_none()
                     .px_3()
                     .py_2()
-                    .border_b_1()
+                    .border_b(theme.shape.border)
                     .border_color(theme.line)
                     .flex()
                     .flex_col()
@@ -707,7 +707,7 @@ impl Render for AgentPanel {
                         .mx_2()
                         .mt_2()
                         .p_2()
-                        .rounded(px(8.))
+                        .rounded(theme.shape.control)
                         .bg(theme.bg_elev)
                         .flex()
                         .items_center()
@@ -739,7 +739,7 @@ impl Render for AgentPanel {
                 div()
                     .flex_none()
                     .p_2()
-                    .border_t_1()
+                    .border_t(theme.shape.border)
                     .border_color(theme.line)
                     .flex()
                     .items_center()
