@@ -77,6 +77,32 @@ impl Default for Layout {
 
 impl Global for Layout {}
 
+/// A part whose border can be dragged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    Sidebar,
+    Chat,
+    Dock,
+}
+
+impl Part {
+    /// The part's name in the file.
+    fn key(self) -> &'static str {
+        match self {
+            Part::Sidebar => "sidebar",
+            Part::Chat => "chat",
+            Part::Dock => "dock",
+        }
+    }
+}
+
+/// The folder the layout was last read from, which is where a change made
+/// by hand in the window is written. Nothing is written before a file was
+/// looked for there: a test that never loads one writes none.
+struct Home(PathBuf);
+
+impl Global for Home {}
+
 /// The sizes each part may have. Below the first a part cannot hold what
 /// is in it; above the second it leaves no room for the rest.
 const SIDE: (f32, f32) = (200., 900.);
@@ -86,6 +112,28 @@ const BAR: (f32, f32) = (22., 64.);
 impl Layout {
     pub fn get(cx: &App) -> Layout {
         cx.try_global::<Layout>().copied().unwrap_or_default()
+    }
+
+    /// The size of a part that can be dragged: a width or a height.
+    pub fn size(&self, part: Part) -> f32 {
+        match part {
+            Part::Sidebar => self.sidebar.width,
+            Part::Chat => self.chat.width,
+            Part::Dock => self.dock.height,
+        }
+    }
+
+    /// The layout with `part` at `size`, or the nearest size that fits.
+    pub fn with(mut self, part: Part, size: f32) -> Self {
+        // Nothing at all would mean the size it came with; a border
+        // dragged shut means the smallest.
+        let size = size.max(1.);
+        match part {
+            Part::Sidebar => self.sidebar.width = size,
+            Part::Chat => self.chat.width = size,
+            Part::Dock => self.dock.height = size,
+        }
+        self.fitted()
     }
 
     /// The same layout with every size one a window can show: a part left
@@ -132,6 +180,7 @@ pub fn file(layout: &Layout) -> String {
 /// Reads the file in `dir` and puts its layout in use. On a mistake the
 /// layout in use stays and the mistake is returned.
 pub fn reload_from(dir: &Path, cx: &mut App) -> Option<String> {
+    cx.set_global(Home(dir.to_path_buf()));
     let source = std::fs::read_to_string(dir.join(FILE)).unwrap_or_default();
     match parse(&source) {
         Ok(layout) => {
@@ -147,6 +196,40 @@ pub fn reload_from(dir: &Path, cx: &mut App) -> Option<String> {
             Some(error)
         }
     }
+}
+
+/// Writes the size `part` has now into the file, leaving the rest of the
+/// file as the user wrote it. A file with a mistake in it is left alone:
+/// it is the user's to put right.
+pub fn keep(part: Part, cx: &mut App) {
+    let Some(dir) = cx.try_global::<Home>().map(|home| home.0.clone()) else {
+        return;
+    };
+    let layout = Layout::get(cx);
+    let value = match part {
+        Part::Sidebar => serde_json::to_value(layout.sidebar),
+        Part::Chat => serde_json::to_value(layout.chat),
+        Part::Dock => serde_json::to_value(layout.dock),
+    };
+    let Ok(value) = value else { return };
+    cx.background_executor()
+        .spawn(async move {
+            let path = dir.join(FILE);
+            let text = std::fs::read_to_string(&path)
+                .ok()
+                .filter(|text| !settings::strip_comments(text).trim().is_empty())
+                .unwrap_or_else(|| "{\n}\n".into());
+            if parse(&text).is_err() {
+                return;
+            }
+            let text = import::jsonc::set_key(&text, part.key(), &value);
+            // Whole or not at all: the file is read as soon as it changes.
+            let fresh = dir.join(format!("{FILE}.new"));
+            if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&fresh, text).is_ok() {
+                let _ = std::fs::rename(&fresh, &path);
+            }
+        })
+        .detach();
 }
 
 #[cfg(test)]

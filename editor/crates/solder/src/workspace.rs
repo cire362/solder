@@ -8,9 +8,10 @@ use std::{
 };
 
 use gpui::{
-    AnyView, App, Context, DismissEvent, Entity, EntityId, FocusHandle, Focusable, KeyBinding,
-    ManagedView, MouseButton, PathPromptOptions, PromptLevel, SharedString, Subscription, Task,
-    Window, WindowControlArea, actions, deferred, div, prelude::*, px,
+    AnyElement, AnyView, App, Context, DismissEvent, Entity, EntityId, FocusHandle, Focusable,
+    KeyBinding, ManagedView, MouseButton, MouseDownEvent, MouseMoveEvent, PathPromptOptions,
+    PromptLevel, SharedString, Subscription, Task, Window, WindowControlArea, actions, deferred,
+    div, prelude::*, px,
 };
 
 use crate::{
@@ -30,7 +31,7 @@ use crate::{
     git_store::{GitStore, GitStoreEvent},
     go_to_line::GoToLine as GoToLineDelegate,
     inline_edit::{InlineEdit, InlineEditEvent},
-    layout::Layout,
+    layout::{self, Layout, Part},
     locations::{CodeActionPicker, LocationPicker, RenamePrompt},
     lsp_store::{LspStore, from_range},
     perf::{self, Perf},
@@ -280,6 +281,9 @@ pub struct Workspace {
     active_pane: usize,
     recent: VecDeque<Arc<str>>,
     sidebar: Option<SidebarTab>,
+    /// A border being dragged: the part it sizes, where the pointer went
+    /// down along the border's way, and the part's size then.
+    resizing: Option<(Part, f32, f32)>,
     modal: Option<Modal>,
     terminals: Vec<(Entity<Terminal>, Subscription)>,
     active_terminal: usize,
@@ -620,6 +624,7 @@ impl Workspace {
             active_pane: 0,
             recent: VecDeque::new(),
             sidebar: Some(SidebarTab::Files),
+            resizing: None,
             modal: None,
             terminals: Vec::new(),
             active_terminal: 0,
@@ -2945,6 +2950,116 @@ impl Workspace {
         self.open_config_file(settings::keymap_path(), default, window, cx);
     }
 
+    /// The borders that can be dragged: a strip over each, as long as the
+    /// part it sizes is shown. A double click puts the size back.
+    fn resize_handles(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        const GRIP: f32 = 6.;
+        let layout = Layout::get(cx);
+        let dock = self.dock_open && self.dock_has_tabs();
+        let top = layout.title_bar.height;
+        let bottom = layout.status_bar.height + if dock { layout.dock.height } else { 0. };
+        let handle = |part: Part, cx: &mut Context<Self>| {
+            div()
+                .id(match part {
+                    Part::Sidebar => "resize-sidebar",
+                    Part::Chat => "resize-chat",
+                    Part::Dock => "resize-dock",
+                })
+                .absolute()
+                .occlude()
+                .cursor(if part == Part::Dock {
+                    gpui::CursorStyle::ResizeUpDown
+                } else {
+                    gpui::CursorStyle::ResizeLeftRight
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        if event.click_count >= 2 {
+                            this.resizing = None;
+                            let standard = Layout::default().size(part);
+                            cx.set_global(Layout::get(cx).with(part, standard));
+                            layout::keep(part, cx);
+                            cx.refresh_windows();
+                            return;
+                        }
+                        let at = match part {
+                            Part::Dock => event.position.y,
+                            _ => event.position.x,
+                        };
+                        this.resizing = Some((part, f32::from(at), Layout::get(cx).size(part)));
+                    }),
+                )
+        };
+        let mut handles = Vec::new();
+        if self.sidebar.is_some() {
+            handles.push(
+                handle(Part::Sidebar, cx)
+                    .debug_selector(|| "resize-sidebar".into())
+                    .top(px(top))
+                    .bottom(px(bottom))
+                    .left(px(layout.sidebar.width - GRIP / 2.))
+                    .w(px(GRIP))
+                    .into_any_element(),
+            );
+        }
+        if self.chat_open {
+            handles.push(
+                handle(Part::Chat, cx)
+                    .debug_selector(|| "resize-chat".into())
+                    .top(px(top))
+                    .bottom(px(bottom))
+                    .right(px(layout.chat.width - GRIP / 2.))
+                    .w(px(GRIP))
+                    .into_any_element(),
+            );
+        }
+        if dock {
+            handles.push(
+                handle(Part::Dock, cx)
+                    .debug_selector(|| "resize-dock".into())
+                    .left_0()
+                    .right_0()
+                    .bottom(px(bottom - GRIP / 2.))
+                    .h(px(GRIP))
+                    .into_any_element(),
+            );
+        }
+        handles
+    }
+
+    /// The pointer moved with a border held: the part follows it. The
+    /// file is written once, when the border is let go.
+    fn resize_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((part, from, size)) = self.resizing else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            return self.resize_end(cx);
+        }
+        // The sidebar grows to the right; the chat and the dock grow
+        // towards the middle of the window, against the pointer's way.
+        let moved = match part {
+            Part::Sidebar => f32::from(event.position.x) - from,
+            Part::Chat => from - f32::from(event.position.x),
+            Part::Dock => from - f32::from(event.position.y),
+        };
+        let layout = Layout::get(cx).with(part, size + moved);
+        if layout != Layout::get(cx) {
+            cx.set_global(layout);
+            cx.refresh_windows();
+        }
+    }
+
+    fn resize_end(&mut self, cx: &mut Context<Self>) {
+        if let Some((part, _, size)) = self.resizing.take()
+            && Layout::get(cx).size(part) != size
+        {
+            layout::keep(part, cx);
+        }
+    }
+
     fn open_layout(&mut self, _: &OpenLayout, window: &mut Window, cx: &mut Context<Self>) {
         let default = crate::layout::file(&Layout::get(cx));
         self.open_config_file(crate::layout::path(), default, window, cx);
@@ -3834,6 +3949,16 @@ impl Render for Workspace {
                 d.child(self.render_dock(cx))
             })
             .child(self.render_status(cx))
+            .children(self.resize_handles(cx))
+            .on_mouse_move(cx.listener(Self::resize_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.resize_end(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.resize_end(cx)),
+            )
             .children(self.modal.as_ref().map(|modal| {
                 deferred(
                     div()
@@ -10363,5 +10488,84 @@ brackets = [
         reload(cx);
         assert_eq!(size(cx, "sidebar").0, 390.);
         assert_eq!(size(cx, "status-bar").1, 26.);
+
+        // A border is dragged: the part follows the pointer, and when it
+        // is let go its size is in the file, among what the user wrote.
+        std::fs::write(
+            config.join("layout.json"),
+            "// mine\n{\n  \"tab_bar\": { \"height\": 30 } // lower\n}\n",
+        )
+        .unwrap();
+        reload(cx);
+        let none = gpui::Modifiers::default();
+        let grip = |cx: &mut VisualTestContext, part: &'static str| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.debug_bounds(part)
+                .unwrap_or_else(|| panic!("no {part}"))
+                .center()
+        };
+        let written = |cx: &mut VisualTestContext, what: &str| {
+            for _ in 0..200 {
+                cx.run_until_parked();
+                let text = std::fs::read_to_string(config.join("layout.json")).unwrap_or_default();
+                if text.contains(what) {
+                    return text;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("layout.json never had {what}");
+        };
+        let at = grip(cx, "resize-sidebar");
+        cx.simulate_mouse_down(at, MouseButton::Left, none);
+        cx.simulate_mouse_move(at + gpui::point(px(60.), px(5.)), MouseButton::Left, none);
+        assert_eq!(cx.read(Layout::get).sidebar.width, 450.);
+        assert_eq!(size(cx, "sidebar").0, 450.);
+        // Nothing is written while it is held.
+        assert!(
+            !std::fs::read_to_string(config.join("layout.json"))
+                .unwrap()
+                .contains("sidebar")
+        );
+        cx.simulate_mouse_up(at + gpui::point(px(60.), px(5.)), MouseButton::Left, none);
+        let text = written(cx, "\"sidebar\"");
+        assert!(
+            text.contains("// mine") && text.contains("// lower"),
+            "{text}"
+        );
+        assert_eq!(layout::parse(&text).unwrap().sidebar.width, 450.);
+        assert_eq!(layout::parse(&text).unwrap().tab_bar.height, 30.);
+        // Moving the pointer with nothing held sizes nothing.
+        cx.simulate_mouse_move(at + gpui::point(px(200.), px(0.)), None, none);
+        assert_eq!(cx.read(Layout::get).sidebar.width, 450.);
+
+        // The chat's border is on its left: dragged left, the chat grows,
+        // and no further than a window can show.
+        ws.update(cx, |w, cx| {
+            w.chat_open = true;
+            cx.notify();
+        });
+        let at = grip(cx, "resize-chat");
+        cx.simulate_mouse_down(at, MouseButton::Left, none);
+        cx.simulate_mouse_move(at - gpui::point(px(40.), px(0.)), MouseButton::Left, none);
+        assert_eq!(cx.read(Layout::get).chat.width, 420.);
+        cx.simulate_mouse_move(at + gpui::point(px(300.), px(0.)), MouseButton::Left, none);
+        assert_eq!(cx.read(Layout::get).chat.width, 200.);
+        cx.simulate_mouse_up(at, MouseButton::Left, none);
+        written(cx, "\"chat\"");
+
+        // A double click on a border puts its part back, in the file too.
+        let at = grip(cx, "resize-sidebar");
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: at,
+            modifiers: none,
+            click_count: 2,
+            first_mouse: false,
+        });
+        assert_eq!(cx.read(Layout::get).sidebar.width, 390.);
+        let text = written(cx, "390");
+        assert_eq!(layout::parse(&text).unwrap().sidebar.width, 390.);
+        assert_eq!(layout::parse(&text).unwrap().chat.width, 200.);
     }
 }

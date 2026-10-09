@@ -277,7 +277,7 @@ file, so the two never disagree. It starts after the Zed items of phase 8.
       `settings.json`
 
 ### By hand
-- [ ] Borders are dragged to resize; a double click puts a size back
+- [x] Borders are dragged to resize; a double click puts a size back
 - [ ] A panel's tab is dragged to another place in its dock or to another
       dock; an item of a bar is dragged along it or to the other bar
 - [ ] A menu on every panel tab and bar item: hide, move to, and the list of

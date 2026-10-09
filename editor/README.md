@@ -827,6 +827,12 @@ A part left out has the size it came with. A size no window can show is
 brought to the nearest that fits (a side panel is 200 to 900 wide, the dock
 100 to 1200 high, a bar 22 to 64). A mistake in the file is said in the
 status bar, like one in `settings.json`, and the layout that was right stays.
+The same sizes can be set by hand: drag the border of the sidebar, the chat
+or the bottom dock. The part follows the pointer, and when the border is let
+go its size is written into the file, next to whatever else you wrote there,
+comments included. A double click on a border puts its part back to the size
+it came with. A file with a mistake in it is not written to.
+
 The file holds sizes so far; places, order and what is hidden come next.
 
 ## Settings from another editor
