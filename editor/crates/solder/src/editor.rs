@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
@@ -16,6 +17,7 @@ use text::{Buffer, Selection, SelectionGoal};
 use crate::{
     document::{Document, DocumentEvent, map_offset},
     element::{EditorElement, LayoutSnapshot},
+    indent,
     perf::Perf,
     theme::ActiveTheme,
 };
@@ -739,8 +741,56 @@ impl Editor {
     /// Typed text. Adds bracket and quote pairs, types over a closing
     /// character that is already there, and wraps selections in pairs.
     fn handle_input(&mut self, text: &str, cx: &mut Context<Self>) {
+        let wanted = self.first_word_indent(cx);
         self.insert_typed(text, cx);
+        self.reindent_first_word(wanted, cx);
         self.after_typing(text, cx);
+    }
+
+    /// The row of the only cursor and the indentation the language wants
+    /// for it, while the cursor is in the blanks or the first word of that
+    /// row: where what is typed can change how deep the line goes, the
+    /// way `end` or a closing tag does.
+    fn first_word_indent(&self, cx: &App) -> Option<(usize, indent::Wanted)> {
+        if self.is_single_line() || self.selections.len() != 1 {
+            return None;
+        }
+        let cursor = self.selections[0];
+        if !cursor.is_empty() {
+            return None;
+        }
+        let point = self.buf(cx).offset_to_point(cursor.head);
+        let line = self.buf(cx).line_str(point.row);
+        let word = line[..point.column].trim_start_matches([' ', '\t']);
+        if word.len() > 32 || word.contains(char::is_whitespace) {
+            return None;
+        }
+        Some((point.row, indent::of_row(self.doc(cx), point.row)?))
+    }
+
+    /// Moves the line to where the language wants it, if what was typed
+    /// changed that. A line the user put somewhere else stays there for as
+    /// long as the answer is the same, and an answer from text that does
+    /// not parse moves nothing.
+    fn reindent_first_word(
+        &mut self,
+        before: Option<(usize, indent::Wanted)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((row, before)) = before else { return };
+        let Some((now_row, now)) = self.first_word_indent(cx) else {
+            return;
+        };
+        if now_row != row || now.text == before.text || (now.in_error && !before.in_error) {
+            return;
+        }
+        let line = self.buf(cx).line_str(row);
+        let blanks = line.len() - line.trim_start_matches([' ', '\t']).len();
+        if line[..blanks] == now.text {
+            return;
+        }
+        let start = self.buf(cx).line_start(row);
+        self.edit_ranges(vec![(start..start + blanks, now.text)], cx);
     }
 
     fn insert_typed(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -756,6 +806,15 @@ impl Editor {
         let (Some(c), None) = (chars.next(), chars.next()) else {
             return self.insert(text, cx);
         };
+        // A language from an extension lists its own pairs.
+        let language = self.doc(cx).language_at(self.newest_selection().head);
+        if let Some(editing) = language
+            .as_deref()
+            .and_then(|l| l.editing())
+            .filter(|e| !e.pairs.is_empty())
+        {
+            return self.insert_paired(c, editing, cx);
+        }
         let rust = self.doc(cx).language_name() == Some("Rust");
         let close = match c {
             '(' => Some(')'),
@@ -795,6 +854,90 @@ impl Editor {
             }
             (s.range(), c.to_string(), c.len_utf8())
         });
+    }
+
+    /// A typed character in a language whose extension lists its pairs:
+    /// what `insert_typed` does, by that list. A start may be longer than
+    /// a character (`<!--`), and a pair may be told not to close inside a
+    /// string or a comment.
+    fn insert_paired(&mut self, c: char, editing: &syntax::Editing, cx: &mut Context<Self>) {
+        let typed = c.len_utf8();
+        let head = self.newest_selection().head;
+        let doc = self.doc(cx);
+        let opens: Vec<&syntax::Pair> = editing
+            .pairs
+            .iter()
+            .filter(|pair| pair.close && pair.start.ends_with(c))
+            .filter(|pair| pair.not_in.is_empty() || !doc.in_scope(head, &pair.not_in))
+            .collect();
+        let closing = editing
+            .pairs
+            .iter()
+            .any(|pair| pair.close && pair.end.len() == typed && pair.end.starts_with(c));
+        if opens.is_empty() && !closing {
+            return self.insert(&c.to_string(), cx);
+        }
+        let before = editing.autoclose_before.as_deref().unwrap_or(")]},;:");
+        self.edit_selections(cx, |b, s| {
+            let head = s.head;
+            if !s.is_empty() {
+                let Some(pair) = opens.iter().find(|pair| pair.start.len() == typed) else {
+                    return (s.range(), c.to_string(), typed);
+                };
+                let inner = b.text_for_range(s.range());
+                let len = inner.len();
+                return (s.range(), format!("{c}{inner}{}", pair.end), typed + len);
+            }
+            if closing && b.char_at(head) == Some(c) {
+                return (head..head + typed, c.to_string(), typed);
+            }
+            // The longest start this character completes.
+            let point = b.offset_to_point(head);
+            let line = b.line_str(point.row);
+            let written = &line[..point.column];
+            let pair = opens
+                .iter()
+                .filter(|pair| written.ends_with(&pair.start[..pair.start.len() - typed]))
+                .max_by_key(|pair| pair.start.len());
+            if let Some(pair) = pair {
+                let next_ok = b
+                    .char_at(head)
+                    .is_none_or(|n| n.is_whitespace() || before.contains(n));
+                let quote = pair.start == pair.end;
+                let prev_ok = !quote
+                    || b.char_before(head)
+                        .is_none_or(|p| !p.is_alphanumeric() && p != c);
+                if next_ok && prev_ok {
+                    return (head..head, format!("{c}{}", pair.end), typed);
+                }
+            }
+            (s.range(), c.to_string(), typed)
+        });
+    }
+
+    /// The pairs of the language at the newest cursor that have this flag
+    /// set, or `None` for a language that lists none and keeps the
+    /// editor's own.
+    fn pairs_with(
+        &self,
+        flag: impl Fn(&syntax::Pair) -> bool,
+        cx: &App,
+    ) -> Option<Vec<(String, String)>> {
+        let language = self.doc(cx).language_at(self.newest_selection().head)?;
+        let editing = language.editing().filter(|e| !e.pairs.is_empty())?;
+        Some(
+            editing
+                .pairs
+                .iter()
+                .filter(|pair| flag(pair))
+                .map(|pair| (pair.start.clone(), pair.end.clone()))
+                .collect(),
+        )
+    }
+
+    fn word_characters(&self, cx: &App) -> String {
+        self.doc(cx)
+            .word_characters_at(self.newest_selection().head)
     }
 
     // ---------------------------------------------------------------- actions
@@ -866,26 +1009,30 @@ impl Editor {
     }
 
     fn move_word_left(&mut self, _: &MoveWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let extra = self.word_characters(cx);
         self.move_selections(false, cx, |b, s| {
-            (b.prev_word_start(s.head), SelectionGoal::None)
+            (b.prev_word_start(s.head, &extra), SelectionGoal::None)
         });
     }
 
     fn move_word_right(&mut self, _: &MoveWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        let extra = self.word_characters(cx);
         self.move_selections(false, cx, |b, s| {
-            (b.next_word_end(s.head), SelectionGoal::None)
+            (b.next_word_end(s.head, &extra), SelectionGoal::None)
         });
     }
 
     fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let extra = self.word_characters(cx);
         self.move_selections(true, cx, |b, s| {
-            (b.prev_word_start(s.head), SelectionGoal::None)
+            (b.prev_word_start(s.head, &extra), SelectionGoal::None)
         });
     }
 
     fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        let extra = self.word_characters(cx);
         self.move_selections(true, cx, |b, s| {
-            (b.next_word_end(s.head), SelectionGoal::None)
+            (b.next_word_end(s.head, &extra), SelectionGoal::None)
         });
     }
 
@@ -995,18 +1142,38 @@ impl Editor {
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
         let unit = self.doc(cx).indent_unit();
+        // The pairs that close themselves: the language's, one character a
+        // side, or the editor's own.
+        let pairs: Vec<(char, char)> = match self.pairs_with(|pair| pair.close, cx) {
+            Some(pairs) => pairs
+                .iter()
+                .filter_map(|(start, end)| {
+                    let (mut start, mut end) = (start.chars(), end.chars());
+                    match (start.next(), start.next(), end.next(), end.next()) {
+                        (Some(open), None, Some(close), None) => Some((open, close)),
+                        _ => None,
+                    }
+                })
+                .collect(),
+            None => vec![
+                ('(', ')'),
+                ('[', ']'),
+                ('{', '}'),
+                ('"', '"'),
+                ('\'', '\''),
+                ('`', '`'),
+            ],
+        };
         self.edit_selections(cx, |b, s| {
             if !s.is_empty() {
                 return (s.range(), String::new(), 0);
             }
             // Between an empty pair: delete both halves.
             if let (Some(open), Some(close)) = (b.char_before(s.head), b.char_at(s.head))
-                && matches!(
-                    (open, close),
-                    ('(', ')') | ('[', ']') | ('{', '}') | ('"', '"') | ('\'', '\'') | ('`', '`')
-                )
+                && pairs.contains(&(open, close))
             {
-                return (s.head - 1..s.head + 1, String::new(), 0);
+                let range = s.head - open.len_utf8()..s.head + close.len_utf8();
+                return (range, String::new(), 0);
             }
             // In leading whitespace, delete back to the previous indent stop.
             let p = b.offset_to_point(s.head);
@@ -1039,9 +1206,10 @@ impl Editor {
     }
 
     fn delete_word_left(&mut self, _: &DeleteWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let extra = self.word_characters(cx);
         self.edit_selections(cx, |b, s| {
             let range = if s.is_empty() {
-                b.prev_word_start(s.head)..s.head
+                b.prev_word_start(s.head, &extra)..s.head
             } else {
                 s.range()
             };
@@ -1050,9 +1218,10 @@ impl Editor {
     }
 
     fn delete_word_right(&mut self, _: &DeleteWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        let extra = self.word_characters(cx);
         self.edit_selections(cx, |b, s| {
             let range = if s.is_empty() {
-                s.head..b.next_word_end(s.head)
+                s.head..b.next_word_end(s.head, &extra)
             } else {
                 s.range()
             };
@@ -1082,7 +1251,19 @@ impl Editor {
             return;
         }
         let unit = self.doc(cx).indent_unit();
-        let python = self.doc(cx).language_name() == Some("Python");
+        // Languages where a line that ends in a colon opens a block.
+        let python = matches!(self.doc(cx).language_name(), Some("Python" | "YAML"));
+        // A language from an extension says which pairs take a line of
+        // their own between them, and how deep the line after a break goes.
+        let pairs = self.pairs_with(|pair| pair.newline, cx);
+        let depths: HashMap<usize, String> = self
+            .selections
+            .iter()
+            .filter_map(|s| {
+                let depth = indent::after_break(self.doc(cx), s.range())?;
+                Some((s.range().start, depth))
+            })
+            .collect();
         self.edit_selections(cx, |b, s| {
             let range = s.range();
             let p = b.offset_to_point(range.start);
@@ -1091,17 +1272,38 @@ impl Editor {
                 .chars()
                 .take_while(|c| *c == ' ' || *c == '\t')
                 .collect();
-            let before = b.char_before(range.start);
-            let after = b.char_at(range.end);
-            let opens = matches!(before, Some('{' | '[' | '(')) || (python && before == Some(':'));
-            let closes = matches!(
-                (before, after),
-                (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')'))
-            );
+            let (opens, closes) = match &pairs {
+                Some(pairs) => {
+                    let written = &line[..p.column];
+                    let end = b.offset_to_point(range.end);
+                    let rest = b.line_str(end.row);
+                    let rest = &rest[end.column..];
+                    let opens = pairs.iter().any(|(start, _)| written.ends_with(start));
+                    let closes = pairs
+                        .iter()
+                        .any(|(start, end)| written.ends_with(start) && rest.starts_with(end));
+                    (opens, closes)
+                }
+                None => {
+                    let before = b.char_before(range.start);
+                    let after = b.char_at(range.end);
+                    let opens =
+                        matches!(before, Some('{' | '[' | '(')) || (python && before == Some(':'));
+                    let closes = matches!(
+                        (before, after),
+                        (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')'))
+                    );
+                    (opens, closes)
+                }
+            };
             if closes {
                 let text = format!("\n{indent}{unit}\n{indent}");
                 let cursor = 1 + indent.len() + unit.len();
                 (range, text, cursor)
+            } else if let (false, Some(depth)) = (opens, depths.get(&range.start)) {
+                let text = format!("\n{depth}");
+                let len = text.len();
+                (range, text, len)
             } else if opens {
                 let text = format!("\n{indent}{unit}");
                 let len = text.len();
@@ -1203,16 +1405,11 @@ impl Editor {
             return;
         }
         let rows: Vec<usize> = self.selected_row_blocks(cx).into_iter().flatten().collect();
-        let Some(prefix) = rows.first().and_then(|row| {
-            // Past the indent, so a line inside a script block answers for
-            // the script and not for the markup around it.
-            let line = self.buf(cx).line_str(*row);
-            let indent = line.len() - line.trim_start().len();
-            self.doc(cx)
-                .line_comment_at(self.buf(cx).line_start(*row) + indent)
-        }) else {
-            return;
-        };
+        let Some(first) = rows.first() else { return };
+        // Past the indent, so a line inside a script block answers for
+        // the script and not for the markup around it.
+        let line = self.buf(cx).line_str(*first);
+        let at = self.buf(cx).line_start(*first) + line.len() - line.trim_start().len();
         let lines: Vec<(usize, String)> = rows
             .iter()
             .map(|r| (*r, self.buf(cx).line_str(*r).into_owned()))
@@ -1221,6 +1418,36 @@ impl Editor {
         if lines.is_empty() {
             return;
         }
+        let Some(prefix) = self.doc(cx).line_comment_at(at) else {
+            // No comment that runs to the end of the line: each line goes
+            // between the two ends of the other kind, as in markup.
+            let Some((open, close)) = self.doc(cx).block_comment_at(at) else {
+                return;
+            };
+            let commented = |l: &str| {
+                let l = l.trim();
+                l.len() >= open.len() + close.len() && l.starts_with(&open) && l.ends_with(&close)
+            };
+            let all_commented = lines.iter().all(|(_, l)| commented(l));
+            let mut edits = Vec::new();
+            for (row, line) in &lines {
+                let start = self.buf(cx).line_start(*row);
+                let text = line.trim_start();
+                let from = start + line.len() - text.len();
+                let to = from + text.trim_end().len();
+                if all_commented {
+                    let inner = &text.trim_end()[open.len()..text.trim_end().len() - close.len()];
+                    let head = open.len() + usize::from(inner.starts_with(' '));
+                    let tail = close.len() + usize::from(inner.len() > 1 && inner.ends_with(' '));
+                    edits.push((from..from + head, String::new()));
+                    edits.push((to - tail..to, String::new()));
+                } else {
+                    edits.push((from..from, format!("{open} ")));
+                    edits.push((to..to, format!(" {close}")));
+                }
+            }
+            return self.edit_ranges(edits, cx);
+        };
         let all_commented = lines
             .iter()
             .all(|(_, l)| l.trim_start().starts_with(prefix));
@@ -1371,7 +1598,8 @@ impl Editor {
         Perf::input_started(cx);
         let newest = self.newest_selection();
         if newest.is_empty() {
-            let word = self.buf(cx).word_range_at(newest.head);
+            let extra = self.word_characters(cx);
+            let word = self.buf(cx).word_range_at(newest.head, &extra);
             if word.is_empty() {
                 return;
             }
@@ -1555,9 +1783,10 @@ impl Editor {
         }
         Perf::input_started(cx);
         self.document.update(cx, |d, _| d.seal_history());
+        let extra = self.doc(cx).word_characters_at(offset);
         let (mode, origin) = match event.click_count {
             1 => (DragMode::Char, offset..offset),
-            2 => (DragMode::Word, self.buf(cx).word_range_at(offset)),
+            2 => (DragMode::Word, self.buf(cx).word_range_at(offset, &extra)),
             _ => (DragMode::Line, self.buf(cx).line_range_at(offset)),
         };
         if event.modifiers.shift && mode == DragMode::Char {
@@ -1593,7 +1822,10 @@ impl Editor {
         };
         let unit = match drag.mode {
             DragMode::Char => offset..offset,
-            DragMode::Word => self.buf(cx).word_range_at(offset),
+            DragMode::Word => {
+                let extra = self.doc(cx).word_characters_at(offset);
+                self.buf(cx).word_range_at(offset, &extra)
+            }
             DragMode::Line => self.buf(cx).line_range_at(offset),
         };
         let origin = drag.origin.clone();

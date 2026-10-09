@@ -8,13 +8,63 @@ use std::{
 
 use serde_json::{Value, json};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LaunchConfig {
     pub name: String,
     /// The launch request's arguments for js-debug.
     pub request: Value,
     /// A page to open in a browser session once the server answers there.
     pub browser: Option<String>,
+    /// The debug adapter of an extension that runs it, in place of
+    /// js-debug: the extension then says what the request is.
+    pub adapter: Option<ExtensionAdapter>,
+}
+
+/// A debug adapter an installed extension brings, and what to debug with it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExtensionAdapter {
+    /// The extension's id.
+    pub extension: String,
+    pub launch: extension::host::DebugLaunch,
+}
+
+/// The open file with each debug adapter that installed extensions bring
+/// for its language: `rdbg app.rb`.
+pub fn from_extensions(root: &Path, file: &Path, cx: &gpui::App) -> Vec<LaunchConfig> {
+    let Some(language) = syntax::language_for_path(file) else {
+        return Vec::new();
+    };
+    let Some(store) = crate::extension_store::ExtensionStore::try_global(cx) else {
+        return Vec::new();
+    };
+    let shown = file
+        .strip_prefix(root)
+        .unwrap_or(file)
+        .display()
+        .to_string();
+    store
+        .read(cx)
+        .debuggers_for(language.name)
+        .into_iter()
+        .map(|(extension, adapter)| {
+            let name = format!("{adapter} {shown}");
+            LaunchConfig {
+                name: name.clone(),
+                adapter: Some(ExtensionAdapter {
+                    extension,
+                    launch: extension::host::DebugLaunch {
+                        label: name,
+                        adapter,
+                        program: file.display().to_string(),
+                        cwd: Some(root.display().to_string()),
+                        args: Vec::new(),
+                        env: Vec::new(),
+                    },
+                }),
+                ..Default::default()
+            }
+        })
+        .collect()
 }
 
 /// Node and the debugged program skip Node's own code when stepping.
@@ -78,7 +128,7 @@ pub fn detect(root: &Path, file: Option<&Path>) -> Vec<LaunchConfig> {
         out.push(LaunchConfig {
             name: format!("node {shown}"),
             request,
-            browser: None,
+            ..Default::default()
         });
     }
     let mut manifests = crate::services::find_files(root, &["package.json"], 3);
@@ -129,12 +179,13 @@ pub fn detect(root: &Path, file: Option<&Path>) -> Vec<LaunchConfig> {
                     name: format!("{prefix}{label} + browser"),
                     request: request.clone(),
                     browser: Some(url.clone()),
+                    adapter: None,
                 });
             }
             out.push(LaunchConfig {
                 name: format!("{prefix}{label}"),
                 request,
-                browser: None,
+                ..Default::default()
             });
         }
     }

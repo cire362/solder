@@ -69,6 +69,9 @@ pub struct Settings {
     pub language_servers: BTreeMap<String, ServerOverride>,
     /// Format with the language server before every save.
     pub format_on_save: bool,
+    /// The icon theme of an installed extension, by name: pictures next
+    /// to file names in the tree and on tabs. None by default.
+    pub icon_theme: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -95,6 +98,7 @@ impl Default for Settings {
             show_performance_hud: true,
             language_servers: BTreeMap::new(),
             format_on_save: false,
+            icon_theme: None,
         }
     }
 }

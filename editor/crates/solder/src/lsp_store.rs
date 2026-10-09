@@ -70,6 +70,28 @@ pub fn spec_for(language: &str) -> Option<ServerSpec> {
             root_markers: &["package.json"],
             install_hint: "npm i -g vscode-langservers-extracted",
         },
+        // The servers Zed has built in for the languages it has built in,
+        // found on the PATH like the ones above. Markdown and shell have
+        // none there either: theirs come with extensions (Marksman, Basher),
+        // which name these languages as Zed does.
+        "C" | "C++" => ServerSpec {
+            name: "clangd",
+            program: "clangd",
+            args: &[],
+            root_markers: &["compile_commands.json", "compile_flags.txt", ".clangd"],
+            install_hint: if cfg!(target_os = "macos") {
+                "xcode-select --install"
+            } else {
+                "apt install clangd"
+            },
+        },
+        "YAML" => ServerSpec {
+            name: "yaml-language-server",
+            program: "yaml-language-server",
+            args: &["--stdio"],
+            root_markers: &["package.json"],
+            install_hint: "npm i -g yaml-language-server",
+        },
         "JSON" => ServerSpec {
             name: "json-language-server",
             program: "vscode-json-language-server",

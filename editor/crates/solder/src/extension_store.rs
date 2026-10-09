@@ -15,8 +15,9 @@ use std::{
 };
 
 use extension::{
-    Entry, Extension, Origin, Snippet, catalog,
-    host::{Host, Status, World},
+    Entry, Event, Extension, Origin, Refusals, Snippet, catalog,
+    gate::{Did, Gate},
+    host::{CodeLabel, Completion, DebugAdapter, DebugLaunch, Host, Status, World},
     install::{self, Progress, Staged},
     world::{SettingsFor, System},
 };
@@ -25,6 +26,7 @@ use gpui::{App, AppContext, Context, Entity, Global, SharedString, Task, WeakEnt
 
 use crate::{
     document::Document,
+    file_icons::FileIcons,
     import_settings,
     lsp_store::LspStore,
     settings::{ServerOverride, Settings},
@@ -117,10 +119,15 @@ pub struct ExtensionStore {
     pub errors: HashMap<Key, String>,
     /// What "Use" last did with a theme.
     pub theme_status: Option<Result<String, String>>,
+    /// The same for the last icon theme chosen.
+    pub icon_status: Option<Result<String, String>>,
     documents: Vec<WeakEntity<Document>>,
     scans: usize,
     /// The loaded code of extensions, by extension id.
     hosts: HashMap<String, Slot>,
+    /// By extension id. Kept when the code is loaded again, so what an
+    /// extension did is not forgotten with it.
+    gates: HashMap<String, Gated>,
     /// The extension servers that were asked for their command already, by
     /// extension and server id: that is when an extension installs what it
     /// needs, and it comes before anything else is asked of it.
@@ -137,6 +144,14 @@ pub struct ExtensionStore {
     _pump: Task<()>,
 }
 
+/// What stands between one extension and the world: what the user took
+/// back from it, which the gate reads at every call, and what it did.
+#[derive(Clone, Default)]
+struct Gated {
+    refusals: Arc<Mutex<Refusals>>,
+    did: Did,
+}
+
 /// The loaded code of an extension: what its slot holds, or loaded now.
 /// Blocking, and slow the first time.
 fn host_in(
@@ -146,6 +161,7 @@ fn host_in(
     world: Option<Arc<dyn World>>,
     statuses: mpsc::UnboundedSender<(String, Status)>,
     settings: SettingsFor,
+    gated: Gated,
 ) -> Result<Arc<Host>, String> {
     let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(host) = &*slot {
@@ -156,8 +172,12 @@ fn host_in(
             let _ = statuses.unbounded_send((server.to_string(), status));
         });
         system.settings = Some(settings);
+        // Next to the extensions: their work folders are `work/<id>` under
+        // the same root.
+        system.node_home = work_dir.ancestors().nth(2).map(install::node_dir);
         Arc::new(system)
     });
+    let world = Arc::new(Gate::new(world, gated.refusals, gated.did));
     let host = Arc::new(Host::load(extension, work_dir, world)?);
     *slot = Some(host.clone());
     Ok(host)
@@ -210,7 +230,10 @@ impl ExtensionStore {
         };
         copy(&asked, cx);
         let watched = asked.clone();
-        let watching = cx.observe_global::<Settings>(move |_, cx| copy(&watched, cx));
+        let watching = cx.observe_global::<Settings>(move |this, cx| {
+            copy(&watched, cx);
+            this.sync_icons(cx);
+        });
         Self {
             root,
             config,
@@ -228,9 +251,11 @@ impl ExtensionStore {
             state: extension::State::default(),
             errors: HashMap::new(),
             theme_status: None,
+            icon_status: None,
             documents: Vec::new(),
             scans: 0,
             hosts: HashMap::new(),
+            gates: HashMap::new(),
             resolved: Arc::default(),
             world: None,
             statuses,
@@ -383,6 +408,11 @@ impl ExtensionStore {
                     .retain(|(extension, _)| loaded.contains(&extension));
                 if let (Some(state), false) = (state, this.loaded) {
                     this.state = state;
+                    // A gate made before the decisions were read.
+                    for (id, gated) in &this.gates {
+                        *gated.refusals.lock().unwrap_or_else(|e| e.into_inner()) =
+                            this.state.refusals(Origin::Zed, id);
+                    }
                 }
                 this.installed = installed;
                 this.snippets = snippets;
@@ -405,7 +435,62 @@ impl ExtensionStore {
         .detach();
     }
 
+    /// Puts the icon theme the settings name in use, if an extension that
+    /// is installed and on has it.
+    fn sync_icons(&mut self, cx: &mut Context<Self>) {
+        let wanted = cx
+            .try_global::<Settings>()
+            .and_then(|settings| settings.icon_theme.clone());
+        let theme = wanted.and_then(|name| {
+            self.installed
+                .iter()
+                .filter(|extension| !self.is_off(extension.origin, &extension.id))
+                .flat_map(|extension| &extension.icon_themes)
+                .find(|theme| theme.name == name)
+                .cloned()
+        });
+        let now = cx
+            .try_global::<FileIcons>()
+            .and_then(|icons| icons.0.as_deref());
+        if now != theme.as_ref() {
+            cx.set_global(FileIcons(theme.map(Arc::new)));
+            cx.refresh_windows();
+        }
+    }
+
+    /// Makes `name` the icon theme, in `settings.json`.
+    pub fn use_icon_theme(&mut self, name: String, cx: &mut Context<Self>) {
+        let config = self.config.clone();
+        cx.spawn(async move |this, cx| {
+            let dir = config.clone();
+            let chosen = name.clone();
+            let applied = cx
+                .background_executor()
+                .spawn(async move {
+                    let choice = import_settings::Choice {
+                        settings: vec![import::Setting {
+                            key: "icon_theme",
+                            label: "Icon theme",
+                            value: chosen.into(),
+                        }],
+                        ..Default::default()
+                    };
+                    import_settings::apply(&dir, &choice)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.icon_status = Some(applied.map(|_| name));
+                // As with a theme: at once, not when the watcher notices.
+                crate::settings::reload_from(&config, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn sync_languages(&mut self, cx: &mut Context<Self>) {
+        self.sync_icons(cx);
         let specs: Vec<syntax::LanguageSpec> = self
             .installed
             .iter()
@@ -422,6 +507,29 @@ impl ExtensionStore {
                     grammar: grammar.module.clone(),
                     highlights: grammar.highlights.clone(),
                     injections: grammar.injections.clone(),
+                    editing: syntax::Editing {
+                        pairs: language
+                            .pairs
+                            .iter()
+                            .map(|pair| syntax::Pair {
+                                start: pair.start.clone(),
+                                end: pair.end.clone(),
+                                close: pair.close,
+                                newline: pair.newline,
+                                not_in: pair.not_in.clone(),
+                            })
+                            .collect(),
+                        autoclose_before: language.autoclose_before.clone(),
+                        block_comment: language.block_comment.clone(),
+                        word_characters: language.word_characters.clone(),
+                        completion_characters: language.completion_characters.clone(),
+                        increase_indent: language.increase_indent.clone(),
+                        decrease_indent: language.decrease_indent.clone(),
+                        indents: grammar.indents.clone(),
+                        brackets: grammar.brackets.clone(),
+                        outline: grammar.outline.clone(),
+                        overrides: grammar.overrides.clone(),
+                    },
                 })
             })
             .collect();
@@ -487,6 +595,113 @@ impl ExtensionStore {
             .collect()
     }
 
+    /// The debug adapters installed extensions bring for `language`: the
+    /// extension's id and the adapter's name. The language says which
+    /// adapters debug it; an extension that has one of them is asked.
+    pub fn debuggers_for(&self, language: &str) -> Vec<(String, String)> {
+        let on = |extension: &&Extension| {
+            extension.runs_code() && !self.is_off(extension.origin, &extension.id)
+        };
+        let wanted: Vec<&String> = self
+            .installed
+            .iter()
+            .filter(on)
+            .flat_map(|extension| &extension.languages)
+            .filter(|known| known.name == language)
+            .flat_map(|known| &known.debuggers)
+            .collect();
+        self.installed
+            .iter()
+            .filter(on)
+            .flat_map(|extension| {
+                extension
+                    .debug_adapters
+                    .iter()
+                    .filter(|adapter| wanted.contains(adapter))
+                    .map(|adapter| (extension.id.clone(), adapter.clone()))
+            })
+            .collect()
+    }
+
+    /// Asks the extension how to start its debug adapter for `launch`. It
+    /// may install the adapter first, so this runs on a thread of its own,
+    /// like [`ExtensionStore::resolve`].
+    pub fn debug_adapter(
+        &mut self,
+        extension: &str,
+        launch: DebugLaunch,
+        root: &Path,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<DebugAdapter, String>> {
+        let Some(extension) = self.find(Origin::Zed, extension).cloned() else {
+            return Task::ready(Err(format!("{extension} is not installed")));
+        };
+        let slot = self.hosts.entry(extension.id.clone()).or_default().clone();
+        let work_dir = install::work_dir(&self.root, &extension.id);
+        let world = self.world.clone();
+        let statuses = self.statuses.clone();
+        let settings = self.settings_for();
+        let gated = self.gated(&extension.id);
+        let root = root.to_path_buf();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("solder-extension".into())
+            .spawn(move || {
+                let answer = host_in(
+                    &slot, &extension, &work_dir, world, statuses, settings, gated,
+                )
+                .and_then(|host| host.debug_adapter(&launch, &root));
+                let _ = tx.send(answer);
+            });
+        if let Err(error) = spawned {
+            return Task::ready(Err(error.to_string()));
+        }
+        cx.background_executor().spawn(async move {
+            rx.await
+                .unwrap_or_else(|_| Err("The extension stopped without an answer".into()))
+        })
+    }
+
+    /// How the extension that brought `server` wants these completions of
+    /// it shown, one answer for each. `None` when no extension's code is
+    /// running for that server: one is not started for a menu's sake, and
+    /// a server that runs was started by its extension. An extension that
+    /// is busy, or fails, paints nothing.
+    pub fn labels(
+        &self,
+        server: &str,
+        completions: Vec<Completion>,
+        cx: &App,
+    ) -> Option<Task<Vec<Option<CodeLabel>>>> {
+        let extension = self.installed.iter().find(|extension| {
+            extension.runs_code()
+                && !self.is_off(extension.origin, &extension.id)
+                && extension.servers.iter().any(|s| s.id == server)
+        })?;
+        let host = self
+            .hosts
+            .get(&extension.id)?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
+        let server = server.to_string();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        std::thread::Builder::new()
+            .name("solder-extension".into())
+            .spawn(move || {
+                let labels = host
+                    .labels_for_completions(&server, &completions)
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+                let _ = tx.send(labels);
+            })
+            .ok()?;
+        Some(
+            cx.background_executor()
+                .spawn(async move { rx.await.unwrap_or_default() }),
+        )
+    }
+
     /// Asks the extension how to start `server` for the project in `root`.
     /// The extension may first download the server, so this can take as
     /// long as that does. It runs on a thread of its own.
@@ -505,13 +720,22 @@ impl ExtensionStore {
         let statuses = self.statuses.clone();
         let resolved = self.resolved.clone();
         let settings = self.settings_for();
+        let gated = self.gated(&extension.id);
         let (id, root) = (server.id.clone(), root.to_path_buf());
         let (tx, rx) = futures::channel::oneshot::channel();
         let spawned = std::thread::Builder::new()
             .name("solder-extension".into())
             .spawn(move || {
                 let answer = (|| {
-                    let host = host_in(&slot, &extension, &work_dir, world, statuses, settings)?;
+                    let host = host_in(
+                        &slot,
+                        &extension,
+                        &work_dir,
+                        world,
+                        statuses,
+                        settings,
+                        gated.clone(),
+                    )?;
                     let json = |text: Option<String>| {
                         text.and_then(|text| serde_json::from_str(&text).ok())
                     };
@@ -526,6 +750,15 @@ impl ExtensionStore {
                         configuration: json(host.workspace_configuration(&id, &root)?),
                     })
                 })();
+                // A server that could not be got ready is part of what the
+                // extension did, in the words the status bar had.
+                if let Err(error) = &answer {
+                    gated
+                        .did
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(Event::Failed(format!("{id}: {error}")));
+                }
                 let _ = tx.send(answer);
             });
         if let Err(error) = spawned {
@@ -556,7 +789,8 @@ impl ExtensionStore {
             };
             let slot = self.hosts.entry(extension.id.clone()).or_default().clone();
             let work_dir = install::work_dir(&self.root, &extension.id);
-            asked.push((server.id, extension, slot, work_dir));
+            let gated = self.gated(&extension.id);
+            asked.push((server.id, extension, slot, work_dir, gated));
         }
         let world = self.world.clone();
         let statuses = self.statuses.clone();
@@ -577,7 +811,7 @@ impl ExtensionStore {
                         None => *into = Some(more),
                     }
                 };
-                for (id, extension, slot, work_dir) in asked {
+                for (id, extension, slot, work_dir, gated) in asked {
                     let Ok(host) = host_in(
                         &slot,
                         &extension,
@@ -585,6 +819,7 @@ impl ExtensionStore {
                         world.clone(),
                         statuses.clone(),
                         settings.clone(),
+                        gated,
                     ) else {
                         continue;
                     };
@@ -780,6 +1015,48 @@ impl ExtensionStore {
             .detach();
     }
 
+    fn gated(&mut self, id: &str) -> Gated {
+        let refused = self.state.refusals(Origin::Zed, id);
+        self.gates
+            .entry(id.to_string())
+            .or_insert_with(|| Gated {
+                refusals: Arc::new(Mutex::new(refused)),
+                did: Did::default(),
+            })
+            .clone()
+    }
+
+    /// What the user took back from the code of the Zed extension `id`.
+    pub fn refusals(&self, id: &str) -> Refusals {
+        self.state.refusals(Origin::Zed, id)
+    }
+
+    /// Takes something back from an extension's code, or gives it back.
+    /// It holds from the next thing the extension asks for: what it
+    /// already started keeps running.
+    pub fn set_refusals(&mut self, id: &str, refused: Refusals, cx: &mut Context<Self>) {
+        if let Some(gated) = self.gates.get(id) {
+            *gated.refusals.lock().unwrap_or_else(|e| e.into_inner()) = refused.clone();
+        }
+        self.state.set_refusals(Origin::Zed, id, refused);
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    /// What the code of the Zed extension `id` did outside its sandbox
+    /// since the app started, and what it was refused.
+    pub fn did(&self, id: &str) -> Vec<Event> {
+        self.gates.get(id).map_or_else(Vec::new, |gated| {
+            gated
+                .did
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned()
+                .collect()
+        })
+    }
+
     pub fn is_off(&self, origin: Origin, id: &str) -> bool {
         self.state.is_off(origin, id)
     }
@@ -883,6 +1160,9 @@ impl ExtensionStore {
         // Installed again later, it is a first install: on, following
         // updates, and asked what it may do.
         self.state.forget(origin, id);
+        if origin == Origin::Zed {
+            self.gates.remove(id);
+        }
         self.updates.remove(&key);
         self.save_state(cx);
         cx.spawn(async move |this, cx| {

@@ -21,10 +21,13 @@ stack and the measured performance numbers.
 
 - Never commit to `main` directly. Branch from an up-to-date `main`:
   `feat/<topic>`, `fix/<topic>`, `perf/<topic>`, `refactor/<topic>`,
-  `docs/<topic>`, `chore/<topic>`, `ci/<topic>`. A large feature (a roadmap
-  item) gets its own branch, and its follow-up work stays on that branch. A
-  small change that is already checked (a visual fix, a lint, a bug found on
-  the way) does not get a branch of its own: commit it separately on the
+  `docs/<topic>`, `chore/<topic>`, `ci/<topic>`. A branch is for a large
+  update: a whole block of the roadmap (all of "Zed extensions, complete"),
+  not each of its items. All of its work is committed to that one branch and
+  it is merged once, when the whole update is ready: do not open a branch or
+  a pull request per item, and do not wait for a merge to go on. A small
+  change that is already checked (a visual fix, a lint, a bug found on the
+  way) does not get a branch of its own either: commit it separately on the
   branch in progress and mention it in that pull request.
 - Commits follow Conventional Commits with a scope: `site`, `editor`, `text`,
   `syntax`, `lsp`, `terminal`, `git`, `services`, `db`, `ci`. Example:
@@ -121,12 +124,19 @@ Never guess a signature.
   only when the Extensions tab is opened, searches or installs, and only against
   Zed's catalog and Open VSX. An archive is unpacked in a staging folder
   and checked before it replaces anything. Highlight queries follow the
-  rule that the last matching pattern wins.
+  rule that the last matching pattern wins. What such a language says
+  about typing (`syntax::Editing` from its `config.toml`, the queries in
+  `crates/syntax/src/rules.rs`) holds for that language only: a built-in
+  one keeps the editor's own rules. Indentation follows Zed's rules
+  (`SyntaxTree::indent`), so that a query means here what it means there;
+  the language's patterns are compiled in `indent.rs`, which has the regex.
   The code of a Zed extension runs in `crates/extension/src/host.rs`: a
   WebAssembly component in wasmtime, with one folder of its own and a fuel
   budget per call. All it does outside goes through the `World` trait
   (`world.rs` is the real one: npm with `--ignore-scripts`, GitHub
-  releases, downloads). Its calls block for as long as a download takes:
+  releases, downloads), and through a `Gate` in front of it (`gate.rs`),
+  which refuses what the user took back from that extension and writes
+  down what it did. A new way out of the sandbox goes through both. Its calls block for as long as a download takes:
   `ExtensionStore::resolve` runs them on a thread of their own, never on
   the UI thread or the background executor. The files in
   `crates/extension/wit` are Zed's and stay as published. Each version of

@@ -2,7 +2,9 @@
 //!
 //! One connection per debug session, over TCP: js-debug serves every session
 //! (the program, its child processes, a browser's pages) on one port, and
-//! asks for a new connection with `startDebugging` for each child. One
+//! asks for a new connection with `startDebugging` for each child. An
+//! adapter an extension brings is started as the extension says, and talks
+//! on the port it was told or on its own input and output. One
 //! reader and one writer thread per connection; requests return futures that
 //! resolve with the response, and events and the adapter's own requests come
 //! out of a channel the app polls.
@@ -10,9 +12,9 @@
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Read, Write},
-    net::{Shutdown, TcpStream},
+    net::{Ipv4Addr, Shutdown, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicI64, Ordering},
@@ -67,16 +69,41 @@ pub struct Connection {
     seq: AtomicI64,
     outgoing: std_mpsc::Sender<Vec<u8>>,
     pending: Pending,
-    stream: TcpStream,
+    /// The socket, for a connection that has one: closing it ends both
+    /// loops. One over an adapter's input and output ends with the adapter.
+    stream: Option<TcpStream>,
 }
 
 impl Connection {
     pub fn connect(port: u16) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Incoming>)> {
-        let stream =
-            TcpStream::connect(("127.0.0.1", port)).map_err(|e| Error::Io(e.to_string()))?;
+        Self::connect_to(Ipv4Addr::LOCALHOST, port)
+    }
+
+    /// Connects to an adapter that listens at `host`.
+    pub fn connect_to(
+        host: Ipv4Addr,
+        port: u16,
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Incoming>)> {
+        let stream = TcpStream::connect((host, port)).map_err(|e| Error::Io(e.to_string()))?;
         let _ = stream.set_nodelay(true);
         let reader = stream.try_clone().map_err(|e| Error::Io(e.to_string()))?;
         let writer = stream.try_clone().map_err(|e| Error::Io(e.to_string()))?;
+        Self::over(reader, writer, Some(stream))
+    }
+
+    /// Talks to an adapter on its own input and output.
+    pub fn stdio(
+        input: ChildStdin,
+        output: ChildStdout,
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Incoming>)> {
+        Self::over(output, input, None)
+    }
+
+    fn over(
+        reader: impl Read + Send + 'static,
+        writer: impl Write + Send + 'static,
+        stream: Option<TcpStream>,
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Incoming>)> {
         let (out_tx, out_rx) = std_mpsc::channel::<Vec<u8>>();
         let (in_tx, in_rx) = mpsc::unbounded();
         let pending: Pending = Arc::default();
@@ -142,7 +169,9 @@ impl Connection {
     }
 
     pub fn close(&self) {
-        let _ = self.stream.shutdown(Shutdown::Both);
+        if let Some(stream) = &self.stream {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
     }
 }
 
@@ -152,7 +181,7 @@ impl Drop for Connection {
     }
 }
 
-fn write_loop(mut stream: TcpStream, rx: std_mpsc::Receiver<Vec<u8>>) {
+fn write_loop(mut stream: impl Write, rx: std_mpsc::Receiver<Vec<u8>>) {
     while let Ok(body) = rx.recv() {
         let header = format!("Content-Length: {}\r\n\r\n", body.len());
         if stream.write_all(header.as_bytes()).is_err()
@@ -164,7 +193,7 @@ fn write_loop(mut stream: TcpStream, rx: std_mpsc::Receiver<Vec<u8>>) {
     }
 }
 
-fn read_loop(stream: TcpStream, pending: Pending, incoming: mpsc::UnboundedSender<Incoming>) {
+fn read_loop(stream: impl Read, pending: Pending, incoming: mpsc::UnboundedSender<Incoming>) {
     let mut reader = BufReader::new(stream);
     while let Some(message) = read_message(&mut reader) {
         let Ok(value) = serde_json::from_slice::<Value>(&message) else {
@@ -238,10 +267,15 @@ fn read_message(reader: &mut impl BufRead) -> Option<Vec<u8>> {
 
 /// The arguments of `initialize` every session starts with.
 pub fn initialize_arguments() -> Value {
+    initialize_arguments_for("pwa-node")
+}
+
+/// The same for an adapter of another name.
+pub fn initialize_arguments_for(adapter: &str) -> Value {
     json!({
         "clientID": "solder",
         "clientName": "Solder",
-        "adapterID": "pwa-node",
+        "adapterID": adapter,
         "pathFormat": "path",
         "linesStartAt1": true,
         "columnsStartAt1": true,
@@ -256,9 +290,28 @@ pub fn initialize_arguments() -> Value {
 /// A debug adapter server process listening on a local port.
 pub struct Adapter {
     child: Child,
+    /// Where it listens. An adapter that talks on its own input and output
+    /// has no port, and the one connection made to it when it started.
+    pub host: Ipv4Addr,
     pub port: u16,
     stopped: bool,
 }
+
+/// How an adapter an extension brings is started: its program, arguments
+/// and environment as the extension gave them, and where it listens, if it
+/// does.
+pub struct Launch<'a> {
+    pub program: &'a Path,
+    pub args: &'a [String],
+    pub env: &'a [(String, String)],
+    pub cwd: &'a Path,
+    pub listen: Option<(Ipv4Addr, u16)>,
+    /// How long to wait for it to listen.
+    pub patience: Duration,
+}
+
+/// The one connection to an adapter that talks on its input and output.
+pub type Link = (Arc<Connection>, mpsc::UnboundedReceiver<Incoming>);
 
 impl Adapter {
     /// Starts `program args... <port> 127.0.0.1` and waits until it listens.
@@ -273,15 +326,37 @@ impl Adapter {
             .and_then(|l| l.local_addr())
             .map(|a| a.port())
             .map_err(|e| Error::Io(e.to_string()))?;
+        let mut args = args.to_vec();
+        args.extend([port.to_string(), "127.0.0.1".to_string()]);
+        let launch = Launch {
+            program,
+            args: &args,
+            env: &[],
+            cwd,
+            listen: Some((Ipv4Addr::LOCALHOST, port)),
+            patience: Duration::from_secs(15),
+        };
+        Self::launch_watched(&launch, editor).map(|(adapter, _)| adapter)
+    }
+
+    /// Starts an adapter as an extension described it. One that listens is
+    /// waited for; one that does not comes with its connection.
+    pub fn launch(launch: &Launch) -> Result<(Self, Option<Link>)> {
+        Self::launch_watched(launch, std::process::id())
+    }
+
+    fn launch_watched(launch: &Launch, editor: u32) -> Result<(Self, Option<Link>)> {
+        let program = launch.program;
         let mut command = Command::new(program);
         command
-            .args(args)
-            .arg(port.to_string())
-            .arg("127.0.0.1")
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .args(launch.args)
+            .envs(launch.env.iter().cloned())
+            .current_dir(launch.cwd)
             .stderr(Stdio::piped());
+        match launch.listen {
+            Some(_) => command.stdin(Stdio::null()).stdout(Stdio::null()),
+            None => command.stdin(Stdio::piped()).stdout(Stdio::piped()),
+        };
         // A group of its own: the programs and browsers it launches join
         // it, so stopping the group stops them all.
         #[cfg(unix)]
@@ -290,19 +365,31 @@ impl Adapter {
             .spawn()
             .map_err(|e| Error::Io(format!("{}: {e}", program.display())))?;
         watch(editor, child.id());
+        let Some((host, port)) = launch.listen else {
+            let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
+                let _ = child.kill();
+                return Err(Error::Io("The debug adapter has no input or output".into()));
+            };
+            let connection = Connection::stdio(input, output)?;
+            let adapter = Self {
+                child,
+                host: Ipv4Addr::LOCALHOST,
+                port: 0,
+                stopped: false,
+            };
+            return Ok((adapter, Some(connection)));
+        };
         let start = Instant::now();
         loop {
-            if TcpStream::connect_timeout(
-                &([127, 0, 0, 1], port).into(),
-                Duration::from_millis(200),
-            )
-            .is_ok()
+            if TcpStream::connect_timeout(&(host, port).into(), Duration::from_millis(200)).is_ok()
             {
-                return Ok(Self {
+                let adapter = Self {
                     child,
+                    host,
                     port,
                     stopped: false,
-                });
+                };
+                return Ok((adapter, None));
             }
             if let Ok(Some(status)) = child.try_wait() {
                 let mut err = String::new();
@@ -314,7 +401,7 @@ impl Adapter {
                     err.lines().last().unwrap_or("")
                 )));
             }
-            if start.elapsed() > Duration::from_secs(15) {
+            if start.elapsed() > launch.patience {
                 let _ = child.kill();
                 return Err(Error::Io("The debug adapter did not start".into()));
             }
@@ -558,6 +645,73 @@ mod tests {
         let args = breakpoints_arguments(Path::new("/p/app.js"), &[3, 9]);
         assert_eq!(args["breakpoints"][1]["line"], 9);
         assert_eq!(args["source"]["name"], "app.js");
+    }
+
+    #[test]
+    fn an_adapter_is_started_as_described_and_talks_on_its_own_output() {
+        // Answers every request with its arguments and a variable of its
+        // environment, then says it is ready.
+        let script = r#"
+import json, os, sys
+def read():
+    length = 0
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    return json.loads(sys.stdin.buffer.read(length))
+def send(message):
+    body = json.dumps(message).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+while True:
+    message = read()
+    if message is None:
+        break
+    send({"type": "response", "request_seq": message["seq"], "command": message["command"],
+          "success": True, "body": {"asked": message["arguments"], "mode": os.environ.get("MODE")}})
+    send({"type": "event", "event": "initialized", "body": {}})
+"#;
+        let args = ["-c".to_string(), script.to_string()];
+        let env = [("MODE".to_string(), "test".to_string())];
+        let launch = Launch {
+            program: Path::new("python3"),
+            args: &args,
+            env: &env,
+            cwd: Path::new("/"),
+            listen: None,
+            patience: Duration::from_secs(5),
+        };
+        let (mut adapter, link) = Adapter::launch(&launch).unwrap();
+        assert_eq!(adapter.port, 0);
+        let (connection, mut incoming) = link.expect("a connection on its input and output");
+        let arguments = initialize_arguments_for("rdbg");
+        assert_eq!(arguments["adapterID"], "rdbg");
+        let body =
+            futures::executor::block_on(connection.request("initialize", arguments)).unwrap();
+        assert_eq!(body["asked"]["adapterID"], "rdbg");
+        assert_eq!(body["mode"], "test");
+        let event = futures::executor::block_on(futures::StreamExt::next(&mut incoming));
+        assert!(matches!(event, Some(Incoming::Event { event, .. }) if event == "initialized"));
+        adapter.stop();
+
+        // One that is said to listen and does not is given up on after the
+        // time it was allowed.
+        let args = ["-c".to_string(), "import time; time.sleep(30)".to_string()];
+        let silent = Launch {
+            args: &args,
+            env: &[],
+            listen: Some((Ipv4Addr::LOCALHOST, 9)),
+            patience: Duration::from_millis(300),
+            ..launch
+        };
+        let error = Adapter::launch(&silent).err().unwrap();
+        assert!(matches!(error, Error::Io(e) if e.contains("did not start")));
     }
 
     #[test]

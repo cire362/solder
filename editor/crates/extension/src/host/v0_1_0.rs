@@ -23,4 +23,4 @@ http!(api);
 worktree!(bindings, located);
 key_value_store!(bindings);
 world_functions!(bindings);
-start!(bindings);
+start!(bindings, before_label_details);

@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use import::{ThemeFile, jsonc, theme};
+
+use crate::icons::{self, IconTheme};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -36,6 +38,24 @@ pub struct Grammar {
     pub module: PathBuf,
     pub highlights: Option<PathBuf>,
     pub injections: Option<PathBuf>,
+    pub indents: Option<PathBuf>,
+    pub brackets: Option<PathBuf>,
+    pub outline: Option<PathBuf>,
+    /// Gives names to the places `Pair::not_in` speaks of.
+    pub overrides: Option<PathBuf>,
+}
+
+/// Two pieces of text that go together: brackets, quotes, a tag's ends.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pair {
+    pub start: String,
+    pub end: String,
+    /// The end is typed for the user when the start is.
+    pub close: bool,
+    /// Enter between the two puts the end on a line of its own.
+    pub newline: bool,
+    /// Where it does not close: `string`, `comment`.
+    pub not_in: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -46,6 +66,21 @@ pub struct Language {
     /// Other names it goes by: a code fence name, a VS Code language id.
     pub aliases: Vec<String>,
     pub line_comment: Option<String>,
+    /// The start and the end of a comment that has both.
+    pub block_comment: Option<(String, String)>,
+    pub pairs: Vec<Pair>,
+    /// What a pair may close in front of, besides a blank.
+    pub autoclose_before: Option<String>,
+    /// Characters that belong to a word besides letters, digits and `_`.
+    pub word_characters: String,
+    /// The same for the word a completion goes on from.
+    pub completion_characters: String,
+    /// Regular expressions: a line that matches the first is followed by a
+    /// deeper one, a line that matches the second goes one level back.
+    pub increase_indent: Option<String>,
+    pub decrease_indent: Option<String>,
+    /// The debug adapters that debug it, by name.
+    pub debuggers: Vec<String>,
     /// Missing for a VS Code language: its TextMate grammar is not read.
     pub grammar: Option<Grammar>,
 }
@@ -88,9 +123,13 @@ pub struct Extension {
     pub description: String,
     pub dir: PathBuf,
     pub themes: Vec<ThemeFile>,
+    /// Which picture goes with which file, in the tree and on tabs.
+    pub icon_themes: Vec<IconTheme>,
     pub snippets: Vec<SnippetFile>,
     pub languages: Vec<Language>,
     pub servers: Vec<Server>,
+    /// The debug adapters its code knows how to get and start, by name.
+    pub debug_adapters: Vec<String>,
     pub code: Code,
     /// The commands its manifest declares its code runs: a program and the
     /// arguments it may be given (`*` for any one, `**` for any that remain).
@@ -116,7 +155,12 @@ impl Extension {
         let servers = self
             .servers
             .iter()
-            .map(|server| format!("Download and start the language server {}", server.name));
+            .map(|server| format!("Download and start the language server {}", server.name))
+            .chain(
+                self.debug_adapters
+                    .iter()
+                    .map(|adapter| format!("Get and start the debug adapter {adapter}")),
+            );
         let commands = self.commands.iter().map(|(program, args)| {
             if args.is_empty() {
                 format!("Run {program}")
@@ -150,7 +194,17 @@ impl Extension {
                 "language server",
                 "language servers",
             ),
+            count(
+                if self.runs_code() {
+                    self.debug_adapters.len()
+                } else {
+                    0
+                },
+                "debug adapter",
+                "debug adapters",
+            ),
             count(self.themes.len(), "theme", "themes"),
+            count(self.icon_themes.len(), "icon theme", "icon themes"),
             count(self.snippets.len(), "snippet file", "snippet files"),
         ]
         .into_iter()
@@ -241,6 +295,21 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         .flat_map(|path| theme::all_zed(path))
         .collect();
 
+    // Icon themes: the files the manifest names, and those in the folder
+    // they are kept in.
+    let mut icon_paths = files(&dir.join("icon_themes"), "json");
+    for named in strings(&manifest["icon_themes"]) {
+        if let Some(path) = inside(dir, &named).filter(|p| p.is_file())
+            && !icon_paths.contains(&path)
+        {
+            icon_paths.push(path);
+        }
+    }
+    let icon_themes = icon_paths
+        .iter()
+        .flat_map(|path| icons::read(dir, path))
+        .collect();
+
     // Snippets: the file the manifest names, or one per language in
     // `snippets/`, where `snippets.json` is for every language.
     let mut snippet_paths = files(&dir.join("snippets"), "json");
@@ -297,7 +366,38 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
             module,
             highlights: query("highlights.scm"),
             injections: query("injections.scm"),
+            indents: query("indents.scm"),
+            brackets: query("brackets.scm"),
+            outline: query("outline.scm"),
+            overrides: query("overrides.scm"),
         });
+        // A comment with two ends is a pair of strings, or a table that
+        // also says how its middle lines begin.
+        let comment = &config["block_comment"];
+        let (start, end) = match comment.as_array() {
+            Some(ends) if ends.len() == 2 => (text(&ends[0]), text(&ends[1])),
+            _ => (text(&comment["start"]), text(&comment["end"])),
+        };
+        let pattern = |one: &str, many: &str| {
+            let mut patterns: Vec<String> = config[one]
+                .as_str()
+                .map(str::to_string)
+                .into_iter()
+                .collect();
+            patterns.extend(
+                config[many]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|p| p["pattern"].as_str().or(p.as_str()))
+                    .map(str::to_string),
+            );
+            match patterns.len() {
+                0 => None,
+                1 => patterns.pop(),
+                _ => Some(format!("(?:{})", patterns.join(")|(?:"))),
+            }
+        };
         languages.push(Language {
             suffixes: strings(&config["path_suffixes"]),
             aliases: config["code_fence_block_name"]
@@ -310,6 +410,26 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
                 .first()
                 .map(|c| c.trim().to_string())
                 .filter(|c| !c.is_empty()),
+            block_comment: (!start.is_empty() && !end.is_empty()).then_some((start, end)),
+            pairs: config["brackets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|pair| Pair {
+                    start: pair["start"].as_str().unwrap_or_default().to_string(),
+                    end: pair["end"].as_str().unwrap_or_default().to_string(),
+                    close: pair["close"].as_bool().unwrap_or(false),
+                    newline: pair["newline"].as_bool().unwrap_or(false),
+                    not_in: strings(&pair["not_in"]),
+                })
+                .filter(|pair| !pair.start.is_empty() && !pair.end.is_empty())
+                .collect(),
+            autoclose_before: config["autoclose_before"].as_str().map(str::to_string),
+            word_characters: strings(&config["word_characters"]).concat(),
+            completion_characters: strings(&config["completion_query_characters"]).concat(),
+            debuggers: strings(&config["debuggers"]),
+            increase_indent: pattern("increase_indent_pattern", "increase_indent_patterns"),
+            decrease_indent: pattern("decrease_indent_pattern", "decrease_indent_patterns"),
             grammar,
             name,
         });
@@ -362,10 +482,8 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         _ => false,
     };
     for (key, what) in [
-        ("icon_themes", "Icon themes"),
         ("context_servers", "Context servers"),
         ("slash_commands", "Slash commands"),
-        ("debug_adapters", "Debug adapters"),
         ("agent_servers", "Agent servers"),
         ("indexed_docs_providers", "Documentation indexing"),
     ] {
@@ -384,9 +502,16 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         description: text(&manifest["description"]),
         dir: dir.to_path_buf(),
         themes,
+        icon_themes,
         snippets,
         languages,
         servers,
+        debug_adapters: manifest["debug_adapters"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(name, _)| name.clone())
+            .collect(),
         code,
         commands,
         missing,
@@ -480,7 +605,7 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
             suffixes,
             aliases: std::iter::once(id).chain(aliases).collect(),
             line_comment,
-            grammar: None,
+            ..Default::default()
         });
     }
 
@@ -513,9 +638,11 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         description: label(&text(&manifest["description"])),
         dir: dir.to_path_buf(),
         themes,
+        icon_themes: Vec::new(),
         snippets,
         languages,
         servers: Vec::new(),
+        debug_adapters: Vec::new(),
         code,
         commands: Vec::new(),
         missing,

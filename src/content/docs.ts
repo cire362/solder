@@ -154,11 +154,12 @@ export const DOC_GROUPS: DocGroup[] = [
           { p: "Open the **Extensions** tab of the sidebar. It lists what is installed, then the answers of Zed's catalog and Open VSX in one list. Type to search both, and press **Install** on a row." },
           { note: "Solder has no extension service of its own. The two catalogs are asked when the tab is opened and when you search, never at startup." },
           { h: "What an extension brings", id: "what-works" },
-          { p: "A Zed extension brings its languages with highlighting, its snippets, its themes and a language server. A VS Code extension brings its themes and snippets. Its code is written for VS Code and does not run in Solder, so for a language the tab points to the Zed extension instead." },
+          { p: "A Zed extension brings its languages with highlighting and with the way they are typed (indentation, brackets, pairs that close themselves, comments), its snippets, its themes, its icon themes, its language servers and its debug adapters. A VS Code extension brings its themes and snippets. Its code is written for VS Code and does not run in Solder, so for a language the tab points to the Zed extension instead." },
           { p: "Select a row to see both lists for that extension: what Solder uses, and what does not run here." },
           { h: "What asks first", id: "asks-first" },
           { p: "An extension's own code runs in a sandbox: it can compute, and it can write to one folder of its own. A language server is different. It is a program the extension downloads and Solder starts with your rights." },
           { p: "So an extension that brings a server, or declares commands it runs, is downloaded and then waits. The tab shows what installing it allows, and nothing is put in place until you press **Install** there. A later version asks again only if it wants something new." },
+          { p: "What you allowed can be taken back for one extension: its details have a **Refuse** button for the commands it runs, for npm, for downloads, and for each host it downloaded from. Below them the tab lists what its code did since Solder started, and what it asked for and did not get." },
           { h: "Updates, and turning one off", id: "manage" },
           { list: [
             "Newer versions are looked for when the tab is opened. **Update** on a row installs one, and the button next to the search installs all of them.",

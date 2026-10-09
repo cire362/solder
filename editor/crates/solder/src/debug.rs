@@ -106,6 +106,8 @@ pub struct DebugStore {
     data_dir: PathBuf,
     adapter_spec: AdapterSpec,
     adapter: Option<dap::Adapter>,
+    /// What the adapter of this run is told it is called.
+    adapter_id: String,
     root: PathBuf,
     next_id: usize,
     run: u64,
@@ -155,6 +157,7 @@ impl DebugStore {
             data_dir,
             adapter_spec,
             adapter: None,
+            adapter_id: "pwa-node".into(),
             root: PathBuf::new(),
             next_id: 1,
             run: 0,
@@ -360,6 +363,10 @@ impl DebugStore {
         cx.notify();
         self.timeline.clear();
         self.timeline_task = None;
+        if let Some(from) = config.adapter.clone() {
+            return self.start_from_extension(config.name, from, root, run, cx);
+        }
+        self.adapter_id = "pwa-node".into();
         let spec = self.adapter_spec.clone();
         let data_dir = self.data_dir.clone();
         cx.spawn(async move |this, cx| {
@@ -393,6 +400,75 @@ impl DebugStore {
                         }
                         let name = config.name.clone();
                         this.open_session(port, name, None, "launch", request, cx);
+                    }
+                    Err(e) => this.state = State::Failed(e.into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Starts a run with the debug adapter of an extension. The extension
+    /// says how to start the adapter (it may install it first) and what to
+    /// ask it for; the adapter then listens on the port it was given, or
+    /// talks on its own input and output.
+    fn start_from_extension(
+        &mut self,
+        name: String,
+        from: crate::debug_launch::ExtensionAdapter,
+        root: PathBuf,
+        run: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.adapter_id = from.launch.adapter.clone();
+        self.state = State::Starting("Getting the debugger ready...".into());
+        let asked = crate::extension_store::ExtensionStore::global(cx).update(cx, |store, cx| {
+            store.debug_adapter(&from.extension, from.launch.clone(), &root, cx)
+        });
+        cx.spawn(async move |this, cx| {
+            let started = async {
+                let adapter = asked.await?;
+                cx.background_executor()
+                    .spawn(async move {
+                        let program = adapter
+                            .command
+                            .clone()
+                            .ok_or("The extension named no debug adapter to start")?;
+                        let cwd = adapter.cwd.clone().map_or(root, PathBuf::from);
+                        let wait = adapter.connection.and_then(|(_, _, wait)| wait);
+                        let launch = dap::Launch {
+                            program: Path::new(&program),
+                            args: &adapter.args,
+                            env: &adapter.env,
+                            cwd: &cwd,
+                            listen: adapter.connection.map(|(host, port, _)| (host, port)),
+                            patience: std::time::Duration::from_millis(wait.unwrap_or(15_000)),
+                        };
+                        let (process, link) =
+                            dap::Adapter::launch(&launch).map_err(|e| e.to_string())?;
+                        Ok::<_, String>((process, link, adapter))
+                    })
+                    .await
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                if this.run != run {
+                    return;
+                }
+                match started {
+                    Ok((process, link, adapter)) => {
+                        let port = process.port;
+                        this.adapter = Some(process);
+                        this.state = State::Running;
+                        let kind = if adapter.attach { "attach" } else { "launch" };
+                        let arguments =
+                            serde_json::from_str(&adapter.configuration).unwrap_or(Value::Null);
+                        match link {
+                            Some(link) => this.run_session(link, name, None, kind, arguments, cx),
+                            None => this.open_session(port, name, None, kind, arguments, cx),
+                        }
                     }
                     Err(e) => this.state = State::Failed(e.into()),
                 }
@@ -456,17 +532,33 @@ impl DebugStore {
         arguments: Value,
         cx: &mut Context<Self>,
     ) {
-        let (conn, mut incoming) = match Connection::connect(port) {
-            Ok(c) => c,
+        let host = self
+            .adapter
+            .as_ref()
+            .map_or(std::net::Ipv4Addr::LOCALHOST, |adapter| adapter.host);
+        match Connection::connect_to(host, port) {
+            Ok(link) => self.run_session(link, name, parent, kind, arguments, cx),
             Err(e) => {
                 self.log("stderr", format!("Could not connect to the debugger: {e}"));
                 if parent.is_none() {
                     self.state = State::Failed(e.to_string().into());
                 }
                 cx.notify();
-                return;
             }
-        };
+        }
+    }
+
+    /// Runs a session's startup on a connection that is there: initialize,
+    /// the launch or attach request, breakpoints, configurationDone.
+    fn run_session(
+        &mut self,
+        (conn, mut incoming): dap::Link,
+        name: String,
+        parent: Option<usize>,
+        kind: &str,
+        arguments: Value,
+        cx: &mut Context<Self>,
+    ) {
         let id = self.next_id;
         self.next_id += 1;
         let run = self.run;
@@ -502,7 +594,10 @@ impl DebugStore {
             ended: false,
             _task: task,
         });
-        let init = conn.request("initialize", dap::initialize_arguments());
+        let init = conn.request(
+            "initialize",
+            dap::initialize_arguments_for(&self.adapter_id),
+        );
         let kind = kind.to_string();
         cx.spawn(async move |this, cx| {
             if let Err(e) = init.await {
@@ -543,7 +638,13 @@ impl DebugStore {
                 };
                 if command == "startDebugging" {
                     conn.respond(seq, &command, true, Value::Null);
-                    let port = self.adapter.as_ref().map(|a| a.port);
+                    // An adapter on its own input and output has no port
+                    // for a second session to come in by.
+                    let port = self
+                        .adapter
+                        .as_ref()
+                        .map(|a| a.port)
+                        .filter(|port| *port != 0);
                     let kind = arguments["request"]
                         .as_str()
                         .unwrap_or("launch")

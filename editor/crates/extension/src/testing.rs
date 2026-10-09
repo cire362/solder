@@ -110,6 +110,20 @@ pub fn write(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
+pub const ZED_ICON_THEME: &str = r#"{"name":"Demo Icons","author":"a","themes":[
+        {"name":"Demo Icons","appearance":"dark",
+         "directory_icons":{"collapsed":"./icons/folder.svg","expanded":"./icons/folder-open.svg"},
+         "file_icons":{"default":{"path":"./icons/file.svg"},"rust":{"path":"./icons/rust.svg"}}}
+    ]}"#;
+
+/// A small picture, different for each name.
+pub fn svg(name: &str) -> String {
+    let shade = 0x30 + name.bytes().fold(0u8, |sum, b| sum.wrapping_add(b)) % 0xc0;
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 16 16\"><rect x=\"2\" y=\"2\" width=\"12\" height=\"12\" rx=\"3\" fill=\"#{shade:02x}80c0\"/></svg>"
+    )
+}
+
 pub const ZED_THEME: &str = r##"{"name":"Demo","author":"a","themes":[
         {"name":"Demo Dark","appearance":"dark","style":{"background":"#101014","editor.background":"#101014","text":"#e0e0e6","syntax":{"keyword":{"color":"#ff8800"}}}},
         {"name":"Demo Light","appearance":"light","style":{"background":"#fafafa","editor.background":"#fafafa","text":"#202020","syntax":{}}}
@@ -159,6 +173,17 @@ line_comments = ["// ", "/// "]
 code_fence_block_name = "dm"
 brackets = [
     { start = "{", end = "}", close = true, newline = true },
+    { start = "\"", end = "\"", close = true, newline = false, not_in = ["string"] },
+    { start = "", end = "x", close = true, newline = false },
+]
+autoclose_before = ";:.,=}])>"
+block_comment = ["/* ", " */"]
+word_characters = ["-", "$"]
+completion_query_characters = ["-"]
+increase_indent_pattern = '^.*\{\s*$'
+decrease_indent_patterns = [
+    { pattern = '^\s*\}', valid_after = ["if"] },
+    { pattern = '^\s*end\b' },
 ]
 "#,
     );
@@ -166,12 +191,21 @@ brackets = [
         &dir.join("languages/demo/highlights.scm"),
         "(comment) @comment",
     );
+    write(&dir.join("languages/demo/indents.scm"), "(block) @indent");
+    write(
+        &dir.join("languages/demo/overrides.scm"),
+        "(string) @string",
+    );
     write(&dir.join("languages/demo/injections.scm"), "");
     write(
         &dir.join("languages/template/config.toml"),
         "name = \"Demo Template\"\ngrammar = \"missing\"\npath_suffixes = [\"dt\"]\n",
     );
     write(&dir.join("themes/demo.json"), ZED_THEME);
+    write(&dir.join("icon_themes/demo.json"), ZED_ICON_THEME);
+    for icon in ["file", "rust", "folder", "folder-open"] {
+        write(&dir.join(format!("icons/{icon}.svg")), &svg(icon));
+    }
     write(
         &dir.join("snippets/javascript.json"),
         r#"{"Log": {"prefix": "clg", "body": "console.log($1)"}}"#,

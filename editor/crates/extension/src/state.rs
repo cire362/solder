@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Extension, Origin};
+use crate::{Extension, Origin, Refusals};
 
 const FILE: &str = "state.json";
 
@@ -18,6 +18,13 @@ struct Choice {
     kept: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed: Vec<String>,
+    /// What the user took back after allowing it.
+    #[serde(default, skip_serializing_if = "nothing")]
+    refused: Refusals,
+}
+
+fn nothing(refused: &Refusals) -> bool {
+    *refused == Refusals::default()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -102,6 +109,18 @@ impl State {
         self.change(extension.origin, &extension.id, |c| c.allowed = allowed);
     }
 
+    /// What the user took back from an extension's code: commands, npm,
+    /// downloads, or a host.
+    pub fn refusals(&self, origin: Origin, id: &str) -> Refusals {
+        self.choice(origin, id)
+            .map(|c| c.refused.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_refusals(&mut self, origin: Origin, id: &str, refused: Refusals) {
+        self.change(origin, id, |c| c.refused = refused);
+    }
+
     /// Drops everything about an extension that was removed.
     pub fn forget(&mut self, origin: Origin, id: &str) {
         self.choices.remove(&name(origin, id));
@@ -168,6 +187,25 @@ mod tests {
         assert!(!read.is_off(Origin::VsCode, "demo"));
         assert!(read.is_kept(Origin::VsCode, "vue.volar"));
         assert!(read.asks(&extension).is_empty());
+
+        // What was taken back from its code is kept too, and what was
+        // given back is gone from the file.
+        let refused = Refusals {
+            downloads: true,
+            hosts: vec!["example.com".into()],
+            ..Default::default()
+        };
+        state.set_refusals(Origin::Zed, "demo", refused.clone());
+        state.save(&dir).unwrap();
+        assert_eq!(State::load(&dir).refusals(Origin::Zed, "Demo"), refused);
+        assert_eq!(
+            State::load(&dir).refusals(Origin::Zed, "other"),
+            Refusals::default()
+        );
+        state.set_refusals(Origin::Zed, "demo", Refusals::default());
+        state.save(&dir).unwrap();
+        let text = std::fs::read_to_string(dir.join("state.json")).unwrap();
+        assert!(!text.contains("refused"), "{text}");
 
         // A decision taken back leaves no trace in the file.
         state.set_kept(Origin::VsCode, "Vue.volar", false);

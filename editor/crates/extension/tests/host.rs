@@ -8,7 +8,8 @@ use std::{
 };
 
 use extension::host::{
-    Command, FileKind, Host, HttpRequest, HttpResponse, Output, Release, Status, World,
+    CodeLabel, Command, Completion, DebugLaunch, FileKind, Host, HttpRequest, HttpResponse,
+    LabelSpan, Output, Release, Status, World,
 };
 
 const PACKAGE: &str = "@zed-industries/vscode-langservers-extracted";
@@ -451,4 +452,119 @@ fn the_users_settings_reach_the_extension() {
         json(host.workspace_configuration(vue, &project).unwrap()),
         settings
     );
+}
+
+#[test]
+fn every_version_that_can_label_completions_is_asked() {
+    // What a server sent, with all the protocol can say about an item.
+    let completions = [
+        Completion {
+            label: "div".into(),
+            detail: Some("An element".into()),
+            label_detail: Some("(…)".into()),
+            label_description: Some("html".into()),
+            kind: Some(10),
+            format: Some(2),
+        },
+        Completion {
+            label: "plain".into(),
+            kind: Some(99),
+            ..Default::default()
+        },
+    ];
+    // These extensions do not paint their completions: each is asked in
+    // the words of its own version and leaves both as the server sent
+    // them. 0.0.1 had no such question and is not asked.
+    let labels = |name: &str| {
+        let extension = fixture(name);
+        let work = work_dir(&format!("host-{name}-labels"));
+        let host = Host::load(&extension, &work, Arc::new(Script::default())).unwrap();
+        host.labels_for_completions(&extension.servers[0].id, &completions)
+    };
+    for name in ["pest", "nginx", "terraform", "ledger", "html"] {
+        assert_eq!(labels(name), Some(Ok(vec![None, None])), "{name}");
+    }
+    // Vue's does: a property is shown as a tag, followed by its detail,
+    // and only the name is what the typed word is matched against.
+    let painted = CodeLabel {
+        code: String::new(),
+        spans: vec![
+            LabelSpan::Literal {
+                text: "div".into(),
+                highlight: Some("tag".into()),
+            },
+            LabelSpan::Literal {
+                text: " ".into(),
+                highlight: None,
+            },
+            LabelSpan::Literal {
+                text: "An element".into(),
+                highlight: None,
+            },
+        ],
+        filter: 0..3,
+    };
+    assert_eq!(labels("vue"), Some(Ok(vec![Some(painted), None])));
+}
+
+#[test]
+fn an_extension_says_how_to_start_its_debug_adapter() {
+    let extension = fixture("ruby");
+    assert_eq!(extension.debug_adapters, ["rdbg"]);
+    let work = work_dir("host-ruby-debug");
+    let world = Arc::new(Script {
+        on_path: Some("/usr/local/bin/rdbg".into()),
+        ..Default::default()
+    });
+    let host = Host::load(&extension, &work, world.clone()).unwrap();
+    let project = work_dir("host-ruby-project");
+    let launch = DebugLaunch {
+        label: "Debug app.rb".into(),
+        adapter: "rdbg".into(),
+        program: project.join("app.rb").to_string_lossy().into_owned(),
+        cwd: Some(project.to_string_lossy().into_owned()),
+        args: vec!["--verbose".into()],
+        env: vec![("RAILS_ENV".into(), "test".into())],
+    };
+    let adapter = host.debug_adapter(&launch, &project).unwrap();
+    // It looked for the debugger on the PATH and found it; it would have
+    // installed its gem otherwise.
+    assert_eq!(world.take()[0], "which rdbg");
+    assert_eq!(adapter.command.as_deref(), Some("/usr/local/bin/rdbg"));
+    // The adapter listens, on this machine and on a port the editor
+    // picked for it, and the program and its arguments follow.
+    let (host_address, port, _) = adapter.connection.unwrap();
+    assert_eq!(host_address, std::net::Ipv4Addr::LOCALHOST);
+    assert!(port > 0);
+    assert!(
+        adapter.args.contains(&format!("--port={port}")),
+        "{:?}",
+        adapter.args
+    );
+    let program = project.join("app.rb").to_string_lossy().into_owned();
+    let tail = &adapter.args[adapter.args.len() - 4..];
+    assert_eq!(tail, ["--command", program.as_str(), "--", "--verbose"]);
+    assert_eq!(adapter.env, [("RAILS_ENV".to_string(), "test".to_string())]);
+    assert_eq!(adapter.cwd.as_deref(), project.to_str());
+    assert!(!adapter.attach);
+    let configuration: serde_json::Value = serde_json::from_str(&adapter.configuration).unwrap();
+    assert_eq!(configuration["request"], "launch");
+    assert_eq!(configuration["script_or_command"], program.as_str());
+
+    // An adapter it does not have, and an extension from before there
+    // were any.
+    let other = DebugLaunch {
+        adapter: "gdb".into(),
+        ..launch.clone()
+    };
+    assert!(host.debug_adapter(&other, &project).is_err());
+    let old = fixture("nginx");
+    let old_host = Host::load(
+        &old,
+        &work_dir("host-nginx-debug"),
+        Arc::new(Script::default()),
+    )
+    .unwrap();
+    let error = old_host.debug_adapter(&launch, &project).unwrap_err();
+    assert!(error.contains("no debug adapter"), "{error}");
 }

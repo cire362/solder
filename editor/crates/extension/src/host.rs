@@ -28,6 +28,9 @@ const MEMORY: usize = 256 * 1024 * 1024;
 /// What one call may compute before it is stopped. Waiting on the world
 /// (a download, npm) costs none.
 const FUEL: u64 = 20_000_000_000;
+/// The same for painting the labels of a menu, which is waited for with
+/// every completion: a fraction of a second at most.
+const LABEL_FUEL: u64 = 500_000_000;
 
 /// A program to start, as an extension describes it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -35,6 +38,73 @@ pub struct Command {
     pub command: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+}
+
+/// A completion as a language server sent it, for the extension to say how
+/// to show it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Completion {
+    pub label: String,
+    pub detail: Option<String>,
+    /// The two parts of the item's `labelDetails`.
+    pub label_detail: Option<String>,
+    pub label_description: Option<String>,
+    /// The protocol's numbers for the kind and the insert text format.
+    pub kind: Option<i32>,
+    pub format: Option<i32>,
+}
+
+/// How an extension wants a completion shown: a piece of code in its
+/// language, to be highlighted as code, and the parts of it to show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeLabel {
+    pub code: String,
+    pub spans: Vec<LabelSpan>,
+    /// The part of what is shown that the typed word is matched against.
+    pub filter: std::ops::Range<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LabelSpan {
+    /// A range of `code`.
+    Code(std::ops::Range<usize>),
+    /// Text that is not in `code`, colored as the named highlight.
+    Literal {
+        text: String,
+        highlight: Option<String>,
+    },
+}
+
+/// A program to debug, as the editor knows it before any adapter does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DebugLaunch {
+    pub label: String,
+    /// The debug adapter's name in its extension's manifest.
+    pub adapter: String,
+    pub program: String,
+    pub cwd: Option<String>,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// How to start a debug adapter and what to ask it for, as an extension
+/// worked it out from a [`DebugLaunch`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugAdapter {
+    /// The adapter's program. `None` for one that is not a process to
+    /// start: it is only connected to.
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub cwd: Option<String>,
+    /// Where the adapter listens: an address, a port, and how long to wait
+    /// for it in milliseconds. `None` means it talks on its own input and
+    /// output.
+    pub connection: Option<(std::net::Ipv4Addr, u16, Option<u64>)>,
+    /// `false` to launch the program, `true` to attach to one that runs.
+    pub attach: bool,
+    /// The arguments of that request, as JSON.
+    pub configuration: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -86,8 +156,13 @@ pub enum Status {
 
 /// Everything an extension reaches outside its sandbox through.
 pub trait World: Send + Sync + 'static {
-    /// The path of Node.js.
+    /// The path of Node.js: the user's, or one Solder got earlier.
     fn node(&self) -> Result<String, String>;
+    /// Gets a Node.js of Solder's own for a machine that has none, and
+    /// gives its path. A world that cannot says so.
+    fn install_node(&self) -> Result<String, String> {
+        Err("Node.js was not found, and this language server needs it".into())
+    }
     fn npm_latest(&self, package: &str) -> Result<String, String>;
     /// Installs a package under `dir/node_modules`.
     fn npm_install(&self, dir: &Path, package: &str, version: &str) -> Result<(), String>;
@@ -111,6 +186,9 @@ pub trait World: Send + Sync + 'static {
     fn settings(&self, _category: &str, _key: Option<&str>) -> Option<String> {
         None
     }
+    /// The extension tried to run a command its manifest does not declare,
+    /// and was not let. For the record of what it did; nothing to answer.
+    fn undeclared(&self, _command: &Command) {}
 }
 
 /// Adds `more` to `into`, the way one extension's options are added to a
@@ -286,6 +364,7 @@ impl State {
 
     fn run_declared(&self, command: Command) -> Result<Output, String> {
         if !declared(&self.commands, &command) {
+            self.world.undeclared(&command);
             return Err(format!(
                 "The extension's manifest does not declare that it runs {}",
                 command.command
@@ -381,6 +460,30 @@ trait Calls: Send {
         _worktree: Resource<Worktree>,
     ) -> wasmtime::Result<Result<Option<String>, String>> {
         Ok(Ok(None))
+    }
+
+    /// How to start the adapter that debugs `launch`. Versions before 0.6
+    /// know no debug adapters.
+    fn debug_adapter(
+        &self,
+        _store: &mut Store<State>,
+        _launch: &DebugLaunch,
+        _worktree: Resource<Worktree>,
+    ) -> wasmtime::Result<Result<DebugAdapter, String>> {
+        Ok(Err(
+            "It was built for a version of Zed's API that has no debug adapters".into(),
+        ))
+    }
+
+    /// How to show each of a server's completions; `None` leaves one as
+    /// the server sent it. Versions before 0.0.6 cannot say.
+    fn labels_for_completions(
+        &self,
+        _store: &mut Store<State>,
+        _server: &str,
+        completions: &[Completion],
+    ) -> wasmtime::Result<Result<Vec<Option<CodeLabel>>, String>> {
+        Ok(Ok(vec![None; completions.len()]))
     }
 }
 
@@ -721,13 +824,41 @@ macro_rules! world_functions {
 macro_rules! start {
     ($bindings:ident) => {
         start!(@start $bindings);
-        start!(@by_id $bindings {});
+        start!(@by_id $bindings {
+            start!(@labels $bindings, |c| Some(
+                $bindings::zed::extension::lsp::CompletionLabelDetails {
+                    detail: c.label_detail.clone(),
+                    description: c.label_description.clone(),
+                }
+            )
+            .filter(|d| d.detail.is_some() || d.description.is_some()));
+        });
+    };
+    // 0.0.6 and 0.1.0: a completion had no label details yet.
+    ($bindings:ident, before_label_details) => {
+        start!(@start $bindings);
+        start!(@by_id $bindings {
+            start!(@labels $bindings);
+        });
     };
     // From 0.4, an extension may add to the options and settings of a
     // server that is not its own.
     ($bindings:ident, sets_up_others) => {
+        start!($bindings, sets_up_others, {});
+    };
+    // From 0.6, what a version adds of its own is written where its
+    // bindings are.
+    ($bindings:ident, sets_up_others, { $($extra:tt)* }) => {
         start!(@start $bindings);
         start!(@by_id $bindings {
+            start!(@labels $bindings, |c| Some(
+                $bindings::zed::extension::lsp::CompletionLabelDetails {
+                    detail: c.label_detail.clone(),
+                    description: c.label_description.clone(),
+                }
+            )
+            .filter(|d| d.detail.is_some() || d.description.is_some()));
+
             fn additional_initialization_options(
                 &self,
                 store: &mut Store<State>,
@@ -751,7 +882,95 @@ macro_rules! start {
                     store, server, target, worktree,
                 )
             }
+
+            $($extra)*
         });
+    };
+    (@labels $bindings:ident $(, |$c:ident| $details:expr)?) => {
+        fn labels_for_completions(
+            &self,
+            store: &mut Store<State>,
+            server: &str,
+            completions: &[Completion],
+        ) -> wasmtime::Result<Result<Vec<Option<CodeLabel>>, String>> {
+            use $bindings::zed::extension::lsp;
+            let completions: Vec<lsp::Completion> = completions
+                .iter()
+                .map(|c| lsp::Completion {
+                    label: c.label.clone(),
+                    $(label_details: {
+                        let $c = c;
+                        $details
+                    },)?
+                    detail: c.detail.clone(),
+                    kind: c.kind.map(|kind| {
+                        use lsp::CompletionKind as K;
+                        match kind {
+                            1 => K::Text,
+                            2 => K::Method,
+                            3 => K::Function,
+                            4 => K::Constructor,
+                            5 => K::Field,
+                            6 => K::Variable,
+                            7 => K::Class,
+                            8 => K::Interface,
+                            9 => K::Module,
+                            10 => K::Property,
+                            11 => K::Unit,
+                            12 => K::Value,
+                            13 => K::Enum,
+                            14 => K::Keyword,
+                            15 => K::Snippet,
+                            16 => K::Color,
+                            17 => K::File,
+                            18 => K::Reference,
+                            19 => K::Folder,
+                            20 => K::EnumMember,
+                            21 => K::Constant,
+                            22 => K::Struct,
+                            23 => K::Event,
+                            24 => K::Operator,
+                            25 => K::TypeParameter,
+                            other => K::Other(other),
+                        }
+                    }),
+                    insert_text_format: c.format.map(|format| match format {
+                        1 => lsp::InsertTextFormat::PlainText,
+                        2 => lsp::InsertTextFormat::Snippet,
+                        other => lsp::InsertTextFormat::Other(other),
+                    }),
+                })
+                .collect();
+            let labels = self.call_labels_for_completions(store, server, &completions)?;
+            Ok(labels.map(|labels| {
+                labels
+                    .into_iter()
+                    .map(|label| {
+                        let label = label?;
+                        Some(CodeLabel {
+                            code: label.code,
+                            spans: label
+                                .spans
+                                .into_iter()
+                                .map(|span| match span {
+                                    $bindings::CodeLabelSpan::CodeRange(range) => {
+                                        LabelSpan::Code(range.start as usize..range.end as usize)
+                                    }
+                                    $bindings::CodeLabelSpan::Literal(literal) => {
+                                        LabelSpan::Literal {
+                                            text: literal.text,
+                                            highlight: literal.highlight_name,
+                                        }
+                                    }
+                                })
+                                .collect(),
+                            filter: label.filter_range.start as usize
+                                ..label.filter_range.end as usize,
+                        })
+                    })
+                    .collect()
+            }))
+        }
     };
     (@by_id $bindings:ident { $($more:tt)* }) => {
         impl Calls for $bindings::Extension {
@@ -926,6 +1145,8 @@ pub struct Host {
     running: Mutex<Running>,
     /// The first language the manifest lists for each server.
     languages: Vec<(String, String)>,
+    /// The debug adapters the manifest declares.
+    debug_adapters: Vec<String>,
 }
 
 impl Host {
@@ -991,6 +1212,7 @@ impl Host {
                     )
                 })
                 .collect(),
+            debug_adapters: extension.debug_adapters.clone(),
         })
     }
 
@@ -1045,6 +1267,53 @@ impl Host {
             args: command.args,
             env: command.env,
         })
+    }
+
+    /// How the extension wants `completions` of its `server` shown, one
+    /// answer for each. `None` when the extension is in the middle of
+    /// something else, a download for one: a menu does not wait for that.
+    pub fn labels_for_completions(
+        &self,
+        server: &str,
+        completions: &[Completion],
+    ) -> Option<Result<Vec<Option<CodeLabel>>, String>> {
+        let mut running = self.running.try_lock().ok()?;
+        let Running { store, extension } = &mut *running;
+        let problem = |e: wasmtime::Error| format!("The extension failed: {e:#}");
+        if let Err(error) = store.set_fuel(LABEL_FUEL) {
+            return Some(Err(problem(error)));
+        }
+        let labels = extension
+            .labels_for_completions(store, server, completions)
+            .map_err(problem)
+            .and_then(|labels| labels);
+        // An extension answers up to the last completion it has a label
+        // for: the list may be shorter than what it was asked about.
+        Some(labels.map(|mut labels| {
+            labels.resize(completions.len(), None);
+            labels
+        }))
+    }
+
+    /// How to start the debug adapter for `launch` in the project at
+    /// `root`. The extension may install the adapter first.
+    pub fn debug_adapter(&self, launch: &DebugLaunch, root: &Path) -> Result<DebugAdapter, String> {
+        // Asked about an adapter that is not its own, an extension may
+        // answer all the same, with its own.
+        if !self.debug_adapters.contains(&launch.adapter) {
+            return Err(format!(
+                "The extension has no debug adapter called {}",
+                launch.adapter
+            ));
+        }
+        let mut adapter = self.ask(root, |extension, store, worktree| {
+            extension.debug_adapter(store, launch, worktree)
+        })?;
+        let running = self.running.lock().unwrap();
+        adapter.command = adapter
+            .command
+            .map(|command| program(&running.store.data().work_dir, &command));
+        Ok(adapter)
     }
 
     /// The JSON to send the server as `initializationOptions`, if any.

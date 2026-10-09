@@ -13,7 +13,9 @@
 //! what that code reaches outside it: npm, GitHub, downloads.
 
 pub mod catalog;
+pub mod gate;
 pub mod host;
+pub mod icons;
 pub mod install;
 pub mod manifest;
 pub mod snippet;
@@ -22,6 +24,8 @@ pub mod testing;
 pub mod world;
 
 pub use catalog::Entry;
+pub use gate::{Event, Refusals};
+pub use icons::IconTheme;
 pub use manifest::{Code, Extension, Grammar, Language, Origin, Server, SnippetFile};
 pub use snippet::Snippet;
 pub use state::State;

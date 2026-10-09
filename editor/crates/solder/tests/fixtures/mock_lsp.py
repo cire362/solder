@@ -148,6 +148,7 @@ while True:
             {"label": "helper", "kind": 3},
         ] if not TAG else [
             {"label": f"{TAG}_println", "kind": 3},
+            {"label": f"{TAG}_title", "kind": 10, "detail": "a prop"},
         ]})
     elif method == "textDocument/hover":
         send({"jsonrpc": "2.0", "id": mid, "result": {"contents": {

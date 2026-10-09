@@ -72,11 +72,17 @@ impl DebugPanel {
     pub fn refresh_configs(&mut self, file: Option<PathBuf>, start: bool, cx: &mut Context<Self>) {
         let root = self.root.clone();
         let current = self.configs.get(self.selected).map(|c| c.name.clone());
+        // What installed extensions can debug the open file with.
+        let adapters = file
+            .as_deref()
+            .map(|file| debug_launch::from_extensions(&root, file, cx))
+            .unwrap_or_default();
         let found = cx
             .background_executor()
             .spawn(async move { debug_launch::detect(&root, file.as_deref()) });
         cx.spawn(async move |this, cx| {
-            let configs = found.await;
+            let mut configs = adapters;
+            configs.extend(found.await);
             this.update(cx, |this, cx| {
                 this.selected = current
                     .and_then(|name| configs.iter().position(|c| c.name == name))

@@ -4,7 +4,9 @@ Everything the website promises, grouped into phases. Each phase only depends on
 the ones above it. Optimization work (see README) starts after phase 7.
 Phase 8 goes past what the website promises: it is what it takes for an
 extension made for Zed or VS Code to be installed with one button and work
-as it does in the editor it was made for.
+as it does in the editor it was made for. Phase 9 makes the window the
+user's own: where every panel and button is, how it looks and which keys
+drive it.
 
 Status: `[x]` done, `[~]` partial, `[ ]` not started.
 
@@ -107,8 +109,9 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 ## 8. Extensions, in full
 
 Where it stands: extensions install from Zed's catalog and Open VSX. A Zed
-extension brings its languages, snippets, themes and one language server. A
-VS Code extension brings its themes and snippets only.
+extension brings its languages (highlighting and how they are typed),
+snippets, themes and language servers. A VS Code extension brings its themes
+and snippets only.
 
 The two kinds are different work. A Zed extension is data plus a small
 sandboxed program with a fixed interface, so it can be supported completely.
@@ -129,8 +132,10 @@ to build them.
 - [x] Updates: newer versions are looked for when the tab is opened, never at
       startup; update one or all; keep a version
 - [x] Turn an extension off without removing it
-- [ ] For each installed extension, what works and what does not, from what it
-      asked for at run time and did not get, not from its manifest alone
+- [x] For each installed extension, what works and what does not, from what it
+      asked for at run time and did not get, not from its manifest alone:
+      what its code ran, installed and downloaded since the app started, what
+      it was refused, and which server it could not get ready
 - [x] A section on extensions in `editor/README.md` and in the website's docs
 
 ### Zed extensions, complete
@@ -146,24 +151,49 @@ to build them.
       settings from `settings.json`, and the language's tab size. The editor
       also applies them itself to a server an extension brings, for the
       extensions that do not ask
-- [ ] The rest of a language's files: indentation, brackets, the outline,
-      and from `config.toml` the pairs that close themselves, the block
-      comment and the word characters
-- [ ] Completion and symbol labels as the extension paints them
-      (`labels-for-completions`, `labels-for-symbols`)
-- [ ] The languages Zed builds in and so does not list in its catalog (C,
-      C++, Markdown, YAML, shell): grammars and servers of our own for them,
-      installed the same way
-- [ ] Icon themes: file icons in the tree and on tabs
-- [ ] A Node of Solder's own for servers written in JavaScript when the
-      machine has none, downloaded on first need
-- [ ] The commands an extension may run and the hosts it may download from,
-      granted or refused per extension (Zed's capabilities)
-- [ ] A time limit for a grammar's scanner, which today can hold a parse
-- [ ] Debug adapters of extensions, in the debugger
-- [ ] Slash commands and context servers of extensions, in the chat and the
-      agent
-- [ ] Each new version of Zed's API as it is published (0.8 is the next)
+- [x] The rest of a language's files: indentation (`indents.scm` and the
+      two patterns), brackets, the outline (in the project map the AI gets;
+      there is no outline to look at yet), and from `config.toml` the pairs
+      that close themselves, the block comment and the word characters
+- [x] Completion labels as the extension paints them
+      (`labels-for-completions`): colored as code in the file's language,
+      with the typed word matched against the part that is the name
+- [ ] Symbol labels (`labels-for-symbols`). The editor has no list of a
+      file's or a project's symbols to paint them in; it comes with one
+- [x] The languages Zed builds in and so does not list in its catalog (C,
+      C++, Markdown, YAML, shell): built in here too, as grammars in the
+      binary, with the servers Zed has for them (clangd, yaml-language-server)
+      taken from the PATH. Markdown is two grammars and the languages of its
+      code blocks; a paragraph that did not change is not parsed again
+- [x] Icon themes: file icons in the tree and on tabs, chosen in the
+      Extensions tab or by `icon_theme` in `settings.json`
+- [x] A Node of Solder's own for servers written in JavaScript when the
+      machine has none, downloaded on first need: the newest long-term
+      release, checked against its published hash, with the npm it brings
+- [x] The commands an extension may run and the hosts it may download from,
+      granted or refused per extension (Zed's capabilities): commands, npm,
+      downloads and single hosts, each taken back or given again in the
+      extension's details
+- [ ] A time limit for a grammar's scanner, which today can hold a parse.
+      tree-sitter 0.26 makes the WebAssembly store itself and has no way to
+      put a deadline on it (with interruption turned on in the engine, its
+      store would trap at once). What is left is to reach into its store, to
+      parse such grammars off the UI thread and give up on one that hangs,
+      or to change tree-sitter. Decided on 2026-10-05: left open until
+      tree-sitter has a way of its own, as Zed has no such limit either
+- [x] Debug adapters of extensions, in the debugger: the open file with
+      each adapter its language names, started as the extension says, over
+      a port or the adapter's own input and output
+- [ ] Which of a language's servers start. Every server an extension lists
+      for a language is started today, and Ruby's lists eight: the user's
+      choice per language (`language_servers`, with `!name` to leave one
+      out), and Zed's defaults for the languages that need them
+- [ ] Context servers of extensions, in the agent. They are MCP servers
+      (context7, GitHub and Postgres are the most installed), and the agent
+      has no MCP client yet: the client and these servers are one update of
+      their own, after this block
+- [ ] Each new version of Zed's API as it is published (0.8 is the next;
+      0.7.0 was still the newest on 2026-10-05)
 
 ### VS Code extensions: what needs no code
 - [ ] TextMate grammars: highlighting for the languages only VS Code has an
@@ -207,7 +237,72 @@ to build them.
       the result is the list of what works
 
 ### What will not run
-Not tasks, but said so nobody waits for them: extensions whose licence or
-own checks tie them to Microsoft's products (Pylance, C# Dev Kit, Remote
-SSH, Live Share), and anything published only on Microsoft's Marketplace,
-which other editors may not use.
+Not tasks, but said so nobody waits for them: slash commands of Zed
+extensions, which no extension in Zed's catalog has (2026-10-05), so there is
+nothing to run them for; extensions whose licence or own checks tie them to
+Microsoft's products (Pylance, C# Dev Kit, Remote SSH, Live Share); and
+anything published only on Microsoft's Marketplace, which other editors may
+not use.
+
+## 9. An editor shaped by its user
+
+Where it stands: keys are the user's (`keymap.json`), and so are the colors
+(a theme file, 34 tokens). The rest is fixed in code: the sidebar is on the
+left and 390 px wide, the chat on the right, the terminal at the bottom, the
+sidebar's tabs and the status bar's items in one order, the interface font
+and its size, and the only icons are those of files, from an extension's
+icon theme; buttons and panels are words.
+
+How it is built: `layout.json`, next to `settings.json`, is the truth and is
+read again when it is saved. Whatever is done by hand in the window (a border
+dragged, a tab moved, a button hidden from its menu) is written to the same
+file, so the two never disagree. It starts after the Zed items of phase 8.
+
+### The layout file
+- [ ] `layout.json`: the sizes that are constants today (sidebar, chat,
+      terminal dock, title bar, tab bar, status bar), read at start and when
+      the file is saved. A mistake in it is reported like one in
+      `settings.json`, and the last layout that was right stays
+- [ ] Docks on the left, right and bottom, and any panel in any of them:
+      Files, Search, Git, Services, Database, API, AI, Extensions, the chat,
+      the agent, the terminal, the debugger. Their order in a dock, which
+      are hidden, which one is open
+- [ ] The title bar and the status bar as lists of items: which are there, in
+      what order, on which side. The tab bar: above or below the editor, or
+      none
+- [ ] An item is drawn as a word, an icon or both, and its command and icon
+      can be changed, so a button for any command can be put on a bar
+- [ ] The interface font, its size and how dense rows are, in
+      `settings.json`
+
+### By hand
+- [ ] Borders are dragged to resize; a double click puts a size back
+- [ ] A panel's tab is dragged to another place in its dock or to another
+      dock; an item of a bar is dragged along it or to the other bar
+- [ ] A menu on every panel tab and bar item: hide, move to, and the list of
+      what is hidden, to bring it back
+- [ ] A command that puts the layout back as it came
+
+### Layouts by name
+- [ ] Several layouts kept by name (writing, review, debugging), switched by
+      a command or a key; the one a project was left in is the one it opens
+      with
+- [ ] Key layouts by name: the built-in one, the ones that follow other
+      editors, and the user's own, switched by a command, with `keymap.json`
+      still on top
+
+### Themes
+- [ ] Every color in the window comes from a token a theme can set: the ones
+      still written in code become tokens
+- [ ] Shapes as tokens next to colors: the radii, the spacing, the width of
+      borders
+- [ ] A theme file is applied as it is saved, and any token can be set in
+      `settings.json` on top of the theme in use
+
+### Icons
+- [ ] A set of icons of Solder's own for buttons, panels and the bars
+      (Phosphor, MIT, drawn from files kept in the app, so nothing is
+      downloaded)
+- [~] File icons in the tree and on tabs from the icon themes of Zed and
+      VS Code extensions (the items of phase 8), chosen in `settings.json`.
+      Zed's are in; VS Code's are not yet

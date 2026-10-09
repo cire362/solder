@@ -8,7 +8,8 @@ crates/
   extension/ extensions of Zed and VS Code: manifests, the two catalogs, installing,
             and the sandbox that runs a Zed extension's code to get its language server
   syntax/   tree-sitter parsing and highlighting for Rust, TS/TSX, JS, JSON, CSS, Go, Python,
-            and for the languages of extensions (grammars in WebAssembly)
+            C, C++, Markdown, YAML and shell, and for the languages of extensions
+            (grammars in WebAssembly)
   db/       database connections: detection, drivers, statement splitting (no UI)
   rest/     HTTP: .http files, route detection, OpenAPI import, sending (no UI)
   ai/       local models: hardware, catalog, downloads, llama-server, benchmark (no UI)
@@ -391,7 +392,9 @@ text. Files outside the project, symbolic links, Git-ignored files and build
 folders are also excluded.
 
 **Project map** is off by default. Turn it on to attach relative paths and
-declaration names with line numbers for Rust, TS/TSX, JS, Go and Python. It does
+declaration names with line numbers for Rust, TS/TSX, JS, Go, Python, C, C++ and
+shell, the headings of Markdown, and extension languages that say what they
+declare. It does
 not attach their bodies or let the model read other files. The map is built on
 request in the background, preferring paths mentioned in the question and files
 near the current file. Each request includes a fresh map, not copies of old maps.
@@ -679,12 +682,28 @@ here.
 
 | From | Solder uses | Does not run here |
 |---|---|---|
-| A Zed extension | Languages (highlighting, and the languages inside them), snippets, themes, its language servers | Icon themes, slash commands, context servers, debug adapters |
+| A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, icon themes, its language servers, its debug adapters | Context servers (they need an MCP client, which is planned) |
 | A VS Code extension | Themes (JSON), snippets | Its code, TextMate grammars, everything the code would add |
 
 A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
 It is compiled on the first file that needs it and runs in wasmtime inside
 the parser, where it sees nothing but the text.
+
+The other files of a language are read too, and mean here what they mean in
+Zed:
+
+| File | What it gives |
+|---|---|
+| `config.toml`: `brackets`, `autoclose_before` | The pairs that close themselves, are typed over and take a line between them on Enter. `not_in` keeps a pair from closing inside a string or a comment |
+| `config.toml`: `block_comment` | `cmd-/` in a language with no comment that runs to the end of a line: each line goes between the two ends |
+| `config.toml`: `word_characters`, `completion_query_characters` | What a word is for moving, selecting and deleting by word, and for the word a completion goes on from |
+| `config.toml`: `increase_indent_pattern`, `decrease_indent_pattern` | A line after one that matches the first is deeper; a line that matches the second goes one level back as it is typed |
+| `indents.scm` | How deep the line after Enter goes, and where a closing word or tag goes when it is typed |
+| `brackets.scm` | The bracket at the cursor and its other half, which may be words or tags |
+| `overrides.scm` | Where a string or a comment is, for `not_in` |
+| `outline.scm` | What a file declares, in the project map the AI gets |
+
+A language built into Solder keeps the editor's own rules for all of this.
 
 A language server comes from the extension's own code, a WebAssembly
 component built against Zed's extension API (every version from 0.0.1 to 0.7
@@ -694,6 +713,32 @@ program to start. That code runs in a sandbox with a memory limit and a
 budget for each call; its files are one folder
 (`extensions/work/<id>` in the app's data folder). The server itself is a
 program Solder starts with your rights, as Zed does.
+
+Many servers are written in JavaScript and need Node.js. Yours is used when
+you have one. When the machine has none, Solder downloads the newest
+long-term release from nodejs.org the first time a server needs it, checks
+it against the published hash and keeps it in `extensions/node` in the app's
+data folder, for every extension; the status bar says so while it downloads.
+It is not updated on its own: delete that folder to get a newer one.
+
+A debug adapter comes from the extension's code too. When the open file is in
+a language whose extension names a debugger (Ruby names `rdbg`), the debug
+panel lists it next to the JavaScript choices, as `rdbg app.rb`. Started, the
+extension is asked how to run the adapter for that file; it may install the
+adapter first, with the commands its manifest declares. The adapter then
+listens on a port Solder picks for it, or talks on its own input and output,
+and the session is the same as any other: breakpoints, stepping, variables,
+the console.
+
+An icon theme puts a picture next to each file in the tree and on tabs, by
+the file's name and ending. Press **Use** on it in the Extensions tab, or
+name it in `settings.json` (`"icon_theme": "Catppuccin Mocha"`); with none
+named, the tree has no pictures. The pictures are the extension's own SVG
+files, read from its folder.
+
+An extension may also paint the completions of its server: Vue's shows a
+property as a tag followed by its detail. Its answer is colored as code in
+the file's language, and what you type is matched against the name in it.
 
 A file can have several servers: the one Solder knows for its language and
 every one that installed extensions bring for it. Their diagnostics show
@@ -737,6 +782,17 @@ That is why such an extension **asks first**. It is downloaded and read, and
 then waits: the tab shows what installing it allows (the servers it gets, the
 commands its manifest declares), and nothing is in place until you press
 **Install** there. A later version asks again only for what is new.
+
+What installing allowed can be taken back afterwards, for that extension
+alone. Under **It may** in its details, each of these has a **Refuse**
+button, which turns into **Allow**: running the commands it declares,
+installing packages from npm, downloading files, and each host it has
+downloaded from. A refusal holds from the next thing the extension asks for;
+a server it already started keeps running. Below that the tab lists what
+its code did since Solder started (what it ran, installed and downloaded
+from where) and what it asked for and did not get: what was refused, a
+command its manifest does not declare, a server it could not get ready. So
+what works is read from what happened, not from the manifest.
 
 For an installed extension the tab has:
 

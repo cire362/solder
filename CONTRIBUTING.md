@@ -11,7 +11,9 @@ keep automated changes safe.
 - `fix/<topic>` for bug fixes
 - `perf/<topic>`, `refactor/<topic>`, `docs/<topic>`, `chore/<topic>`
 
-One branch per roadmap item or bug. Merge into `main` through a pull request.
+One branch per large update (a whole block of the roadmap, not each of its
+items) or per bug fixed on its own. Merge into `main` through a pull request,
+once, when the whole update is ready.
 
 ## Commits
 

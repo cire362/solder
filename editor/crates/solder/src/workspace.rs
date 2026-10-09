@@ -3221,6 +3221,9 @@ impl Workspace {
                 let editor = tab.editor.clone();
                 let doc = tab.editor.read(cx).doc(cx);
                 let name: SharedString = doc.title().into();
+                let icon = doc
+                    .path()
+                    .and_then(|path| crate::file_icons::file(path, cx));
                 let dirty = doc.is_dirty();
                 let active = pane.active == Some(ix);
                 let close_editor = editor.clone();
@@ -3257,6 +3260,14 @@ impl Workspace {
                             this.close(&middle_editor, window, cx)
                         }),
                     )
+                    .when_some(icon, |d, icon| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .debug_selector(move || format!("tab-icon-{ix}"))
+                                .child(icon),
+                        )
+                    })
                     .child(name)
                     .child(
                         // Unsaved state doubles as the close target, like most editors.
@@ -8289,6 +8300,7 @@ mod tests {
                 "env": {},
             }),
             browser: Some("http://localhost:4123".into()),
+            adapter: None,
         };
         store.update(cx, |s, cx| s.start(config, root.clone(), cx));
         // The server says where it listens; the page opens in a browser
@@ -8878,14 +8890,45 @@ mod tests {
         );
         write_file(
             &dir.join("languages/vue/config.toml"),
-            "name = \"Vue.js\"\ngrammar = \"vue\"\npath_suffixes = [\"vue\"]\ncode_fence_block_name = \"vue\"\n",
+            r#"name = "Vue.js"
+grammar = "vue"
+path_suffixes = ["vue"]
+code_fence_block_name = "vue"
+block_comment = ["<!-- ", " -->"]
+autoclose_before = ";:.,=}])>"
+word_characters = ["-"]
+increase_indent_pattern = ':\s*$'
+decrease_indent_pattern = '^\s*end\b'
+brackets = [
+    { start = "{", end = "}", close = true, newline = true },
+    { start = "<", end = ">", close = true, newline = true, not_in = ["string", "comment"] },
+    { start = "\"", end = "\"", close = true, newline = false, not_in = ["string"] },
+]
+"#,
         );
-        for query in ["highlights.scm", "injections.scm"] {
+        for query in [
+            "highlights.scm",
+            "injections.scm",
+            "indents.scm",
+            "brackets.scm",
+            "overrides.scm",
+            "outline.scm",
+        ] {
             std::fs::copy(fixtures.join(query), dir.join("languages/vue").join(query)).unwrap();
         }
         std::fs::create_dir_all(dir.join("grammars")).unwrap();
         std::fs::copy(fixtures.join("vue.wasm"), dir.join("grammars/vue.wasm")).unwrap();
         write_file(&dir.join("themes/demo.json"), extension::testing::ZED_THEME);
+        write_file(
+            &dir.join("icon_themes/demo.json"),
+            extension::testing::ZED_ICON_THEME,
+        );
+        for icon in ["file", "rust", "folder", "folder-open"] {
+            write_file(
+                &dir.join(format!("icons/{icon}.svg")),
+                &extension::testing::svg(icon),
+            );
+        }
         write_file(
             &dir.join("snippets/vue.json"),
             r#"{"Base": {"prefix": "vbase", "body": ["<section>", "\t${1:$TM_FILENAME_BASE}", "</section>"], "description": "A section"}}"#,
@@ -9017,6 +9060,25 @@ mod tests {
         );
         assert!(config.join("themes/demo-dark.json").is_file());
 
+        // And its icon theme gives files their pictures: the open file's
+        // tab has one. The choice is a line in the settings.
+        let icons = |cx: &App| {
+            cx.try_global::<crate::file_icons::FileIcons>()
+                .and_then(|icons| icons.0.as_ref().map(|theme| theme.name.clone()))
+        };
+        assert_eq!(cx.read(|cx| icons(cx)), None);
+        click(cx, "extension-icons-0");
+        wait_for(cx, "the icon theme", &|cx| {
+            icons(cx).as_deref() == Some("Demo Icons")
+        });
+        assert_eq!(
+            cx.read(|cx| cx.global::<Settings>().icon_theme.clone()),
+            Some("Demo Icons".into())
+        );
+        bounds_soon(cx, "tab-icon-0");
+        let rust = cx.read(|cx| crate::file_icons::file(Path::new("src/main.rs"), cx).is_some());
+        assert!(rust);
+
         // Opening the tab asked the catalog about what is installed, and it
         // has a newer version: the row offers it, and so does Update all.
         let has_update = |cx: &App| {
@@ -9046,6 +9108,7 @@ mod tests {
         // on, the language is back. The decision is written down.
         click(cx, "extension-off");
         wait_for(cx, "the language to go", &|cx| language(cx).is_none());
+        assert_eq!(cx.read(|cx| icons(cx)), None);
         assert!(cx.read(|cx| store.read(cx).find(Origin::Zed, "vue").is_some()));
         wait_for(cx, "the decision on disk", &|_| {
             std::fs::read_to_string(folder.join("state.json"))
@@ -9055,6 +9118,7 @@ mod tests {
         wait_for(cx, "the language to return", &|cx| {
             language(cx) == Some("Vue.js")
         });
+        assert_eq!(cx.read(|cx| icons(cx)).as_deref(), Some("Demo Icons"));
 
         // Update all downloads it again.
         let downloads = |requests: &std::sync::Mutex<Vec<String>>| {
@@ -9084,6 +9148,176 @@ mod tests {
             std::fs::read_to_string(folder.join("state.json"))
                 .is_ok_and(|text| !text.contains("vue"))
         });
+    }
+
+    #[gpui::test]
+    fn a_language_of_an_extension_is_typed_the_way_its_files_say(cx: &mut TestAppContext) {
+        let _languages = extension_languages();
+        let catalog = r#"{"data":[{"id":"vue","name":"Vue","version":"0.4.0","description":"Vue support.","download_count":1,"provides":["languages"]}]}"#;
+        let (base, _) = serve(vec![
+            ("/extensions", Served::ok(catalog.as_bytes().to_vec())),
+            (
+                "/extensions/vue/download",
+                Served::ok(vue_archive("ext-typing")),
+            ),
+        ]);
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-typing", &base);
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        cx.dispatch_action(ShowExtensions);
+        wait_for(cx, "the catalog", &|cx| {
+            !store.read(cx).catalog(Origin::Zed).entries.is_empty()
+        });
+        store.update(cx, |store, cx| {
+            let entry = store.catalog(Origin::Zed).entries[0].clone();
+            store.install(entry, cx)
+        });
+        wait_for(cx, "the language", &|cx| {
+            let doc = editor.read(cx).doc(cx);
+            doc.language_name() == Some("Vue.js") && doc.syntax().is_some()
+        });
+        cx.update(|window, cx| window.focus(&editor.focus_handle(cx)));
+
+        // The whole file becomes `text`, with the cursor where `|` is.
+        let put = |cx: &mut VisualTestContext, text: &str| {
+            let at = text.find('|').unwrap();
+            let text = text.replacen('|', "", 1);
+            editor.update_in(cx, |e, _, cx| {
+                let all = 0..e.text(cx).len();
+                e.select_range(all, cx);
+                e.insert(&text, cx);
+                e.select_range(at..at, cx);
+            });
+            wait_for(cx, "the tree", &|cx| {
+                editor
+                    .read(cx)
+                    .doc(cx)
+                    .syntax()
+                    .is_some_and(|s| !s.is_stale())
+            });
+        };
+        // The text with `|` where the cursor is.
+        let seen = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.read(|cx| {
+                let editor = editor.read(cx);
+                let mut text = editor.text(cx);
+                text.insert(editor.newest_range().end, '|');
+                text
+            })
+        };
+
+        // Enter after a tag that opens: one level deeper, by `indents.scm`.
+        put(
+            cx,
+            "<template>\n  <div class=\"main-nav\">|\n  </div>\n</template>\n",
+        );
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            seen(cx),
+            "<template>\n  <div class=\"main-nav\">\n    |\n  </div>\n</template>\n"
+        );
+        // `<` closes itself, as `config.toml` lists it, and its `>` is
+        // typed over.
+        cx.simulate_input("<");
+        assert!(seen(cx).contains("    <|>\n"), "{}", seen(cx));
+        cx.simulate_input("p>a");
+        assert!(seen(cx).contains("    <p>a|\n"), "{}", seen(cx));
+        // Enter after a line that closed its own tag: no deeper.
+        cx.simulate_input("</p>");
+        cx.simulate_keystrokes("enter");
+        assert!(
+            seen(cx).contains("    <p>a</p>\n    |\n  </div>"),
+            "{}",
+            seen(cx)
+        );
+
+        // A closing tag typed on a line of its own goes back under the tag
+        // it closes.
+        put(
+            cx,
+            "<template>\n  <div>\n    <p>a</p>\n    |\n</template>\n",
+        );
+        cx.simulate_input("</div>");
+        assert_eq!(
+            seen(cx),
+            "<template>\n  <div>\n    <p>a</p>\n  </div>|\n</template>\n"
+        );
+
+        // The two patterns of `config.toml`: the line after one that ends
+        // in a colon is deeper, and `end` goes back as it is typed. When
+        // the word turns out to be another, the line returns.
+        put(
+            cx,
+            "<template>\n  <div>\n    then:|\n  </div>\n</template>\n",
+        );
+        cx.simulate_keystrokes("enter");
+        assert!(seen(cx).contains("    then:\n      |\n"), "{}", seen(cx));
+        cx.simulate_input("en");
+        assert!(seen(cx).contains("    then:\n      en|\n"), "{}", seen(cx));
+        cx.simulate_input("d");
+        assert!(seen(cx).contains("    then:\n    end|\n"), "{}", seen(cx));
+        cx.simulate_input("less");
+        assert!(
+            seen(cx).contains("    then:\n      endless|\n"),
+            "{}",
+            seen(cx)
+        );
+        // A line the user moved stays where it was put while what is typed
+        // changes nothing about it.
+        put(
+            cx,
+            "<template>\n  <div>\n    <p>a</p>\n|\n  </div>\n</template>\n",
+        );
+        cx.simulate_input("text");
+        assert!(seen(cx).contains("</p>\ntext|\n"), "{}", seen(cx));
+
+        // A quote closes itself where a value starts, and not inside one:
+        // `overrides.scm` says where a string is.
+        put(cx, "<template>\n  <div class=|>\n  </div>\n</template>\n");
+        cx.simulate_input("\"");
+        assert!(seen(cx).contains("class=\"|\">"), "{}", seen(cx));
+        put(
+            cx,
+            "<template>\n  <div class=\"a |b\">\n  </div>\n</template>\n",
+        );
+        cx.simulate_input("\"");
+        assert!(seen(cx).contains("class=\"a \"|b\">"), "{}", seen(cx));
+        // Backspace between the two halves of a pair takes both.
+        put(cx, "<template>\n  <div>\n    |\n  </div>\n</template>\n");
+        cx.simulate_input("{");
+        assert!(seen(cx).contains("    {|}\n"), "{}", seen(cx));
+        cx.simulate_keystrokes("backspace");
+        assert!(seen(cx).contains("<div>\n    |\n"), "{}", seen(cx));
+
+        // The language has no comment that runs to the end of a line: a
+        // line goes between the two ends of the other kind, and back.
+        put(
+            cx,
+            "<template>\n  <div>\n    <p>a|</p>\n  </div>\n</template>\n",
+        );
+        cx.simulate_keystrokes("secondary-/");
+        assert!(
+            seen(cx).contains("\n    <!-- <p>a|</p> -->\n"),
+            "{}",
+            seen(cx)
+        );
+        cx.simulate_keystrokes("secondary-/");
+        assert!(seen(cx).contains("\n    <p>a|</p>\n"), "{}", seen(cx));
+        // In the script it is the script's `//`, as before.
+        put(
+            cx,
+            "<template></template>\n<script setup lang=\"ts\">\nconst a| = 1\n</script>\n",
+        );
+        cx.simulate_keystrokes("secondary-/");
+        assert!(seen(cx).contains("\n// const a| = 1\n"), "{}", seen(cx));
+
+        // `-` is part of a word here.
+        put(
+            cx,
+            "<template>\n  <div class=\"|main-nav\">\n  </div>\n</template>\n",
+        );
+        cx.simulate_keystrokes("alt-right");
+        assert!(seen(cx).contains("\"main-nav|\""), "{}", seen(cx));
     }
 
     #[gpui::test]
@@ -9159,7 +9393,7 @@ mod tests {
     /// What extensions reach outside their sandbox through, for the test
     /// below: the server is "on the PATH" as a script that starts the mock
     /// language server, and nothing else is available.
-    struct ServerOnPath(String);
+    struct ServerOnPath(&'static str, String);
 
     impl extension::host::World for ServerOnPath {
         fn node(&self) -> Result<String, String> {
@@ -9192,7 +9426,7 @@ mod tests {
             Err("no commands here".into())
         }
         fn which(&self, binary: &str) -> Option<String> {
-            (binary == "vscode-html-language-server").then(|| self.0.clone())
+            (binary == self.0).then(|| self.1.clone())
         }
         fn env(&self) -> Vec<(String, String)> {
             Vec::new()
@@ -9279,7 +9513,10 @@ mod tests {
             );
             cx.set_global(settings);
         });
-        let world = ServerOnPath(script.to_string_lossy().into_owned());
+        let world = ServerOnPath(
+            "vscode-html-language-server",
+            script.to_string_lossy().into_owned(),
+        );
         store.update(cx, |store, _| {
             store.world = Some(std::sync::Arc::new(world))
         });
@@ -9431,7 +9668,10 @@ mod tests {
             let store = cx.new(|cx| {
                 let mut store =
                     ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
-                let world = ServerOnPath(script.to_string_lossy().into_owned());
+                let world = ServerOnPath(
+                    "vscode-html-language-server",
+                    script.to_string_lossy().into_owned(),
+                );
                 store.world = Some(std::sync::Arc::new(world));
                 store
             });
@@ -9821,5 +10061,238 @@ mod tests {
                 has("println") && has("vue_println")
             })
         });
+        // Vue's extension paints what its server answered: a property as a
+        // tag, followed by its detail. The typed word is matched against
+        // the name alone. What the TypeScript server answered is not
+        // Vue's to paint and stays as it came.
+        let labels = cx.read(|cx| {
+            let menu = editor.read(cx).completion.as_ref().unwrap();
+            let label = |name: &str| {
+                let index = menu.items.iter().position(|item| item.label == name)?;
+                menu.labels[index].clone()
+            };
+            (label("vue_title"), label("println"))
+        });
+        let painted = labels.0.expect("a label painted by Vue's extension");
+        assert_eq!(painted.text, "vue_title a prop");
+        assert_eq!(painted.runs, [(0..9, syntax::HighlightKind::Tag)]);
+        assert_eq!(painted.filter, 0..9);
+        assert_eq!(labels.1, None);
+    }
+
+    #[gpui::test]
+    fn what_an_extension_may_do_is_taken_back_and_what_it_did_is_shown(cx: &mut TestAppContext) {
+        // Zed's real Vue extension, installed. Its code gets its server
+        // from npm, which in this world makes the files it then looks for.
+        let root = db::testing::dir("ws-gate").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        let data = db::testing::dir("ws-gate-data");
+        let installed = data.join("extensions/zed/vue");
+        std::fs::create_dir_all(&installed).unwrap();
+        let fixtures =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../extension/tests/fixtures/vue");
+        for file in ["extension.toml", "extension.wasm"] {
+            std::fs::copy(fixtures.join(file), installed.join(file)).unwrap();
+        }
+        // The catalogs are a server that has nothing: the tab is opened
+        // below, and no test goes to the real ones.
+        let (base, _) = serve(Vec::new());
+        cx.executor().allow_parking();
+        let store = cx.update(|cx| {
+            let store = cx.new(|cx| {
+                let mut store =
+                    ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
+                store.zed_url = base.clone();
+                store.open_vsx_url = base.clone();
+                store.world = Some(std::sync::Arc::new(VueWorld {
+                    node: "node".into(),
+                    settings: store.settings_for(),
+                }));
+                store
+            });
+            ExtensionStore::set_global(store.clone(), cx);
+            store.update(cx, |s, cx| s.scan(cx));
+            store
+        });
+        let (_ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "the extensions folder", &|cx| store.read(cx).loaded);
+        let server = cx.read(|cx| store.read(cx).servers_for("Vue.js")[0].clone());
+        let resolve = |cx: &mut VisualTestContext| {
+            let asked = store.update(cx, |store, cx| store.resolve(&server, &root, cx));
+            cx.executor().block(asked)
+        };
+        let did = |cx: &mut VisualTestContext| cx.read(|cx| store.read(cx).did("vue"));
+        let npm = extension::Event::Installed("@vue/language-server".into());
+        let refused = extension::Event::Refused("Install @vue/language-server from npm".into());
+
+        // Allowed everything, as installing it did: it installs its server,
+        // and that is written down.
+        assert!(did(cx).is_empty());
+        resolve(cx).unwrap();
+        assert!(did(cx).contains(&npm), "{:?}", did(cx));
+        assert!(!did(cx).contains(&refused));
+
+        // npm is taken back with the button in its details.
+        cx.dispatch_action(ShowExtensions);
+        let button = bounds_soon(cx, "extension-may-npm-0");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        wait_for(cx, "npm to be refused", &|cx| {
+            store.read(cx).refusals("vue").npm
+        });
+        wait_for(cx, "the decision on disk", &|_| {
+            std::fs::read_to_string(data.join("extensions/state.json"))
+                .is_ok_and(|text| text.contains("\"npm\": true"))
+        });
+        // What it has running goes on. Started afresh (off and on again),
+        // it asks npm once more, is refused and says why; nothing else was
+        // taken from it.
+        resolve(cx).unwrap();
+        store.update(cx, |store, cx| {
+            store.set_off(Origin::Zed, "vue", true, cx);
+            store.set_off(Origin::Zed, "vue", false, cx);
+        });
+        let error = resolve(cx).unwrap_err();
+        assert!(error.contains("refused for this extension"), "{error}");
+        assert!(did(cx).contains(&refused), "{:?}", did(cx));
+        // So is the server that could not be got ready for it.
+        assert!(
+            did(cx).iter().any(|event| matches!(event,
+                extension::Event::Failed(what) if what.starts_with("vue-language-server: "))),
+            "{:?}",
+            did(cx)
+        );
+        // What it did before is still there to read.
+        assert!(did(cx).contains(&npm));
+
+        // Given back with the same button, it works again, and the file
+        // has no trace of the refusal.
+        cx.run_until_parked();
+        let button = bounds_soon(cx, "extension-may-npm-0");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        wait_for(cx, "npm to be allowed", &|cx| {
+            !store.read(cx).refusals("vue").npm
+        });
+        resolve(cx).unwrap();
+        wait_for(cx, "the decision on disk", &|_| {
+            std::fs::read_to_string(data.join("extensions/state.json"))
+                .is_ok_and(|text| !text.contains("refused"))
+        });
+    }
+
+    #[gpui::test]
+    fn a_debug_adapter_of_an_extension_debugs_a_file_of_its_language(cx: &mut TestAppContext) {
+        let _languages = extension_languages();
+        // Zed's real Ruby extension, installed, with a Ruby language that
+        // names `rdbg` as its debugger. (Its grammar here is Vue's: the test
+        // needs a language, not its colors.) `rdbg` is "on the PATH" as a
+        // script that starts the stand-in adapter on the port it is given.
+        let root = db::testing::dir("ws-rdbg").canonicalize().unwrap();
+        let app = root.join("app.rb");
+        std::fs::write(
+            &app,
+            "def add(a, b)\n  sum = a + b\n  sum\nend\nputs add(2, 3)\n",
+        )
+        .unwrap();
+        let data = db::testing::dir("ws-rdbg-data");
+        let installed = data.join("extensions/zed/ruby");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        std::fs::create_dir_all(installed.join("grammars")).unwrap();
+        for file in ["extension.toml", "extension.wasm"] {
+            std::fs::copy(
+                fixtures.join("extension/tests/fixtures/ruby").join(file),
+                installed.join(file),
+            )
+            .unwrap();
+        }
+        std::fs::copy(
+            fixtures.join("syntax/tests/fixtures/vue/vue.wasm"),
+            installed.join("grammars/vue.wasm"),
+        )
+        .unwrap();
+        write_file(
+            &installed.join("languages/ruby/config.toml"),
+            "name = \"Ruby\"\ngrammar = \"vue\"\npath_suffixes = [\"rb\"]\ndebuggers = [\"rdbg\"]\n",
+        );
+        let scratch = db::testing::dir("ws-rdbg-bin");
+        let rdbg = scratch.join("rdbg");
+        let mock = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_dap.py");
+        executable(
+            &rdbg,
+            &format!(
+                "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --port=*) port=\"${{a#--port=}}\";; esac; done\nexec python3 '{}' \"$port\" 127.0.0.1\n",
+                mock.display()
+            ),
+        );
+        cx.executor().allow_parking();
+        let (extensions, debug) = cx.update(|cx| {
+            let extensions = cx.new(|cx| {
+                let mut store =
+                    ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
+                store.world = Some(std::sync::Arc::new(ServerOnPath(
+                    "rdbg",
+                    rdbg.to_string_lossy().into_owned(),
+                )));
+                store
+            });
+            ExtensionStore::set_global(extensions.clone(), cx);
+            extensions.update(cx, |s, cx| s.scan(cx));
+            let debug = cx.new(|_| {
+                crate::debug::DebugStore::new(
+                    data.join("debug"),
+                    crate::debug::AdapterSpec::JsDebug,
+                )
+            });
+            crate::debug::DebugStore::set_global(debug.clone(), cx);
+            (extensions, debug)
+        });
+        let (ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "the extensions folder", &|cx| {
+            extensions.read(cx).loaded
+        });
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(app.clone(), None, window, cx)
+        });
+        wait_for(cx, "the language", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|e| e.read(cx).doc(cx).language_name() == Some("Ruby"))
+        });
+
+        // The extension says it brings the adapter, and the file of its
+        // language can be debugged with it; a file of another cannot.
+        assert_eq!(
+            cx.read(|cx| extensions
+                .read(cx)
+                .find(Origin::Zed, "ruby")
+                .unwrap()
+                .provides()),
+            "1 language, 8 language servers, 1 debug adapter"
+        );
+        let configs = cx.read(|cx| crate::debug_launch::from_extensions(&root, &app, cx));
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "rdbg app.rb");
+        let none =
+            cx.read(|cx| crate::debug_launch::from_extensions(&root, &root.join("a.js"), cx));
+        assert!(none.is_empty());
+
+        // Started, the extension is asked how; the adapter it names is
+        // started as it says and listens where the editor told it to. The
+        // run stops on the breakpoint in the file.
+        debug.update(cx, |s, cx| {
+            s.toggle(&app, 2, cx);
+            s.start(configs[0].clone(), root.clone(), cx)
+        });
+        wait_for(cx, "the pause in app.rb", &|cx| {
+            paused_line(&debug, cx) == Some(2)
+        });
+        assert!(cx.read(|cx| debug.read(cx).state.active()));
+        debug.update(cx, |s, cx| s.stop(cx));
+        cx.run_until_parked();
+        assert!(cx.read(|cx| !debug.read(cx).state.active()));
+
+        // Turned off, the extension debugs nothing.
+        extensions.update(cx, |s, cx| s.set_off(Origin::Zed, "ruby", true, cx));
+        let none = cx.read(|cx| extensions.read(cx).debuggers_for("Ruby"));
+        assert!(none.is_empty());
     }
 }
