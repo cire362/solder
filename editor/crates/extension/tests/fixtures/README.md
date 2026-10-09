@@ -8,7 +8,8 @@ give them a scripted world; nothing is downloaded.
 One for each shape the API has had; the versions in between differ from
 these by what the compiler checks. Vue's is here as the extension that sets
 up a server it does not bring: it adds its plugin to the TypeScript server. Ruby's
-is here for its debug adapter, `rdbg`.
+is here for its debug adapter, `rdbg`. The Postgres context server is here as an
+extension that brings one, and reads the user's settings to start it.
 
 | folder | version | built for API | license | source |
 | --- | --- | --- | --- | --- |
@@ -19,3 +20,4 @@ is here for its debug adapter, `rdbg`.
 | `html` | 0.3.2 | 0.7.0 | Apache-2.0 | https://github.com/zed-industries/zed/tree/main/extensions/html |
 | `vue` | 0.4.0 | 0.7.0 | Apache-2.0 | https://github.com/zed-extensions/vue |
 | `ruby` | 0.16.21 | 0.7.0 | Apache-2.0 | https://github.com/zed-extensions/ruby |
+| `postgres-context-server` | 0.0.5 | 0.7.0 | Apache-2.0 | https://github.com/zed-extensions/postgres-context-server |

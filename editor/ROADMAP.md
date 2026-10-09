@@ -76,6 +76,11 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
       review the diff and merge (commands sandboxed with `sandbox-exec` or `bwrap`)
 - [x] AI review before push (outgoing commits' diff, findings as data, push waits
       only when something is found)
+- [x] Context servers for the agent (MCP): servers named in `settings.json`
+      are started with a task, their tools are offered to the model next to
+      the agent's own, and the first call of each waits for the user
+- [ ] Context servers reached over the network (HTTP), and what a server has
+      besides tools: prompts and resources
 
 ## 7. Debugger, plugins, onboarding
 - [x] Debugger over DAP; one session across browser and server; query timeline
@@ -188,10 +193,10 @@ to build them.
       for a language is started today, and Ruby's lists eight: the user's
       choice per language (`language_servers`, with `!name` to leave one
       out), and Zed's defaults for the languages that need them
-- [ ] Context servers of extensions, in the agent. They are MCP servers
-      (context7, GitHub and Postgres are the most installed), and the agent
-      has no MCP client yet: the client and these servers are one update of
-      their own, after this block
+- [x] Context servers of extensions, in the agent. They are MCP servers
+      (context7, GitHub and Postgres are the most installed): the extension
+      says how to start one and reads the user's settings for it, and the
+      agent uses its tools like those of a server named in `settings.json`
 - [ ] Each new version of Zed's API as it is published (0.8 is the next;
       0.7.0 was still the newest on 2026-10-05)
 

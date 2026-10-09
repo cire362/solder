@@ -188,6 +188,8 @@ fn host_in(
 struct Asked {
     servers: std::collections::BTreeMap<String, ServerOverride>,
     indent: usize,
+    /// What the user set for a context server, by the server's name.
+    context: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 struct GlobalExtensionStore(Entity<ExtensionStore>);
@@ -225,6 +227,11 @@ impl ExtensionStore {
                 *asked.lock().unwrap_or_else(|e| e.into_inner()) = Asked {
                     servers: settings.language_servers.clone(),
                     indent: settings.indent_size,
+                    context: settings
+                        .context_servers
+                        .iter()
+                        .filter_map(|(name, server)| Some((name.clone(), server.settings.clone()?)))
+                        .collect(),
                 };
             }
         };
@@ -309,6 +316,12 @@ impl ExtensionStore {
                 }
                 "language" if asked.indent > 0 => {
                     Some(extension::world::language_settings(asked.indent))
+                }
+                // In the shape Zed's API gives an extension: its own
+                // command is not the user's to set here, its settings are.
+                "context_servers" => {
+                    let settings = asked.context.get(key?)?;
+                    Some(serde_json::json!({ "command": null, "settings": settings }).to_string())
                 }
                 _ => None,
             }
@@ -593,6 +606,60 @@ impl ExtensionStore {
                     })
             })
             .collect()
+    }
+
+    /// The context servers installed extensions bring: the extension's id
+    /// and the server's name.
+    pub fn context_servers(&self) -> Vec<(String, String)> {
+        self.installed
+            .iter()
+            .filter(|extension| {
+                extension.runs_code() && !self.is_off(extension.origin, &extension.id)
+            })
+            .flat_map(|extension| {
+                extension
+                    .context_servers
+                    .iter()
+                    .map(|server| (extension.id.clone(), server.clone()))
+            })
+            .collect()
+    }
+
+    /// Asks the extension how to start its context server. It may install
+    /// the server first, so this runs on a thread of its own.
+    pub fn context_server_command(
+        &mut self,
+        extension: &str,
+        server: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<extension::host::Command, String>> {
+        let Some(extension) = self.find(Origin::Zed, extension).cloned() else {
+            return Task::ready(Err(format!("{extension} is not installed")));
+        };
+        let slot = self.hosts.entry(extension.id.clone()).or_default().clone();
+        let work_dir = install::work_dir(&self.root, &extension.id);
+        let world = self.world.clone();
+        let statuses = self.statuses.clone();
+        let settings = self.settings_for();
+        let gated = self.gated(&extension.id);
+        let server = server.to_string();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("solder-extension".into())
+            .spawn(move || {
+                let answer = host_in(
+                    &slot, &extension, &work_dir, world, statuses, settings, gated,
+                )
+                .and_then(|host| host.context_server_command(&server));
+                let _ = tx.send(answer);
+            });
+        if let Err(error) = spawned {
+            return Task::ready(Err(error.to_string()));
+        }
+        cx.background_executor().spawn(async move {
+            rx.await
+                .unwrap_or_else(|_| Err("The extension stopped without an answer".into()))
+        })
     }
 
     /// The debug adapters installed extensions bring for `language`: the

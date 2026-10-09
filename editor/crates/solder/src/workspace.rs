@@ -7677,6 +7677,233 @@ mod tests {
     }
 
     #[gpui::test]
+    fn the_agent_uses_a_context_servers_tools_after_asking(cx: &mut TestAppContext) {
+        use crate::agent_task::{Entry, Status};
+        // The model calls one tool of a context server twice, then another,
+        // then proposes a plan.
+        let (api, seen) = scripted_model(vec![
+            tool_step("m1", "mcp_notes_echo", serde_json::json!({"text": "hello"})),
+            tool_step("m2", "mcp_notes_echo", serde_json::json!({"text": "again"})),
+            tool_step("m3", "mcp_notes_fail", serde_json::json!({})),
+            tool_step(
+                "p1",
+                "update_plan",
+                serde_json::json!({"steps": [{"text": "Nothing to do"}]}),
+            ),
+        ]);
+        let repo = db::testing::dir("agent-mcp");
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(repo.join("notes.txt"), "plain\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let repo = repo.canonicalize().unwrap();
+        let data = db::testing::dir("agent-mcp-data");
+        let log = data.join("calls.jsonl");
+        cx.executor().allow_parking();
+        let store = cx.update(|cx| {
+            let store = cx.new(|_| {
+                crate::ai_store::AiStore::new(ai::Dirs::new(&data), "http://127.0.0.1:9".into())
+                    .with_scan_dirs(Vec::new())
+                    .for_tests(down_urls())
+            });
+            crate::ai_store::AiStore::set_global(store.clone(), cx);
+            store
+        });
+        let (ws, cx) = setup(cx, repo.clone());
+        // Three servers in the settings: the stand-in, with a variable of
+        // its own; one whose program is not there; one turned off.
+        let mock = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ai/tests/fixtures/mock_mcp.py");
+        let settings = serde_json::json!({ "context_servers": {
+            "notes": {
+                "command": "python3",
+                "args": [mock],
+                "env": { "MOCK_MCP_LOG": log, "MOCK_MCP_KEY": "secret" },
+            },
+            "broken": { "command": "/no/such/server" },
+            "off": { "command": "python3", "args": [mock], "enabled": false },
+        } });
+        cx.update(|_, cx| {
+            cx.set_global(settings::parse_settings(&settings.to_string()).unwrap());
+            crate::mcp_store::McpStore::global(cx)
+                .update(cx, |mcp, _| mcp.env = Some(std::env::vars().collect()));
+        });
+        store.update(cx, |s, cx| {
+            s.load(cx);
+            s.add_provider("Mock".into(), api.clone(), None, cx);
+        });
+        wait_for(cx, "the provider", &|cx| {
+            store
+                .read(cx)
+                .provider("custom-mock")
+                .is_some_and(|p| !p.models().is_empty())
+        });
+        store.update(cx, |s, cx| {
+            s.choose(
+                ai::Role::Chat,
+                crate::ai_providers::ModelRef {
+                    provider: "custom-mock".into(),
+                    model: "agent-model".into(),
+                },
+                cx,
+            )
+        });
+        // No server runs before a task needs one.
+        assert!(cx.read(|cx| {
+            crate::mcp_store::McpStore::global_if_any(cx)
+                .is_none_or(|mcp| mcp.read(cx).servers.is_empty())
+        }));
+
+        cx.simulate_keystrokes("secondary-shift-i");
+        cx.simulate_input("Look at the notes");
+        cx.simulate_keystrokes("enter");
+        let panel = cx.read(|cx| ws.read(cx).agent.clone());
+        let asked = |cx: &App, what: &str| {
+            let task = panel.read(cx).task.as_ref()?.read(cx);
+            match &task.status {
+                Status::AwaitingApproval { command, .. } => Some(command.contains(what)),
+                _ => None,
+            }
+        };
+        // The first call of a tool waits for the user: it runs where the
+        // server does, not in the sandbox.
+        wait_for(cx, "the question about echo", &|cx| {
+            asked(cx, "echo of notes") == Some(true)
+        });
+        let task = cx.read(|cx| panel.read(cx).task.clone().unwrap());
+        assert!(!log.exists());
+        // The model was offered the tools of the server that runs, next
+        // to the agent's own, and none of the one turned off.
+        let tools: Vec<String> = seen.lock().unwrap()[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        for name in [
+            "read_file",
+            "mcp_notes_echo",
+            "mcp_notes_fail",
+            "mcp_notes_data",
+        ] {
+            assert!(tools.contains(&name.to_string()), "{name}: {tools:?}");
+        }
+        assert!(!tools.iter().any(|name| name.starts_with("mcp_off")));
+        // What the server says about itself is part of the instructions.
+        let system = seen.lock().unwrap()[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            system.contains("About notes: Ask before you look."),
+            "{system}"
+        );
+        // The server that did not start is said, and the task went on.
+        let notes = |cx: &App| -> Vec<String> {
+            task.read(cx)
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    Entry::Note(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(
+            cx.read(|cx| notes(cx)).iter().any(|note| note.starts_with(
+                "The context server broken did not start: Could not start /no/such/server"
+            )),
+            "{:?}",
+            cx.read(|cx| notes(cx))
+        );
+
+        // Allowed, it runs, and the second call of the same tool does not
+        // ask. Another tool does.
+        task.update(cx, |task, cx| task.decide(true, cx));
+        wait_for(cx, "the question about fail", &|cx| {
+            asked(cx, "fail of notes") == Some(true)
+        });
+        let calls: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                serde_json::json!(["echo", {"text": "hello"}, "secret"]),
+                serde_json::json!(["echo", {"text": "again"}, "secret"]),
+            ]
+        );
+        let ran: Vec<(String, String)> = cx.read(|cx| {
+            task.read(cx)
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    Entry::Tool { title, output, .. } => Some((title.clone(), output.clone())),
+                    _ => None,
+                })
+                .collect()
+        });
+        assert_eq!(
+            ran[0],
+            ("Called echo of notes".into(), "hello\n[image]".into())
+        );
+        assert_eq!(ran[1].1, "again\n[image]");
+
+        // The AI tab lists the servers of the settings, each with how it
+        // is doing.
+        cx.dispatch_action(ShowAi);
+        let ai_panel = cx.read(|cx| ws.read(cx).ai_panel.clone());
+        ai_panel.update(cx, |panel, cx| {
+            panel.show(crate::ai_panel::View::Servers, cx)
+        });
+        for row in ["context-server-0", "context-server-1", "context-server-2"] {
+            bounds_soon(cx, row);
+        }
+
+        // Refused, it is not called, and the model is told.
+        task.update(cx, |task, cx| task.decide(false, cx));
+        wait_for(cx, "the plan", &|cx| {
+            task.read(cx).status == Status::AwaitingPlan
+        });
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+        let last = seen.lock().unwrap().last().unwrap().to_string();
+        assert!(last.contains("The user declined to run"), "{last}");
+        // The server stays for the next task; changing the settings stops
+        // the ones that are no longer wanted.
+        let running = |cx: &App| {
+            crate::mcp_store::McpStore::global_if_any(cx)
+                .unwrap()
+                .read(cx)
+                .servers
+                .iter()
+                .filter(|entry| matches!(entry.state, crate::mcp_store::State::Running(..)))
+                .count()
+        };
+        assert_eq!(cx.read(|cx| running(cx)), 1);
+        cx.update(|_, cx| {
+            cx.set_global(Settings::default());
+            let ready = crate::mcp_store::McpStore::global(cx)
+                .update(cx, |mcp, cx| mcp.start_all(&repo, cx));
+            drop(ready);
+        });
+        assert_eq!(cx.read(|cx| running(cx)), 0);
+    }
+
+    #[gpui::test]
     fn agent_plans_works_asks_and_merges_on_its_own_branch(cx: &mut TestAppContext) {
         use crate::agent_task::Status;
         let (api, seen) = scripted_model(vec![
@@ -10294,5 +10521,144 @@ brackets = [
         extensions.update(cx, |s, cx| s.set_off(Origin::Zed, "ruby", true, cx));
         let none = cx.read(|cx| extensions.read(cx).debuggers_for("Ruby"));
         assert!(none.is_empty());
+    }
+
+    #[gpui::test]
+    fn an_extension_brings_a_context_server_and_reads_its_settings(cx: &mut TestAppContext) {
+        use crate::mcp_store::{McpStore, State};
+        // Zed's real Postgres context server extension, installed. Its
+        // code installs the server from npm and starts it with Node, which
+        // here is a script that runs the stand-in server and hands it the
+        // address the extension read from the user's settings.
+        let root = db::testing::dir("ws-pg").canonicalize().unwrap();
+        let data = db::testing::dir("ws-pg-data");
+        let installed = data.join("extensions/zed/postgres-context-server");
+        std::fs::create_dir_all(&installed).unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../extension/tests/fixtures/postgres-context-server");
+        for file in ["extension.toml", "extension.wasm"] {
+            std::fs::copy(fixtures.join(file), installed.join(file)).unwrap();
+        }
+        let scratch = db::testing::dir("ws-pg-bin");
+        let log = scratch.join("calls.jsonl");
+        let node = scratch.join("node");
+        let mock = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ai/tests/fixtures/mock_mcp.py");
+        executable(
+            &node,
+            &format!(
+                "#!/bin/sh\nMOCK_MCP_LOG='{}' MOCK_MCP_KEY=\"$DATABASE_URL\" exec python3 '{}'\n",
+                log.display(),
+                mock.display()
+            ),
+        );
+        cx.executor().allow_parking();
+        let extensions = cx.update(|cx| {
+            let store = cx.new(|cx| {
+                let mut store =
+                    ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
+                store.world = Some(std::sync::Arc::new(VueWorld {
+                    node: node.to_string_lossy().into_owned(),
+                    settings: store.settings_for(),
+                }));
+                store
+            });
+            ExtensionStore::set_global(store.clone(), cx);
+            store.update(cx, |s, cx| s.scan(cx));
+            store
+        });
+        let (_ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "the extensions folder", &|cx| {
+            extensions.read(cx).loaded
+        });
+        assert_eq!(
+            cx.read(|cx| extensions
+                .read(cx)
+                .find(Origin::Zed, "postgres-context-server")
+                .unwrap()
+                .provides()),
+            "1 context server"
+        );
+        let mcp = cx.update(|_, cx| {
+            let mcp = McpStore::global(cx);
+            mcp.update(cx, |mcp, _| mcp.env = Some(std::env::vars().collect()));
+            mcp
+        });
+        // Started as an agent task starts them, and waited for: each ends
+        // up running or failed.
+        let start = |cx: &mut VisualTestContext| {
+            mcp.update(cx, |mcp, cx| mcp.start_all(&root, cx)).detach();
+            wait_for(cx, "the context servers", &|cx| {
+                !mcp.read(cx)
+                    .servers
+                    .iter()
+                    .any(|entry| matches!(entry.state, State::Starting))
+            });
+        };
+        let state = |cx: &mut VisualTestContext| {
+            cx.read(|cx| {
+                let mcp = mcp.read(cx);
+                assert_eq!(mcp.servers.len(), 1);
+                let entry = &mcp.servers[0];
+                assert_eq!(entry.extension.as_deref(), Some("postgres-context-server"));
+                match &entry.state {
+                    State::Running(_, tools) => format!("{} tools", tools.len()),
+                    State::Failed(why) => why.to_string(),
+                    _ => "not started".into(),
+                }
+            })
+        };
+
+        // The server is listed with no line in the settings. Started, the
+        // extension says what it needs and does not have.
+        start(cx);
+        assert_eq!(state(cx), "missing `database_url` setting");
+        // Its code installed the server on the way, which is written down.
+        assert!(
+            cx.read(|cx| extensions.read(cx).did("postgres-context-server"))
+                .contains(&extension::Event::Installed(
+                    "@zeddotdev/postgres-context-server".into()
+                ))
+        );
+
+        // With the address in the settings, under the server's name, it
+        // starts, and the server is told the address.
+        let settings = serde_json::json!({ "context_servers": {
+            "postgres-context-server": { "settings": { "database_url": "postgresql://localhost/app" } },
+        } });
+        cx.update(|_, cx| cx.set_global(settings::parse_settings(&settings.to_string()).unwrap()));
+        cx.run_until_parked();
+        start(cx);
+        assert_eq!(state(cx), "4 tools");
+        let tools = cx.read(|cx| mcp.read(cx).tools());
+        let echo = tools
+            .iter()
+            .find(|tool| tool.spec.name == "mcp_postgres-context-server_echo")
+            .expect("the server's tool under a name of its own");
+        let said = echo
+            .server
+            .call(
+                &echo.tool,
+                serde_json::json!({ "text": "select 1" }),
+                crate::mcp_store::CALL,
+            )
+            .unwrap();
+        assert_eq!(said.0, "select 1\n[image]");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("postgresql://localhost/app"), "{logged}");
+
+        // Turned off in the settings, or with its extension turned off, it
+        // is stopped and gone from the list.
+        let off = serde_json::json!({ "context_servers": {
+            "postgres-context-server": { "enabled": false },
+        } });
+        cx.update(|_, cx| cx.set_global(settings::parse_settings(&off.to_string()).unwrap()));
+        start(cx);
+        assert!(cx.read(|cx| mcp.read(cx).servers.is_empty()));
+        cx.update(|_, cx| cx.set_global(Settings::default()));
+        extensions.update(cx, |s, cx| {
+            s.set_off(Origin::Zed, "postgres-context-server", true, cx)
+        });
+        start(cx);
+        assert!(cx.read(|cx| mcp.read(cx).servers.is_empty()));
     }
 }

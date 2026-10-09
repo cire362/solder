@@ -1,0 +1,25 @@
+id = "postgres-context-server"
+name = "Postgres Context Server"
+version = "0.0.5"
+schema_version = 1
+description = "Model Context Server for PostgreSQL"
+repository = "https://github.com/zed-extensions/postgres-context-server"
+authors = ["Max Brunsfeld <max@zed.dev>"]
+themes = []
+icon_themes = []
+languages = []
+capabilities = []
+
+[lib]
+kind = "Rust"
+version = "0.7.0"
+
+[grammars]
+
+[language_servers]
+
+[context_servers.postgres-context-server]
+
+[slash_commands]
+
+[indexed_docs_providers]
