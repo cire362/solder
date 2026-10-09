@@ -5,7 +5,26 @@ use gpui::{
     AnyView, ClickEvent, Div, ElementId, Hsla, SharedString, Stateful, Window, div, prelude::*, px,
 };
 
-use crate::theme::{Theme, UI_FONT_SIZE};
+use crate::theme::{ActiveTheme, Theme, UI_FONT_SIZE};
+
+pub struct Tooltip(pub String);
+
+impl gpui::Render for Tooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .max_w(crate::theme::text(400.))
+            .px_2()
+            .py_1()
+            .rounded(theme.shape.control)
+            .border(theme.shape.border)
+            .border_color(theme.line)
+            .bg(theme.bg_elev)
+            .text_color(theme.fg)
+            .text_size(UI_FONT_SIZE)
+            .child(self.0.clone())
+    }
+}
 
 /// A bordered box around a single-line editor.
 pub fn text_field(editor: impl Into<AnyView>, focused: bool, theme: &Theme) -> Div {

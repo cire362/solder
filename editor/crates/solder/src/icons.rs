@@ -250,7 +250,14 @@ pub fn panel(panel: Panel) -> &'static str {
     }
 }
 
-pub fn item(item: Item) -> &'static str {
+pub fn named(name: &str) -> Option<&'static str> {
+    PICTURES
+        .iter()
+        .filter_map(|(path, _)| path.strip_prefix("icons/")?.strip_suffix(".svg"))
+        .find(|icon| *icon == name)
+}
+
+pub fn item(item: &Item) -> &'static str {
     match item {
         Item::Project => "folder",
         Item::File => "file",
@@ -263,6 +270,7 @@ pub fn item(item: Item) -> &'static str {
         Item::Connection => "database",
         Item::Plugins => "puzzle-piece",
         Item::Performance => "gauge",
+        Item::Button { .. } => "gear",
     }
 }
 
@@ -312,7 +320,7 @@ mod tests {
         for name in Panel::ALL
             .into_iter()
             .map(panel)
-            .chain(Item::ALL.into_iter().map(item))
+            .chain(Item::ALL.iter().map(item))
             .chain(
                 ["Run", "Stop", "Save", "Copy", "Remove", "Install"]
                     .into_iter()

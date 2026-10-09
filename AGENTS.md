@@ -92,7 +92,9 @@ Never guess a signature.
   nothing left to show leaves through `Workspace::panel_gone`. What the
   title bar and the status bar say is `layout::Item`s, drawn by
   `Workspace::bar_item`: a new thing to say there is a new item, not a
-  line in the bar's own code. A change made
+  line in the bar's own code. A button on a bar is an item too
+  (`Item::Button`), and runs its command through `bar_commands::run`, the
+  same commands the palette and the keymap have. A change made
   by hand in the window is written back to the file (`layout::keep` for a
   size, `layout::put` for the rest): one key at a time and one write after another, and
   the file is not read while a write of ours is on its way. Global state lives in `Settings`, `Theme`, `Perf` and

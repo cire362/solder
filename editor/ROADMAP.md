@@ -281,8 +281,12 @@ file, so the two never disagree. It starts after the Zed items of phase 8.
 - [x] The title bar and the status bar as lists of items: which are there, in
       what order, on which side. The tab bar: above or below the editor, or
       none. Eleven items, two of them new (`file`, `branch`)
-- [ ] An item is drawn as a word, an icon or both, and its command and icon
-      can be changed, so a button for any command can be put on a bar
+- [x] An item is drawn as a word, an icon or both, and its command and icon
+      can be changed, so a button for any command can be put on a bar.
+      `items` in the layout file, by the item's name; a name that is no
+      item of the editor's is a button. The menu of an item sets how it is
+      drawn and adds or removes a button; the icon and the command of one
+      are changed in the file
 - [x] The interface font, its size and how dense rows are, in
       `settings.json` (`ui_font_family`, `ui_font_size`, `ui_density`)
 

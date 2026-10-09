@@ -965,6 +965,45 @@ they need no icon files or network connection at run time. They use the text
 color of their control and scale with `ui_font_size`. File icons still come
 from the extension icon theme selected with `icon_theme`.
 
+An item of a bar is drawn as a word, an icon or both, and a bar can hold a
+button for any command. Both are under `items` in the layout file, by the
+item's name:
+
+```json
+{
+  "status_bar": { "left": ["position", "language"], "right": [{ "button": "term" }] },
+  "items": {
+    "position": { "display": "icon" },
+    "language": { "display": "text" },
+    "term": {
+      "label": "Terminal",
+      "icon": "terminal-window",
+      "command": "workspace::ToggleTerminal"
+    }
+  }
+}
+```
+
+`display` is `text`, `icon` or `both`, which is how an item comes. `icon` is
+one of the embedded icons by its Phosphor name (`gear`, `play`, `git-branch`,
+`magnifying-glass`, and the rest of the folder `assets/icons/phosphor`).
+`label` is the word it shows. `command` is what a click runs, written as in
+`keymap.json`: a command's name, `["name", arguments]` for one that takes
+them, or `{ "plugin": "...", "command": "..." }` for a plugin's command.
+
+A name under `items` that is no item of the editor's is a button, and a bar
+holds it as `{ "button": "name" }`. An item of the editor's own takes the same
+keys: with a `label` or a `command` it shows that word and runs that command
+in place of its own. An icon alone says what it is when the pointer rests on
+it.
+
+By hand, the menu of an item has **Text**, **Icon** and **Text and icon**,
+**Add command button**, which lists every command and puts a button for the
+chosen one at the end of that bar, and for a button **Remove button**. **Edit
+icon or command** opens the file. A button with no command, an icon that is
+not in the app or a command that does not exist is a mistake, said in the
+status bar, and the layout that was right stays.
+
 `place` of `tab_bar` is where the tabs of the open files are: `top`, `bottom`
 or `none`. With none, files are changed by the keys and the file finder.
 

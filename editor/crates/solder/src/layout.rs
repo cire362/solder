@@ -213,7 +213,7 @@ pub struct Low {
 
 /// What a bar can hold. Each says one thing about the window, and is not
 /// drawn while it has nothing to say.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Item {
     /// The project's name.
@@ -236,6 +236,33 @@ pub enum Item {
     Plugins,
     /// The numbers of `show_performance_hud`.
     Performance,
+    /// A button for a command, written `{ "button": "name" }`. What it
+    /// runs and how it looks is under that name in `items`.
+    #[serde(untagged)]
+    Button {
+        button: String,
+    },
+}
+
+// Read by hand: left to serde, a name that is no item was said to match
+// "no variant", without the name that would tell the user which line.
+impl<'de> Deserialize<'de> for Item {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Written {
+            Name(String),
+            Button { button: String },
+        }
+        let unknown = "an item's name or { \"button\": \"name\" }";
+        match Written::deserialize(deserializer).map_err(|_| serde::de::Error::custom(unknown))? {
+            Written::Button { button } => Ok(Item::Button { button }),
+            Written::Name(name) => Item::ALL
+                .into_iter()
+                .find(|item| item.id() == name)
+                .ok_or_else(|| serde::de::Error::custom(format!("no item \u{201c}{name}\u{201d}"))),
+        }
+    }
 }
 
 impl Item {
@@ -253,7 +280,7 @@ impl Item {
         Item::Performance,
     ];
 
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> &str {
         match self {
             Item::Project => "Project",
             Item::File => "File",
@@ -266,11 +293,12 @@ impl Item {
             Item::Connection => "Connection",
             Item::Plugins => "Plugins",
             Item::Performance => "Performance",
+            Item::Button { button } => button,
         }
     }
 
     /// Its name in the file, and in the names tests find it by.
-    pub fn id(self) -> &'static str {
+    pub fn id(&self) -> &str {
         match self {
             Item::Project => "project",
             Item::File => "file",
@@ -283,8 +311,40 @@ impl Item {
             Item::Connection => "connection",
             Item::Plugins => "plugins",
             Item::Performance => "performance",
+            Item::Button { button } => button,
         }
     }
+}
+
+/// How an item of a bar is drawn: as a word, an icon or both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Display {
+    Text,
+    Icon,
+    #[default]
+    Both,
+}
+
+/// The same action notation as a key binding; plugins keep their owner.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Command {
+    Action(String),
+    Args((String, serde_json::Value)),
+    Plugin { plugin: String, command: String },
+}
+
+/// What `items` says of one item: how it is drawn, and for a button the
+/// command it runs. On an item of the editor's own, a command or a label
+/// takes the place of what the item did and said.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ItemStyle {
+    pub display: Display,
+    pub icon: Option<String>,
+    pub label: Option<String>,
+    pub command: Option<Command>,
 }
 
 /// One of the four lists an item can be moved into.
@@ -414,6 +474,9 @@ pub struct Layout {
     /// open on its first panel and the others are closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open: Option<Vec<Panel>>,
+    /// Appearance and command overrides, including named buttons.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub items: BTreeMap<String, ItemStyle>,
 }
 
 impl Default for Layout {
@@ -453,6 +516,7 @@ impl Default for Layout {
             },
             hidden: Vec::new(),
             open: None,
+            items: BTreeMap::new(),
         }
     }
 }
@@ -674,10 +738,125 @@ impl Layout {
         }
     }
 
-    pub fn item_place(&self, item: Item) -> Option<BarEnd> {
+    pub fn item_place(&self, item: impl std::borrow::Borrow<Item>) -> Option<BarEnd> {
         BarEnd::ALL
             .into_iter()
-            .find(|end| self.items(*end).contains(&item))
+            .find(|end| self.items(*end).contains(item.borrow()))
+    }
+
+    pub fn style(&self, item: &Item) -> &ItemStyle {
+        static STANDARD: LazyLock<ItemStyle> = LazyLock::new(ItemStyle::default);
+        self.items.get(item.id()).unwrap_or(&STANDARD)
+    }
+
+    pub fn styled(mut self, item: &Item, display: Display) -> Self {
+        self.items.entry(item.id().to_owned()).or_default().display = display;
+        self
+    }
+
+    /// Every item there is: the editor's own, then the buttons `items`
+    /// names.
+    pub fn named_items(&self) -> Vec<Item> {
+        let buttons = self
+            .items
+            .keys()
+            .filter(|name| !Item::ALL.iter().any(|item| item.id() == *name))
+            .map(|name| Item::Button {
+                button: name.clone(),
+            });
+        Item::ALL.into_iter().chain(buttons).collect()
+    }
+
+    /// The layout without a button: off the bars, and out of `items`, so
+    /// that it is not offered among the hidden ones either.
+    pub fn without_button(self, button: &str) -> Self {
+        let mut layout = self.hiding_item(Item::Button {
+            button: button.to_owned(),
+        });
+        layout.items.remove(button);
+        layout
+    }
+
+    pub fn add_button(mut self, label: String, command: Command, end: BarEnd) -> Self {
+        let button = (1..)
+            .map(|n| format!("button-{n}"))
+            .find(|name| !self.items.contains_key(name))
+            .unwrap();
+        self.items.insert(
+            button.clone(),
+            ItemStyle {
+                label: Some(label),
+                command: Some(command),
+                icon: Some("gear".into()),
+                ..Default::default()
+            },
+        );
+        self.moved_item(Item::Button { button }, end, None)
+    }
+
+    fn check_items(&self) -> Result<(), String> {
+        for (name, style) in &self.items {
+            let known = Item::ALL.iter().any(|item| item.id() == name);
+            if !known
+                && (name.is_empty()
+                    || name.len() > 80
+                    || !name
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || "-_".contains(c))
+                    || style.command.is_none())
+            {
+                return Err(format!(
+                    "{FILE}: item {name}: a button needs a name and command"
+                ));
+            }
+            if style
+                .icon
+                .as_deref()
+                .is_some_and(|icon| crate::icons::named(icon).is_none())
+            {
+                return Err(format!("{FILE}: item {name}: unknown icon"));
+            }
+            if style
+                .label
+                .as_ref()
+                .is_some_and(|label| label.trim().is_empty() || label.len() > 256)
+            {
+                return Err(format!("{FILE}: item {name}: use a short label"));
+            }
+        }
+        for end in BarEnd::ALL {
+            for item in self.items(end) {
+                if let Item::Button { button } = item
+                    && (Item::ALL.iter().any(|item| item.id() == button)
+                        || !self.items.contains_key(button))
+                {
+                    return Err(format!("{FILE}: unknown button {button}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_commands(&self, cx: &App) -> Result<(), String> {
+        for (name, style) in &self.items {
+            let action = match &style.command {
+                Some(Command::Action(action)) => Some((action, None)),
+                Some(Command::Args((action, args))) => Some((action, Some(args.clone()))),
+                Some(Command::Plugin { plugin, command })
+                    if plugin.is_empty() || command.is_empty() =>
+                {
+                    return Err(format!(
+                        "{FILE}: item {name}: a plugin command needs its owner and id"
+                    ));
+                }
+                _ => None,
+            };
+            if let Some((action, args)) = action {
+                cx.build_action(action, args)
+                    .map_err(|error| format!("{FILE}: item {name}: {error}"))?;
+            }
+        }
+        Ok(())
     }
 
     fn items_mut(&mut self, end: BarEnd) -> &mut Vec<Item> {
@@ -695,16 +874,16 @@ impl Layout {
     pub fn hiding_item(self, item: Item) -> Self {
         let mut layout = self.fitted();
         for end in BarEnd::ALL {
-            layout.items_mut(end).retain(|other| *other != item);
+            layout.items_mut(end).retain(|other| other != &item);
         }
         layout
     }
 
     pub fn moved_item(self, item: Item, to: BarEnd, before: Option<Item>) -> Self {
-        if before == Some(item) {
+        if before.as_ref() == Some(&item) {
             return self;
         }
-        let mut layout = self.hiding_item(item);
+        let mut layout = self.hiding_item(item.clone());
         let items = layout.items_mut(to);
         let at = before
             .and_then(|before| items.iter().position(|other| *other == before))
@@ -825,7 +1004,7 @@ impl Layout {
                 items.retain(|item| {
                     let keep = !named.contains(item);
                     if keep {
-                        named.push(*item);
+                        named.push(item.clone());
                     }
                     keep
                 });
@@ -835,8 +1014,8 @@ impl Layout {
             end.get_or_insert_with(|| {
                 standard
                     .iter()
-                    .copied()
                     .filter(|item| !named.contains(item))
+                    .cloned()
                     .collect()
             });
         }
@@ -866,9 +1045,9 @@ pub fn parse(source: &str) -> Result<Layout, String> {
     if stripped.trim().is_empty() {
         return Ok(Layout::default());
     }
-    serde_json::from_str::<Layout>(&stripped)
-        .map(Layout::fitted)
-        .map_err(|e| format!("{FILE}: {e}"))
+    let layout = serde_json::from_str::<Layout>(&stripped).map_err(|e| format!("{FILE}: {e}"))?;
+    layout.check_items()?;
+    Ok(layout.fitted())
 }
 
 /// The file a user starts from: every part with the size it has now.
@@ -901,6 +1080,7 @@ pub fn reload_from(dir: &Path, cx: &mut App) -> Option<String> {
         let path = layout_path(dir, choices.active.as_deref());
         let source = read(&path, choices.active.is_none())?;
         let layout = parse_at(&path, &source)?;
+        layout.check_commands(cx)?;
         let switched = cx.global::<Home>().choices.active != choices.active;
         cx.global_mut::<Home>().choices = choices;
         Ok((layout, switched))
@@ -972,6 +1152,10 @@ pub fn put(layout: Layout, cx: &mut App) {
     }
     if layout.open != old.open {
         changed.push(("open", serde_json::to_value(&layout.open)));
+    }
+    // A new button's settings must reach the file before a bar names it.
+    if layout.items != old.items {
+        changed.push(("items", serde_json::to_value(&layout.items)));
     }
     if layout.title_bar != old.title_bar {
         changed.push(("title_bar", serde_json::to_value(&layout.title_bar)));
@@ -1424,6 +1608,108 @@ mod tests {
             error.starts_with("layout.json") && error.contains("clock"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn an_item_is_a_word_an_icon_or_both_and_a_button_runs_a_command() {
+        use Item::*;
+        let button = |name: &str| Button {
+            button: name.into(),
+        };
+        let layout = parse(
+            r#"{
+              "status_bar": { "left": ["position", { "button": "term" }], "right": ["language"] },
+              "items": {
+                "position": { "display": "icon" },
+                "language": { "display": "text", "icon": "code", "label": "Lang",
+                              "command": "workspace::ToggleTerminal" },
+                "term": { "label": "Terminal", "icon": "terminal-window",
+                          "command": ["workspace::SwitchLayout", { "name": "Review" }] },
+                "plug": { "display": "icon", "command": { "plugin": "todo", "command": "list" } }
+              }
+            }"#,
+        )
+        .unwrap();
+        // A button is an item like the others, by the name it has.
+        assert_eq!(layout.status_bar.left(), [Position, button("term")]);
+        assert_eq!(layout.item_place(button("term")), Some(BarEnd::StatusLeft));
+        // How each is drawn; one the file says nothing of is both.
+        assert_eq!(layout.style(&Position).display, Display::Icon);
+        assert_eq!(layout.style(&Indent), &ItemStyle::default());
+        assert_eq!(ItemStyle::default().display, Display::Both);
+        let language = layout.style(&Language);
+        assert_eq!(language.label.as_deref(), Some("Lang"));
+        assert_eq!(
+            language.command,
+            Some(Command::Action("workspace::ToggleTerminal".into()))
+        );
+        // A command is written as in a keymap, or names a plugin's.
+        assert!(matches!(
+            &layout.style(&button("term")).command,
+            Some(Command::Args((name, args)))
+                if name == "workspace::SwitchLayout" && args["name"] == "Review"
+        ));
+        assert!(matches!(
+            &layout.style(&button("plug")).command,
+            Some(Command::Plugin { plugin, command }) if plugin == "todo" && command == "list"
+        ));
+        // A button on no bar is hidden, and offered with the hidden ones.
+        assert_eq!(layout.item_place(button("plug")), None);
+        assert!(layout.named_items().contains(&button("plug")));
+        assert_eq!(parse(&file(&layout)).unwrap(), layout);
+
+        // By hand: how an item is drawn, a new button, and its removal.
+        let layout = layout.styled(&Position, Display::Text);
+        assert_eq!(layout.style(&Position).display, Display::Text);
+        let command = Command::Action("workspace::ToggleSidebar".into());
+        let layout = layout
+            .add_button("Toggle sidebar".into(), command.clone(), BarEnd::TitleRight)
+            .add_button("Again".into(), command.clone(), BarEnd::TitleRight);
+        assert_eq!(
+            layout.title_bar.right(),
+            [button("button-1"), button("button-2")]
+        );
+        let made = layout.style(&button("button-1"));
+        assert_eq!(made.label.as_deref(), Some("Toggle sidebar"));
+        assert_eq!(made.command, Some(command));
+        assert_eq!(parse(&file(&layout)).unwrap(), layout);
+        let layout = layout.without_button("button-1");
+        assert_eq!(layout.title_bar.right(), [button("button-2")]);
+        assert!(!layout.items.contains_key("button-1"));
+        assert!(!layout.named_items().contains(&button("button-1")));
+        assert_eq!(parse(&file(&layout)).unwrap(), layout);
+
+        // Mistakes are said with the name of what is wrong.
+        for (source, says) in [
+            // A button with nothing to run.
+            (r#"{ "items": { "save": { "label": "Save" } } }"#, "save"),
+            (
+                r#"{ "items": { "position": { "icon": "nope" } } }"#,
+                "unknown icon",
+            ),
+            (r#"{ "items": { "position": { "label": "  " } } }"#, "label"),
+            // A bar names a button `items` does not have.
+            (
+                r#"{ "status_bar": { "left": [{ "button": "ghost" }] } }"#,
+                "ghost",
+            ),
+            // A button may not take the name of an item of the editor's.
+            (
+                r#"{ "status_bar": { "left": [{ "button": "position" }] } }"#,
+                "position",
+            ),
+            (r#"{ "status_bar": { "left": [3] } }"#, "item"),
+            (
+                r#"{ "items": { "position": { "display": "loud" } } }"#,
+                "loud",
+            ),
+        ] {
+            let error = parse(source).unwrap_err();
+            assert!(
+                error.starts_with("layout.json") && error.contains(says),
+                "{error}"
+            );
+        }
     }
 
     #[test]

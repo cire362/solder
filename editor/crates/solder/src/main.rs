@@ -7,6 +7,7 @@ mod ai_providers;
 mod ai_review;
 mod ai_store;
 mod api_panel;
+mod bar_commands;
 mod buffer_search;
 mod chat_panel;
 mod command_palette;

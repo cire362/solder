@@ -32,7 +32,7 @@ use crate::{
     go_to_line::GoToLine as GoToLineDelegate,
     inline_edit::{InlineEdit, InlineEditEvent},
     key_layout_picker::{KeyLayoutPicker, SwitchKeyLayout},
-    layout::{self, BarEnd, Item, Layout, Panel, Part, Place, TabBar, TabsAt},
+    layout::{self, BarEnd, Display, Item, Layout, Panel, Part, Place, TabBar, TabsAt},
     layout_picker::{LayoutPicker, SwitchLayout},
     locations::{CodeActionPicker, LocationPicker, RenamePrompt},
     lsp_store::{LspStore, from_range},
@@ -298,10 +298,35 @@ struct DraggedPanel(Panel);
 /// What follows the pointer then.
 struct DraggedTab(Panel);
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DraggedItem(Item);
 
 struct DraggedBarItem(Item);
+
+struct BarPart {
+    text: String,
+    id: Option<(&'static str, usize)>,
+    color: Option<gpui::Hsla>,
+    action: Option<Box<dyn gpui::Action>>,
+}
+
+impl BarPart {
+    fn render(self, clickable: bool, theme: &crate::theme::Theme) -> AnyElement {
+        let d = div()
+            .when_some(self.color, |d, color| d.text_color(color))
+            .child(self.text);
+        match self.action.filter(|_| clickable) {
+            Some(action) => d
+                .id(self.id.unwrap())
+                .px_1p5()
+                .rounded(theme.shape.token)
+                .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+                .into_any_element(),
+            None => d.into_any_element(),
+        }
+    }
+}
 
 impl Render for DraggedBarItem {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -318,8 +343,8 @@ impl Render for DraggedBarItem {
             .text_size(UI_FONT_SIZE)
             .text_color(theme.fg)
             .gap_1p5()
-            .child(crate::icons::draw(crate::icons::item(self.0)))
-            .child(self.0.label())
+            .child(crate::icons::draw(crate::icons::item(&self.0)))
+            .child(self.0.label().to_owned())
     }
 }
 
@@ -1844,7 +1869,7 @@ impl Workspace {
     }
 
     fn render_bar_menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let (position, end, selected) = self.bar_menu?;
+        let (position, end, selected) = self.bar_menu.clone()?;
         let theme = cx.theme().clone();
         let layout = Layout::get(cx).clone();
         let separator = || {
@@ -1856,41 +1881,108 @@ impl Workspace {
         };
         let mut items = Vec::new();
         if let Some(item) = selected {
+            let hidden = item.clone();
             items.push(Self::menu_item(
                 "bar-menu-hide".into(),
-                format!("Hide {}", item.label()),
+                format!(
+                    "Hide {}",
+                    layout.style(&item).label.as_deref().unwrap_or(item.label())
+                ),
                 Box::new(move |_, _, cx| {
-                    layout::put(Layout::get(cx).clone().hiding_item(item), cx);
+                    layout::put(Layout::get(cx).clone().hiding_item(hidden.clone()), cx);
                 }),
                 cx,
             ));
             for to in BarEnd::ALL {
-                if layout.item_place(item) != Some(to) {
+                if layout.item_place(&item) != Some(to) {
+                    let item = item.clone();
                     items.push(Self::menu_item(
                         format!("bar-menu-move-{}", to.id()),
                         format!("Move to {}", to.label()),
                         Box::new(move |_, _, cx| {
-                            layout::put(Layout::get(cx).clone().moved_item(item, to, None), cx);
+                            layout::put(
+                                Layout::get(cx).clone().moved_item(item.clone(), to, None),
+                                cx,
+                            );
                         }),
                         cx,
                     ));
                 }
             }
             items.push(separator());
+            for (display, id, label) in [
+                (Display::Text, "text", "Text"),
+                (Display::Icon, "icon", "Icon"),
+                (Display::Both, "both", "Text and icon"),
+            ] {
+                let item = item.clone();
+                items.push(Self::menu_item(
+                    format!("bar-menu-{id}"),
+                    label.into(),
+                    Box::new(move |_, _, cx| {
+                        layout::put(Layout::get(cx).clone().styled(&item, display), cx);
+                    }),
+                    cx,
+                ));
+            }
+            items.push(Self::menu_item(
+                "bar-menu-edit".into(),
+                "Edit icon or command".into(),
+                Box::new(|this, window, cx| {
+                    this.open_layout(&OpenLayout, window, cx);
+                }),
+                cx,
+            ));
+            if let Item::Button { button } = &item {
+                let button = button.clone();
+                items.push(Self::menu_item(
+                    "bar-menu-remove".into(),
+                    "Remove button".into(),
+                    Box::new(move |_, _, cx| {
+                        layout::put(Layout::get(cx).clone().without_button(&button), cx);
+                    }),
+                    cx,
+                ));
+            }
+            items.push(separator());
         }
-        for hidden in Item::ALL {
-            if layout.item_place(hidden).is_none() {
+        for hidden in layout.named_items() {
+            if layout.item_place(&hidden).is_none() {
                 items.push(Self::menu_item(
                     format!("bar-menu-show-{}", hidden.id()),
-                    format!("Show {}", hidden.label()),
+                    format!(
+                        "Show {}",
+                        layout
+                            .style(&hidden)
+                            .label
+                            .as_deref()
+                            .unwrap_or(hidden.label())
+                    ),
                     Box::new(move |_, _, cx| {
-                        layout::put(Layout::get(cx).clone().moved_item(hidden, end, None), cx);
+                        layout::put(
+                            Layout::get(cx)
+                                .clone()
+                                .moved_item(hidden.clone(), end, None),
+                            cx,
+                        );
                     }),
                     cx,
                 ));
             }
         }
         items.push(separator());
+        items.push(Self::menu_item(
+            "bar-menu-add".into(),
+            "Add command button".into(),
+            Box::new(move |this, window, cx| {
+                let commands =
+                    crate::bar_commands::Commands::new(end, this.plugins.clone(), window, cx);
+                this.toggle_modal(window, cx, move |window, cx| {
+                    Picker::new(commands, window, cx)
+                });
+            }),
+            cx,
+        ));
         items.push(Self::menu_item(
             "bar-menu-reset".into(),
             "Reset layout".into(),
@@ -4188,24 +4280,26 @@ impl Workspace {
 
     /// What an item of a bar shows now, in as many pieces as it has to
     /// say; none while it has nothing to say.
-    fn bar_item(&self, item: Item, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn bar_item(&self, item: &Item, cx: &mut Context<Self>) -> Vec<BarPart> {
         let theme = cx.theme().clone();
-        let says = |text: String| div().child(text).into_any_element();
+        let says = |text: String| BarPart {
+            text,
+            id: None,
+            color: None,
+            action: None,
+        };
         // The wrapper of the whole item keeps the window from being
         // dragged, while these parts keep their own click actions.
         let does = |id: (&'static str, usize),
                     text: String,
                     color: gpui::Hsla,
                     action: Box<dyn gpui::Action>| {
-            div()
-                .id(id)
-                .px_1p5()
-                .rounded(theme.shape.token)
-                .text_color(color)
-                .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                .child(text)
-                .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
-                .into_any_element()
+            BarPart {
+                text,
+                id: Some(id),
+                color: Some(color),
+                action: Some(action),
+            }
         };
         // A file in front has a cursor, an indent and a language; a diff
         // in its place has none of them.
@@ -4366,6 +4460,14 @@ impl Workspace {
                 }
                 parts
             }
+            Item::Button { .. } => vec![says(
+                Layout::get(cx)
+                    .style(item)
+                    .label
+                    .as_deref()
+                    .unwrap_or(item.label())
+                    .to_owned(),
+            )],
         }
     }
 
@@ -4376,13 +4478,46 @@ impl Workspace {
         let children: Vec<_> = items
             .iter()
             .filter_map(|item| {
-                let item = *item;
                 let parts = self.bar_item(item, cx);
-                (!parts.is_empty()).then(|| {
+                if parts.is_empty() {
+                    return None;
+                }
+                let style = Layout::get(cx).style(item).clone();
+                let default_action = parts
+                    .first()
+                    .and_then(|part| part.action.as_ref())
+                    .map(|action| action.boxed_clone());
+                let tooltip = parts
+                    .iter()
+                    .map(|part| part.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let icon = style
+                    .icon
+                    .as_deref()
+                    .and_then(crate::icons::named)
+                    .unwrap_or_else(|| crate::icons::item(item));
+                let whole = style.command.is_some()
+                    || style.display == Display::Icon
+                    || style.label.is_some();
+                let content: Vec<_> = if style.display == Display::Icon {
+                    Vec::new()
+                } else if let Some(label) = style.label {
+                    vec![div().child(label).into_any_element()]
+                } else {
+                    parts
+                        .into_iter()
+                        .map(|part| part.render(!whole, &theme))
+                        .collect()
+                };
+                let id = item.id().to_owned();
+                let menu_item = item.clone();
+                let over_item = item.clone();
+                let drop_item = item.clone();
+                Some(
                     div()
-                        .id(("bar-item", item as usize))
-                        .debug_selector(move || format!("item-{}", item.id()))
-                        // Native title-bar hit testing must stop here too.
+                        .id(SharedString::from(format!("bar-item-{id}")))
+                        .debug_selector(move || format!("item-{id}"))
                         .occlude()
                         .flex()
                         .items_center()
@@ -4392,16 +4527,17 @@ impl Workspace {
                             MouseButton::Right,
                             cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                                 this.dock_menu = None;
-                                this.bar_menu = Some((event.position, end, Some(item)));
+                                this.bar_menu =
+                                    Some((event.position, end, Some(menu_item.clone())));
                                 cx.stop_propagation();
                                 cx.notify();
                             }),
                         )
-                        .on_drag(DraggedItem(item), |dragged, _, _, cx| {
-                            cx.new(|_| DraggedBarItem(dragged.0))
+                        .on_drag(DraggedItem(item.clone()), |dragged, _, _, cx| {
+                            cx.new(|_| DraggedBarItem(dragged.0.clone()))
                         })
                         .drag_over::<DraggedItem>(move |style, dragged, _, _| {
-                            if dragged.0 == item {
+                            if dragged.0 == over_item {
                                 style
                             } else {
                                 style.bg(theme.accent_soft)
@@ -4409,16 +4545,34 @@ impl Workspace {
                         })
                         .on_drop(cx.listener(move |_, dragged: &DraggedItem, _, cx| {
                             layout::put(
-                                Layout::get(cx)
-                                    .clone()
-                                    .moved_item(dragged.0, end, Some(item)),
+                                Layout::get(cx).clone().moved_item(
+                                    dragged.0.clone(),
+                                    end,
+                                    Some(drop_item.clone()),
+                                ),
                                 cx,
                             );
                         }))
-                        .child(crate::icons::draw(crate::icons::item(item)))
-                        .child(div().flex().items_center().gap_4().children(parts))
-                        .into_any_element()
-                })
+                        .when(style.display != Display::Text, |d| {
+                            d.child(crate::icons::draw(icon))
+                        })
+                        .child(div().flex().items_center().gap_4().children(content))
+                        .when(whole, |d| {
+                            d.hover(|d| d.bg(theme.line).text_color(theme.fg)).on_click(
+                                move |_, window, cx| {
+                                    if let Some(command) = &style.command {
+                                        crate::bar_commands::run(command, window, cx);
+                                    } else if let Some(action) = &default_action {
+                                        window.dispatch_action(action.boxed_clone(), cx);
+                                    }
+                                },
+                            )
+                        })
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| crate::ui::Tooltip(tooltip.clone())).into()
+                        })
+                        .into_any_element(),
+                )
             })
             .collect();
         // Config errors stay visible even when their own layout is empty.
@@ -4449,7 +4603,12 @@ impl Workspace {
             )
             .drag_over::<DraggedItem>(move |style, _, _, _| style.bg(theme.accent_soft))
             .on_drop(cx.listener(move |_, dragged: &DraggedItem, _, cx| {
-                layout::put(Layout::get(cx).clone().moved_item(dragged.0, end, None), cx);
+                layout::put(
+                    Layout::get(cx)
+                        .clone()
+                        .moved_item(dragged.0.clone(), end, None),
+                    cx,
+                );
             }))
             .children(children)
             .children(error.map(|e| div().truncate().text_color(theme.error).child(e)))
@@ -11877,7 +12036,7 @@ brackets = [
         };
         // Whether an item has something to say now.
         let says = |cx: &mut VisualTestContext, item: Item| {
-            ws.update(cx, |w, cx| !w.bar_item(item, cx).is_empty())
+            ws.update(cx, |w, cx| !w.bar_item(&item, cx).is_empty())
         };
 
         // As they come: the project's name in the title bar, the cursor,
@@ -11932,6 +12091,124 @@ brackets = [
         assert_eq!(body.top(), title.bottom());
         assert_eq!(body.bottom(), status.top());
         assert!(cx.read(|cx| Layout::get(cx).status_bar.left().contains(&Item::Position)));
+    }
+
+    #[gpui::test]
+    fn an_item_is_drawn_as_asked_and_a_button_runs_its_command(cx: &mut TestAppContext) {
+        use Item::*;
+        use layout::{Command, Display};
+        let root = db::testing::dir("ws-bar-buttons").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        let config = db::testing::dir("ws-bar-buttons-config");
+        let file = config.join("layout.json");
+        std::fs::write(&file, "// mine\n{}\n").unwrap();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(root.join("notes.txt")), "plain\n", None, window, cx)
+        });
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        let none = gpui::Modifiers::default();
+        let at = |cx: &mut VisualTestContext, selector: &'static str| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            bounds_soon(cx, selector).center()
+        };
+        let click = |cx: &mut VisualTestContext, selector: &'static str| {
+            let point = at(cx, selector);
+            cx.simulate_click(point, none);
+            cx.run_until_parked();
+        };
+        let menu = |cx: &mut VisualTestContext, selector: &'static str, option: &'static str| {
+            let point = at(cx, selector);
+            cx.simulate_mouse_down(point, MouseButton::Right, none);
+            cx.simulate_mouse_up(point, MouseButton::Right, none);
+            cx.run_until_parked();
+            click(cx, option);
+        };
+        let layout = |cx: &mut VisualTestContext| cx.read(|cx| Layout::get(cx).clone());
+        let left = |cx: &mut VisualTestContext| cx.read(|cx| ws.read(cx).left);
+        let button = Button {
+            button: "button-1".into(),
+        };
+
+        // The menu of an item says how it is drawn.
+        assert_eq!(layout(cx).style(&Position).display, Display::Both);
+        menu(cx, "item-position", "bar-menu-icon");
+        assert_eq!(layout(cx).style(&Position).display, Display::Icon);
+        menu(cx, "item-position", "bar-menu-text");
+        assert_eq!(layout(cx).style(&Position).display, Display::Text);
+
+        // And adds a button for a command, chosen from all of them, at
+        // the end of the bar the menu was opened on.
+        menu(cx, "item-position", "bar-menu-add");
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        cx.simulate_input("toggle sidebar");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+        let made = layout(cx).style(&button).clone();
+        assert_eq!(made.label.as_deref(), Some("Toggle sidebar"));
+        assert_eq!(
+            made.command,
+            Some(Command::Action("workspace::ToggleSidebar".into()))
+        );
+        assert_eq!(layout(cx).item_place(&button), Some(BarEnd::StatusLeft));
+        // It runs the command, as an icon alone too.
+        assert_eq!(left(cx), Some(Panel::Files));
+        click(cx, "item-button-1");
+        assert_eq!(left(cx), None);
+        menu(cx, "item-button-1", "bar-menu-icon");
+        assert_eq!(layout(cx).style(&button).display, Display::Icon);
+        click(cx, "item-button-1");
+        assert_eq!(left(cx), Some(Panel::Files));
+        // All of it is in the file, next to what the user wrote there.
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if std::fs::read_to_string(&file)
+                .is_ok_and(|s| layout::parse(&s).is_ok_and(|read| read == layout(cx)))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(layout::parse(&saved).unwrap(), layout(cx));
+        assert!(
+            saved.contains("// mine") && saved.contains("button-1"),
+            "{saved}"
+        );
+
+        // The file gives an item of the editor's own another word and
+        // another command: the language now opens Search.
+        std::fs::write(
+            &file,
+            r#"{ "items": { "language": { "label": "Find", "command": "workspace::ShowSearch" } } }"#,
+        )
+        .unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert!(cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+        click(cx, "item-language");
+        assert_eq!(left(cx), Some(Panel::Search));
+        // A command that is none is a mistake, and the layout stays.
+        let before = layout(cx);
+        std::fs::write(
+            &file,
+            r#"{ "items": { "language": { "command": "workspace::Nope" } } }"#,
+        )
+        .unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        let errors = cx.read(|cx| cx.global::<settings::ConfigErrors>().0.clone());
+        assert!(errors.iter().any(|e| e.contains("language")), "{errors:?}");
+        assert_eq!(layout(cx), before);
+
+        // A button is removed from its menu: off the bar and out of the
+        // file, not hidden.
+        std::fs::write(&file, saved).unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert_eq!(layout(cx).item_place(&button), Some(BarEnd::StatusLeft));
+        menu(cx, "item-button-1", "bar-menu-remove");
+        assert_eq!(layout(cx).item_place(&button), None);
+        assert!(!layout(cx).items.contains_key("button-1"));
     }
 
     #[gpui::test]
@@ -12023,7 +12300,7 @@ brackets = [
         drag(cx, "item-project", "item-project");
         assert_eq!(layout(cx), before);
         assert_eq!(layout(cx).item_place(Problems), Some(StatusLeft));
-        assert!(ws.update(cx, |w, cx| w.bar_item(Problems, cx).is_empty()));
+        assert!(ws.update(cx, |w, cx| w.bar_item(&Problems, cx).is_empty()));
 
         open(cx, "item-indent");
         cx.simulate_keystrokes("escape");
