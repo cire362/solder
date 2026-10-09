@@ -161,14 +161,6 @@ pub fn bind_keys(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
 
-/// The bottom dock's tab in front.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DockView {
-    Terminal,
-    Results,
-    Response,
-    Debug,
-}
 const RECENT_LIMIT: usize = 20;
 
 /// Where to put the cursor after opening a file.
@@ -239,8 +231,6 @@ pub struct Workspace {
     results: Entity<ResultsView>,
     /// The Results tab is in the dock (a query has run and it was not closed).
     show_results: bool,
-    /// What the dock shows: the active terminal or one of its other tabs.
-    dock_view: DockView,
     /// The last HTTP response, the dock's Response tab.
     response: Entity<crate::response::ResponseView>,
     show_response: bool,
@@ -265,13 +255,14 @@ pub struct Workspace {
     panes: Vec<Pane>,
     active_pane: usize,
     recent: VecDeque<Arc<str>>,
-    /// The panel each side dock shows; `None` for a dock that is closed.
-    /// Which dock a panel is in is the layout's to say.
+    /// The panel each dock shows; `None` for a dock that is closed. Which
+    /// dock a panel is in is the layout's to say.
     left: Option<Panel>,
     right: Option<Panel>,
-    /// Where the focus is when it is anywhere in the left or the right
-    /// dock, to know if closing a dock takes the focus with it.
-    dock_focus: [FocusHandle; 2],
+    bottom: Option<Panel>,
+    /// Where the focus is when it is anywhere in a dock, to know if
+    /// closing the dock takes the focus with it.
+    dock_focus: [FocusHandle; 3],
     _layout: Subscription,
     /// A border being dragged: the part it sizes, where the pointer went
     /// down along the border's way, and the part's size then.
@@ -279,7 +270,6 @@ pub struct Workspace {
     modal: Option<Modal>,
     terminals: Vec<(Entity<Terminal>, Subscription)>,
     active_terminal: usize,
-    dock_open: bool,
     _subscriptions: Vec<Subscription>,
     _hud_tick: Task<()>,
 }
@@ -333,8 +323,7 @@ impl Workspace {
                     // The window whose project holds the file shows it.
                     if path.starts_with(this.root(cx)) {
                         this.show_debug = true;
-                        this.dock_view = DockView::Debug;
-                        this.dock_open = true;
+                        this.show_panel(Panel::Debug, cx);
                         this.open_path(
                             path.clone(),
                             Some(Jump::Point {
@@ -444,8 +433,7 @@ impl Workspace {
                         this.results
                             .update(cx, |r, cx| r.browse(connection, engine, spec, cx));
                         this.show_results = true;
-                        this.dock_view = DockView::Results;
-                        this.dock_open = true;
+                        this.show_panel(Panel::Results, cx);
                         cx.notify();
                     }
                     DatabasePanelEvent::Structure {
@@ -467,8 +455,7 @@ impl Workspace {
                                 workspace
                                     .update(cx, |ws, cx| {
                                         ws.show_results = true;
-                                        ws.dock_view = DockView::Results;
-                                        ws.dock_open = true;
+                                        ws.show_panel(Panel::Results, cx);
                                         cx.notify();
                                     })
                                     .ok();
@@ -617,15 +604,15 @@ impl Workspace {
             recent: VecDeque::new(),
             left: Some(Panel::Files),
             right: None,
-            dock_focus: [cx.focus_handle(), cx.focus_handle()],
+            bottom: None,
+            dock_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
             // A panel the layout moved to the other dock while it was
             // shown goes there with it.
-            _layout: cx.observe_global::<Layout>(|this, cx| this.follow_layout(cx)),
+            _layout: cx.observe_global_in::<Layout>(window, Self::follow_layout),
             resizing: None,
             modal: None,
             terminals: Vec::new(),
             active_terminal: 0,
-            dock_open: false,
             _subscriptions: subscriptions,
             _hud_tick: hud_tick,
             git,
@@ -643,7 +630,6 @@ impl Workspace {
             inline_edit: None,
             results,
             show_results: false,
-            dock_view: DockView::Terminal,
             response,
             show_response: false,
             plugins,
@@ -1382,8 +1368,7 @@ impl Workspace {
         );
         self.terminals.push((terminal.clone(), subscription));
         self.active_terminal = self.terminals.len() - 1;
-        self.dock_view = DockView::Terminal;
-        self.dock_open = true;
+        self.show_panel(Panel::Terminal, cx);
         if focus {
             window.focus(&terminal.focus_handle(cx));
         }
@@ -1422,8 +1407,7 @@ impl Workspace {
     ) {
         if let Some(ix) = self.terminals.iter().position(|(t, _)| t == terminal) {
             self.active_terminal = ix;
-            self.dock_view = DockView::Terminal;
-            self.dock_open = true;
+            self.show_panel(Panel::Terminal, cx);
             window.focus(&terminal.focus_handle(cx));
             cx.notify();
         }
@@ -1434,11 +1418,76 @@ impl Workspace {
         window.focus(&self.services.focus_handle(cx));
     }
 
-    /// Changes the sidebar tab and tells panels that poll whether they are
-    /// on screen.
     /// Whether `panel` is the one a dock shows now.
     fn shown(&self, panel: Panel) -> bool {
-        self.left == Some(panel) || self.right == Some(panel)
+        [self.left, self.right, self.bottom].contains(&Some(panel))
+    }
+
+    /// Whether a panel has a tab now. Results, the last response and the
+    /// debugger have one only while they have something to show, and the
+    /// terminals while there is one.
+    fn available(&self, panel: Panel) -> bool {
+        match panel {
+            Panel::Terminal => !self.terminals.is_empty(),
+            Panel::Results => self.show_results,
+            Panel::Response => self.show_response,
+            Panel::Debug => self.show_debug,
+            _ => true,
+        }
+    }
+
+    /// A panel has nothing left to show. The dock that showed it shows
+    /// the first of its panels that has, or closes.
+    fn panel_gone(&mut self, panel: Panel, cx: &mut Context<Self>) {
+        for place in Place::ALL {
+            if *self.dock(place) == Some(panel) {
+                let next = Layout::get(cx)
+                    .panels(place)
+                    .iter()
+                    .copied()
+                    .find(|other| *other != panel && self.available(*other));
+                *self.dock(place) = next;
+                self.docks_changed(next, cx);
+            }
+        }
+    }
+
+    /// Where the keyboard goes in a panel.
+    fn panel_focus(&self, panel: Panel, cx: &App) -> Option<FocusHandle> {
+        Some(match panel {
+            Panel::Files => self.project_panel.focus_handle(cx),
+            Panel::Search => self.project_search.focus_handle(cx),
+            Panel::Git => self.git_panel.focus_handle(cx),
+            Panel::Services => self.services.focus_handle(cx),
+            Panel::Database => self.database_panel.focus_handle(cx),
+            Panel::Api => self.api_panel.focus_handle(cx),
+            Panel::Ai => self.ai_panel.focus_handle(cx),
+            Panel::Extensions => self.extensions_panel.focus_handle(cx),
+            Panel::Chat => self.chat.focus_handle(cx),
+            Panel::Agent => self.agent.focus_handle(cx),
+            Panel::Debug => self.debug_panel.focus_handle(cx),
+            Panel::Response => self.response.focus_handle(cx),
+            Panel::Results => self.results.focus_handle(cx),
+            Panel::Terminal => {
+                let (terminal, _) = self.terminals.get(self.active_terminal)?;
+                terminal.focus_handle(cx)
+            }
+        })
+    }
+
+    /// The focus was in a panel that is gone. What its dock shows now
+    /// takes it, or the file in front if the dock closed: left on what is
+    /// no longer drawn, no key would reach anything.
+    fn focus_dock(&mut self, place: Place, window: &mut Window, cx: &mut Context<Self>) {
+        let shown = *self.dock(place);
+        match (
+            shown.and_then(|panel| self.panel_focus(panel, cx)),
+            self.active_editor(),
+        ) {
+            (Some(handle), _) => window.focus(&handle),
+            (None, Some(editor)) => window.focus(&editor.focus_handle(cx)),
+            (None, None) => window.focus(&self.focus_handle),
+        }
     }
 
     /// The dock a panel shows in: the one the layout puts it in, or for a
@@ -1451,6 +1500,7 @@ impl Workspace {
         match place {
             Place::Left => &mut self.left,
             Place::Right => &mut self.right,
+            Place::Bottom => &mut self.bottom,
         }
     }
 
@@ -1506,23 +1556,43 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The layout changed. A panel a dock shows may now belong to the
-    /// other one: it is shown there. A dock that lost what it showed, and
-    /// got nothing in exchange, shows its first panel, or closes if it has
-    /// none.
-    fn follow_layout(&mut self, cx: &mut Context<Self>) {
+    /// The layout changed. A panel a dock shows may now belong to
+    /// another: it is shown there. A dock that lost what it showed, and
+    /// got nothing in exchange, shows the first panel it has, or closes if
+    /// it has none. The keyboard does not stay in a panel that is no
+    /// longer shown: no key would reach anything from there.
+    fn follow_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let layout = Layout::get(cx).clone();
-        let (left, right) = (self.left, self.right);
-        let settle = |here: Option<Panel>, there: Option<Panel>, place: Place| {
+        let before = [self.left, self.right, self.bottom];
+        for (index, place) in Place::ALL.into_iter().enumerate() {
+            let here = before[index];
             // A hidden panel that is shown stays where it was opened.
             let stays = here.filter(|p| layout.place(*p).is_none_or(|now| now == place));
-            let comes = there.filter(|p| layout.place(*p) == Some(place));
-            stays
-                .or(comes)
-                .or_else(|| here.and_then(|_| layout.side(place).panels.first().copied()))
-        };
-        self.left = settle(left, right, Place::Left);
-        self.right = settle(right, left, Place::Right);
+            let comes = before
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .find_map(|(_, shown)| shown.filter(|p| layout.place(*p) == Some(place)));
+            let first = layout
+                .panels(place)
+                .iter()
+                .copied()
+                .find(|panel| self.available(*panel));
+            let now = stays.or(comes).or(here.and(first));
+            *self.dock(place) = now;
+        }
+        let lost = Panel::ALL.into_iter().any(|panel| {
+            !self.shown(panel)
+                && self
+                    .panel_focus(panel, cx)
+                    .is_some_and(|focus| focus.contains_focused(window, cx))
+        });
+        if lost {
+            match self.active_editor() {
+                Some(editor) => window.focus(&editor.focus_handle(cx)),
+                None => window.focus(&self.focus_handle),
+            }
+        }
         self.docks_changed(None, cx);
     }
 
@@ -1551,8 +1621,7 @@ impl Workspace {
         self.results
             .update(cx, |r, cx| r.run(connection, query, cx));
         self.show_results = true;
-        self.dock_view = DockView::Results;
-        self.dock_open = true;
+        self.show_panel(Panel::Results, cx);
         if focus {
             window.focus(&self.results.focus_handle(cx));
         }
@@ -1795,8 +1864,7 @@ impl Workspace {
                         this.results
                             .update(cx, |r, cx| r.browse(connection, engine, spec, cx));
                         this.show_results = true;
-                        this.dock_view = DockView::Results;
-                        this.dock_open = true;
+                        this.show_panel(Panel::Results, cx);
                         cx.notify();
                     }
                     ErdEvent::Structure(object) => {
@@ -2078,8 +2146,7 @@ impl Workspace {
             cx.notify();
         });
         self.show_response = true;
-        self.dock_view = DockView::Response;
-        self.dock_open = true;
+        self.show_panel(Panel::Response, cx);
         cx.notify();
     }
 
@@ -2225,23 +2292,6 @@ impl Workspace {
         .detach();
     }
 
-    /// The tab in front once another closes.
-    fn fallback_dock_view(&self) -> DockView {
-        if self.show_debug {
-            DockView::Debug
-        } else if self.show_results {
-            DockView::Results
-        } else if self.show_response {
-            DockView::Response
-        } else {
-            DockView::Terminal
-        }
-    }
-
-    fn dock_has_tabs(&self) -> bool {
-        !self.terminals.is_empty() || self.show_results || self.show_response || self.show_debug
-    }
-
     // ---------------------------------------------------------------- debug
 
     /// The Debug tab in front, with what can be debugged read again for the
@@ -2253,8 +2303,7 @@ impl Workspace {
         self.debug_panel
             .update(cx, |p, cx| p.refresh_configs(file, start, cx));
         self.show_debug = true;
-        self.dock_view = DockView::Debug;
-        self.dock_open = true;
+        self.show_panel(Panel::Debug, cx);
         cx.notify();
     }
 
@@ -2357,12 +2406,16 @@ impl Workspace {
     }
 
     fn close_debug(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_focused = self
+            .debug_panel
+            .focus_handle(cx)
+            .contains_focused(window, cx);
+        let place = self.place_of(Panel::Debug, cx);
         self.show_debug = false;
-        self.dock_view = self.fallback_dock_view();
-        if !self.dock_has_tabs() {
-            self.dock_open = false;
+        self.panel_gone(Panel::Debug, cx);
+        if was_focused {
+            self.focus_dock(place, window, cx);
         }
-        let _ = window;
         cx.notify();
     }
 
@@ -2371,7 +2424,7 @@ impl Workspace {
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active = self.dock_view == DockView::Debug;
+        let active = self.shown(Panel::Debug);
         let paused = self.debug.read(cx).state == crate::debug::State::Paused;
         div()
             .id("debug-tab")
@@ -2388,8 +2441,7 @@ impl Workspace {
             .when(active, |d| d.bg(theme.bg_elev))
             .hover(|d| d.text_color(theme.fg))
             .on_click(cx.listener(|this, _, _, cx| {
-                this.dock_view = DockView::Debug;
-                cx.notify();
+                this.show_panel(Panel::Debug, cx);
             }))
             .when(paused, |d| {
                 d.child(div().size(px(6.)).rounded(px(3.)).bg(theme.warning))
@@ -2414,16 +2466,11 @@ impl Workspace {
 
     fn close_response(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let was_focused = self.response.focus_handle(cx).contains_focused(window, cx);
+        let place = self.place_of(Panel::Response, cx);
         self.show_response = false;
-        self.dock_view = self.fallback_dock_view();
-        if !self.dock_has_tabs() {
-            self.dock_open = false;
-        }
+        self.panel_gone(Panel::Response, cx);
         if was_focused {
-            match self.active_editor() {
-                Some(e) => window.focus(&e.focus_handle(cx)),
-                None => window.focus(&self.focus_handle),
-            }
+            self.focus_dock(place, window, cx);
         }
         cx.notify();
     }
@@ -2433,8 +2480,7 @@ impl Workspace {
     pub fn send_request(&mut self, request: rest::Request, cx: &mut Context<Self>) {
         self.response.update(cx, |r, cx| r.send(request, cx));
         self.show_response = true;
-        self.dock_view = DockView::Response;
-        self.dock_open = true;
+        self.show_panel(Panel::Response, cx);
         cx.notify();
     }
 
@@ -2458,20 +2504,11 @@ impl Workspace {
 
     fn close_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let was_focused = self.results.focus_handle(cx).contains_focused(window, cx);
+        let place = self.place_of(Panel::Results, cx);
         self.show_results = false;
-        self.dock_view = self.fallback_dock_view();
-        if !self.dock_has_tabs() {
-            self.dock_open = false;
-        }
+        self.panel_gone(Panel::Results, cx);
         if was_focused {
-            match (
-                self.terminals.get(self.active_terminal),
-                self.active_editor(),
-            ) {
-                (Some((t, _)), _) => window.focus(&t.focus_handle(cx)),
-                (None, Some(e)) => window.focus(&e.focus_handle(cx)),
-                (None, None) => window.focus(&self.focus_handle),
-            }
+            self.focus_dock(place, window, cx);
         }
         cx.notify();
     }
@@ -2488,27 +2525,14 @@ impl Workspace {
         let was_focused = terminal.focus_handle(cx).contains_focused(window, cx);
         drop(self.terminals.remove(ix));
         if self.terminals.is_empty() {
-            self.dock_open = self.dock_open && self.dock_has_tabs();
-            self.dock_view = self.fallback_dock_view();
             self.active_terminal = 0;
+            self.panel_gone(Panel::Terminal, cx);
         } else {
             self.active_terminal = self.active_terminal.min(self.terminals.len() - 1);
         }
         if was_focused {
-            match (
-                self.terminals.get(self.active_terminal),
-                self.active_editor(),
-            ) {
-                _ if self.dock_view == DockView::Results => {
-                    window.focus(&self.results.focus_handle(cx))
-                }
-                _ if self.dock_view == DockView::Response => {
-                    window.focus(&self.response.focus_handle(cx))
-                }
-                (Some((t, _)), _) => window.focus(&t.focus_handle(cx)),
-                (None, Some(e)) => window.focus(&e.focus_handle(cx)),
-                (None, None) => window.focus(&self.focus_handle),
-            }
+            let place = self.place_of(Panel::Terminal, cx);
+            self.focus_dock(place, window, cx);
         }
         cx.notify();
     }
@@ -2531,19 +2555,15 @@ impl Workspace {
                 self.spawn_terminal(command, window, cx);
             }
             Some(t)
-                if self.dock_open
-                    && self.dock_view == DockView::Terminal
+                if self.shown(Panel::Terminal)
                     && t.focus_handle(cx).contains_focused(window, cx) =>
             {
-                self.dock_open = false;
-                if let Some(e) = self.active_editor() {
-                    window.focus(&e.focus_handle(cx));
-                }
-                cx.notify();
+                // The dock the terminals are in, wherever that is.
+                let place = self.place_of(Panel::Terminal, cx);
+                self.close_dock(place, window, cx);
             }
             Some(t) => {
-                self.dock_open = true;
-                self.dock_view = DockView::Terminal;
+                self.show_panel(Panel::Terminal, cx);
                 window.focus(&t.focus_handle(cx));
                 cx.notify();
             }
@@ -2555,14 +2575,16 @@ impl Workspace {
         self.spawn_terminal(command, window, cx);
     }
 
-    fn render_dock(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A tab for each terminal, and the button that opens another. They
+    /// are in whichever dock the layout puts the terminals in.
+    fn terminal_tabs(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let theme = cx.theme().clone();
-        let tabs: Vec<_> = self
+        let mut tabs: Vec<AnyElement> = self
             .terminals
             .iter()
             .enumerate()
             .map(|(ix, (terminal, _))| {
-                let active = ix == self.active_terminal && self.dock_view == DockView::Terminal;
+                let active = ix == self.active_terminal && self.shown(Panel::Terminal);
                 let close = terminal.clone();
                 div()
                     .id(("terminal-tab", ix))
@@ -2579,7 +2601,7 @@ impl Workspace {
                     .hover(|d| d.text_color(theme.fg))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.active_terminal = ix;
-                        this.dock_view = DockView::Terminal;
+                        this.show_panel(Panel::Terminal, cx);
                         if let Some((t, _)) = this.terminals.get(ix) {
                             window.focus(&t.focus_handle(cx));
                         }
@@ -2609,68 +2631,28 @@ impl Workspace {
                                 this.remove_terminal(&close, window, cx);
                             })),
                     )
+                    .into_any_element()
             })
             .collect();
-        div()
-            .h(px(Layout::get(cx).bottom.height))
-            .debug_selector(|| "dock".into())
-            .flex_none()
-            .flex()
-            .flex_col()
-            .border_t_1()
-            .border_color(theme.line)
-            .child(
-                div()
-                    .h(px(32.))
-                    .flex_none()
-                    .px_1p5()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .bg(theme.bg_sunken)
-                    .border_b_1()
-                    .border_color(theme.line)
-                    .when(self.show_debug, |d| {
-                        d.child(self.render_debug_tab(&theme, cx))
-                    })
-                    .when(self.show_response, |d| {
-                        d.child(self.render_response_tab(&theme, cx))
-                    })
-                    .when(self.show_results, |d| {
-                        d.child(self.render_results_tab(&theme, cx))
-                    })
-                    .children(tabs)
-                    .child(
-                        div()
-                            .id("terminal-new")
-                            .size(px(24.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(8.))
-                            .text_color(theme.fg_subtle)
-                            .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                            .child("+")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.new_terminal(&NewTerminal, window, cx)
-                            })),
-                    ),
-            )
-            .child(div().flex_1().min_h_0().map(|d| {
-                if self.dock_view == DockView::Debug {
-                    d.child(self.debug_panel.clone())
-                } else if self.dock_view == DockView::Response {
-                    d.child(self.response.clone())
-                } else if self.dock_view == DockView::Results {
-                    d.child(self.results.clone())
-                } else {
-                    d.children(
-                        self.terminals
-                            .get(self.active_terminal)
-                            .map(|(t, _)| t.clone()),
-                    )
-                }
-            }))
+        tabs.push(
+            div()
+                .id("terminal-new")
+                .debug_selector(|| "terminal-new".into())
+                .flex_none()
+                .size(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .text_color(theme.fg_subtle)
+                .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                .child("+")
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.new_terminal(&NewTerminal, window, cx)),
+                )
+                .into_any_element(),
+        );
+        tabs
     }
 
     fn render_results_tab(
@@ -2678,9 +2660,10 @@ impl Workspace {
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active = self.dock_view == DockView::Results;
+        let active = self.shown(Panel::Results);
         div()
             .id("results-tab")
+            .debug_selector(|| "results-tab".into())
             .h(px(24.))
             .pl_2p5()
             .pr_1()
@@ -2693,7 +2676,7 @@ impl Workspace {
             .when(active, |d| d.bg(theme.bg_elev))
             .hover(|d| d.text_color(theme.fg))
             .on_click(cx.listener(|this, _, window, cx| {
-                this.dock_view = DockView::Results;
+                this.show_panel(Panel::Results, cx);
                 window.focus(&this.results.focus_handle(cx));
                 cx.notify();
             }))
@@ -2720,7 +2703,7 @@ impl Workspace {
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active = self.dock_view == DockView::Response;
+        let active = self.shown(Panel::Response);
         div()
             .id("response-tab")
             .h(px(24.))
@@ -2735,7 +2718,7 @@ impl Workspace {
             .when(active, |d| d.bg(theme.bg_elev))
             .hover(|d| d.text_color(theme.fg))
             .on_click(cx.listener(|this, _, window, cx| {
-                this.dock_view = DockView::Response;
+                this.show_panel(Panel::Response, cx);
                 window.focus(&this.response.focus_handle(cx));
                 cx.notify();
             }))
@@ -3015,7 +2998,7 @@ impl Workspace {
     fn resize_handles(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         const GRIP: f32 = 6.;
         let layout = Layout::get(cx).clone();
-        let dock = self.dock_open && self.dock_has_tabs();
+        let dock = self.bottom.is_some();
         let top = layout.title_bar.height;
         let bottom = layout.status_bar.height + if dock { layout.bottom.height } else { 0. };
         let handle = |part: Part, cx: &mut Context<Self>| {
@@ -3342,7 +3325,13 @@ impl Workspace {
             return self.close_dock(Place::Left, window, cx);
         }
         // Closed, it opens on the first panel it has.
-        if let Some(panel) = Layout::get(cx).left.panels.first().copied() {
+        let first = Layout::get(cx)
+            .left
+            .panels
+            .iter()
+            .copied()
+            .find(|panel| self.available(*panel));
+        if let Some(panel) = first {
             self.left = Some(panel);
             self.docks_changed(Some(panel), cx);
         }
@@ -3503,66 +3492,91 @@ impl Workspace {
             )
     }
 
-    /// A dock at a side of the window: a tab for each panel the layout
-    /// puts in it, and the panel it shows.
-    fn render_side(&self, place: Place, tab: Panel, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A dock: a tab for each panel the layout puts in it that has
+    /// something to show, and the panel it shows.
+    fn render_dock(&self, place: Place, tab: Panel, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let layout = Layout::get(cx).clone();
-        let side = layout.side(place);
         // A hidden panel a command opened has a tab for as long as it shows.
-        let mut panels = side.panels.clone();
+        let mut panels = layout.panels(place).to_vec();
         if !panels.contains(&tab) {
             panels.push(tab);
         }
-        let tabs: Vec<_> = panels
-            .into_iter()
-            .map(|panel| {
-                let active = tab == panel;
-                div()
-                    .id(("panel", panel as usize))
-                    .debug_selector(move || format!("panel-{}", panel.id()))
-                    .flex_none()
-                    .h(px(24.))
-                    .px_1()
-                    .flex()
-                    .items_center()
-                    .rounded(px(8.))
-                    .text_size(UI_FONT_SIZE)
-                    .text_color(if active { theme.fg } else { theme.fg_subtle })
-                    .when(active, |d| d.bg(theme.bg_elev))
-                    .hover(|d| d.text_color(theme.fg))
-                    .child(panel.label())
-                    .on_click(cx.listener(move |this, _, window, cx| match panel {
-                        Panel::Files => this.show_files(&ShowFiles, window, cx),
-                        Panel::Search => this.show_search(&ShowSearch, window, cx),
-                        Panel::Git => this.show_git(&ShowGit, window, cx),
-                        Panel::Services => this.show_services(&ShowServices, window, cx),
-                        Panel::Database => this.show_database(&ShowDatabase, window, cx),
-                        Panel::Api => this.show_api(&ShowApi, window, cx),
-                        Panel::Ai => this.show_ai(&ShowAi, window, cx),
-                        Panel::Extensions => this.show_extensions(&ShowExtensions, window, cx),
-                        Panel::Chat => this.show_right(false, window, cx),
-                        Panel::Agent => this.show_right(true, window, cx),
-                    }))
-            })
-            .collect();
+        let mut tabs: Vec<AnyElement> = Vec::new();
+        for panel in panels {
+            match panel {
+                Panel::Terminal => tabs.extend(self.terminal_tabs(cx)),
+                Panel::Debug if self.show_debug => {
+                    tabs.push(self.render_debug_tab(&theme, cx).into_any_element())
+                }
+                Panel::Response if self.show_response => {
+                    tabs.push(self.render_response_tab(&theme, cx).into_any_element())
+                }
+                Panel::Results if self.show_results => {
+                    tabs.push(self.render_results_tab(&theme, cx).into_any_element())
+                }
+                Panel::Debug | Panel::Response | Panel::Results => {}
+                _ => {
+                    let active = tab == panel;
+                    tabs.push(
+                        div()
+                            .id(("panel", panel as usize))
+                            .debug_selector(move || format!("panel-{}", panel.id()))
+                            .flex_none()
+                            .h(px(24.))
+                            .px_1()
+                            .flex()
+                            .items_center()
+                            .rounded(px(8.))
+                            .text_size(UI_FONT_SIZE)
+                            .text_color(if active { theme.fg } else { theme.fg_subtle })
+                            .when(active, |d| d.bg(theme.bg_elev))
+                            .hover(|d| d.text_color(theme.fg))
+                            .child(panel.label())
+                            .on_click(cx.listener(move |this, _, window, cx| match panel {
+                                Panel::Files => this.show_files(&ShowFiles, window, cx),
+                                Panel::Search => this.show_search(&ShowSearch, window, cx),
+                                Panel::Git => this.show_git(&ShowGit, window, cx),
+                                Panel::Services => this.show_services(&ShowServices, window, cx),
+                                Panel::Database => this.show_database(&ShowDatabase, window, cx),
+                                Panel::Api => this.show_api(&ShowApi, window, cx),
+                                Panel::Ai => this.show_ai(&ShowAi, window, cx),
+                                Panel::Extensions => {
+                                    this.show_extensions(&ShowExtensions, window, cx)
+                                }
+                                Panel::Chat => this.show_right(false, window, cx),
+                                Panel::Agent => this.show_right(true, window, cx),
+                                _ => {}
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
         div()
-            .w(px(side.width))
             .debug_selector(move || match place {
                 Place::Left => "dock-left".into(),
                 Place::Right => "dock-right".into(),
+                Place::Bottom => "dock-bottom".into(),
             })
             .track_focus(&self.dock_focus[place as usize])
             .flex_none()
-            .h_full()
             .flex()
             .flex_col()
-            .map(|d| match place {
-                Place::Left => d.border_r_1(),
-                Place::Right => d.border_l_1(),
-            })
             .border_color(theme.line)
-            .bg(theme.bg_sunken)
+            .map(|d| match place {
+                Place::Left => d
+                    .w(px(layout.left.width))
+                    .h_full()
+                    .border_r_1()
+                    .bg(theme.bg_sunken),
+                Place::Right => d
+                    .w(px(layout.right.width))
+                    .h_full()
+                    .border_l_1()
+                    .bg(theme.bg_sunken),
+                Place::Bottom => d.h(px(layout.bottom.height)).border_t_1(),
+            })
             .child(
                 div()
                     .flex_none()
@@ -3573,21 +3587,32 @@ impl Workspace {
                     .flex_wrap()
                     .items_center()
                     .gap_1()
+                    .bg(theme.bg_sunken)
                     .border_b_1()
                     .border_color(theme.line)
                     .children(tabs),
             )
-            .child(div().flex_1().min_h_0().pt_1().map(|d| match tab {
-                Panel::Files => d.child(self.project_panel.clone()),
-                Panel::Search => d.child(self.project_search.clone()),
-                Panel::Git => d.child(self.git_panel.clone()),
-                Panel::Services => d.child(self.services.clone()),
-                Panel::Database => d.child(self.database_panel.clone()),
-                Panel::Api => d.child(self.api_panel.clone()),
-                Panel::Ai => d.child(self.ai_panel.clone()),
-                Panel::Extensions => d.child(self.extensions_panel.clone()),
-                Panel::Chat => d.child(self.chat.clone()),
-                Panel::Agent => d.child(self.agent.clone()),
+            .child(div().flex_1().min_h_0().map(|d| {
+                match tab {
+                    Panel::Files => d.pt_1().child(self.project_panel.clone()),
+                    Panel::Search => d.pt_1().child(self.project_search.clone()),
+                    Panel::Git => d.pt_1().child(self.git_panel.clone()),
+                    Panel::Services => d.pt_1().child(self.services.clone()),
+                    Panel::Database => d.pt_1().child(self.database_panel.clone()),
+                    Panel::Api => d.pt_1().child(self.api_panel.clone()),
+                    Panel::Ai => d.pt_1().child(self.ai_panel.clone()),
+                    Panel::Extensions => d.pt_1().child(self.extensions_panel.clone()),
+                    Panel::Chat => d.pt_1().child(self.chat.clone()),
+                    Panel::Agent => d.pt_1().child(self.agent.clone()),
+                    Panel::Debug => d.child(self.debug_panel.clone()),
+                    Panel::Response => d.child(self.response.clone()),
+                    Panel::Results => d.child(self.results.clone()),
+                    Panel::Terminal => d.children(
+                        self.terminals
+                            .get(self.active_terminal)
+                            .map(|(t, _)| t.clone()),
+                    ),
+                }
             }))
     }
 
@@ -3955,16 +3980,17 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .children(self.left.map(|tab| self.render_side(Place::Left, tab, cx)))
+                    .children(self.left.map(|tab| self.render_dock(Place::Left, tab, cx)))
                     .children(panes)
                     .children(
                         self.right
-                            .map(|tab| self.render_side(Place::Right, tab, cx)),
+                            .map(|tab| self.render_dock(Place::Right, tab, cx)),
                     ),
             )
-            .when(self.dock_open && self.dock_has_tabs(), |d| {
-                d.child(self.render_dock(cx))
-            })
+            .children(
+                self.bottom
+                    .map(|tab| self.render_dock(Place::Bottom, tab, cx)),
+            )
             .child(self.render_status(cx))
             .children(self.resize_handles(cx))
             .on_mouse_move(cx.listener(Self::resize_move))
@@ -4411,7 +4437,7 @@ mod tests {
         wait(cx, "terminal to close", &|cx| {
             ws.read(cx).terminals.is_empty()
         });
-        assert!(!cx.read(|cx| ws.read(cx).dock_open));
+        assert!(cx.read(|cx| ws.read(cx).bottom.is_none()));
     }
 
     fn git_fixture(name: &str) -> PathBuf {
@@ -5582,7 +5608,7 @@ mod tests {
         });
         let results = cx.read(|cx| ws.read(cx).results.clone());
         wait_for(cx, "browse", &|cx| {
-            results.read(cx).query.contains("FROM \"users\"") && ws.read(cx).dock_open
+            results.read(cx).query.contains("FROM \"users\"") && ws.read(cx).bottom.is_some()
         });
 
         // Search: Enter selects and centers the first match.
@@ -5778,8 +5804,7 @@ mod tests {
         // As opening it from the Database tab does: show the Results tab.
         ws.update(cx, |ws, cx| {
             ws.show_results = true;
-            ws.dock_view = DockView::Results;
-            ws.dock_open = true;
+            ws.show_panel(Panel::Results, cx);
             cx.notify();
         });
         cx.update(|window, cx| window.focus(&results.focus_handle(cx)));
@@ -5914,7 +5939,7 @@ mod tests {
         );
         cx.read(|cx| {
             let ws = ws.read(cx);
-            assert!(ws.dock_open && ws.show_results && ws.dock_view == DockView::Results);
+            assert!(ws.show_results && ws.bottom == Some(Panel::Results));
         });
 
         cx.update(|window, cx| window.focus(&results.focus_handle(cx)));
@@ -5940,7 +5965,7 @@ mod tests {
             &|cx| matches!(&results.read(cx).state, State::Failed(e) if e.contains("nope")),
         );
         ws.update_in(cx, |ws, window, cx| ws.close_results(window, cx));
-        assert!(!cx.read(|cx| ws.read(cx).dock_open));
+        assert!(cx.read(|cx| ws.read(cx).bottom.is_none()));
     }
 
     /// A server that answers every request with its method, path and body
@@ -6043,7 +6068,7 @@ mod tests {
         assert_eq!(json["method"], "POST");
         assert_eq!(json["path"], "/users");
         assert_eq!(json["body"], "{\"name\": \"Ada\"}");
-        assert!(cx.read(|cx| ws.read(cx).dock_view == DockView::Response && ws.read(cx).dock_open));
+        assert!(cx.read(|cx| ws.read(cx).bottom == Some(Panel::Response)));
 
         // A request that names a variable nobody defines says which one.
         let editor_text = active_text(&ws, cx);
@@ -8605,7 +8630,7 @@ mod tests {
             cx.read(|cx| store.read(cx).lines(&app).cloned()),
             Some([(2, true)].into())
         );
-        assert_eq!(cx.read(|cx| ws.read(cx).dock_view), DockView::Debug);
+        assert_eq!(cx.read(|cx| ws.read(cx).bottom), Some(Panel::Debug));
         assert_eq!(active_path(&ws, cx), Some(app.clone()));
 
         // Variables, and an object opened one level.
@@ -10751,6 +10776,123 @@ brackets = [
         cx.dispatch_action(ShowFiles);
         cx.dispatch_action(ShowAgent);
         assert_eq!(docks(cx), (Some(Panel::Files), Some(Panel::Agent)));
+    }
+
+    #[gpui::test]
+    fn terminals_and_results_are_panels_of_any_dock_too(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let root = db::testing::dir("ws-docks-low").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        let config = db::testing::dir("ws-docks-low-config");
+        let (ws, cx) = setup(cx, root.clone());
+        let docks = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.read(|cx| {
+                let ws = ws.read(cx);
+                (ws.left, ws.right, ws.bottom)
+            })
+        };
+        // Where a tab is once the window has drawn it inside `dock`: a
+        // tab that moved is still remembered where it was last.
+        let inside = |cx: &mut VisualTestContext, dock: &'static str, tab: &'static str| {
+            for _ in 0..200 {
+                cx.update(|window, _| window.refresh());
+                cx.run_until_parked();
+                if let (Some(dock), Some(tab)) = (cx.debug_bounds(dock), cx.debug_bounds(tab))
+                    && dock.contains(&tab.center())
+                {
+                    return tab;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("no {tab} in {dock}");
+        };
+        // As it comes, the bottom dock is closed until something is in
+        // it: a terminal opens it, and results come in front there.
+        assert_eq!(docks(cx), (Some(Panel::Files), None, None));
+        let terminal = ws
+            .update_in(cx, |w, window, cx| {
+                let command = TerminalCommand {
+                    program: Some("/bin/sh".into()),
+                    cwd: root.clone(),
+                    ..Default::default()
+                };
+                w.spawn_terminal(command, window, cx)
+            })
+            .expect("terminal starts");
+        assert_eq!(docks(cx).2, Some(Panel::Terminal));
+        ws.update_in(cx, |w, window, cx| {
+            w.show_results = true;
+            w.show_panel(Panel::Results, cx);
+            window.focus(&w.results.focus_handle(cx));
+        });
+        assert_eq!(docks(cx).2, Some(Panel::Results));
+        inside(cx, "dock-bottom", "terminal-new");
+        inside(cx, "dock-bottom", "results-tab");
+
+        // The layout puts the terminals on the right, alone, results on
+        // the left and Search at the bottom. Files stays in front on the
+        // left; the bottom dock lost what it showed and shows Search. The
+        // keyboard was in the results, which no dock shows now, and is
+        // not left there.
+        std::fs::write(
+            config.join("layout.json"),
+            r#"{
+              "left": { "panels": ["files", "results", "chat", "agent"] },
+              "right": { "panels": ["terminal"] },
+              "bottom": { "panels": ["search"] }
+            }"#,
+        )
+        .unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert!(cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+        assert_eq!(docks(cx), (Some(Panel::Files), None, Some(Panel::Search)));
+        inside(cx, "dock-bottom", "panel-search");
+        assert!(cx.update(|window, cx| {
+            !ws.read(cx)
+                .results
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+        }));
+
+        // The terminal's key opens the dock the terminals are in now, and
+        // their tabs are there.
+        cx.dispatch_action(ToggleTerminal);
+        assert_eq!(
+            docks(cx),
+            (
+                Some(Panel::Files),
+                Some(Panel::Terminal),
+                Some(Panel::Search)
+            )
+        );
+        inside(cx, "dock-right", "terminal-new");
+        // The tab of the results is on the left, and shows them there.
+        let results = inside(cx, "dock-left", "results-tab");
+        cx.simulate_click(results.center(), gpui::Modifiers::default());
+        assert_eq!(docks(cx).0, Some(Panel::Results));
+        // Closed, they leave the dock to the first panel it has.
+        ws.update_in(cx, |w, window, cx| w.close_results(window, cx));
+        assert_eq!(docks(cx).0, Some(Panel::Files));
+        assert!(cx.read(|cx| !ws.read(cx).available(Panel::Results)));
+
+        // The key again, with the keyboard in the terminal, closes that
+        // dock; once more opens it. The last terminal to end closes it,
+        // since the dock has nothing else, and the keyboard is not left
+        // in it.
+        ws.update_in(cx, |_, window, cx| window.focus(&terminal.focus_handle(cx)));
+        cx.dispatch_action(ToggleTerminal);
+        assert_eq!(docks(cx).1, None);
+        cx.dispatch_action(ToggleTerminal);
+        assert_eq!(docks(cx).1, Some(Panel::Terminal));
+        cx.simulate_input("exit");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the terminal to end", &|cx| {
+            ws.read(cx).terminals.is_empty()
+        });
+        assert_eq!(docks(cx), (Some(Panel::Files), None, Some(Panel::Search)));
+        cx.dispatch_action(ShowAgent);
+        assert_eq!(docks(cx).0, Some(Panel::Agent));
     }
 
     #[gpui::test]

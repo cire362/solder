@@ -868,7 +868,7 @@ applied as soon as it is saved.
     "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions"]
   },
   "right": { "width": 380, "panels": ["chat", "agent"] },
-  "bottom": { "height": 280 },
+  "bottom": { "height": 280, "panels": ["terminal", "debug", "response", "results"] },
   "title_bar": { "height": 38 },
   "tab_bar": { "height": 34 },
   "status_bar": { "height": 26 },
@@ -876,9 +876,14 @@ applied as soon as it is saved.
 }
 ```
 
-There are three docks. The two at the sides hold panels, each with a tab:
-`panels` says which a dock holds and in what order, so the chat can be on the
-left and the file tree on the right, or everything in one dock. A panel named
+There are three docks, and each holds panels, with a tab for each: `panels`
+says which a dock holds and in what order, so the chat can be on the left,
+the file tree on the right and the terminals beside the code, or everything
+in one dock. `terminal` is every terminal, each with a tab of its own, and
+the button that opens another. `debug`, `response` (the answer to an HTTP
+request) and `results` (of a query) have a tab only while they have something
+to show; when the last of them closes, or the last terminal ends, its dock
+shows the first panel it has left, or closes. A panel named
 in `hidden` has no tab; its command and its key still open it, in the dock it
 comes in, and its tab is there for as long as it shows. A panel the file does
 not name is where it comes, after the ones the file names. When more tabs
@@ -899,8 +904,8 @@ the file, next to whatever else you wrote there, comments included. A double
 click on a border puts its dock back to the size it came with. A file with a
 mistake in it is not written to.
 
-The bottom dock's own tabs (terminals, results, the debugger) are not in the
-file yet, and neither are the bars' items.
+The bars' items are not in the file yet, and neither is which panel each dock
+has open.
 
 ## Settings from another editor
 

@@ -7,9 +7,9 @@
 //! what is wrong where a mistake in `settings.json` is said. A size outside
 //! what a window can show is brought back to the nearest one that fits.
 //!
-//! There are three docks, left, right and bottom. The two at the sides
-//! hold panels, each with a tab: which panels a dock holds and in what
-//! order is the file's to say, and a panel can be hidden from both.
+//! There are three docks, left, right and bottom. Each holds panels, with
+//! a tab for each: which panels a dock holds and in what order is the
+//! file's to say, and a panel can be hidden from all of them.
 
 use std::{
     path::{Path, PathBuf},
@@ -41,17 +41,28 @@ pub enum Panel {
     Extensions,
     Chat,
     Agent,
+    /// The terminals: each has a tab of its own where this panel is.
+    Terminal,
+    /// The three below have a tab only while they have something to show.
+    Debug,
+    Response,
+    Results,
 }
 
-/// A dock at a side of the window.
+/// One of the three docks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Place {
     Left,
     Right,
+    Bottom,
+}
+
+impl Place {
+    pub const ALL: [Place; 3] = [Place::Left, Place::Right, Place::Bottom];
 }
 
 impl Panel {
-    pub const ALL: [Panel; 10] = [
+    pub const ALL: [Panel; 14] = [
         Panel::Files,
         Panel::Search,
         Panel::Git,
@@ -62,6 +73,10 @@ impl Panel {
         Panel::Extensions,
         Panel::Chat,
         Panel::Agent,
+        Panel::Terminal,
+        Panel::Debug,
+        Panel::Response,
+        Panel::Results,
     ];
 
     /// What its tab says.
@@ -77,6 +92,10 @@ impl Panel {
             Panel::Extensions => "Extensions",
             Panel::Chat => "Chat",
             Panel::Agent => "Agent",
+            Panel::Terminal => "Terminal",
+            Panel::Results => "Results",
+            Panel::Response => "Response",
+            Panel::Debug => "Debug",
         }
     }
 
@@ -93,6 +112,10 @@ impl Panel {
             Panel::Extensions => "extensions",
             Panel::Chat => "chat",
             Panel::Agent => "agent",
+            Panel::Terminal => "terminal",
+            Panel::Results => "results",
+            Panel::Response => "response",
+            Panel::Debug => "debug",
         }
     }
 
@@ -100,6 +123,7 @@ impl Panel {
     pub fn home(self) -> Place {
         match self {
             Panel::Chat | Panel::Agent => Place::Right,
+            Panel::Terminal | Panel::Results | Panel::Response | Panel::Debug => Place::Bottom,
             _ => Place::Left,
         }
     }
@@ -114,7 +138,16 @@ pub struct Side {
     pub panels: Vec<Panel>,
 }
 
-/// A bar or a dock across the window: its height.
+/// The dock across the bottom of the window: its height, and its panels
+/// in the order of their tabs.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Low {
+    pub height: f32,
+    pub panels: Vec<Panel>,
+}
+
+/// A bar across the window: its height.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Across {
@@ -143,9 +176,10 @@ pub struct Layout {
     /// The dock on the right: the chat and the agent, as it comes.
     #[serde(default)]
     pub right: Side,
-    /// The terminal, results and the debugger at the bottom.
+    /// The dock at the bottom: the terminals, the debugger and results,
+    /// as it comes.
     #[serde(default)]
-    pub bottom: Across,
+    pub bottom: Low,
     #[serde(default)]
     pub title_bar: Across,
     #[serde(default)]
@@ -174,7 +208,10 @@ impl Default for Layout {
                 width: 380.,
                 panels: at(Place::Right),
             },
-            bottom: Across { height: 280. },
+            bottom: Low {
+                height: 280.,
+                panels: at(Place::Bottom),
+            },
             title_bar: Across { height: 38. },
             tab_bar: Across { height: 34. },
             status_bar: Across { height: 26. },
@@ -224,22 +261,20 @@ impl Layout {
         cx.try_global::<Layout>().unwrap_or(&STANDARD)
     }
 
-    pub fn side(&self, place: Place) -> &Side {
+    /// The panels of a dock, in the order of their tabs.
+    pub fn panels(&self, place: Place) -> &[Panel] {
         match place {
-            Place::Left => &self.left,
-            Place::Right => &self.right,
+            Place::Left => &self.left.panels,
+            Place::Right => &self.right.panels,
+            Place::Bottom => &self.bottom.panels,
         }
     }
 
     /// The dock a panel's tab is in; `None` for a hidden one.
     pub fn place(&self, panel: Panel) -> Option<Place> {
-        if self.left.panels.contains(&panel) {
-            Some(Place::Left)
-        } else if self.right.panels.contains(&panel) {
-            Some(Place::Right)
-        } else {
-            None
-        }
+        Place::ALL
+            .into_iter()
+            .find(|place| self.panels(*place).contains(&panel))
     }
 
     /// The size of a part that can be dragged: a width or a height.
@@ -277,8 +312,12 @@ impl Layout {
                 hidden.push(panel);
             }
         }
-        for side in [&mut self.left, &mut self.right] {
-            side.panels.retain(|panel| {
+        for panels in [
+            &mut self.left.panels,
+            &mut self.right.panels,
+            &mut self.bottom.panels,
+        ] {
+            panels.retain(|panel| {
                 let keep = !hidden.contains(panel) && !placed.contains(panel);
                 if keep {
                     placed.push(*panel);
@@ -291,6 +330,7 @@ impl Layout {
                 match panel.home() {
                     Place::Left => self.left.panels.push(panel),
                     Place::Right => self.right.panels.push(panel),
+                    Place::Bottom => self.bottom.panels.push(panel),
                 }
             }
         }
@@ -366,7 +406,7 @@ pub fn keep(part: Part, cx: &mut App) {
     let value = match part {
         Part::Left => serde_json::to_value(&layout.left),
         Part::Right => serde_json::to_value(&layout.right),
-        Part::Bottom => serde_json::to_value(layout.bottom),
+        Part::Bottom => serde_json::to_value(&layout.bottom),
     };
     let Ok(value) = value else { return };
     cx.background_executor()
@@ -404,6 +444,7 @@ mod tests {
         assert_eq!(layout.left.width, 300.);
         assert_eq!(layout.left.panels, Layout::default().left.panels);
         assert_eq!(layout.bottom.height, 420.);
+        assert_eq!(layout.bottom.panels, Layout::default().bottom.panels);
         assert_eq!(layout.right, Layout::default().right);
         assert_eq!(layout.status_bar, Layout::default().status_bar);
         // A size no window can show is brought to the nearest that fits,
@@ -431,13 +472,16 @@ mod tests {
     fn every_panel_is_in_one_dock_or_hidden() {
         use Panel::*;
         // As it comes: eight on the left, the chat and the agent on the
-        // right, none hidden.
+        // right, the terminals, the debugger and the two kinds of answers
+        // at the bottom, none hidden.
         let standard = Layout::default();
         assert_eq!(
             standard.left.panels,
             [Files, Search, Git, Services, Database, Api, Ai, Extensions]
         );
         assert_eq!(standard.right.panels, [Chat, Agent]);
+        assert_eq!(standard.bottom.panels, [Terminal, Debug, Response, Results]);
+        assert_eq!(standard.place(Terminal), Some(Place::Bottom));
         assert_eq!(standard.place(Git), Some(Place::Left));
         assert_eq!(standard.place(Agent), Some(Place::Right));
 
@@ -448,7 +492,8 @@ mod tests {
         let layout = parse(
             r#"{
               "left": { "panels": ["chat", "git", "files", "chat"] },
-              "right": { "panels": ["search", "git", "api"] },
+              "right": { "panels": ["search", "git", "api", "terminal"] },
+              "bottom": { "panels": ["agent", "terminal"] },
               "hidden": ["api", "ai", "api"]
             }"#,
         )
@@ -457,16 +502,24 @@ mod tests {
             layout.left.panels,
             [Chat, Git, Files, Services, Database, Extensions]
         );
-        assert_eq!(layout.right.panels, [Search, Agent]);
+        assert_eq!(layout.right.panels, [Search, Terminal]);
+        assert_eq!(layout.bottom.panels, [Agent, Debug, Response, Results]);
         assert_eq!(layout.hidden, [Api, Ai]);
+        assert_eq!(layout.place(Terminal), Some(Place::Right));
+        assert_eq!(layout.place(Agent), Some(Place::Bottom));
         assert_eq!(layout.place(Chat), Some(Place::Left));
         assert_eq!(layout.place(Search), Some(Place::Right));
         assert_eq!(layout.place(Api), None);
         for panel in Panel::ALL {
-            let places = [&layout.left.panels, &layout.right.panels, &layout.hidden]
-                .iter()
-                .filter(|list| list.contains(&panel))
-                .count();
+            let places = [
+                &layout.left.panels,
+                &layout.right.panels,
+                &layout.bottom.panels,
+                &layout.hidden,
+            ]
+            .iter()
+            .filter(|list| list.contains(&panel))
+            .count();
             assert_eq!(places, 1, "{panel:?}");
         }
         // Written out and read again, it is the same.
@@ -478,5 +531,6 @@ mod tests {
         .unwrap();
         assert!(empty.left.panels.is_empty());
         assert_eq!(empty.right.panels.len(), 10);
+        assert_eq!(empty.bottom.panels.len(), 4);
     }
 }
