@@ -255,7 +255,8 @@ not use.
 Where it stands: the layout file sets the sizes, docks, panels and bars;
 panels move by hand too. Layouts have names and are remembered per project.
 The interface font, size and density are settings, and every color, corner
-radius and border width is a theme token. Keys are the user's (`keymap.json`).
+radius and border width is a theme token. Key layouts have names too, with
+the user's own bindings (`keymap.json`) on top.
 The only icons are those of files, from a Zed extension's icon theme;
 buttons and panels are still words.
 
@@ -301,9 +302,11 @@ file, so the two never disagree. It starts after the Zed items of phase 8.
       with. `layouts/<name>.json` is the selected layout's file, `layout.json`
       is Default; all open windows share the choice and remember it for
       their projects in `layouts.json`
-- [ ] Key layouts by name: the built-in one, the ones that follow other
+- [x] Key layouts by name: the built-in one, the ones that follow other
       editors, and the user's own, switched by a command, with `keymap.json`
-      still on top
+      still on top. Default, VS Code, JetBrains and `keymaps/<name>.json`,
+      copied, selected and opened through commands; the choice is a
+      setting shared by the windows. Invalid saves keep the last good keys
 
 ### Themes
 - [x] Every color in the window comes from a token a theme can set: the ones

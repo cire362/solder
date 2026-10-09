@@ -31,6 +31,7 @@ use crate::{
     git_store::{GitStore, GitStoreEvent},
     go_to_line::GoToLine as GoToLineDelegate,
     inline_edit::{InlineEdit, InlineEditEvent},
+    key_layout_picker::{KeyLayoutPicker, SwitchKeyLayout},
     layout::{self, Item, Layout, Panel, Part, Place, TabBar, TabsAt},
     layout_picker::{LayoutPicker, SwitchLayout},
     locations::{CodeActionPicker, LocationPicker, RenamePrompt},
@@ -74,6 +75,8 @@ actions!(
         OpenKeymap,
         OpenLayout,
         SaveLayout,
+        SaveKeyLayout,
+        OpenKeyLayout,
         ResetLayout,
         SplitRight,
         FocusNextPane,
@@ -3428,6 +3431,41 @@ impl Workspace {
         self.layout_picker(true, window, cx);
     }
 
+    fn switch_key_layout(
+        &mut self,
+        action: &SwitchKeyLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(name) = &action.name {
+            crate::key_layout::choose(name.clone(), cx);
+        } else {
+            self.key_layout_picker(false, window, cx);
+        }
+    }
+
+    fn save_key_layout(&mut self, _: &SaveKeyLayout, window: &mut Window, cx: &mut Context<Self>) {
+        self.key_layout_picker(true, window, cx);
+    }
+
+    fn open_key_layout(&mut self, _: &OpenKeyLayout, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = crate::key_layout::path(cx) {
+            self.open_path(path, None, window, cx);
+        } else {
+            // Built-in sets are copied first, so editing one cannot change
+            // what Default or another editor's preset means.
+            self.key_layout_picker(true, window, cx);
+        }
+    }
+
+    fn key_layout_picker(&mut self, save: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_modal(window, cx, move |window, cx| {
+            let picker = Picker::new(KeyLayoutPicker::new(save), window, cx);
+            KeyLayoutPicker::load(window, cx);
+            picker
+        });
+    }
+
     fn layout_picker(&mut self, save: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_modal(window, cx, move |window, cx| {
             let picker = Picker::new(LayoutPicker::new(save), window, cx);
@@ -4408,6 +4446,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_layout))
             .on_action(cx.listener(Self::switch_layout))
             .on_action(cx.listener(Self::save_layout))
+            .on_action(cx.listener(Self::switch_key_layout))
+            .on_action(cx.listener(Self::save_key_layout))
+            .on_action(cx.listener(Self::open_key_layout))
             .on_action(cx.listener(Self::reset_layout))
             .on_action(cx.listener(Self::split_right))
             .on_action(cx.listener(Self::focus_next_pane))
@@ -9665,6 +9706,130 @@ mod tests {
             assert!(errors.is_empty(), "{errors:?}");
             assert!(bindings.len() > 30);
         }
+    }
+
+    #[gpui::test]
+    fn key_layouts_switch_copy_and_keep_personal_overrides(cx: &mut TestAppContext) {
+        use crate::key_layout;
+        let root = fixture("key-layouts");
+        let config = db::testing::dir("ws-key-layouts");
+        std::fs::write(
+            config.join("settings.json"),
+            "// mine\n{\"buffer_font_size\":16}\n",
+        )
+        .unwrap();
+        std::fs::write(config.join(settings::IMPORTED_KEYMAP), r#"[{"context":"Editor && mode == full","bindings":{"ctrl-alt-d":"editor::SelectLine"}}]"#).unwrap();
+        std::fs::create_dir_all(config.join("keymaps")).unwrap();
+        let custom = config.join("keymaps/Review.json");
+        std::fs::write(&custom, r#"[{"context":"Editor && mode == full","bindings":{"ctrl-alt-d":"editor::DuplicateLine"}}]"#).unwrap();
+        std::fs::write(config.join("keymap.json"), r#"[{"context":"Workspace","bindings":{"alt-shift-r":["workspace::SwitchKeyLayout",{"name":"Review"}],"alt-shift-d":["workspace::SwitchKeyLayout",{"name":"Default"}]}}]"#).unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(root.join("keys.txt")), "one\ntwo", None, window, cx)
+        });
+        let wait = |cx: &mut VisualTestContext, name: &str| {
+            wait_for(cx, "the selected keys", &|cx| {
+                !key_layout::pending(cx) && key_layout::active(cx) == name
+            });
+            cx.run_until_parked();
+        };
+        cx.simulate_keystrokes("alt-shift-r");
+        wait(cx, "Review");
+        cx.simulate_keystrokes("ctrl-alt-d");
+        assert_eq!(active_text(&ws, cx), "one\none\ntwo");
+        // A full-editor binding leaves Enter to a picker's parent.
+        cx.dispatch_action(SwitchKeyLayout::default());
+        cx.simulate_input("VS Code");
+        bounds_soon(cx, "key-layout-choice-0");
+        cx.simulate_keystrokes("enter");
+        wait(cx, key_layout::VSCODE);
+        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+        cx.simulate_keystrokes("alt-shift-down");
+        assert_eq!(active_text(&ws, cx), "one\none\none\ntwo");
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        editor.update(cx, |e, cx| e.select_range(0..4, cx));
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(active_text(&ws, cx), "one\none\ntwo");
+        cx.dispatch_action(SaveKeyLayout);
+        cx.simulate_input("My keys");
+        bounds_soon(cx, "key-layout-save");
+        cx.simulate_keystrokes("enter");
+        wait(cx, "My keys");
+        let copied = std::fs::read_to_string(config.join("keymaps/My keys.json")).unwrap();
+        assert_eq!(
+            copied,
+            import::keymap::to_json(&import::keymap::vscode_preset(cfg!(target_os = "macos")))
+        );
+        assert!(
+            std::fs::read_to_string(config.join("settings.json"))
+                .unwrap()
+                .starts_with("// mine\n")
+        );
+        assert_eq!(cx.read(|cx| Settings::get(cx).buffer_font_size), 16.);
+
+        // The user's own assignment wins over the selected file, which
+        // in turn wins over the old imported assignment.
+        cx.simulate_keystrokes("alt-shift-r");
+        wait(cx, "Review");
+        std::fs::write(config.join("keymap.json"), r#"[{"context":"Editor && mode == full","bindings":{"ctrl-alt-d":"editor::SelectLine"}}]"#).unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        cx.simulate_keystrokes("ctrl-alt-d backspace");
+        assert_eq!(active_text(&ws, cx), "one\ntwo");
+        // A partial invalid map is rejected as a whole. Its last good
+        // keys remain active, and the file is left for the user to fix.
+        std::fs::write(config.join("keymap.json"), "[]").unwrap();
+        std::fs::write(
+            &custom,
+            r#"[{"bindings":{"ctrl-alt-d":"editor::SelectLine","ctrl-alt-x":"no::SuchAction"}}]"#,
+        )
+        .unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        wait_for(cx, "the rejected key file", &|cx| {
+            !cx.global::<settings::ConfigErrors>().0.is_empty()
+        });
+        assert!(!cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+        editor.update(cx, |e, cx| e.select_range(0..0, cx));
+        cx.simulate_keystrokes("ctrl-alt-d");
+        assert_eq!(active_text(&ws, cx), "one\none\ntwo");
+        // Two immediate selections are serialized; the last one wins
+        // both in the app and after reading the settings again.
+        cx.dispatch_action(SwitchKeyLayout {
+            name: Some(key_layout::JETBRAINS.into()),
+        });
+        cx.dispatch_action(SwitchKeyLayout {
+            name: Some(key_layout::DEFAULT.into()),
+        });
+        wait(cx, key_layout::DEFAULT);
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert_eq!(
+            cx.read(|cx| Settings::get(cx).key_layout.clone()),
+            key_layout::DEFAULT
+        );
+        editor.update(cx, |e, cx| e.select_range(0..0, cx));
+        cx.simulate_keystrokes("ctrl-alt-d backspace");
+        assert_eq!(active_text(&ws, cx), "one\ntwo");
+        let before = std::fs::read_to_string(config.join("settings.json")).unwrap();
+        cx.dispatch_action(SwitchKeyLayout {
+            name: Some("Missing".into()),
+        });
+        wait(cx, key_layout::DEFAULT);
+        assert_eq!(
+            std::fs::read_to_string(config.join("settings.json")).unwrap(),
+            before
+        );
+        assert!(!cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+        cx.dispatch_action(SwitchKeyLayout {
+            name: Some("My keys".into()),
+        });
+        wait(cx, "My keys");
+        assert!(cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()));
+        cx.dispatch_action(OpenKeyLayout);
+        wait_for(cx, "the selected key file", &|cx| {
+            ws.read(cx).active_editor().unwrap().read(cx).path(cx)
+                == Some(config.join("keymaps/My keys.json").as_path())
+        });
     }
 
     #[gpui::test]

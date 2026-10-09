@@ -68,6 +68,8 @@ pub struct Settings {
     pub ui_font_size: f32,
     /// How tall the rows of lists are: `compact`, `default`, `comfortable`.
     pub ui_density: Density,
+    /// Default, VS Code, JetBrains, or a file in `keymaps`.
+    pub key_layout: String,
     /// Indent width for files whose indentation cannot be detected.
     pub indent_size: usize,
     /// Latency, frame time and memory in the status bar.
@@ -244,6 +246,7 @@ impl Default for Settings {
             ui_font_family: UI_FONT.to_string(),
             ui_font_size: UI_FONT_PX,
             ui_density: Density::Standard,
+            key_layout: crate::key_layout::DEFAULT.into(),
             indent_size: 4,
             show_performance_hud: true,
             language_servers: BTreeMap::new(),
@@ -509,6 +512,26 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+#[derive(Default)]
+struct KeyFiles {
+    imported: Vec<KeyBinding>,
+    personal: Vec<KeyBinding>,
+}
+impl Global for KeyFiles {}
+
+/// A named set arrives from the background. Use the newest personal and
+/// imported files, rather than a snapshot from when its read began.
+pub(crate) fn bind_key_files(selected: Vec<KeyBinding>, cx: &mut App) {
+    let files = cx.default_global::<KeyFiles>();
+    let imported = files.imported.clone();
+    let personal = files.personal.clone();
+    cx.clear_key_bindings();
+    bind_defaults(cx);
+    cx.bind_keys(imported);
+    cx.bind_keys(selected);
+    cx.bind_keys(personal);
+}
+
 /// Loads the config files and applies them. Safe to call again on change.
 pub fn reload(cx: &mut App) {
     reload_from(&config_dir(), cx);
@@ -516,6 +539,11 @@ pub fn reload(cx: &mut App) {
 
 /// `reload`, from the config folder given.
 pub fn reload_from(dir: &Path, cx: &mut App) {
+    // A selection writes the setting and its file together. Watching an
+    // intermediate save must not apply just half of that change.
+    if crate::key_layout::pending(cx) {
+        return;
+    }
     let mut errors = Vec::new();
     let mut settings = match parse_settings(&read(&dir.join("settings.json"))) {
         Ok(s) => s,
@@ -533,16 +561,21 @@ pub fn reload_from(dir: &Path, cx: &mut App) {
     }
     errors.extend(settings.theme_overrides.mistakes());
     cx.global_mut::<crate::perf::Perf>().hud_visible = settings.show_performance_hud;
+    let key_layout = settings.key_layout.clone();
     cx.set_global(settings);
 
-    cx.clear_key_bindings();
-    bind_defaults(cx);
-    // Later bindings win: the defaults, what was imported, the user's own.
-    for file in [IMPORTED_KEYMAP, "keymap.json"] {
-        let (bindings, keymap_errors) = parse_keymap(file, &read(&dir.join(file)), cx);
-        cx.bind_keys(bindings);
-        errors.extend(keymap_errors);
-    }
+    // An explicit choice wins over an older import. Personal bindings
+    // remain above both, so choosing a set never discards them.
+    let (imported, keymap_errors) =
+        parse_keymap(IMPORTED_KEYMAP, &read(&dir.join(IMPORTED_KEYMAP)), cx);
+    errors.extend(keymap_errors);
+    let (personal, keymap_errors) =
+        parse_keymap("keymap.json", &read(&dir.join("keymap.json")), cx);
+    errors.extend(keymap_errors);
+    cx.set_global(KeyFiles { imported, personal });
+    let (bindings, keymap_errors) = crate::key_layout::reload_from(dir, &key_layout, cx);
+    bind_key_files(bindings, cx);
+    errors.extend(keymap_errors);
     errors.extend(crate::layout::reload_from(dir, cx));
     for e in &errors {
         eprintln!("{e}");
@@ -557,13 +590,17 @@ pub fn watch(cx: &mut App) {
 }
 
 /// Reads the config files in `dir` again whenever one of them is saved,
-/// a theme or a named layout in its folder too.
+/// a theme, named layout or key layout in its folder too.
 pub fn watch_dir(dir: PathBuf, cx: &mut App) {
     // The folder of themes is watched from the start, so that the first
     // theme put there is seen.
     let themes = dir.join("themes");
     let layouts = dir.join("layouts");
-    if std::fs::create_dir_all(&themes).is_err() || std::fs::create_dir_all(&layouts).is_err() {
+    let keymaps = dir.join("keymaps");
+    if [&themes, &layouts, &keymaps]
+        .into_iter()
+        .any(|dir| std::fs::create_dir_all(dir).is_err())
+    {
         return;
     }
     let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
@@ -578,6 +615,9 @@ pub fn watch_dir(dir: PathBuf, cx: &mut App) {
         || watcher.watch(&themes, RecursiveMode::NonRecursive).is_err()
         || watcher
             .watch(&layouts, RecursiveMode::NonRecursive)
+            .is_err()
+        || watcher
+            .watch(&keymaps, RecursiveMode::NonRecursive)
             .is_err()
     {
         return;
@@ -597,7 +637,7 @@ pub fn watch_dir(dir: PathBuf, cx: &mut App) {
     .detach();
 }
 
-pub const DEFAULT_KEYMAP: &str = r#"// Key bindings added here apply on top of the defaults.
+pub const DEFAULT_KEYMAP: &str = r#"// Key bindings added here apply on top of the selected key layout.
 // Run "Workspace: Toggle command palette" to see action names.
 [
   {

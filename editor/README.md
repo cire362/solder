@@ -987,6 +987,36 @@ it for every project still open. A project with no saved choice uses the
 current layout. Missing or broken layout files leave the last good layout
 in use and say what is wrong in the status bar.
 
+**Workspace: Switch key layout** chooses **Default**, **VS Code**,
+**JetBrains**, or a file in `~/.config/solder/keymaps/<name>.json`. The presets
+cover the commands Solder has, with the keys of the current platform. The
+choice is saved as `key_layout` in `settings.json` and applies to all windows.
+
+**Workspace: Save key layout** copies the selected set under a new name and
+selects it; an existing file is left alone. **Workspace: Open key layout**
+opens that file for editing. For a built-in set it asks for a copy's name
+first; run Open key layout again to edit the saved copy. Saving a key layout
+applies it immediately. Invalid bindings or a missing file keep the last
+good set and report the error in the status bar.
+
+Bindings apply in this order: Solder's defaults, `keymap-imported.json`, the
+selected set, then personal `keymap.json`. A saved copy contains only the
+selected set; personal and imported bindings keep their own files.
+**Workspace: Open keymap** still opens the personal file. A key can choose a
+set directly, for example in `keymap.json`:
+
+```json
+[
+  {
+    "context": "Workspace",
+    "bindings": {
+      "alt-shift-v": ["workspace::SwitchKeyLayout", { "name": "VS Code" }],
+      "alt-shift-d": ["workspace::SwitchKeyLayout", { "name": "Default" }]
+    }
+  }
+]
+```
+
 The text of the interface is set in `settings.json`, apart from the code's:
 
 ```json

@@ -38,6 +38,8 @@ mod import_view;
 mod indent;
 mod inline_completion;
 mod inline_edit;
+mod key_layout;
+mod key_layout_picker;
 mod key_prompts;
 mod layout;
 mod layout_picker;
