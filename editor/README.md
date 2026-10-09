@@ -1003,7 +1003,8 @@ Solder's tokens as hex colors, so it can be edited or written by hand:
   "name": "Night Owl",
   "appearance": "dark",
   "colors": { "bg": "#011627", "fg": "#d6deeb", "accent": "#7e57c2" },
-  "syntax": { "keyword": "#c792ea", "string": "#ecc48d" }
+  "syntax": { "keyword": "#c792ea", "string": "#ecc48d" },
+  "terminal": { "red": "#ef5350", "bright_blue": "#82aaff" }
 }
 ```
 
@@ -1012,6 +1013,30 @@ theme, the workbench colors and the TextMate rules are laid over those tokens;
 what the theme does not say (or says in a way that would not read here, like a
 border in its brightest color) is worked out from its background and text.
 Snippets, Vim configs and JetBrains color schemes are not imported.
+
+Every color in the window is one of these tokens: 21 in `colors`, 9 in `syntax`
+and the 16 of `terminal`, which are the colors programs there ask for by number
+(`black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, and each
+with `bright_` before it). A theme from VS Code or Zed brings the terminal
+colors it has.
+
+A theme's file is applied as soon as it is saved, so a theme can be written
+with the window in view. To change a few tokens without a file of your own, set
+them in `settings.json`, over whichever theme is in use:
+
+```json
+{
+  "theme": "dark",
+  "theme_overrides": {
+    "accent": "#00c2a8",
+    "syntax": { "comment": "#7a7a85" },
+    "terminal": { "red": "#ff5f56" }
+  }
+}
+```
+
+A name that is no token, or a value that is no color, changes nothing and is
+said in the status bar.
 
 ## Measured so far
 

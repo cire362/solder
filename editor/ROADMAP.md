@@ -253,7 +253,7 @@ not use.
 ## 9. An editor shaped by its user
 
 Where it stands: keys are the user's (`keymap.json`), and so are the colors
-(a theme file, 34 tokens). The rest is fixed in code: the sidebar is on the
+(a theme file, 30 tokens). The rest is fixed in code: the sidebar is on the
 left and 390 px wide, the chat on the right, the terminal at the bottom, the
 sidebar's tabs and the status bar's items in one order, the interface font
 and its size, and the only icons are those of files, from an extension's
@@ -304,12 +304,13 @@ file, so the two never disagree. It starts after the Zed items of phase 8.
       still on top
 
 ### Themes
-- [ ] Every color in the window comes from a token a theme can set: the ones
-      still written in code become tokens
+- [x] Every color in the window comes from a token a theme can set: the ones
+      still written in code become tokens. They were the terminal's sixteen;
+      themes from VS Code and Zed bring theirs
 - [ ] Shapes as tokens next to colors: the radii, the spacing, the width of
       borders
-- [ ] A theme file is applied as it is saved, and any token can be set in
-      `settings.json` on top of the theme in use
+- [x] A theme file is applied as it is saved, and any token can be set in
+      `settings.json` on top of the theme in use (`theme_overrides`)
 
 ### Icons
 - [ ] A set of icons of Solder's own for buttons, panels and the bars

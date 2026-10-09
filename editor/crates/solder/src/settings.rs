@@ -13,7 +13,7 @@ use gpui::{App, Font, Global, KeyBinding, Pixels, px};
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 
-use crate::theme::{CODE_FONT, Theme, UI_FONT, UI_FONT_PX};
+use crate::theme::{CODE_FONT, Theme, Tokens, UI_FONT, UI_FONT_PX};
 
 /// `system`, `dark`, `light`, or the name of a theme in the `themes`
 /// folder next to `settings.json`.
@@ -57,6 +57,8 @@ pub struct Settings {
     /// The named theme, read when the settings are.
     #[serde(skip)]
     pub custom_theme: Option<Theme>,
+    /// Tokens set over the theme in use, whichever it is.
+    pub theme_overrides: ThemeOverrides,
     pub buffer_font_family: String,
     pub buffer_font_size: f32,
     pub buffer_line_height: f32,
@@ -164,6 +166,46 @@ pub struct ServerOverride {
     pub settings: Option<serde_json::Value>,
 }
 
+/// Tokens of a theme set in `settings.json`, as a theme file names them:
+/// `"accent": "#ff8800"`, and `syntax` and `terminal` for theirs.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeOverrides {
+    #[serde(skip_serializing_if = "Tokens::is_empty")]
+    pub syntax: Tokens,
+    #[serde(skip_serializing_if = "Tokens::is_empty")]
+    pub terminal: Tokens,
+    #[serde(flatten)]
+    pub colors: Tokens,
+}
+
+impl ThemeOverrides {
+    /// What is wrong in them: a name that is no token, a value that is
+    /// no color. Such a line changes nothing, which is worth saying.
+    pub fn mistakes(&self) -> Vec<String> {
+        use import::theme::{COLORS, Rgba, SYNTAX, TERMINAL};
+        let mut mistakes = Vec::new();
+        for (tokens, known, of) in [
+            (&self.colors, COLORS, ""),
+            (&self.syntax, SYNTAX, "syntax."),
+            (&self.terminal, TERMINAL, "terminal."),
+        ] {
+            for (name, value) in tokens {
+                if !known.contains(&name.as_str()) {
+                    mistakes.push(format!(
+                        "settings.json: theme_overrides: no token \u{201c}{of}{name}\u{201d}"
+                    ));
+                } else if Rgba::parse(value).is_none() {
+                    mistakes.push(format!(
+                        "settings.json: theme_overrides: {of}{name}: \u{201c}{value}\u{201d} is not a color"
+                    ));
+                }
+            }
+        }
+        mistakes
+    }
+}
+
 /// How tall the rows of lists are.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,6 +227,7 @@ impl Default for Settings {
         Self {
             theme: ThemeMode::System,
             custom_theme: None,
+            theme_overrides: ThemeOverrides::default(),
             buffer_font_family: CODE_FONT.to_string(),
             buffer_font_size: 13.,
             buffer_line_height: 20.,
@@ -261,13 +304,16 @@ impl Settings {
     }
 
     pub fn theme(&self, appearance: gpui::WindowAppearance) -> Theme {
-        match (&self.theme, &self.custom_theme) {
+        let mut theme = match (&self.theme, &self.custom_theme) {
             (ThemeMode::Named(_), Some(theme)) => theme.clone(),
             (ThemeMode::Dark, _) => Theme::dark(),
             (ThemeMode::Light, _) => Theme::light(),
             // The system's, also for a named theme whose file is gone.
             _ => Theme::for_appearance(appearance),
-        }
+        };
+        let over = &self.theme_overrides;
+        theme.lay(&over.colors, &over.syntax, &over.terminal);
+        theme
     }
 }
 
@@ -474,6 +520,7 @@ pub fn reload_from(dir: &Path, cx: &mut App) {
             Err(e) => errors.push(e),
         }
     }
+    errors.extend(settings.theme_overrides.mistakes());
     cx.global_mut::<crate::perf::Perf>().hud_visible = settings.show_performance_hud;
     cx.set_global(settings);
 
@@ -495,8 +542,16 @@ pub fn reload_from(dir: &Path, cx: &mut App) {
 
 /// Applies config changes as soon as the files are saved.
 pub fn watch(cx: &mut App) {
-    let dir = config_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
+    watch_dir(config_dir(), cx);
+}
+
+/// Reads the config files in `dir` again whenever one of them is saved,
+/// a theme in its `themes` folder too.
+pub fn watch_dir(dir: PathBuf, cx: &mut App) {
+    // The folder of themes is watched from the start, so that the first
+    // theme put there is seen.
+    let themes = dir.join("themes");
+    if std::fs::create_dir_all(&themes).is_err() {
         return;
     }
     let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
@@ -507,7 +562,9 @@ pub fn watch(cx: &mut App) {
     }) else {
         return;
     };
-    if watcher.watch(&dir, RecursiveMode::NonRecursive).is_err() {
+    if watcher.watch(&dir, RecursiveMode::NonRecursive).is_err()
+        || watcher.watch(&themes, RecursiveMode::NonRecursive).is_err()
+    {
         return;
     }
     cx.spawn(async move |cx| {
@@ -517,7 +574,7 @@ pub fn watch(cx: &mut App) {
                 .timer(Duration::from_millis(50))
                 .await;
             while rx.try_recv().is_ok() {}
-            if cx.update(reload).is_err() {
+            if cx.update(|cx| reload_from(&dir, cx)).is_err() {
                 break;
             }
         }
@@ -602,6 +659,65 @@ mod tests {
         assert_eq!(servers["table"].variables()["A"], "b");
         assert!(!servers["table"].enabled);
         assert_eq!(servers["bare"].program(), None);
+    }
+
+    #[test]
+    fn tokens_are_set_over_the_theme_in_use() {
+        use gpui::{Hsla, WindowAppearance::Dark, rgb};
+        let settings = parse_settings(
+            r##"{
+              "theme": "light",
+              "theme_overrides": {
+                "accent": "#00ff88",
+                "syntax": { "comment": "#777777" },
+                "terminal": { "bright_red": "#ff0000" }
+              }
+            }"##,
+        )
+        .unwrap();
+        assert!(settings.theme_overrides.mistakes().is_empty());
+        // The theme in use with those three laid over it, and nothing
+        // else moved.
+        let theme = settings.theme(Dark);
+        let light = Theme::light();
+        assert_eq!(theme.accent, Hsla::from(rgb(0x00ff88)));
+        assert_eq!(theme.syntax.comment, Hsla::from(rgb(0x777777)));
+        assert_eq!(theme.terminal[9], Hsla::from(rgb(0xff0000)));
+        assert_eq!(
+            (theme.bg, theme.syntax.keyword),
+            (light.bg, light.syntax.keyword)
+        );
+        assert_eq!(theme.terminal[1], light.terminal[1]);
+        // Over the system's theme and a named one alike.
+        let system = parse_settings(r##"{ "theme_overrides": { "bg": "#000000" } }"##).unwrap();
+        assert_eq!(system.theme(Dark).bg, Hsla::from(rgb(0x000000)));
+        assert_eq!(system.theme(Dark).fg, Theme::dark().fg);
+
+        // A name that is no token and a value that is no color change
+        // nothing, and are said.
+        let wrong = parse_settings(
+            r##"{ "theme_overrides": {
+                "acent": "#00ff88", "fg": "red", "syntax": { "keyword": "#12" }, "terminal": { "pink": "#ff00ff" }
+            } }"##,
+        )
+        .unwrap();
+        assert_eq!(wrong.theme(Dark), Theme::dark());
+        let mistakes = wrong.theme_overrides.mistakes();
+        assert_eq!(mistakes.len(), 4, "{mistakes:?}");
+        assert!(
+            mistakes
+                .iter()
+                .all(|m| m.starts_with("settings.json: theme_overrides"))
+        );
+        assert!(mistakes.iter().any(|m| m.contains("acent")));
+        assert!(mistakes.iter().any(|m| m.contains("terminal.pink")));
+        assert!(
+            mistakes
+                .iter()
+                .any(|m| m.contains("syntax.keyword") && m.contains("not a color"))
+        );
+        // Nothing set is nothing written.
+        assert!(default_settings_file().contains("\"theme_overrides\": {}"));
     }
 
     #[test]

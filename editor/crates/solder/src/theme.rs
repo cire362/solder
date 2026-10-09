@@ -5,6 +5,9 @@
 use gpui::{App, Global, Hsla, WindowAppearance, px, rgb, rgba};
 use syntax::HighlightKind;
 
+/// Tokens by name, each a color as a theme file writes it.
+pub type Tokens = std::collections::BTreeMap<String, String>;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
     pub bg: Hsla,
@@ -29,6 +32,9 @@ pub struct Theme {
     pub conflict_ours: Hsla,
     pub conflict_theirs: Hsla,
     pub syntax: SyntaxColors,
+    /// The sixteen colors programs in the terminal ask for by number, in
+    /// the order of `import::theme::TERMINAL`.
+    pub terminal: [Hsla; 16],
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -96,6 +102,12 @@ impl Theme {
                 variable: rgb(0xc4c4cc).into(),
                 tag: rgb(0xe8743f).into(),
             },
+            // The site's zinc tones.
+            terminal: [
+                0x27272a, 0xf87171, 0x86efac, 0xfbbf24, 0x93c5fd, 0xd8b4fe, 0x67e8f9, 0xd4d4d8,
+                0x52525b, 0xfca5a5, 0xbbf7d0, 0xfde68a, 0xbfdbfe, 0xe9d5ff, 0xa5f3fc, 0xfafafa,
+            ]
+            .map(|color| rgb(color).into()),
         }
     }
 
@@ -133,6 +145,11 @@ impl Theme {
                 variable: rgb(0x3f3f46).into(),
                 tag: rgb(0xb24a1c).into(),
             },
+            terminal: [
+                0x18181b, 0xdc2626, 0x15803d, 0xb45309, 0x1d4ed8, 0x7e22ce, 0x0e7490, 0x52525b,
+                0x71717a, 0xef4444, 0x16a34a, 0xca8a04, 0x2563eb, 0x9333ea, 0x0891b2, 0x27272a,
+            ]
+            .map(|color| rgb(color).into()),
         }
     }
 
@@ -144,56 +161,67 @@ impl Theme {
         } else {
             Self::dark()
         };
-        let color = |map: &std::collections::BTreeMap<String, String>, key: &str| {
+        theme.lay(&file.colors, &file.syntax, &file.terminal);
+        theme
+    }
+
+    /// Sets the tokens these name. A name that is no token, or a value
+    /// that is no color, changes nothing.
+    pub fn lay(&mut self, colors: &Tokens, syntax: &Tokens, terminal: &Tokens) {
+        let color = |map: &Tokens, key: &str| {
             let c = import::theme::Rgba::parse(map.get(key)?)?;
             let packed = u32::from_be_bytes([c.r, c.g, c.b, c.a]);
             Some(Hsla::from(rgba(packed)))
         };
-        let colors: [(&str, &mut Hsla); 21] = [
-            ("bg", &mut theme.bg),
-            ("bg_elev", &mut theme.bg_elev),
-            ("bg_sunken", &mut theme.bg_sunken),
-            ("fg", &mut theme.fg),
-            ("fg_muted", &mut theme.fg_muted),
-            ("fg_subtle", &mut theme.fg_subtle),
-            ("line", &mut theme.line),
-            ("accent", &mut theme.accent),
-            ("accent_soft", &mut theme.accent_soft),
-            ("accent_fg", &mut theme.accent_fg),
-            ("selection", &mut theme.selection),
-            ("active_line", &mut theme.active_line),
-            ("search_match", &mut theme.search_match),
-            ("search_active", &mut theme.search_active),
-            ("bracket", &mut theme.bracket),
-            ("error", &mut theme.error),
-            ("warning", &mut theme.warning),
-            ("git_added", &mut theme.git_added),
-            ("git_modified", &mut theme.git_modified),
-            ("conflict_ours", &mut theme.conflict_ours),
-            ("conflict_theirs", &mut theme.conflict_theirs),
+        let slots: [(&str, &mut Hsla); 21] = [
+            ("bg", &mut self.bg),
+            ("bg_elev", &mut self.bg_elev),
+            ("bg_sunken", &mut self.bg_sunken),
+            ("fg", &mut self.fg),
+            ("fg_muted", &mut self.fg_muted),
+            ("fg_subtle", &mut self.fg_subtle),
+            ("line", &mut self.line),
+            ("accent", &mut self.accent),
+            ("accent_soft", &mut self.accent_soft),
+            ("accent_fg", &mut self.accent_fg),
+            ("selection", &mut self.selection),
+            ("active_line", &mut self.active_line),
+            ("search_match", &mut self.search_match),
+            ("search_active", &mut self.search_active),
+            ("bracket", &mut self.bracket),
+            ("error", &mut self.error),
+            ("warning", &mut self.warning),
+            ("git_added", &mut self.git_added),
+            ("git_modified", &mut self.git_modified),
+            ("conflict_ours", &mut self.conflict_ours),
+            ("conflict_theirs", &mut self.conflict_theirs),
         ];
-        for (key, slot) in colors {
-            if let Some(found) = color(&file.colors, key) {
+        for (key, slot) in slots {
+            if let Some(found) = color(colors, key) {
                 *slot = found;
             }
         }
-        let syntax: [(&str, &mut Hsla); 9] = [
-            ("keyword", &mut theme.syntax.keyword),
-            ("string", &mut theme.syntax.string),
-            ("function", &mut theme.syntax.function),
-            ("type", &mut theme.syntax.r#type),
-            ("comment", &mut theme.syntax.comment),
-            ("number", &mut theme.syntax.number),
-            ("punctuation", &mut theme.syntax.punctuation),
-            ("variable", &mut theme.syntax.variable),
-            ("tag", &mut theme.syntax.tag),
+        let slots: [(&str, &mut Hsla); 9] = [
+            ("keyword", &mut self.syntax.keyword),
+            ("string", &mut self.syntax.string),
+            ("function", &mut self.syntax.function),
+            ("type", &mut self.syntax.r#type),
+            ("comment", &mut self.syntax.comment),
+            ("number", &mut self.syntax.number),
+            ("punctuation", &mut self.syntax.punctuation),
+            ("variable", &mut self.syntax.variable),
+            ("tag", &mut self.syntax.tag),
         ];
-        for (key, slot) in syntax {
-            if let Some(found) = color(&file.syntax, key) {
+        for (key, slot) in slots {
+            if let Some(found) = color(syntax, key) {
                 *slot = found;
             }
         }
-        theme
+        for (key, slot) in import::theme::TERMINAL.iter().zip(&mut self.terminal) {
+            if let Some(found) = color(terminal, key) {
+                *slot = found;
+            }
+        }
     }
 
     pub fn for_appearance(appearance: WindowAppearance) -> Self {

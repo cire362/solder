@@ -11380,6 +11380,55 @@ brackets = [
     }
 
     #[gpui::test]
+    fn a_theme_file_is_applied_as_it_is_saved(cx: &mut TestAppContext) {
+        use gpui::{Hsla, rgb};
+        cx.executor().allow_parking();
+        let root = db::testing::dir("ws-theme-live").canonicalize().unwrap();
+        let config = db::testing::dir("ws-theme-live-config")
+            .canonicalize()
+            .unwrap();
+        let theme_file = |bg: &str| {
+            format!(
+                r##"{{ "name": "Mine", "appearance": "dark",
+                      "colors": {{ "bg": "{bg}", "accent": "#112233" }},
+                      "terminal": {{ "red": "#ff0000" }} }}"##
+            )
+        };
+        std::fs::create_dir_all(config.join("themes")).unwrap();
+        std::fs::write(config.join("themes/mine.json"), theme_file("#101010")).unwrap();
+        std::fs::write(
+            config.join("settings.json"),
+            r##"{ "theme": "Mine", "theme_overrides": { "accent": "#00ff88" } }"##,
+        )
+        .unwrap();
+        let (_ws, cx) = setup(cx, root);
+        cx.update(|_, cx| {
+            settings::reload_from(&config, cx);
+            settings::watch_dir(config.clone(), cx);
+        });
+        cx.run_until_parked();
+        // The theme of the file, with the token of the settings over it.
+        let theme = |cx: &App| cx.global::<crate::theme::Theme>().clone();
+        assert_eq!(cx.read(theme).bg, Hsla::from(rgb(0x101010)));
+        assert_eq!(cx.read(theme).terminal[1], Hsla::from(rgb(0xff0000)));
+        assert_eq!(cx.read(theme).accent, Hsla::from(rgb(0x00ff88)));
+        assert_eq!(cx.read(theme).fg, crate::theme::Theme::dark().fg);
+
+        // The theme's file is saved with another background: the window
+        // has it without anything else being touched.
+        std::fs::write(config.join("themes/mine.json"), theme_file("#202020")).unwrap();
+        wait_for(cx, "the saved theme", &|cx| {
+            theme(cx).bg == Hsla::from(rgb(0x202020))
+        });
+        assert_eq!(cx.read(theme).accent, Hsla::from(rgb(0x00ff88)));
+        // And the settings, with the token taken back: the theme's own.
+        std::fs::write(config.join("settings.json"), r#"{ "theme": "Mine" }"#).unwrap();
+        wait_for(cx, "the theme's own accent", &|cx| {
+            theme(cx).accent == Hsla::from(rgb(0x112233))
+        });
+    }
+
+    #[gpui::test]
     fn the_interface_has_the_font_size_and_density_of_the_settings(cx: &mut TestAppContext) {
         let root = db::testing::dir("ws-ui-font").canonicalize().unwrap();
         std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
