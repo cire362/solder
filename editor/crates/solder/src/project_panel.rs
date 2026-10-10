@@ -579,6 +579,52 @@ impl ProjectPanel {
                 })
         };
         let separator = || div().my_1().h(px(1.)).bg(theme.line);
+        // What extensions put in this menu for the file it is on.
+        let offered = path.as_deref().map_or_else(Vec::new, |path| {
+            let Some(store) = crate::extension_store::ExtensionStore::try_global(cx) else {
+                return Vec::new();
+            };
+            let store = store.read(cx);
+            let mut facts = store.facts();
+            let part = |part: Option<&std::ffi::OsStr>| {
+                part.map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            };
+            let ending = match part(path.extension()) {
+                ending if ending.is_empty() => ending,
+                ending => format!(".{ending}"),
+            };
+            for (name, value) in [
+                ("resourceFilename", part(path.file_name()).into()),
+                ("resourceExtname", ending.into()),
+                ("resourceScheme", "file".into()),
+                ("explorerResourceIsFolder", path.is_dir().into()),
+            ] {
+                facts.insert(name.into(), value);
+            }
+            store.menu("explorer/context", &facts, Some(path))
+        });
+        let theirs = offered.into_iter().enumerate().map(|(i, offered)| {
+            let (theme, action) = (theme.clone(), offered.action);
+            div()
+                .id(("m-extension", i))
+                .debug_selector(move || format!("m-extension-{i}"))
+                .h(px(26.))
+                .px_2()
+                .flex()
+                .items_center()
+                .rounded(theme.shape.token)
+                .text_size(UI_FONT_SIZE)
+                .text_color(theme.fg)
+                .hover(|d| d.bg(theme.accent_soft))
+                .child(div().truncate().child(offered.title))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.menu = None;
+                    window.dispatch_action(Box::new(action.clone()), cx);
+                    cx.notify();
+                }))
+        });
+        let theirs: Vec<_> = theirs.collect();
         Some(deferred(
             anchored().position(position).child(
                 div()
@@ -618,7 +664,9 @@ impl ProjectPanel {
                         "Reveal in Finder",
                         Box::new(RevealInFinder),
                         true,
-                    )),
+                    ))
+                    .when(!theirs.is_empty(), |d| d.child(separator()))
+                    .children(theirs),
             ),
         ))
     }

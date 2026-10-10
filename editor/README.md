@@ -893,6 +893,33 @@ What is in the module today is what every extension starts from:
 None of this costs anything while no extension's code runs: documents and
 cursors are followed only once a host is up.
 
+What an extension's manifest says its code can be asked to do is where
+Solder's own commands are:
+
+- **The palette** lists its commands under the names it gives them
+  (`Git: Pull`). Choosing one starts the extension if it was waiting for
+  that. A command its manifest keeps out of the palette is not there.
+- **Menus.** The right button in a file opens what it put in the editor's
+  menu (`editor/context`), and the menu of the file tree has what it put
+  there (`explorer/context`) under Solder's own entries. Both give the
+  command the file. Other menus of VS Code have no place here yet.
+- **Keys.** The keys it binds are bound, the ones for this machine, with
+  chords. They are over the key layout and under `keymap.json`, so a key
+  of your own always wins. A key bound for when the editor has the
+  keyboard is bound in the editor only.
+
+Entries and keys have conditions (`when`), read against what Solder knows:
+the language and name of the file in front (`editorLangId`,
+`resourceExtname`, `resourceFilename`), whether it has a selection or can be
+changed, the machine (`isMac`), and whatever extensions set with
+`setContext`. A condition that asks for something Solder does not know, or
+compares in a way it does not (`=~`, `in`), does not hold: an entry is left
+out, never shown by mistake. To bind a key of your own to such a command:
+
+```json
+[{ "bindings": { "alt-r": ["workspace::RunExtensionCommand", { "command": "demo.run" }] } }]
+```
+
 Language features need nothing of the editor that a language server does not
 already use. To the editor the host of such an extension is a language
 server: it is asked in the Language Server Protocol, and the host answers

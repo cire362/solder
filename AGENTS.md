@@ -218,6 +218,13 @@ Never guess a signature.
   servers, then a handler there. What a server can do is read once, so
   when an extension registers something more its server is closed and
   the documents get a new one (`LspStore::hosts_changed`).
+  What a manifest contributes (commands, menus, keys) is offered from the
+  manifest, before any code runs: `ExtensionStore::palette`, `menu` and
+  `sync_keys`, all through one action, `RunExtensionCommand`. Conditions
+  are `extension::when`, read against `Workspace::extension_facts`; a
+  fact it lacks is false, so a new fact is added there, never guessed.
+  The store cannot read the workspace it is asked from, which is in the
+  middle of its own update: the workspace brings the facts.
 
 ### Performance rules
 

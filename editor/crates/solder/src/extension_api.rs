@@ -96,6 +96,41 @@ pub struct RunExtensionCommand {
     pub command: String,
     /// What the command is given, as a list.
     pub args: Value,
+    /// The condition a key runs it under, as the extension wrote it:
+    /// where it does not hold, the key is somebody else's.
+    pub when: Option<String>,
+}
+
+/// A command of an extension as a list offers it: what it is called, and
+/// what choosing it does.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Offered {
+    pub title: String,
+    pub action: RunExtensionCommand,
+    /// What its key runs, if it has one: the same command under the
+    /// key's condition, which a list uses to find the key and show it.
+    pub keyed: Option<RunExtensionCommand>,
+}
+
+/// The part of the window a key of an extension works in, read from its
+/// condition: one for when the editor has the keyboard is bound in the
+/// editor, so that the same key elsewhere stays what it was.
+fn key_context(when: Option<&str>) -> Option<&'static str> {
+    let when = when?;
+    let wants = |fact: &str| {
+        when.match_indices(fact)
+            .any(|(at, _)| !when[..at].trim_end().ends_with('!'))
+    };
+    if ["editorTextFocus", "editorFocus", "textInputFocus"]
+        .into_iter()
+        .any(wants)
+    {
+        Some("Editor && mode == full")
+    } else if wants("terminalFocus") {
+        Some("Terminal")
+    } else {
+        None
+    }
 }
 
 // Read by hand, as the other actions with a name in them are: no schema
@@ -203,6 +238,11 @@ pub struct Api {
     /// What extensions wrote, by extension and channel.
     output: BTreeMap<(String, String), String>,
     asks: VecDeque<Ask>,
+    /// What extensions said of themselves for their conditions to read
+    /// (`setContext`).
+    contexts: std::collections::HashMap<String, Value>,
+    /// The keys extensions bind, as they were last given to the keymap.
+    keys: String,
 }
 
 fn uri(path: &Path) -> String {
@@ -215,7 +255,7 @@ fn path_of(uri: &Value) -> Option<PathBuf> {
 }
 
 /// What VS Code calls the document's language.
-fn language_id(document: &Document) -> String {
+pub(crate) fn language_id(document: &Document) -> String {
     let id = document.language_id();
     if id != "plaintext" {
         return id.to_string();
@@ -337,8 +377,14 @@ impl ExtensionStore {
         cx: &mut Context<Self>,
     ) -> Option<Result<Value, String>> {
         match command {
-            // Extensions set these for their menus, which read them.
-            "setContext" => Some(Ok(Value::Null)),
+            // Extensions set these for the conditions of their menus and
+            // keys, which read them.
+            "setContext" => {
+                if let Some(name) = args[0].as_str() {
+                    self.api.contexts.insert(name.to_string(), args[1].clone());
+                }
+                Some(Ok(Value::Null))
+            }
             "vscode.open" => {
                 let target = &args[0];
                 let target = match &target["$uri"] {
@@ -684,6 +730,141 @@ impl ExtensionStore {
         self.api.progress.retain(|(of, _), _| of != id);
         if (status, progress) != (self.api.status.len(), self.api.progress.len()) {
             cx.emit(ExtensionEvent::Bar);
+        }
+    }
+
+    /// What the conditions of extensions are read against that is the
+    /// same wherever they are read: the machine, and what extensions said
+    /// of themselves. The window adds the file in front.
+    pub fn facts(&self) -> std::collections::HashMap<String, Value> {
+        let mut facts = self.api.contexts.clone();
+        for (name, os) in [
+            ("isMac", "macos"),
+            ("isLinux", "linux"),
+            ("isWindows", "windows"),
+        ] {
+            facts.insert(name.into(), json!(std::env::consts::OS == os));
+        }
+        facts
+    }
+
+    /// What the key an extension bound to `command` runs, if it bound one.
+    fn keyed(extension: &extension::Extension, command: &str) -> Option<RunExtensionCommand> {
+        let key = extension.keys.iter().find(|key| key.command == command)?;
+        Some(RunExtensionCommand {
+            command: command.to_string(),
+            args: key.args.clone(),
+            when: key.when.clone(),
+        })
+    }
+
+    /// The commands the palette lists: every one an extension whose code
+    /// may run names in its manifest, but for the ones it keeps out of the
+    /// palette or that cannot be run as things are. Choosing one starts
+    /// the extension if it waits for it.
+    pub fn palette(&self, facts: &std::collections::HashMap<String, Value>) -> Vec<Offered> {
+        let fact = |name: &str| facts.get(name).cloned();
+        let holds = |when: &Option<String>| {
+            when.as_deref()
+                .is_none_or(|when| extension::when::holds(when, &fact))
+        };
+        let mut offered = Vec::new();
+        for extension in self.installed.iter().filter(|e| self.may_run(e)) {
+            for command in &extension.contributed {
+                let kept_out = extension.menus.iter().any(|menu| {
+                    menu.menu == "commandPalette"
+                        && menu.command == command.command
+                        && !holds(&menu.when)
+                });
+                if !kept_out && holds(&command.enablement) {
+                    offered.push(Offered {
+                        title: command.title.clone(),
+                        // Asked for by name, it is given nothing, and
+                        // runs whatever its key would wait for.
+                        action: RunExtensionCommand {
+                            command: command.command.clone(),
+                            args: Value::Null,
+                            when: None,
+                        },
+                        keyed: Self::keyed(extension, &command.command),
+                    });
+                }
+            }
+        }
+        offered
+    }
+
+    /// The commands extensions put in `menu` (`editor/context`,
+    /// `explorer/context`) that are there as things are. Each is given
+    /// `target`, the file the menu is for, as VS Code gives it.
+    pub fn menu(
+        &self,
+        menu: &str,
+        facts: &std::collections::HashMap<String, Value>,
+        target: Option<&Path>,
+    ) -> Vec<Offered> {
+        let fact = |name: &str| facts.get(name).cloned();
+        let holds = |when: &Option<String>| {
+            when.as_deref()
+                .is_none_or(|when| extension::when::holds(when, &fact))
+        };
+        let args = match target {
+            Some(path) => json!([{ "$uri": uri(path) }]),
+            None => Value::Null,
+        };
+        let mut offered: Vec<Offered> = Vec::new();
+        for extension in self.installed.iter().filter(|e| self.may_run(e)) {
+            for item in extension.menus.iter().filter(|item| item.menu == menu) {
+                let named = extension
+                    .contributed
+                    .iter()
+                    .find(|command| command.command == item.command);
+                let enabled = named.is_none_or(|command| holds(&command.enablement));
+                if !holds(&item.when) || !enabled {
+                    continue;
+                }
+                let title = named.map_or(item.command.clone(), |command| command.title.clone());
+                if offered
+                    .iter()
+                    .all(|known| known.action.command != item.command)
+                {
+                    offered.push(Offered {
+                        title,
+                        action: RunExtensionCommand {
+                            command: item.command.clone(),
+                            args: args.clone(),
+                            when: None,
+                        },
+                        keyed: Self::keyed(extension, &item.command),
+                    });
+                }
+            }
+        }
+        offered
+    }
+
+    /// Gives the keymap the keys of the extensions whose code may run.
+    /// Nothing is bound again while they are the same.
+    pub(crate) fn sync_keys(&mut self, cx: &mut Context<Self>) {
+        let mut sections = Vec::new();
+        for extension in self.installed.iter().filter(|e| self.may_run(e)) {
+            for key in &extension.keys {
+                let action = json!({ "command": key.command, "args": key.args, "when": key.when });
+                sections.push(json!({
+                    "context": key_context(key.when.as_deref()),
+                    "bindings": { key.keys.as_str(): ["workspace::RunExtensionCommand", action] },
+                }));
+            }
+        }
+        let source = match sections.is_empty() {
+            true => String::new(),
+            false => Value::Array(sections).to_string(),
+        };
+        if source != self.api.keys {
+            for error in crate::settings::set_extension_keys(&source, cx) {
+                eprintln!("{error}");
+            }
+            self.api.keys = source;
         }
     }
 

@@ -576,6 +576,8 @@ mod tests {
                 wakes: vec![
                     "onStartupFinished".into(),
                     "onCommand:demo.run".into(),
+                    "onCommand:demo.spin".into(),
+                    "onCommand:demo.quit".into(),
                     "onLanguage:demo".into(),
                 ],
             }
@@ -651,12 +653,70 @@ mod tests {
             [
                 "1 of its themes (could not be read)",
                 "An icon theme (drawn with a font, or not readable)",
-                "Key bindings for its commands",
+                "A key binding (a key Solder cannot bind)",
+            ]
+        );
+        // What its code can be asked to do, as its manifest names it; where
+        // each is offered; and the keys for them, the ones of this machine.
+        let titles: Vec<(&str, &str)> = installed
+            .contributed
+            .iter()
+            .map(|c| (c.command.as_str(), c.title.as_str()))
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                ("demo.run", "Demo: Run"),
+                ("demo.spin", "Spin"),
+                ("demo.quit", "Quit")
+            ]
+        );
+        assert_eq!(
+            installed.contributed[1].enablement.as_deref(),
+            Some("demo.ready")
+        );
+        let menus: Vec<(&str, &str, Option<&str>)> = installed
+            .menus
+            .iter()
+            .map(|m| (m.menu.as_str(), m.command.as_str(), m.when.as_deref()))
+            .collect();
+        assert_eq!(
+            menus,
+            [
+                ("commandPalette", "demo.quit", Some("false")),
+                ("editor/context", "demo.run", Some("editorLangId == demo")),
+                (
+                    "explorer/context",
+                    "demo.run",
+                    Some("resourceExtname == .dm")
+                ),
+            ]
+        );
+        let own = if cfg!(target_os = "macos") {
+            "alt-cmd-r"
+        } else {
+            "ctrl-alt-r"
+        };
+        assert_eq!(
+            installed.keys,
+            [
+                crate::KeyContribution {
+                    keys: own.into(),
+                    command: "demo.run".into(),
+                    when: Some("editorTextFocus && editorLangId == demo".into()),
+                    args: serde_json::json!(["from a key"]),
+                },
+                crate::KeyContribution {
+                    keys: "ctrl-k ctrl-q".into(),
+                    command: "demo.quit".into(),
+                    when: None,
+                    args: serde_json::Value::Null,
+                },
             ]
         );
         assert_eq!(
             installed.provides(),
-            "2 themes, 2 icon themes, 1 snippet file"
+            "3 commands, 2 key bindings, 2 themes, 2 icon themes, 1 snippet file"
         );
         // The settings it declares, each with what it is by default; one
         // declared twice is the first.

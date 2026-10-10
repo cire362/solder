@@ -136,7 +136,14 @@ exports.activate = async (context) => {
   await context.globalState.update('starts', starts);
   console.log('demo started');
   context.subscriptions.push(
-    vscode.commands.registerCommand('demo.run', (...args) => ({ ran: args, starts })),
+    vscode.commands.registerCommand('demo.run', (...args) => {
+      // A file it is given is named by its last part.
+      const ran = args.map((arg) => (arg instanceof vscode.Uri ? arg.path.split('/').pop() : arg));
+      vscode.window.showInformationMessage('ran ' + JSON.stringify(ran));
+      // Having run once, its other command may be run.
+      vscode.commands.executeCommand('setContext', 'demo.ready', true);
+      return { ran, starts };
+    }),
     vscode.commands.registerCommand('demo.spin', () => { for (;;) {} }),
     vscode.commands.registerCommand('demo.quit', () => process.exit(7)),
   );
@@ -281,7 +288,16 @@ pub fn vscode_extension(dir: &Path) {
   "description": "Demo for VS Code", "main": "./out/main",
   "activationEvents": ["onStartupFinished"],
   "contributes": {
-    "commands": [{"command": "demo.run", "title": "Demo: Run"}],
+    "commands": [
+      {"command": "demo.run", "title": "%run%", "category": "Demo"},
+      {"command": "demo.spin", "title": "Spin", "enablement": "demo.ready"},
+      {"command": "demo.quit", "title": "Quit"}
+    ],
+    "menus": {
+      "commandPalette": [{"command": "demo.quit", "when": "false"}],
+      "editor/context": [{"command": "demo.run", "when": "editorLangId == demo"}],
+      "explorer/context": [{"command": "demo.run", "when": "resourceExtname == .dm"}]
+    },
     "themes": [
       {"label": "Acme Dark", "uiTheme": "vs-dark", "path": "./themes/dark.json"},
       {"label": "Acme Old", "uiTheme": "vs-dark", "path": "./themes/old.tmTheme"},
@@ -307,13 +323,18 @@ pub fn vscode_extension(dir: &Path) {
       }},
       {"properties": {"acme.name": {"type": "string"}, "acme.format": {"default": false}}}
     ],
-    "keybindings": [{"command": "demo.run", "key": "ctrl+r"}]
+    "keybindings": [
+      {"command": "demo.run", "key": "ctrl+r", "mac": "cmd+alt+r", "linux": "ctrl+alt+r", "when": "editorTextFocus && editorLangId == demo", "args": ["from a key"]},
+      {"command": "demo.quit", "key": "ctrl+k ctrl+q"},
+      {"command": "demo.run", "key": "ctrl+numpad_add"},
+      {"command": "-editor.action.rename", "key": "f2"}
+    ]
   }
 }"#,
     );
     write(
         &dir.join("package.nls.json"),
-        r#"{"title": "Acme Demo", "icons": "Acme Icons", "level": "How strict the linter is"}"#,
+        r#"{"title": "Acme Demo", "icons": "Acme Icons", "level": "How strict the linter is", "run": "Run"}"#,
     );
     // Pictures beside the folder of the theme's file, as such themes
     // keep them.

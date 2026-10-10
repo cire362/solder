@@ -1,6 +1,6 @@
 use std::{
     any::TypeId,
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
@@ -283,6 +283,9 @@ pub struct Workspace {
     /// The menu of a dock: where it opened, the dock, and the panel whose
     /// tab was under the pointer, if one was.
     dock_menu: Option<(Point<Pixels>, Place, Option<Panel>)>,
+    /// What extensions offer for the file in front, where the right
+    /// button was pressed in it.
+    editor_menu: Option<(Point<Pixels>, Vec<crate::extension_api::Offered>)>,
     bar_menu: Option<(Point<Pixels>, BarEnd, Option<Item>)>,
     /// The panel whose tab is being dragged. A closed dock has a place to
     /// drop it on for as long as it is.
@@ -742,6 +745,7 @@ impl Workspace {
             layout_selection: layout::selection(cx),
             resizing: None,
             dock_menu: None,
+            editor_menu: None,
             bar_menu: None,
             dragging: None,
             modal: None,
@@ -1788,6 +1792,7 @@ impl Workspace {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.dock_menu = None;
                 this.bar_menu = None;
+                this.editor_menu = None;
                 run(this, window, cx);
                 cx.notify();
             }))
@@ -1820,11 +1825,95 @@ impl Workspace {
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                         this.dock_menu = None;
                         this.bar_menu = None;
+                        this.editor_menu = None;
                         cx.notify();
                     }))
                     .children(items),
             ),
         )
+    }
+
+    /// What the conditions of extensions are read against in this window:
+    /// the file in front, with what holds everywhere.
+    fn extension_facts(&self, cx: &App) -> HashMap<String, serde_json::Value> {
+        use serde_json::json;
+        let mut facts = ExtensionStore::try_global(cx)
+            .map(|store| store.read(cx).facts())
+            .unwrap_or_default();
+        let Some(editor) = self.active_editor().filter(|_| self.file_diff.is_none()) else {
+            return facts;
+        };
+        let editor = editor.read(cx);
+        let document = editor.doc(cx);
+        let language = json!(crate::extension_api::language_id(document));
+        let has_selection = editor.selections.iter().any(|s| s.anchor != s.head);
+        for (name, value) in [
+            ("editorLangId", language.clone()),
+            ("resourceLangId", language),
+            ("editorTextFocus", json!(true)),
+            ("editorFocus", json!(true)),
+            ("textInputFocus", json!(true)),
+            ("editorIsOpen", json!(true)),
+            ("editorHasSelection", json!(has_selection)),
+            ("editorReadonly", json!(document.is_read_only())),
+            ("resourceScheme", json!("file")),
+        ] {
+            facts.insert(name.into(), value);
+        }
+        if let Some(path) = document.path() {
+            let part =
+                |part: Option<&std::ffi::OsStr>| part.map(|p| p.to_string_lossy().into_owned());
+            if let Some(name) = part(path.file_name()) {
+                facts.insert("resourceFilename".into(), json!(name));
+            }
+            let ending = part(path.extension()).map(|ending| format!(".{ending}"));
+            facts.insert("resourceExtname".into(), json!(ending.unwrap_or_default()));
+        }
+        facts
+    }
+
+    /// The right button in the file in front: what extensions put in the
+    /// editor's menu for it. With nothing of theirs there is no menu.
+    fn open_editor_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let facts = self.extension_facts(cx);
+        let target = self
+            .active_editor()
+            .and_then(|editor| editor.read(cx).path(cx).map(Path::to_path_buf));
+        let offered = ExtensionStore::try_global(cx)
+            .map(|store| {
+                store
+                    .read(cx)
+                    .menu("editor/context", &facts, target.as_deref())
+            })
+            .unwrap_or_default();
+        if !offered.is_empty() {
+            self.editor_menu = Some((position, offered));
+            cx.notify();
+        }
+    }
+
+    fn render_editor_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let (position, offered) = self.editor_menu.clone()?;
+        let items = offered
+            .into_iter()
+            .enumerate()
+            .map(|(i, offered)| {
+                let action = offered.action;
+                Self::menu_item(
+                    format!("editor-menu-{i}"),
+                    offered.title,
+                    Box::new(move |_, window, cx| {
+                        window.dispatch_action(Box::new(action.clone()), cx)
+                    }),
+                    cx,
+                )
+            })
+            .collect();
+        Some(Self::menu_surface(position, items, window, cx))
     }
 
     /// The menu of a dock: what can be done with the tab it was opened
@@ -4043,6 +4132,15 @@ impl Workspace {
         let Some(store) = ExtensionStore::try_global(cx) else {
             return;
         };
+        // A key bound under a condition that does not hold here is not
+        // this command's: whoever else has the key gets it.
+        if let Some(when) = &action.when {
+            let facts = self.extension_facts(cx);
+            if !extension::when::holds(when, &|name| facts.get(name).cloned()) {
+                cx.propagate();
+                return;
+            }
+        }
         let command = action.command.clone();
         let running = store.update(cx, |store, cx| {
             store.run_command(&command, action.args.clone(), cx)
@@ -4066,7 +4164,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let plugins = self.plugins.clone();
-        let palette = CommandPalette::new(plugins, window, cx);
+        let facts = self.extension_facts(cx);
+        let extensions = ExtensionStore::try_global(cx)
+            .map(|store| store.read(cx).palette(&facts))
+            .unwrap_or_default();
+        let palette = CommandPalette::new(plugins, extensions, window, cx);
         self.toggle_modal(window, cx, move |window, cx| {
             Picker::new(palette, window, cx)
         });
@@ -4336,6 +4438,14 @@ impl Workspace {
                     .debug_selector(move || format!("pane-body-{p}"))
                     .flex_1()
                     .min_h_0()
+                    .when(is_active_pane, |d| {
+                        d.on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                this.open_editor_menu(event.position, cx)
+                            }),
+                        )
+                    })
                     .map(|d| match pane.active_editor() {
                         Some(editor) => d.child(editor.clone()),
                         None => d.child(self.render_empty(window, cx)),
@@ -4690,7 +4800,12 @@ impl Workspace {
                             Tone::Error => theme.error,
                         };
                         let action = item.command.map(|(command, args)| {
-                            Box::new(RunExtensionCommand { command, args }) as Box<dyn gpui::Action>
+                            let when = None;
+                            Box::new(RunExtensionCommand {
+                                command,
+                                args,
+                                when,
+                            }) as Box<dyn gpui::Action>
                         });
                         BarPart {
                             text: item.text,
@@ -5178,6 +5293,7 @@ impl Render for Workspace {
             )
             .children(self.render_dock_menu(window, cx))
             .children(self.render_bar_menu(window, cx))
+            .children(self.render_editor_menu(window, cx))
             .child(self.render_status(cx))
             .children(self.resize_handles(cx))
             .on_mouse_move(cx.listener(Self::resize_move))
@@ -12062,7 +12178,12 @@ exports.activate = async (context) => {
                 command: Some((command.clone(), args.clone())),
             }]
         );
-        cx.dispatch_action(RunExtensionCommand { command, args });
+        let when = None;
+        cx.dispatch_action(RunExtensionCommand {
+            command,
+            args,
+            when,
+        });
 
         // It asks three things, one after another, each in the editor's
         // own list: a message with answers, one of a list, a line to type.
@@ -12132,6 +12253,154 @@ exports.activate = async (context) => {
             store.set_off(Origin::VsCode, "Acme.api", true, cx)
         });
         assert!(cx.read(|cx| store.read(cx).bar().is_empty()));
+    }
+
+    #[gpui::test]
+    fn what_an_extension_contributes_is_in_the_palette_the_menus_and_the_keys(
+        cx: &mut TestAppContext,
+    ) {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let _languages = extension_languages();
+        let (base, _) = serve(vec![
+            (
+                "/api/-/search",
+                Served::ok(br#"{"extensions":[]}"#.to_vec()),
+            ),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-contributes", &base);
+        let root = cx.read(|cx| ws.read(cx).root(cx));
+        let folder = cx.read(|cx| store.read(cx).root.clone());
+        extension::testing::vscode_extension(&folder.join("vscode/acme.demo"));
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.scan(cx);
+        });
+        wait_for(cx, "the extension", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.demo").is_some()
+        });
+        let titles = |cx: &App| -> Vec<String> {
+            let facts = ws.read(cx).extension_facts(cx);
+            let offered = store.read(cx).palette(&facts);
+            offered.into_iter().map(|offered| offered.title).collect()
+        };
+        // The note its command leaves in the status bar when it ran.
+        let ran = |cx: &App, with: &str| {
+            let said = format!("ran {with}");
+            store.read(cx).bar().iter().any(|item| item.text == said)
+        };
+        let key = if cfg!(target_os = "macos") {
+            "cmd-alt-r"
+        } else {
+            "ctrl-alt-r"
+        };
+
+        // Its code was not allowed: it has nothing in the palette, and its
+        // keys are nobody's.
+        assert!(cx.read(|cx| titles(cx)).is_empty());
+        store.update(cx, |store, cx| store.allow(Origin::VsCode, "Acme.demo", cx));
+        // Allowed, the palette has the command its manifest names, under
+        // the name it gives it. One it keeps out of the palette is not
+        // there, nor one that cannot be run yet.
+        assert_eq!(cx.read(|cx| titles(cx)), ["Demo: Run"]);
+        cx.dispatch_action(ToggleCommandPalette);
+        cx.run_until_parked();
+        cx.simulate_input("demo: run");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the command to run", &|cx| ran(cx, "[]"));
+        // It said that its other command may be run now, and so it is
+        // there.
+        wait_for(cx, "the other command", &|cx| {
+            titles(cx) == ["Demo: Run", "Spin"]
+        });
+
+        // The key it binds is bound where its condition says: in a file
+        // of its language, not in another.
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let focus = cx.read(|cx| editor.focus_handle(cx));
+        cx.update(|window, _| window.focus(&focus));
+        cx.simulate_keystrokes(key);
+        cx.run_until_parked();
+        let notes = root.join("notes.dm");
+        std::fs::write(&notes, "if 1\n").unwrap();
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(notes.clone(), None, window, cx)
+        });
+        wait_for(cx, "notes.dm", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|editor| editor.read(cx).path(cx) == Some(notes.as_path()))
+                && ws.read(cx).extension_facts(cx)["editorLangId"] == "demo"
+        });
+        assert!(
+            cx.read(|cx| ran(cx, "[]")),
+            "the key ran it in a file of another language"
+        );
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let focus = cx.read(|cx| editor.focus_handle(cx));
+        cx.update(|window, _| window.focus(&focus));
+        cx.simulate_keystrokes(key);
+        wait_for(cx, "the key to run it", &|cx| ran(cx, r#"["from a key"]"#));
+
+        // The right button in the file opens what it put in the editor's
+        // menu, and the command is given the file.
+        let body = cx.debug_bounds("pane-body-0").unwrap().center();
+        let none = gpui::Modifiers::default();
+        cx.simulate_mouse_down(body, MouseButton::Right, none);
+        cx.simulate_mouse_up(body, MouseButton::Right, none);
+        cx.run_until_parked();
+        let item = bounds_soon(cx, "editor-menu-0");
+        cx.simulate_click(item.center(), none);
+        wait_for(cx, "the menu's command", &|cx| ran(cx, r#"["notes.dm"]"#));
+        assert!(cx.read(|cx| ws.read(cx).editor_menu.is_none()));
+        // The tree's menu has it for a file with its ending, and for no
+        // other; in a file of another language the editor has no menu.
+        let in_tree = |cx: &App, name: &str| {
+            let store = store.read(cx);
+            let mut facts = store.facts();
+            let ending = name.rsplit_once('.').map_or("", |(_, ending)| ending);
+            facts.insert("resourceExtname".into(), format!(".{ending}").into());
+            let offered = store.menu("explorer/context", &facts, Some(&root.join(name)));
+            offered.into_iter().map(|o| o.title).collect::<Vec<_>>()
+        };
+        assert_eq!(cx.read(|cx| in_tree(cx, "notes.dm")), ["Demo: Run"]);
+        assert!(cx.read(|cx| in_tree(cx, "App.vue")).is_empty());
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(root.join("App.vue"), None, window, cx)
+        });
+        wait_for(cx, "App.vue", &|cx| {
+            ws.read(cx).extension_facts(cx)["editorLangId"] != "demo"
+        });
+        cx.simulate_mouse_down(body, MouseButton::Right, none);
+        cx.simulate_mouse_up(body, MouseButton::Right, none);
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).editor_menu.is_none()));
+
+        // A key of two strokes, bound everywhere: its command ends the
+        // extension's process, which is how the test sees that it ran.
+        cx.simulate_keystrokes("ctrl-k ctrl-q");
+        wait_for(cx, "the second key", &|cx| {
+            matches!(
+                store.read(cx).code("Acme.demo").map(|code| &code.state),
+                Some(CodeState::Stopped(_))
+            )
+        });
+
+        // Turned off, nothing of it is in the palette.
+        store.update(cx, |store, cx| {
+            store.set_off(Origin::VsCode, "Acme.demo", true, cx)
+        });
+        assert!(cx.read(|cx| titles(cx)).is_empty());
     }
 
     /// What `language_server_features` asks of a server, asked of the code

@@ -680,6 +680,7 @@ impl ExtensionStore {
                 this.sync_languages(cx);
                 // What is installed says which settings there are.
                 this.settings_changed(cx);
+                this.sync_keys(cx);
                 this.wake(cx);
                 cx.notify();
             })
@@ -1531,6 +1532,7 @@ impl ExtensionStore {
             if let Some(extension) = self.find(origin, id).cloned() {
                 self.state.allow(&extension);
                 self.save_state(cx);
+                self.sync_keys(cx);
                 self.wake(cx);
                 cx.notify();
             }
@@ -1623,6 +1625,7 @@ impl ExtensionStore {
             }
         }
         self.sync_languages(cx);
+        self.sync_keys(cx);
         self.wake(cx);
         cx.notify();
     }
@@ -1740,7 +1743,7 @@ impl ExtensionStore {
 
     /// Whether the code of a VS Code extension may run: it has some, the
     /// user allowed it, and it is not turned off.
-    fn may_run(&self, extension: &Extension) -> bool {
+    pub(crate) fn may_run(&self, extension: &Extension) -> bool {
         extension.origin == Origin::VsCode
             && extension.node().is_some()
             && !self.is_off(extension.origin, &extension.id)

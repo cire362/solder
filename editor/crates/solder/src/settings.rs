@@ -564,17 +564,35 @@ struct KeyFiles {
 }
 impl Global for KeyFiles {}
 
+/// The keys installed extensions bind to their commands.
+#[derive(Default)]
+struct ExtensionKeys(Vec<KeyBinding>);
+impl Global for ExtensionKeys {}
+
 /// A named set arrives from the background. Use the newest personal and
-/// imported files, rather than a snapshot from when its read began.
+/// imported files, rather than a snapshot from when its read began. What
+/// extensions bind is over the layout and under the user's own keys, as
+/// in VS Code.
 pub(crate) fn bind_key_files(selected: Vec<KeyBinding>, cx: &mut App) {
     let files = cx.default_global::<KeyFiles>();
     let imported = files.imported.clone();
     let personal = files.personal.clone();
+    let extensions = cx.default_global::<ExtensionKeys>().0.clone();
     cx.clear_key_bindings();
     bind_defaults(cx);
     cx.bind_keys(imported);
     cx.bind_keys(selected);
+    cx.bind_keys(extensions);
     cx.bind_keys(personal);
+}
+
+/// The keys extensions bind changed: `source` is all of them, written as
+/// a keymap file is. Gives what in it could not be bound.
+pub fn set_extension_keys(source: &str, cx: &mut App) -> Vec<String> {
+    let (keys, errors) = parse_keymap("extensions", source, cx);
+    cx.set_global(ExtensionKeys(keys));
+    bind_key_files(crate::key_layout::kept(cx), cx);
+    errors
 }
 
 /// Loads the config files and applies them. Safe to call again on change.

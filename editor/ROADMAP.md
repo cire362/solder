@@ -255,8 +255,10 @@ to build them.
       to the editor for this, for every server; a code lens is among the
       code actions of its line. Not tried against a published extension
       yet: that is the release check below
-- [ ] Commands, menus and key bindings an extension contributes, in the
-      palette and the keymap
+- [x] Commands, menus and key bindings an extension contributes, in the
+      palette and the keymap. Menus: the editor's (`editor/context`), which
+      Solder had none of, and the file tree's (`explorer/context`).
+      Conditions (`when`) are read by a small reader of Solder's own
 - [ ] Debugging: adapters and configurations that extensions register in
       code, in the debugger
 - [ ] Tasks, terminals and file watching

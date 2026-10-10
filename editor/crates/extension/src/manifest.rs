@@ -158,6 +158,41 @@ pub struct Extension {
     /// Every TextMate grammar it has, by the name it goes by: also the
     /// ones that are no language of their own, which others ask for.
     pub grammars: Vec<(String, PathBuf)>,
+    /// The commands of its code that its manifest names for the palette.
+    pub contributed: Vec<Contributed>,
+    /// Where else it offers them, and where it keeps one out.
+    pub menus: Vec<MenuItem>,
+    /// The keys it binds to them, the ones for this machine.
+    pub keys: Vec<KeyContribution>,
+}
+
+/// A command a VS Code extension's code has, as its manifest names it for
+/// the user: `Git: Pull`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Contributed {
+    pub command: String,
+    pub title: String,
+    /// The condition it can be run under, if it has one.
+    pub enablement: Option<String>,
+}
+
+/// A command in a menu: which menu (`commandPalette`, `editor/context`,
+/// `explorer/context`), and the condition it is there under.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MenuItem {
+    pub menu: String,
+    pub command: String,
+    pub when: Option<String>,
+}
+
+/// A key a VS Code extension binds to a command, as Solder writes keys.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KeyContribution {
+    pub keys: String,
+    pub command: String,
+    pub when: Option<String>,
+    /// What the command is given.
+    pub args: Value,
 }
 
 /// A setting a VS Code extension declares: its whole name with the dots
@@ -287,6 +322,8 @@ impl Extension {
                 "context servers",
             ),
             count(self.debuggers.len(), "debugger", "debuggers"),
+            count(self.contributed.len(), "command", "commands"),
+            count(self.keys.len(), "key binding", "key bindings"),
             count(self.themes.len(), "theme", "themes"),
             count(self.icon_themes.len(), "icon theme", "icon themes"),
             count(self.snippets.len(), "snippet file", "snippet files"),
@@ -609,6 +646,9 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         debuggers: Vec::new(),
         settings: Vec::new(),
         grammars: Vec::new(),
+        contributed: Vec::new(),
+        menus: Vec::new(),
+        keys: Vec::new(),
     })
 }
 
@@ -975,13 +1015,78 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
             n => format!("{n} debuggers its code starts"),
         });
     }
-    for (key, what) in [
-        ("productIconThemes", "Product icon themes"),
-        ("keybindings", "Key bindings for its commands"),
-    ] {
-        if !list(key).is_empty() {
-            missing.push(what.to_string());
+    if !list("productIconThemes").is_empty() {
+        missing.push("Product icon themes".to_string());
+    }
+    // What its code can be asked to do: commands, where they are offered,
+    // and the keys for them.
+    let condition = |value: &Value| Some(text(value)).filter(|when| !when.is_empty());
+    let mut contributed: Vec<Contributed> = Vec::new();
+    for entry in list("commands") {
+        let (command, title) = (text(&entry["command"]), label(&text(&entry["title"])));
+        if command.is_empty()
+            || title.is_empty()
+            || contributed.iter().any(|c| c.command == command)
+        {
+            continue;
         }
+        let category = label(&text(&entry["category"]));
+        contributed.push(Contributed {
+            command,
+            title: match category.is_empty() {
+                true => title,
+                false => format!("{category}: {title}"),
+            },
+            enablement: condition(&entry["enablement"]),
+        });
+    }
+    let mut menus: Vec<MenuItem> = Vec::new();
+    for (menu, entries) in contributes["menus"].as_object().into_iter().flatten() {
+        for entry in entries.as_array().into_iter().flatten() {
+            let command = text(&entry["command"]);
+            if !command.is_empty() {
+                menus.push(MenuItem {
+                    menu: menu.clone(),
+                    command,
+                    when: condition(&entry["when"]),
+                });
+            }
+        }
+    }
+    let mut keys: Vec<KeyContribution> = Vec::new();
+    let mut unbound = 0;
+    for entry in list("keybindings") {
+        let command = text(&entry["command"]);
+        // A name with a minus in front takes a binding of VS Code's own
+        // away, which Solder does not have.
+        if command.is_empty() || command.starts_with('-') {
+            continue;
+        }
+        // The key for this platform, or the one for all.
+        let own = match std::env::consts::OS {
+            "macos" => "mac",
+            "windows" => "win",
+            _ => "linux",
+        };
+        let written = match text(&entry[own]) {
+            own if own.is_empty() => text(&entry["key"]),
+            own => own,
+        };
+        match import::keymap::vscode_keys(&written) {
+            Some(keys_written) => keys.push(KeyContribution {
+                keys: keys_written,
+                command,
+                when: condition(&entry["when"]),
+                args: entry["args"].clone(),
+            }),
+            None => unbound += 1,
+        }
+    }
+    if unbound > 0 {
+        missing.push(match unbound {
+            1 => "A key binding (a key Solder cannot bind)".to_string(),
+            n => format!("{n} key bindings (keys Solder cannot bind)"),
+        });
     }
 
     let display = label(&text(&manifest["displayName"]));
@@ -1011,6 +1116,9 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         debuggers,
         settings,
         grammars,
+        contributed,
+        menus,
+        keys,
         servers: Vec::new(),
         debug_adapters: Vec::new(),
         context_servers: Vec::new(),

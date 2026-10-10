@@ -23,13 +23,15 @@ pub mod snippet;
 pub mod state;
 pub mod testing;
 pub mod vscode;
+pub mod when;
 pub mod world;
 
 pub use catalog::Entry;
 pub use gate::{Event, Refusals};
 pub use icons::IconTheme;
 pub use manifest::{
-    Code, Debugger, Extension, Grammar, Language, Origin, Server, Setting, SnippetFile,
+    Code, Contributed, Debugger, Extension, Grammar, KeyContribution, Language, MenuItem, Origin,
+    Server, Setting, SnippetFile,
 };
 pub use snippet::Snippet;
 pub use state::State;
