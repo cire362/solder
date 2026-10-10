@@ -35,6 +35,9 @@ something of its own unchecked or unmade adds it here.
       with local repositories and a headless window. The graph, opening a
       commit patch and inserting text with blame enabled were checked in a
       real macOS window; other platforms have not been checked
+- [ ] Mouse and keyboard use of stash, the blocked commit, model
+      suggestions and the PR panel in a real window. Their actions and
+      controls are covered by process and headless tests
 - [ ] Published extensions. One has been run: the reader `vscode.ipynb`
       1.95.3, on a CI runner, and only for reading and saving. The check of
       the most installed extensions of Open VSX has not produced its list,
@@ -72,7 +75,9 @@ something of its own unchecked or unmade adds it here.
 - [ ] Not measured at all: an editor with extensions running, a notebook
       open, a file with lenses, folding, a file of many megabytes with
       wrapping on, a file in another encoding; Structure and Problems
-      with large lists, and symbol highlights while typing with a server
+      with large lists, and symbol highlights while typing with a server;
+      Git history or a large patch open, and typing with blame enabled
+      (`benchmarks/git-history.md` measures these features inactive)
 - [ ] The numbers on the website (`src/components/performance.tsx`) are
       placeholders, marked so. The measurements in `benchmarks/` are local
       comparisons of a branch with main, not what the site may claim
@@ -85,8 +90,9 @@ something of its own unchecked or unmade adds it here.
       key containers are not recognized; test credentials can also match. A staged
       file above 5 MB stops the editor commit because it is not scanned
 - [ ] Git history loads 200 more commits at a time by reading the enlarged
-      range again. A commit opens a read-only patch, limited to 500 KB; there
-      is no comparison picker between arbitrary commits. Blame shows the
+      range again. A commit opens a read-only patch, limited to 500 KB on
+      screen; the full Git output is read before it is truncated. There is
+      no comparison picker between arbitrary commits. Blame shows the
       short hash and author, with no author tooltip or commit action
 - [ ] Wrapping goes by cells, a character each: rows of characters wider
       than a cell (Chinese, Japanese, Korean) run past the edge, and so do
