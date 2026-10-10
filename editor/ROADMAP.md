@@ -21,6 +21,9 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] The Git PR panel against an authenticated GitHub account. Its CLI
+      process, errors, both kinds of check data and manual refresh are
+      tested with an executable fixture; no live PR was changed in a test
 - [ ] Commit-message suggestions from a real local or hosted model. The
       staged-context policy and editable suggestion are checked with the
       scripted model used by the chat tests
@@ -555,7 +558,7 @@ update. They come after phase 9, in this order unless one is needed sooner.
 - [x] Stash and fetch
 - [x] A check before a commit: keys and secrets in what is staged stop it
 - [x] A commit message proposed by the model from what is staged
-- [ ] The pull request of the branch and the state of its checks, through `gh`
+- [x] The pull request of the branch and the state of its checks, through `gh`
 
 ### Tests and running
 - [ ] A tree of the project's tests: run one, see what failed, go to its line

@@ -27,6 +27,7 @@ actions!(
         ReviewAndPush,
         Pull,
         OpenPullRequest,
+        CreatePullRequest,
         SwitchBranch,
         History,
         FileHistory,
@@ -106,6 +107,8 @@ pub struct GitPanel {
     pub(crate) generation_note: Option<SharedString>,
     pub(crate) history: Option<Entity<crate::git_history_panel::HistoryPanel>>,
     history_subscription: Option<Subscription>,
+    pull_request: Option<Entity<crate::git_pr_panel::PullRequestPanel>>,
+    pr_subscription: Option<Subscription>,
     pub(crate) stashes: Option<Vec<crate::git_stash::Stash>>,
     stash_task: Option<Task<()>>,
     stash_busy: bool,
@@ -118,7 +121,15 @@ pub struct GitPanel {
 impl GitPanel {
     pub fn new(root: PathBuf, git: Entity<GitStore>, cx: &mut Context<Self>) -> Self {
         let message = cx.new(|cx| Editor::single_line("Commit message", cx));
-        let subscription = cx.observe(&git, |_, _, cx| cx.notify());
+        let subscription = cx.observe(&git, |this, git, cx| {
+            if this.pull_request.as_ref().is_some_and(|panel| {
+                git.read(cx).status().branch.as_deref() != Some(panel.read(cx).branch.as_str())
+            }) {
+                this.pull_request = None;
+                this.pr_subscription = None;
+            }
+            cx.notify();
+        });
         Self {
             root,
             git,
@@ -129,6 +140,8 @@ impl GitPanel {
             generation_note: None,
             history: None,
             history_subscription: None,
+            pull_request: None,
+            pr_subscription: None,
             stashes: None,
             stash_task: None,
             stash_busy: false,
@@ -316,6 +329,24 @@ impl GitPanel {
         .into_any_element()
     }
 
+    pub fn show_pull_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let git = self.git.read(cx);
+        let (Some(repo), Some(branch)) = (git.repo().cloned(), git.status().branch.clone()) else {
+            return;
+        };
+        self.history = None;
+        self.history_subscription = None;
+        let panel = cx.new(|cx| crate::git_pr_panel::PullRequestPanel::new(repo, branch, cx));
+        self.pr_subscription = Some(cx.subscribe_in(&panel, window, |this, _, _, window, cx| {
+            this.pull_request = None;
+            this.focus_message(window, cx);
+            cx.notify();
+        }));
+        window.focus(&panel.focus_handle(cx));
+        self.pull_request = Some(panel);
+        cx.notify();
+    }
+
     pub fn show_history(
         &mut self,
         file: Option<String>,
@@ -325,6 +356,8 @@ impl GitPanel {
         let Some(repo) = self.git.read(cx).repo().cloned() else {
             return;
         };
+        self.pull_request = None;
+        self.pr_subscription = None;
         let history = cx.new(|cx| crate::git_history_panel::HistoryPanel::new(repo, file, cx));
         self.history_subscription =
             Some(
@@ -973,6 +1006,9 @@ impl Focusable for GitPanel {
 
 impl Render for GitPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(panel) = &self.pull_request {
+            return div().size_full().child(panel.clone()).into_any_element();
+        }
         if let Some(history) = &self.history {
             return div().size_full().child(history.clone()).into_any_element();
         }

@@ -1738,6 +1738,17 @@ impl Workspace {
     fn open_pull_request(
         &mut self,
         _: &git_panel::OpenPullRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_sidebar(Some(Panel::Git), cx);
+        self.git_panel
+            .update(cx, |p, cx| p.show_pull_request(window, cx));
+    }
+
+    fn create_pull_request(
+        &mut self,
+        _: &git_panel::CreatePullRequest,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -6442,6 +6453,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::push))
             .on_action(cx.listener(Self::pull))
             .on_action(cx.listener(Self::open_pull_request))
+            .on_action(cx.listener(Self::create_pull_request))
             .on_action(cx.listener(Self::new_terminal))
             .relative()
             .size_full()

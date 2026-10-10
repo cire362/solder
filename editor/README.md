@@ -249,6 +249,14 @@ file). Omitted files are named. The result fills the message field for editing;
 it creates no commit. If you edited the message or staged something else while
 waiting, your text is kept. **Cancel suggestion** stops waiting for the answer.
 
+**PR** reads the current branch's GitHub pull request through an installed,
+authenticated `gh`. It shows the number, title, state, draft flag, target branch
+and individual checks, including pending, failed, skipped and cancelled ones.
+**Refresh** reads again; there is no background polling. Opening another branch
+closes the old snapshot. Links open the PR or a check in the browser. Missing
+`gh`, missing authentication or no PR are shown as errors. **Create PR** opens
+the existing browser form for the branch (GitHub or GitLab), for you to submit.
+
 ## Run the stack
 
 Open the Services tab with `cmd-shift-s` (`ctrl-shift-s` on Linux). Solder lists the
