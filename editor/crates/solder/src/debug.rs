@@ -583,12 +583,12 @@ impl DebugStore {
         let conn_events = conn.clone();
         let (launch_sent, ready) = futures::channel::oneshot::channel();
         let task = cx.spawn(async move |this, cx| {
-            // Configuration follows launch even if initialized and the
-            // initialize reply wake different tasks in the same cycle.
+            // The initialize reply and initialized event wake different
+            // tasks. Configuration must follow the launch/attach request,
+            // whichever task the executor schedules first.
             if ready.await.is_err() {
                 return;
             }
-
             while let Some(message) = incoming.next().await {
                 let alive = this
                     .update(cx, |this, cx| {
