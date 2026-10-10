@@ -122,11 +122,11 @@ impl Repo {
         cmd
     }
 
-    fn run(&self, args: &[&str]) -> Result<Vec<u8>> {
+    pub(crate) fn run(&self, args: &[&str]) -> Result<Vec<u8>> {
         self.run_with_input(args, None)
     }
 
-    fn run_with_input(&self, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
+    pub(crate) fn run_with_input(&self, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
         let mut child = self
             .command(args)
             .stdin(if input.is_some() {

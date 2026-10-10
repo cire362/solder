@@ -37,6 +37,8 @@ mod file_finder;
 mod file_icons;
 mod fuzzy;
 mod git;
+mod git_history;
+mod git_history_panel;
 mod git_panel;
 mod git_store;
 mod go_to_line;

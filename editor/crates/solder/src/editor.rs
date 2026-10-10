@@ -2263,6 +2263,12 @@ impl Editor {
     ) {
         window.focus(&self.focus_handle);
         self.hide_popovers(cx);
+        if let Some(layout) = &self.layout
+            && self.doc(cx).blame_enabled()
+            && event.position.x < layout.bounds.left() + layout.em_width * 22.
+        {
+            return;
+        }
         // A click on a line number sets or clears a breakpoint there.
         if !self.is_single_line()
             && let Some(layout) = &self.layout

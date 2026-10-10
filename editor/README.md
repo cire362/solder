@@ -212,6 +212,20 @@ The comparison is read-only. Deleted files remain reviewable without a working
 file; binary and non-UTF-8 files show an explanation rather than corrupted text.
 Conflicted files still open the three-way conflict view.
 
+## Git history
+
+The Git panel's **History** shows the graph across local and remote branches.
+**File history** follows the file in front through renames on the current
+branch. Each reads the latest 200 commits; **Older commits** adds 200 and
+**Refresh** rereads them. Click a commit to open its message and patch as a
+read-only tab (the first 500 KB of a large patch).
+
+**Blame** toggles a hash and author beside each line of the file in front, in
+all of its views. It uses the current text, including unsaved changes; new
+lines say **Not committed**. It is refreshed after typing pauses and when
+Git status changes. Turning it off removes its work and its gutter. History
+and blame use the Git CLI on background threads; neither loads at startup.
+
 ## Run the stack
 
 Open the Services tab with `cmd-shift-s` (`ctrl-shift-s` on Linux). Solder lists the

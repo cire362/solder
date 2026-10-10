@@ -27,6 +27,9 @@ actions!(
         Pull,
         OpenPullRequest,
         SwitchBranch,
+        History,
+        FileHistory,
+        ToggleBlame,
     ]
 );
 
@@ -46,6 +49,10 @@ pub enum GitPanelEvent {
     OpenAt(PathBuf, u32),
     OpenConflict(PathBuf),
     ReviewDiff(PathBuf, DiffScope),
+    OpenCommit {
+        title: String,
+        text: String,
+    },
 }
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
@@ -91,6 +98,8 @@ pub struct GitPanel {
     git: Entity<GitStore>,
     pub(crate) message: Entity<Editor>,
     amend: bool,
+    pub(crate) history: Option<Entity<crate::git_history_panel::HistoryPanel>>,
+    history_subscription: Option<Subscription>,
     pub review: Option<PushReview>,
     review_task: Option<Task<()>>,
     focus_handle: FocusHandle,
@@ -106,11 +115,46 @@ impl GitPanel {
             git,
             message,
             amend: false,
+            history: None,
+            history_subscription: None,
             review: None,
             review_task: None,
             focus_handle: cx.focus_handle(),
             _subscription: subscription,
         }
+    }
+
+    pub fn show_history(
+        &mut self,
+        file: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.git.read(cx).repo().cloned() else {
+            return;
+        };
+        let history = cx.new(|cx| crate::git_history_panel::HistoryPanel::new(repo, file, cx));
+        self.history_subscription =
+            Some(
+                cx.subscribe_in(&history, window, |this, _, event, window, cx| {
+                    match event {
+                        crate::git_history_panel::HistoryEvent::Close => {
+                            this.history = None;
+                            this.focus_message(window, cx);
+                        }
+                        crate::git_history_panel::HistoryEvent::Patch { title, text } => {
+                            cx.emit(GitPanelEvent::OpenCommit {
+                                title: title.clone(),
+                                text: text.clone(),
+                            });
+                        }
+                    }
+                    cx.notify();
+                }),
+            );
+        window.focus(&history.focus_handle(cx));
+        self.history = Some(history);
+        cx.notify();
     }
 
     /// Push, after the chat model reviewed what it sends when review is on.
@@ -653,6 +697,9 @@ impl Focusable for GitPanel {
 
 impl Render for GitPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(history) = &self.history {
+            return div().size_full().child(history.clone()).into_any_element();
+        }
         let theme = cx.theme().clone();
         let git = self.git.read(cx);
         if git.is_not_a_repo() {
@@ -753,6 +800,32 @@ impl Render for GitPanel {
                                 |_, window, cx| {
                                     window.dispatch_action(Box::new(OpenPullRequest), cx)
                                 },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(ui::button(
+                                "git-history-button",
+                                "History",
+                                false,
+                                &theme,
+                                |_, window, cx| window.dispatch_action(Box::new(History), cx),
+                            ))
+                            .child(ui::button(
+                                "git-file-history",
+                                "File history",
+                                false,
+                                &theme,
+                                |_, window, cx| window.dispatch_action(Box::new(FileHistory), cx),
+                            ))
+                            .child(ui::button(
+                                "git-blame",
+                                "Blame",
+                                false,
+                                &theme,
+                                |_, window, cx| window.dispatch_action(Box::new(ToggleBlame), cx),
                             )),
                     )
                     .children(self.render_review(&theme, cx))

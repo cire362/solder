@@ -21,6 +21,10 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] Git history and blame in a real window, and a large repository.
+      Rename and merge history, commit patches and unsaved blame are tested
+      with local repositories and a headless window. Other platforms and
+      non-UTF-8 file blame have not been checked
 - [ ] Published extensions. One has been run: the reader `vscode.ipynb`
       1.95.3, on a CI runner, and only for reading and saving. The check of
       the most installed extensions of Open VSX has not produced its list,
@@ -64,6 +68,10 @@ something of its own unchecked or unmade adds it here.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] Git history loads 200 more commits at a time by reading the enlarged
+      range again. A commit opens a read-only patch, limited to 500 KB; there
+      is no comparison picker between arbitrary commits. Blame shows the
+      short hash and author, with no author tooltip or commit action
 - [ ] Wrapping goes by cells, a character each: rows of characters wider
       than a cell (Chinese, Japanese, Korean) run past the edge, and so do
       rows with inlay hints. Home and End go to the ends of the line, not
@@ -532,7 +540,7 @@ update. They come after phase 9, in this order unless one is needed sooner.
       for extensions' providers too
 
 ### Git history
-- [ ] The history as a graph, the history of one file, blame in the gutter
+- [x] The history as a graph, the history of one file, blame in the gutter
 - [ ] Stash and fetch
 - [ ] A check before a commit: keys and secrets in what is staged stop it
 - [ ] A commit message proposed by the model from what is staged

@@ -757,6 +757,18 @@ impl Workspace {
                     GitPanelEvent::OpenConflict(path) => {
                         this.open_conflict(path.clone(), window, cx)
                     }
+                    GitPanelEvent::OpenCommit { title, text } => {
+                        let document = cx.new(|cx| {
+                            Document::virtual_file(
+                                title.clone(),
+                                PathBuf::from("commit.diff"),
+                                text,
+                                cx,
+                            )
+                        });
+                        let editor = cx.new(|cx| Editor::for_document(document, cx));
+                        this.add_tab(editor, window, cx);
+                    }
                     GitPanelEvent::ReviewDiff(path, scope) => {
                         this.open_file_diff(path.clone(), *scope, window, cx)
                     }
@@ -1501,6 +1513,7 @@ impl Workspace {
     /// tree's colors.
     fn git_status_changed(&mut self, cx: &mut Context<Self>) {
         for document in self.documents(cx) {
+            document.update(cx, |d, cx| d.refresh_blame(cx));
             self.load_diff_base(&document, cx);
         }
         let tints = self.git.read(cx).tints();
@@ -1642,6 +1655,40 @@ impl Workspace {
         self.git_panel.read(cx).focus_message(window, cx);
         self.git.update(cx, |g, cx| g.refresh_now(cx));
         cx.notify();
+    }
+
+    fn history(&mut self, _: &git_panel::History, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_sidebar(Some(Panel::Git), cx);
+        self.git_panel
+            .update(cx, |p, cx| p.show_history(None, window, cx));
+    }
+
+    fn file_history(
+        &mut self,
+        _: &git_panel::FileHistory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let file = self.active_editor().and_then(|e| {
+            let path = e.read(cx).doc(cx).path()?;
+            self.git.read(cx).repo()?.relative(path)
+        });
+        if let Some(file) = file {
+            self.set_sidebar(Some(Panel::Git), cx);
+            self.git_panel
+                .update(cx, |p, cx| p.show_history(Some(file), window, cx));
+        }
+    }
+
+    fn toggle_blame(&mut self, _: &git_panel::ToggleBlame, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor() else {
+            return;
+        };
+        let Some(repo) = self.git.read(cx).repo().cloned() else {
+            return;
+        };
+        let document = editor.read(cx).document.clone();
+        document.update(cx, |d, cx| d.toggle_blame(repo, cx));
     }
 
     fn switch_branch(
@@ -6388,6 +6435,9 @@ impl Render for Workspace {
                 this.services.update(cx, |s, cx| s.stop_all_services(cx))
             }))
             .on_action(cx.listener(Self::show_file_diff))
+            .on_action(cx.listener(Self::history))
+            .on_action(cx.listener(Self::file_history))
+            .on_action(cx.listener(Self::toggle_blame))
             .on_action(cx.listener(Self::switch_branch))
             .on_action(cx.listener(Self::push))
             .on_action(cx.listener(Self::pull))
@@ -7680,6 +7730,74 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("timed out waiting for {selector} on screen");
+    }
+
+    #[gpui::test]
+    fn git_history_opens_a_patch_and_blame_tracks_unsaved_lines(cx: &mut TestAppContext) {
+        let root = git_fixture("history-window");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(root.join("a.txt")), "one\ntwo\n", None, window, cx);
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let doc = cx.read(|cx| editor.read(cx).document.clone());
+        wait_for(cx, "repository", &|cx| {
+            ws.read(cx).git.read(cx).repo().is_some()
+        });
+        cx.dispatch_action(git_panel::History);
+        let panel = cx.read(|cx| ws.read(cx).git_panel.clone());
+        wait_for(cx, "history", &|cx| {
+            panel
+                .read(cx)
+                .history
+                .as_ref()
+                .is_some_and(|h| !h.read(cx).rows.is_empty())
+        });
+        let commit = bounds_soon(cx, "history-row-0");
+        cx.simulate_click(commit.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        wait_for(cx, "commit patch", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|e| e.read(cx).text(cx).contains("+one"))
+        });
+        assert!(cx.read(|cx| {
+            ws.read(cx)
+                .active_editor()
+                .unwrap()
+                .read(cx)
+                .doc(cx)
+                .is_read_only()
+        }));
+        ws.update_in(cx, |w, window, cx| {
+            w.activate(w.active_pane, 0, window, cx);
+        });
+        cx.dispatch_action(git_panel::ToggleBlame);
+        wait_for(cx, "authors", &|cx| doc.read(cx).blame().len() == 2);
+        assert_eq!(cx.read(|cx| doc.read(cx).blame()[0].author.clone()), "Test");
+        cx.simulate_input("new\n");
+        wait_for(cx, "unsaved blame", &|cx| {
+            doc.read(cx)
+                .blame()
+                .first()
+                .is_some_and(|b| b.label() == "Not committed")
+        });
+        assert_eq!(cx.read(|cx| doc.read(cx).blame()[1].author.clone()), "Test");
+        cx.dispatch_action(git_panel::ToggleBlame);
+        assert!(cx.read(|cx| !doc.read(cx).blame_enabled() && doc.read(cx).blame().is_empty()));
+        cx.dispatch_action(git_panel::FileHistory);
+        wait_for(cx, "file history", &|cx| {
+            panel
+                .read(cx)
+                .history
+                .as_ref()
+                .is_some_and(|h| !h.read(cx).rows.is_empty())
+        });
+        let back = bounds_soon(cx, "history-back");
+        cx.simulate_click(back.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.read(|cx| panel.read(cx).history.is_none()));
     }
 
     #[gpui::test]

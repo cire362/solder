@@ -234,6 +234,10 @@ pub struct Document {
     hunks: Arc<Vec<Hunk>>,
     conflicts: Arc<Vec<Conflict>>,
     git_task: Option<Task<()>>,
+    blame_repo: Option<crate::git::Repo>,
+    blame: Arc<Vec<crate::git_history::Blame>>,
+    blame_error: Option<gpui::SharedString>,
+    blame_task: Option<Task<()>>,
     read_only: bool,
     /// What the file is written in, which is what it is saved in.
     encoding: text::encoding::Encoding,
@@ -273,6 +277,10 @@ impl Document {
             hunks: Arc::default(),
             conflicts: Arc::default(),
             git_task: None,
+            blame_repo: None,
+            blame: Arc::default(),
+            blame_error: None,
+            blame_task: None,
             read_only: false,
             encoding: Default::default(),
             notice: None,
@@ -369,7 +377,7 @@ impl Document {
 
     /// What is to be said above the text, if anything.
     pub fn notice(&self) -> Option<&gpui::SharedString> {
-        self.notice.as_ref()
+        self.notice.as_ref().or(self.blame_error.as_ref())
     }
 
     pub fn is_read_only(&self) -> bool {
@@ -382,6 +390,65 @@ impl Document {
 
     pub fn conflicts(&self) -> &Arc<Vec<Conflict>> {
         &self.conflicts
+    }
+
+    pub fn blame_enabled(&self) -> bool {
+        self.blame_repo.is_some()
+    }
+
+    pub fn blame(&self) -> &[crate::git_history::Blame] {
+        &self.blame
+    }
+
+    pub fn toggle_blame(&mut self, repo: crate::git::Repo, cx: &mut Context<Self>) {
+        self.blame_repo = if self.blame_enabled() {
+            None
+        } else {
+            Some(repo)
+        };
+        self.blame = Arc::default();
+        self.blame_error = None;
+        self.blame_task = None;
+        self.refresh_blame(cx);
+        cx.emit(DocumentEvent::GitChanged);
+    }
+
+    pub fn refresh_blame(&mut self, cx: &mut Context<Self>) {
+        let (Some(repo), Some(path)) = (self.blame_repo.clone(), self.path.clone()) else {
+            return;
+        };
+        let Some(file) = repo.relative(&path) else {
+            return;
+        };
+        let rope = self.text.rope().clone();
+        let version = self.version();
+        self.blame_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            let result = cx
+                .background_executor()
+                .spawn(async move { repo.blame(&file, &rope.to_string()) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.version() != version {
+                    return;
+                }
+                match result {
+                    Ok(rows) => {
+                        this.blame = Arc::new(rows);
+                        this.blame_error = None;
+                    }
+                    Err(e) => {
+                        this.blame = Arc::default();
+                        this.blame_error = Some(format!("Blame: {}", e.0).into());
+                    }
+                }
+                cx.emit(DocumentEvent::GitChanged);
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     pub fn diff_base(&self) -> Option<&Arc<str>> {
@@ -892,6 +959,11 @@ impl Document {
         let marker_added = edits.iter().any(|e| e.new_text.contains("<<<<<<<"));
         cx.emit(DocumentEvent::Edited { edits, origin });
         self.schedule_git_refresh(GIT_DEBOUNCE, marker_added, cx);
+        if self.blame_enabled() {
+            // Old row numbers could name a different author after an edit.
+            self.blame = Arc::default();
+            self.refresh_blame(cx);
+        }
         self.update_dirty(cx);
     }
 
@@ -988,6 +1060,7 @@ impl Document {
 
     pub fn set_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.path = Some(path);
+        self.refresh_blame(cx);
         self.syntax = None;
         self.syntax_generation += 1;
         self.initial_parse(cx);
