@@ -1060,6 +1060,8 @@ impl Document {
 
     pub fn set_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.path = Some(path);
+        self.blame = Arc::default();
+        self.blame_error = None;
         self.refresh_blame(cx);
         self.syntax = None;
         self.syntax_generation += 1;

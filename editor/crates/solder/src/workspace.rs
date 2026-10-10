@@ -1688,6 +1688,14 @@ impl Workspace {
             return;
         };
         let document = editor.read(cx).document.clone();
+        if document
+            .read(cx)
+            .path()
+            .and_then(|p| repo.relative(p))
+            .is_none()
+        {
+            return;
+        }
         document.update(cx, |d, cx| d.toggle_blame(repo, cx));
     }
 

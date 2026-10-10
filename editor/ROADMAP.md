@@ -78,9 +78,10 @@ something of its own unchecked or unmade adds it here.
 
 ### Not finished
 - [ ] The commit guard recognizes private-key PEM headers and known AWS,
-      GitHub, GitLab, Slack, API-key and connection-password forms. It is
-      not a universal credential detector: arbitrary passwords, encoded
-      credentials and binary key containers are not recognized. A staged
+      GitHub, GitLab, Slack, API-key and connection-password forms, plus long
+      literal credential assignments (UTF-8 and marked UTF-16 included). It
+      is not a universal detector: short or encoded passwords and binary
+      key containers are not recognized; test credentials can also match. A staged
       file above 5 MB stops the editor commit because it is not scanned
 - [ ] Git history loads 200 more commits at a time by reading the enlarged
       range again. A commit opens a read-only patch, limited to 500 KB; there

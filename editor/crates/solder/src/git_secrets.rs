@@ -25,15 +25,42 @@ fn rules() -> &'static Vec<(&'static str, Regex)> {
     ].into_iter().map(|(name, pattern)| (name, Regex::new(pattern).expect("secret pattern"))).collect())
 }
 
+fn credential_assignment(line: &str, path: &str) -> bool {
+    static QUOTED: OnceLock<Regex> = OnceLock::new();
+    static ENV: OnceLock<Regex> = OnceLock::new();
+    let quoted = QUOTED.get_or_init(|| Regex::new(r#"(?i)\b(?:password|passwd|token|api[_-]?key|access[_-]?token|client[_-]?secret|secret[_-]?(?:access[_-]?)?key)\b["']?\s*[:=]\s*["']([^"'\r\n]{16,512})["']"#).expect("credential assignment pattern"));
+    let env = ENV.get_or_init(|| Regex::new(r"(?i)^\s*(?:export\s+)?(?:PASSWORD|PASSWD|TOKEN|API_KEY|ACCESS_TOKEN|CLIENT_SECRET|AWS_SECRET_ACCESS_KEY)\s*=\s*([A-Za-z0-9_+/=-]{16,512})\s*$").expect("environment credential pattern"));
+    let value = quoted
+        .captures(line)
+        .or_else(|| {
+            std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|name| name.starts_with(".env"))
+                .and_then(|_| env.captures(line))
+        })
+        .and_then(|captures| captures.get(1).map(|m| m.as_str()));
+    value.is_some_and(|v| {
+        let lower = v.to_ascii_lowercase();
+        !v.contains(['$', '<', '{'])
+            && !v.contains("...")
+            && !["your_", "example", "replace", "placeholder"]
+                .iter()
+                .any(|p| lower.starts_with(p))
+    })
+}
+
 pub fn scan(path: &str, bytes: &[u8]) -> Vec<Finding> {
-    let text = String::from_utf8_lossy(bytes);
+    let text = text::encoding::decode(bytes).text;
     text.lines()
         .enumerate()
         .filter_map(|(ix, line)| {
             rules()
                 .iter()
                 .find(|(_, rule)| rule.is_match(line))
-                .map(|(kind, _)| Finding {
+                .map(|(kind, _)| *kind)
+                .or_else(|| credential_assignment(line, path).then_some("Credential value"))
+                .map(|kind| Finding {
                     path: path.into(),
                     line: ix + 1,
                     kind,
@@ -128,6 +155,32 @@ mod tests {
         f.0.commit("safe amend", true).unwrap();
         assert!(f.0.staged_secrets().unwrap().is_empty());
     }
+    #[test]
+    fn utf16_and_literal_credentials_are_checked_and_large_blobs_stop() {
+        let secret = ["API_KEY=", &"Z".repeat(32)].concat();
+        assert_eq!(scan(".env", secret.as_bytes()).len(), 1);
+        let quoted = format!("{} = \"{}\"", "password", "randomcredential1234");
+        assert_eq!(scan("config.toml", quoted.as_bytes()).len(), 1);
+        let bytes = text::encoding::encode(&secret, text::encoding::Encoding::Utf16Le).unwrap();
+        assert_eq!(scan(".env", &bytes).len(), 1);
+        assert!(
+            scan(
+                "config.toml",
+                b"password = read_configuration\napi_key = \"${LONG_ENVIRONMENT_VARIABLE}\""
+            )
+            .is_empty()
+        );
+        let f = Fixture::new("secret-large");
+        f.write("large", &"x".repeat(5 * 1024 * 1024 + 1));
+        f.0.stage(&["large"]).unwrap();
+        assert!(
+            f.0.commit("large", false)
+                .unwrap_err()
+                .0
+                .contains("over 5 MB")
+        );
+    }
+
     #[test]
     fn detects_private_keys_and_credentials_without_catching_placeholders() {
         let key = ["-----BEGIN ", "RSA PRIVATE KEY-----"].concat();
