@@ -405,7 +405,8 @@ update. They come after phase 9, in this order unless one is needed sooner.
 - [x] Pinned tabs; the tab closed last opened again (`cmd-shift-t`). Tabs,
       split panes, cursors and scroll positions return per project, along
       with notebooks and pages whose extensions provide a serializer
-- [ ] Unsaved text kept aside as it is typed and offered back after a crash
+- [x] Unsaved text kept aside as it is typed and put back at the next
+      start after a crash, or after `cmd-q`, which asks nothing
 - [x] Line endings and encoding of a file kept as they were; files too large
       to edit opened for reading, with the reason said. The encodings are
       UTF-8, UTF-16 and two single-byte ones written here, with no

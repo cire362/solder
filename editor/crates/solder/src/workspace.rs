@@ -225,6 +225,9 @@ const CLOSED_TABS: usize = 32;
 #[path = "session.rs"]
 mod session;
 
+#[path = "recovery.rs"]
+mod recovery;
+
 /// A column of tabs. The workspace lays panes out left to right.
 #[derive(Default)]
 struct Pane {
@@ -295,6 +298,9 @@ pub struct Workspace {
     recent: VecDeque<Arc<str>>,
     session_writer: Option<session::Writer>,
     _session_tick: Option<Task<()>>,
+    /// Unsaved text kept aside, for whatever ends the editor unasked.
+    recovery: Option<recovery::Recovery>,
+    _recovery_tick: Option<Task<()>>,
     restoring: bool,
     /// The files of the tabs closed last, the latest at the end, each
     /// with the pane it was in.
@@ -783,6 +789,8 @@ impl Workspace {
             recent: VecDeque::new(),
             session_writer: None,
             _session_tick: None,
+            recovery: None,
+            _recovery_tick: None,
             restoring: false,
             closed_tabs: Vec::new(),
             left,
@@ -1373,6 +1381,11 @@ impl Workspace {
                 let saved = this.update(cx, |this, cx| this.keep_session(cx));
                 if let Ok(saved) = saved {
                     saved.await;
+                }
+                // What was not saved was asked about and let go: it is
+                // not to come back at the next start.
+                if let Ok(forgotten) = this.update(cx, |this, cx| this.forget_unsaved(cx)) {
+                    forgotten.await;
                 }
                 this.update_in(cx, |this, window, cx| {
                     // Nothing left to ask about; close for real.
@@ -13735,6 +13748,180 @@ exports.activate = (context) => {
                 .unwrap()
                 .contains("too large to edit")
         );
+    }
+
+    /// Text that is not saved is kept aside as it is typed, let go when
+    /// it is saved or its tab is closed, and put back at the next start
+    /// where it was neither.
+    #[gpui::test]
+    fn unsaved_text_is_kept_aside_and_put_back(cx: &mut TestAppContext) {
+        let root = fixture("recovery");
+        let dir = db::testing::dir("recovery-kept");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let begin = |cx: &mut VisualTestContext| {
+            ws.update(cx, |w, _| {
+                w.recovery = Some(recovery::Recovery::new(dir.clone()));
+            })
+        };
+        // One pass of the keeping, waited for till it is on disk.
+        let keep = |cx: &mut VisualTestContext| {
+            let kept: std::rc::Rc<std::cell::RefCell<bool>> = Default::default();
+            let done = kept.clone();
+            let pass = ws.update(cx, |w, cx| w.keep_unsaved(cx));
+            cx.spawn(async move |_| {
+                pass.await;
+                *done.borrow_mut() = true;
+            })
+            .detach();
+            wait_for(cx, "the text to be kept", &|_| *kept.borrow());
+        };
+        let kept = || -> Vec<(Option<String>, String)> {
+            let mut all: Vec<_> = std::fs::read_dir(&dir)
+                .map(|entries| entries.flatten().collect::<Vec<_>>())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|entry| {
+                    let read: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(entry.path()).ok()?).ok()?;
+                    let name = read["path"].as_str().map(|path| {
+                        let name = Path::new(path).file_name().unwrap();
+                        name.to_string_lossy().into_owned()
+                    });
+                    Some((name, read["text"].as_str()?.to_string()))
+                })
+                .collect();
+            all.sort();
+            all
+        };
+        let open = |cx: &mut VisualTestContext, name: &str| {
+            let path = root.join(name);
+            ws.update_in(cx, |w, window, cx| {
+                w.open_path(path.clone(), None, window, cx)
+            });
+            wait_for(cx, "the file", &|cx| {
+                let front = ws.read(cx).active_editor();
+                front.is_some_and(|e| e.read(cx).path(cx) == Some(path.as_path()))
+            });
+        };
+        let tabs = |cx: &App| -> Vec<(String, String, bool)> {
+            let tabs = ws.read(cx).panes[0].tabs.iter();
+            tabs.map(|tab| {
+                let editor = tab.editor.read(cx);
+                let doc = editor.doc(cx);
+                (doc.title(), editor.text(cx), doc.is_dirty())
+            })
+            .collect()
+        };
+        begin(cx);
+
+        // A file with changes, a text that never was a file, and a file
+        // with none: the first two are kept, a moment after they changed.
+        open(cx, "src/main.rs");
+        open(cx, "README.md");
+        cx.simulate_input("typed ");
+        ws.update_in(cx, |w, window, cx| w.add_editor(None, "", None, window, cx));
+        cx.simulate_input("a note");
+        keep(cx);
+        let readme = "typed A needle in the docs.\n".to_string();
+        assert_eq!(
+            kept(),
+            [
+                (None, "a note".to_string()),
+                (Some("README.md".to_string()), readme.clone())
+            ]
+        );
+        // Typed on, what is kept follows; saved, it is let go.
+        cx.simulate_input("!");
+        ws.update_in(cx, |w, window, cx| w.activate(0, 1, window, cx));
+        cx.simulate_keystrokes("secondary-s");
+        wait_for(cx, "the save", &|cx| !tabs(cx)[1].2);
+        keep(cx);
+        assert_eq!(kept(), [(None, "a note!".to_string())]);
+
+        // The editor ends unasked with changes in two files and the note:
+        // nothing is saved, nothing was let go.
+        cx.simulate_input("again ");
+        open(cx, "src/main.rs");
+        cx.simulate_input("// lost?\n");
+        keep(cx);
+        assert_eq!(kept().len(), 3);
+        // One of the files is gone from disk by the next start.
+        std::fs::remove_file(root.join("src/main.rs")).unwrap();
+        ws.update_in(cx, |w, _, _| w.panes = vec![Pane::default()]);
+        begin(cx);
+        // At the next start one file is open again already (its tab was
+        // remembered), the other is not.
+        open(cx, "README.md");
+        assert_eq!(cx.read(|cx| tabs(cx)).len(), 1);
+        ws.update_in(cx, |w, window, cx| w.recover_unsaved(window, cx));
+        wait_for(cx, "the text put back", &|cx| tabs(cx).len() == 3);
+        let mut back = cx.read(|cx| tabs(cx));
+        back.sort();
+        assert_eq!(
+            back,
+            [
+                (
+                    "README.md".to_string(),
+                    "typed again A needle in the docs.\n".to_string(),
+                    true
+                ),
+                ("Untitled".to_string(), "a note!".to_string(), true),
+                (
+                    "main.rs".to_string(),
+                    "// lost?\nfn main() {\n    helper();\n}\n".to_string(),
+                    true
+                ),
+            ]
+        );
+        // It says what it is; one step back is the file as it is on disk,
+        // and once it is saved there is nothing left to say.
+        let readme_tab = cx.read(|cx| ws.read(cx).panes[0].tabs[0].editor.clone());
+        let notice = |cx: &App| {
+            let notice = readme_tab.read(cx).doc(cx).notice();
+            notice.map(|notice| notice.to_string())
+        };
+        let said = cx.read(|cx| notice(cx)).unwrap();
+        assert!(
+            said.starts_with("This text was not saved when Solder closed"),
+            "{said}"
+        );
+        ws.update_in(cx, |w, window, cx| w.activate(0, 0, window, cx));
+        cx.simulate_keystrokes("secondary-z");
+        assert_eq!(cx.read(|cx| tabs(cx))[0].1, readme);
+        cx.simulate_keystrokes("secondary-s");
+        wait_for(cx, "the save", &|cx| !tabs(cx)[0].2);
+        assert_eq!(cx.read(|cx| notice(cx)), None);
+        // What was read back is kept anew, under what the texts are now:
+        // the one saved is not, and the old files are gone.
+        keep(cx);
+        assert_eq!(
+            kept(),
+            [
+                (None, "a note!".to_string()),
+                (
+                    Some("main.rs".to_string()),
+                    "// lost?\nfn main() {\n    helper();\n}\n".to_string()
+                )
+            ]
+        );
+        // A tab closed with its changes let go takes what was kept of it;
+        // a window closed with an answer takes the rest.
+        let note = cx.read(|cx| {
+            let tabs = ws.read(cx).panes[0].tabs.iter();
+            let untitled = tabs
+                .map(|tab| tab.editor.clone())
+                .find(|e| e.read(cx).path(cx).is_none());
+            untitled.unwrap()
+        });
+        ws.update_in(cx, |w, window, cx| w.remove_tab(&note, window, cx));
+        drop(note);
+        cx.run_until_parked();
+        keep(cx);
+        assert_eq!(kept().len(), 1);
+        let forgotten = ws.update(cx, |w, cx| w.forget_unsaved(cx));
+        cx.spawn(async move |_| forgotten.await).detach();
+        wait_for(cx, "everything let go", &|_| kept().is_empty());
     }
 
     /// A pinned tab is kept before the others and is not closed by the

@@ -118,8 +118,11 @@ Never guess a signature.
   settings folder. Its writer serializes disk writes on one thread; reads
   and file loads are off the UI thread too. Extension pages are restored
   through their serializers, never by replaying old HTML, and permission
-  to run an extension is still checked. Missing files are skipped; this is
-  not a backup of unsaved text.
+  to run an extension is still checked. Missing files are skipped. Text
+  that is not saved is `workspace::recovery`'s: kept a second after it
+  changed, by one thread and in order, let go when the file is saved, its
+  tab closed or the window closed with an answer, and put back at the
+  next start only after the tabs are. It never writes to the file itself.
 - Language-server requests triggered by typing must run after the current
   effect cycle (`cx.defer`), so the `didChange` for what was just typed
   reaches the server first. See `Editor::after_typing`.

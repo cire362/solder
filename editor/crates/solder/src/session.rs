@@ -110,16 +110,21 @@ impl Writer {
     }
 }
 
-fn path(root: &Path) -> PathBuf {
-    // A stable name across processes and platforms, with the full root
-    // checked again when reading; no paths become directory names.
+/// A name for a path that is the same across processes and platforms,
+/// and is no path itself: nothing of a path becomes a folder's name.
+pub(super) fn name_of(path: &Path) -> String {
     let mut hash = 0xcbf29ce484222325u64;
-    for byte in root.to_string_lossy().bytes() {
+    for byte in path.to_string_lossy().bytes() {
         hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
     }
+    format!("{hash:016x}")
+}
+
+fn path(root: &Path) -> PathBuf {
+    // The full root is checked again when reading.
     settings::config_dir()
         .join("sessions")
-        .join(format!("{hash:016x}.json"))
+        .join(format!("{}.json", name_of(root)))
 }
 
 fn read(path: &Path, root: &Path) -> Option<Session> {
@@ -230,6 +235,7 @@ impl Workspace {
         let path = path(&self.root(cx));
         self.session_writer = Some(Writer::new(path.clone()));
         self.restore_session(path, window, cx);
+        self.start_recovery(window, cx);
         self._subscriptions.push(cx.on_app_quit(|this, cx| {
             let saved = this.keep_session(cx);
             async move {

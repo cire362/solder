@@ -89,6 +89,17 @@ line above the text says which and why. Edits a language server or an
 extension makes to a file that is not open are written in that file's own
 encoding too.
 
+**Text that is not saved is kept aside** as it is typed, for whatever ends
+the editor without asking: a crash, the power, or `cmd-q`, which asks
+nothing. Within a second of a change the whole text of the file goes to
+`sessions/recovery/` beside the settings; saving the file, closing its
+tab, or closing the window with an answer about its changes removes it. What is found there at the next start was neither
+saved nor let go, and is put back: into the tab of its file, into a new
+tab where its file is gone or it never had one. It comes back as changes
+that are not saved, with a line above the text that says so, and one undo
+from it is the file as it is on disk. Nothing is written to the file
+itself until you save. A text over 16 MB is not kept.
+
 A tab can be **pinned** (`cmd-k shift-enter`, or **Workspace: Toggle pin
 tab** in the palette): it goes before the tabs that are not, shows a pin
 where they have their cross, and `cmd-w` and the middle button leave it
@@ -1064,8 +1075,8 @@ per project in `sessions/` beside the settings. Pages of extensions return
 through `registerWebviewPanelSerializer`, with the last `setState` value;
 a custom editor is reopened through its provider. Extensions whose code is
 not allowed are not started for restoration. Missing files are skipped.
-Untitled text and terminal sessions are not restored, and this is not a
-backup of unsaved edits. State is written off the UI thread, in order, once
+Terminal sessions are not restored. Text that was not saved is kept apart
+from this (see Editing), and comes back with its tab. State is written off the UI thread, in order, once
 per second when it changed and when the window closes.
 
 Which extensions work is not claimed from the list above: it is found out.

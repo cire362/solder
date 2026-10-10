@@ -966,6 +966,26 @@ impl Document {
         self.after_change(applied, None, cx);
     }
 
+    /// Puts back text that was typed and never saved, as changes that are
+    /// not saved: one step back from it is the file as it is on disk.
+    /// False where there was nothing to put back.
+    pub fn recover(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        if self.read_only || *self.text.rope() == text {
+            return false;
+        }
+        let len = self.text.len();
+        self.text.seal_history();
+        let applied: Arc<[text::Edit]> = self
+            .text
+            .edit([(0..len, text.to_string())], &[], Instant::now())
+            .into();
+        self.text.seal_history();
+        let said = "This text was not saved when Solder closed. Undo brings back the file as it is on disk.";
+        self.notice = Some(said.into());
+        self.after_change(applied, None, cx);
+        true
+    }
+
     pub fn set_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.path = Some(path);
         self.syntax = None;
