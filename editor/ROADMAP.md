@@ -285,7 +285,8 @@ to build them.
       words and pictures its run put out under it; the extension reads,
       runs and writes it. Not there: pages kept across restarts, pages on
       Wayland, outputs of a notebook that are pages of their own (HTML,
-      widgets), and Jupyter's `.ipynb`, which no extension reads by itself
+      widgets), running Jupyter kernels. Format 4 `.ipynb` files are read and saved by
+      the editor, with metadata, attachments and outputs preserved
 - [x] A check that runs with each release: the most installed extensions of
       Open VSX are installed, activated and asked for their main feature, and
       the result is the list of what works. `extension-census`, run by the

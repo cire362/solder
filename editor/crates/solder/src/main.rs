@@ -45,6 +45,7 @@ mod import_view;
 mod indent;
 mod inline_completion;
 mod inline_edit;
+mod ipynb;
 mod key_layout;
 mod key_layout_picker;
 mod key_prompts;
@@ -181,7 +182,11 @@ pub fn open_workspace_window(
             let workspace = cx.new(|cx| Workspace::new(root, window, cx));
             if let Some((path, content)) = initial {
                 workspace.update(cx, |w, cx| {
-                    w.add_editor(Some(path), &content, None, window, cx)
+                    if path.extension().is_some_and(|ext| ext == "ipynb") {
+                        w.open_path(path, None, window, cx);
+                    } else {
+                        w.add_editor(Some(path), &content, None, window, cx);
+                    }
                 });
             }
             workspace

@@ -969,6 +969,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if path.extension().is_some_and(|ext| ext == "ipynb") {
+            self.open_notebook(path, String::new(), "jupyter-notebook".into(), window, cx);
+            return;
+        }
         self.close_file_diff(window, cx);
         let pane = &self.panes[self.active_pane];
         if let Some(ix) = pane
@@ -13238,6 +13242,50 @@ exports.activate = (context) => {
         });
         cx.run_until_parked();
         assert_eq!(cx.read(|cx| pages(cx)), (Vec::new(), None));
+    }
+
+    #[gpui::test]
+    fn a_jupyter_file_opens_edits_and_saves_without_an_extension(cx: &mut TestAppContext) {
+        let root = fixture("native-notebook");
+        let file = root.join("notes.ipynb");
+        let original = serde_json::json!({"nbformat":4,"nbformat_minor":5,
+            "metadata":{"custom":42},"cells":[{"cell_type":"code","id":"first",
+            "source":["print(1)"],"metadata":{"tags":["keep"]},"execution_count":1,
+            "outputs":[{"output_type":"stream","name":"stdout","text":["1\n"]}]}]});
+        std::fs::write(&file, serde_json::to_vec(&original).unwrap()).unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(file.clone(), None, window, cx)
+        });
+        let notebook = cx.read(|cx| ws.read(cx).notebooks[0].0.clone());
+        wait_for(cx, "the native cells", &|cx| notebook.read(cx).is_ready());
+        assert_eq!(
+            cx.read(|cx| notebook.read(cx).seen(cx)),
+            ["code python [1]: print(1) => 1"]
+        );
+        notebook.update_in(cx, |notebook, window, cx| notebook.focus(window, cx));
+        cx.simulate_input("# edited\n");
+        assert!(cx.read(|cx| notebook.read(cx).is_dirty()));
+        cx.dispatch_action(crate::notebook::AddText);
+        cx.simulate_input("note");
+        cx.simulate_keystrokes("secondary-s");
+        wait_for(cx, "the native save", &|cx| !notebook.read(cx).is_dirty());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(saved["metadata"], original["metadata"]);
+        assert_eq!(saved["cells"][0]["source"], "# edited\nprint(1)");
+        assert_eq!(
+            saved["cells"][0]["outputs"],
+            original["cells"][0]["outputs"]
+        );
+        assert_eq!(
+            saved["cells"][0]["metadata"],
+            original["cells"][0]["metadata"]
+        );
+        assert_eq!(saved["cells"][1]["source"], "note");
+        cx.dispatch_action(CloseTab);
+        assert!(cx.read(|cx| ws.read(cx).notebooks.is_empty()));
     }
 
     /// A file an extension reads as a notebook opens as a tab of cells:

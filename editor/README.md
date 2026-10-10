@@ -984,11 +984,11 @@ choice between several things that can run a kind of notebook (the first
 the extension made is used), renderers of outputs
 (`contributes.notebookRenderer`), cell status bar items, edits an extension
 makes to the cells itself (`NotebookEdit`), and a notebook opened by an
-extension's code (`openNotebookDocument`, `showNotebookDocument`). No
-extension reads Jupyter's `.ipynb` here by itself: in VS Code that reader
-is built into the editor, and the Jupyter extension that runs such
-notebooks needs far more of VS Code than is here. This was made for the
-smaller notebooks that bring both their reader and their runner.
+extension's code (`openNotebookDocument`, `showNotebookDocument`). Jupyter `.ipynb` files (format 4) open directly, without an extension. The
+built-in reader preserves cell ids, metadata, attachments, outputs and
+unknown fields when editing and saving. It does not start a kernel: reading
+and saving a Jupyter file is independent of running its cells. A file over
+64 MB is refused with a reason.
 
 Which extensions work is not claimed from the list above: it is found out.
 With each release the fifty most installed extensions of Open VSX are

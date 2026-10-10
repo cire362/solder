@@ -109,6 +109,8 @@ pub struct Notebook {
     /// The cell the cursor is in, or was in last.
     selected: usize,
     dirty: bool,
+    generation: u64,
+    ipynb: Option<crate::ipynb::File>,
     /// What runs its cells, as the extension calls it.
     runner: Option<SharedString>,
     /// The last thing that went wrong.
@@ -130,14 +132,33 @@ impl Notebook {
     pub fn open(path: PathBuf, extension: String, kind: String, cx: &mut Context<Self>) -> Self {
         let uri = crate::extension_api::uri(&path);
         let me = cx.weak_entity();
-        let reading = ExtensionStore::try_global(cx).map(|store| {
-            store.update(cx, |store, cx| {
-                store.notebook_opened(&extension, &uri, me);
-                let params = json!({ "type": kind, "uri": uri });
-                store.ask_host(&extension, "notebook.open", params, cx)
-            })
-        });
+        let reading = (!extension.is_empty())
+            .then(|| ExtensionStore::try_global(cx))
+            .flatten()
+            .map(|store| {
+                store.update(cx, |store, cx| {
+                    store.notebook_opened(&extension, &uri, me);
+                    let params = json!({ "type": kind, "uri": uri });
+                    store.ask_host(&extension, "notebook.open", params, cx)
+                })
+            });
+        let native_path = extension.is_empty().then(|| path.clone());
         cx.spawn(async move |this, cx| {
+            if let Some(path) = native_path {
+                let read = cx
+                    .background_executor()
+                    .spawn(async move { crate::ipynb::File::read(&path) })
+                    .await;
+                this.update(cx, |this, cx| match read {
+                    Ok((file, read)) => {
+                        this.ipynb = Some(file);
+                        this.read(Ok(read), cx);
+                    }
+                    Err(why) => this.read(Err(why), cx),
+                })
+                .ok();
+                return;
+            }
             let read = match reading {
                 Some(reading) => reading.await,
                 None => Err("Extensions are not there to read it".into()),
@@ -155,6 +176,8 @@ impl Notebook {
             next_handle: 0,
             selected: 0,
             dirty: false,
+            generation: 0,
+            ipynb: None,
             runner: None,
             note: None,
             list: ListState::new(0, ListAlignment::Top, px(400.)),
@@ -275,6 +298,7 @@ impl Notebook {
     }
 
     fn changed(&mut self, cx: &mut Context<Self>) {
+        self.generation += 1;
         if !self.dirty {
             self.dirty = true;
             cx.emit(NotebookEvent::Changed);
@@ -505,14 +529,28 @@ impl Notebook {
     /// Has the extension write the file from the cells as they are.
     /// Resolves to whether it was written.
     pub fn save(&mut self, cx: &mut Context<Self>) -> Task<bool> {
-        let asked = self.ask("notebook.save", json!({ "uri": self.uri }), cx);
+        let generation = self.generation;
+        let asked = match self.ipynb.clone() {
+            Some(file) => {
+                let path = self.path.clone();
+                let cells = self
+                    .cells
+                    .iter()
+                    .map(|cell| (cell.handle, cell.code, cell.editor.read(cx).text(cx)))
+                    .collect::<Vec<_>>();
+                cx.background_executor()
+                    .spawn(async move { file.save(&path, &cells).map(|_| Value::Bool(true)) })
+            }
+            None => self.ask("notebook.save", json!({ "uri": self.uri }), cx),
+        };
         self.note = None;
         cx.spawn(async move |this, cx| {
             let saved = asked.await;
             let done = saved.is_ok();
             this.update(cx, |this, cx| {
                 match saved {
-                    Ok(_) => this.dirty = false,
+                    Ok(_) if this.generation == generation => this.dirty = false,
+                    Ok(_) => {}
                     Err(why) => this.note = Some(why.into()),
                 }
                 cx.emit(NotebookEvent::Changed);

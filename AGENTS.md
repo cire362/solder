@@ -252,8 +252,9 @@ Never guess a signature.
   outside the folders the extension named. A new thing a page may do
   is a new line there, with a test of what it refuses.
   A notebook (`notebook.rs`) is no page: a tab of cells the editor draws
-  itself, kept by the workspace next to the pages' tabs. The extension
-  reads the file, runs the cells and writes it back (`host/notebooks.js`,
+  itself, kept by the workspace next to the pages' tabs. Jupyter format 4 files are read and atomically written by `ipynb.rs`,
+  preserving metadata, attachments and output bundles. Other notebooks
+  use their extension, which reads the file, runs the cells and writes it back (`host/notebooks.js`,
   which also reads and writes the file: no bytes of it cross to the
   editor); the editor says what is typed and which cells there are, a
   cell by a number that stays its own. A cell is an `Editor` as tall as
