@@ -7044,6 +7044,88 @@ mod tests {
         assert!(cx.read(|cx| ws.read(cx).bottom == Some(Panel::Problems)));
     }
 
+    /// The other places the symbol under the cursor is used are lit up
+    /// once the cursor rests, and the places that implement it are gone
+    /// to. Against `tests/fixtures/mock_lsp.py`.
+    #[gpui::test]
+    fn a_symbol_s_other_places_are_lit_and_its_implementations_gone_to(cx: &mut TestAppContext) {
+        let root = fixture("occurrences");
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        let file = root.join("src/main.rs");
+        let text =
+            "trait Shape {}\nstruct Circle;\nimpl Shape for Circle {}\nfn area(c: &Circle) {}\n";
+        std::fs::write(&file, text).unwrap();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let with = |lit: bool| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "rust-analyzer".into(),
+                settings::ServerOverride {
+                    command: Some("python3".into()),
+                    args: Some(vec![script.display().to_string()]),
+                    ..Default::default()
+                },
+            );
+            settings.occurrence_highlights = lit;
+            settings
+        };
+        cx.update(|_, cx| cx.set_global(with(true)));
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(file.clone()), text, None, window, cx)
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let lit = |cx: &App| editor.read(cx).occurrences.to_vec();
+        wait_for(cx, "the server", &|cx| {
+            LspStore::global(cx).is_some_and(|store| {
+                let document = editor.read(cx).document().clone();
+                store.read(cx).document_symbols(&document).is_some()
+            })
+        });
+
+        // With the cursor at rest in a name, every place it stands is lit.
+        editor.update(cx, |editor, cx| editor.select_range(24..24, cx));
+        assert!(cx.read(|cx| lit(cx)).is_empty());
+        wait_for(cx, "the places of Circle", &|cx| lit(cx).len() == 3);
+        assert_eq!(cx.read(|cx| lit(cx)), [22..28, 45..51, 67..73]);
+        // Moved to another of them, they stay lit; moved off them, they
+        // go at once, and the places of what is there now are lit.
+        editor.update(cx, |editor, cx| editor.select_range(47..47, cx));
+        assert_eq!(cx.read(|cx| lit(cx)).len(), 3);
+        editor.update(cx, |editor, cx| editor.select_range(58..58, cx));
+        assert!(cx.read(|cx| lit(cx)).is_empty());
+        wait_for(cx, "the place of area", &|cx| {
+            lit(cx).as_slice() == std::slice::from_ref(&(58..62))
+        });
+        // What is typed takes them away: they were of the text before.
+        let focus = cx.read(|cx| editor.focus_handle(cx));
+        cx.update(|window, _| window.focus(&focus));
+        cx.simulate_input("x");
+        assert!(cx.read(|cx| lit(cx)).is_empty());
+        wait_for(cx, "the place of the new name", &|cx| {
+            lit(cx).as_slice() == std::slice::from_ref(&(58..63))
+        });
+        // Turned off with the cursor still there, nothing stays lit.
+        cx.update(|_, cx| cx.set_global(with(false)));
+        cx.run_until_parked();
+        assert!(cx.read(|cx| lit(cx)).is_empty());
+        assert!(cx.read(|cx| editor.read(cx).occurrences_task.is_none()));
+        // Turned back on, they return without another cursor movement.
+        cx.update(|_, cx| cx.set_global(with(true)));
+        wait_for(cx, "the places after switching on", &|cx| {
+            !lit(cx).is_empty()
+        });
+
+        // The places that implement a trait: with the cursor on its name
+        // the key goes to its `impl`.
+        editor.update(cx, |editor, cx| editor.select_range(8..8, cx));
+        cx.simulate_keystrokes("secondary-f12");
+        wait_for(cx, "the implementation", &|cx| {
+            editor.read(cx).newest_range() == (35..40)
+        });
+    }
+
     /// Runs the real client against `tests/fixtures/mock_lsp.py` over stdio.
     #[gpui::test]
     fn language_server_features(cx: &mut TestAppContext) {

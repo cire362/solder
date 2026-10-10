@@ -166,6 +166,15 @@ found again a quarter of a second after the file last changed, and not at
 all while neither the panel nor the breadcrumbs are on screen. Up to 5000
 symbols of a file are kept.
 
+**The other places a symbol is used** are lit up once the cursor has rested
+in its name for a fifth of a second: the file's server is asked, and what
+it names is drawn behind the text in the color of a matching bracket. They
+stay while the cursor moves among them, go at once when it leaves or the
+text changes, and are not asked for per key. `"occurrence_highlights":
+false` turns them off. `cmd-f12` goes to **the places that implement** what
+is under the cursor (the types that are a trait or an interface): to the
+one place where there is one, to a list where there are several.
+
 ## Problems
 
 **Show problems** (in the palette, the **Problems** tab of the bottom dock,
@@ -1041,7 +1050,7 @@ What is in the module today is what every extension starts from:
 | Watch files | `createFileSystemWatcher`, for the folders of the open windows: files made, changed and deleted, but for `.git` and `node_modules` |
 | Show pages (webviews) and editors of its own for kinds of files | A tab drawn by the system's browser; see below |
 | Read, run and write notebooks | A tab of cells, drawn by Solder: the extension reads the file, runs the cells and writes it back; see below |
-| Give language features in code (`vscode.languages`) | Completions, hovers, definitions, references, rename, formatting, code actions, document and project symbols, signature help, inlay hints, semantic colors, and diagnostics from its collections. A code lens is above its line, where a click runs it, and among the code actions of the line (`cmd-.`) |
+| Give language features in code (`vscode.languages`) | Completions, hovers, definitions, references, rename, formatting, code actions, document and project symbols, signature help, inlay hints, semantic colors, the places that implement a symbol, the other places it is used, and diagnostics from its collections. A code lens is above its line, where a click runs it, and among the code actions of the line (`cmd-.`) |
 
 **Show extension views** opens the **Views** panel. Trees an extension names
 are listed before its code starts; choosing one starts the approved code.

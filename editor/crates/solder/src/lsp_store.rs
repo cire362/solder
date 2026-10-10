@@ -231,6 +231,11 @@ fn supports(caps: &lt::ServerCapabilities, method: &str) -> bool {
         ),
         "textDocument/signatureHelp" => caps.signature_help_provider.is_some(),
         "textDocument/definition" => yes(&caps.definition_provider),
+        "textDocument/implementation" => !matches!(
+            caps.implementation_provider,
+            None | Some(lt::ImplementationProviderCapability::Simple(false))
+        ),
+        "textDocument/documentHighlight" => yes(&caps.document_highlight_provider),
         "textDocument/references" => yes(&caps.references_provider),
         "textDocument/documentSymbol" => yes(&caps.document_symbol_provider),
         "workspace/symbol" => yes(&caps.workspace_symbol_provider),
@@ -1575,6 +1580,15 @@ impl LspStore {
             }
             _ => {}
         }
+    }
+
+    /// Whether an open server answers this kind of request. Background
+    /// features do no work while nothing can answer them.
+    pub fn can_request(&self, document: &Entity<Document>, method: &str) -> bool {
+        self.docs.get(&document.entity_id()).is_some_and(|entry| {
+            self.opened(entry)
+                .any(|(_, server)| supports(&server.capabilities(), method))
+        })
     }
 
     /// Sends a request about `document` to one server: the first of its

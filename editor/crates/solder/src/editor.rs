@@ -86,6 +86,7 @@ actions!(
         SelectPrevCompletion,
         HideCompletions,
         GoToDefinition,
+        GoToImplementation,
         FindReferences,
         RenameSymbol,
         FormatDocument,
@@ -176,6 +177,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("tab", ConfirmCompletion, completions),
         KeyBinding::new("escape", HideCompletions, completions),
         KeyBinding::new("f12", GoToDefinition, full),
+        KeyBinding::new("secondary-f12", GoToImplementation, full),
         KeyBinding::new("shift-f12", FindReferences, full),
         KeyBinding::new("f2", RenameSymbol, full),
         KeyBinding::new("shift-alt-f", FormatDocument, full),
@@ -360,6 +362,11 @@ pub struct Editor {
     pub(crate) folds: Vec<Range<usize>>,
     /// The pointer is over the gutter: lines that can be folded say so.
     pub(crate) gutter_hovered: bool,
+    /// The other places the symbol under the cursor is used, as the
+    /// file's server says: in order, and lit up. Asked for a moment after
+    /// the cursor came to rest.
+    pub(crate) occurrences: Arc<Vec<Range<usize>>>,
+    pub(crate) occurrences_task: Option<Task<()>>,
     /// Whether lines too long for the window go on in the next row, where
     /// this view says other than the settings do.
     pub(crate) wrap: Option<bool>,
@@ -384,6 +391,7 @@ pub struct Editor {
     /// (query files bound to a connection).
     pub(crate) schema_source: Option<SchemaSource>,
     _document_subscription: Subscription,
+    _settings_subscription: Subscription,
 }
 
 /// The engine and current schema for completion, read when it is needed so
@@ -421,11 +429,14 @@ impl Editor {
         let subscription = cx.subscribe(&document, |this, _, event, cx| match event {
             DocumentEvent::Edited { edits, origin } => {
                 this.folds_follow(edits);
+                // Where they were is not where they are now.
+                this.occurrences = Arc::default();
                 if *origin != Some(cx.entity_id()) {
                     this.follow_edits(edits, cx);
                     // Text changed under the suggestion.
                     this.clear_ghost(cx);
                 }
+                this.occurrences_moved(cx);
                 cx.emit(EditorEvent::Edited);
                 cx.notify();
             }
@@ -437,6 +448,10 @@ impl Editor {
             DocumentEvent::DiagnosticsChanged
             | DocumentEvent::HintsChanged
             | DocumentEvent::GitChanged => cx.notify(),
+        });
+        let settings = cx.observe_global::<crate::settings::Settings>(|this, cx| {
+            this.occurrences_moved(cx);
+            cx.notify();
         });
         Self {
             mode: EditorMode::Full,
@@ -456,6 +471,8 @@ impl Editor {
             column: None,
             folds: Vec::new(),
             gutter_hovered: false,
+            occurrences: Arc::default(),
+            occurrences_task: None,
             wrap: None,
             wrap_cols: None,
             wrap_cache: None,
@@ -471,6 +488,7 @@ impl Editor {
             signature: None,
             signature_task: None,
             _document_subscription: subscription,
+            _settings_subscription: settings,
         }
     }
 
@@ -1047,6 +1065,7 @@ impl Editor {
     fn selections_changed(&mut self, cx: &mut Context<Self>) {
         self.autoscroll = true;
         self.sync_ghost(cx);
+        self.occurrences_moved(cx);
         cx.emit(EditorEvent::SelectionsChanged);
         cx.notify();
     }
@@ -2644,6 +2663,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::select_prev_completion))
             .on_action(cx.listener(Self::hide_completions))
             .on_action(cx.listener(Self::go_to_definition))
+            .on_action(cx.listener(Self::go_to_implementation))
             .on_action(cx.listener(Self::find_references))
             .on_action(cx.listener(Self::rename_symbol))
             .on_action(cx.listener(Self::format_document))
@@ -2714,6 +2734,17 @@ mod tests {
                 .map(|s| s.range())
                 .collect()
         })
+    }
+
+    #[gpui::test]
+    fn without_a_server_cursor_moves_do_not_schedule_highlights(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "plain.txt", "word word");
+        cx.simulate_keystrokes("right right");
+        cx.simulate_input("x");
+        cx.read(|cx| {
+            assert!(editor.read(cx).occurrences.is_empty());
+            assert!(editor.read(cx).occurrences_task.is_none());
+        });
     }
 
     #[gpui::test]

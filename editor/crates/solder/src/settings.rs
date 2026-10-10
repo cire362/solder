@@ -91,6 +91,8 @@ pub struct Settings {
     pub code_lens: bool,
     /// A thin line down each level of indentation.
     pub indent_guides: bool,
+    /// The other places the symbol under the cursor is used, lit up.
+    pub occurrence_highlights: bool,
     /// Lines too long for the window go on in the next row.
     pub soft_wrap: bool,
     /// The icon theme of an installed extension, by name: pictures next
@@ -303,6 +305,7 @@ impl Default for Settings {
             semantic_highlighting: true,
             code_lens: true,
             indent_guides: true,
+            occurrence_highlights: true,
             soft_wrap: false,
             icon_theme: None,
             context_servers: BTreeMap::new(),

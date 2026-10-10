@@ -137,6 +137,8 @@ while True:
             "completionProvider": {"triggerCharacters": ["."]},
             "hoverProvider": True,
             "definitionProvider": True,
+            "implementationProvider": True,
+            "documentHighlightProvider": True,
             "referencesProvider": True,
             "documentSymbolProvider": True,
             "workspaceSymbolProvider": True,
@@ -253,6 +255,22 @@ while True:
         start = text.find("helper")
         send({"jsonrpc": "2.0", "id": mid,
               "result": {"uri": uri, "range": rng(text, start, start + len("helper"))}})
+    elif method == "textDocument/implementation":
+        # Every `impl` of the word under the cursor.
+        uri = params["textDocument"]["uri"]
+        text = docs[uri]
+        word = word_at(text, offset(text, params["position"]))
+        found = [m for m in re.finditer(r"impl (\w+)", text) if m.group(1) == word]
+        send({"jsonrpc": "2.0", "id": mid, "result": [
+            {"uri": uri, "range": rng(text, m.start(1), m.end(1))} for m in found]})
+    elif method == "textDocument/documentHighlight":
+        # Every place the word under the cursor stands as a word.
+        uri = params["textDocument"]["uri"]
+        text = docs[uri]
+        word = word_at(text, offset(text, params["position"]))
+        found = re.finditer(r"\b%s\b" % re.escape(word), text) if word else []
+        send({"jsonrpc": "2.0", "id": mid, "result": [
+            {"range": rng(text, m.start(), m.end()), "kind": 1} for m in found]})
     elif method == "textDocument/documentSymbol":
         # Every function of the file, inside one module.
         uri = params["textDocument"]["uri"]

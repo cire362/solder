@@ -39,7 +39,8 @@ something of its own unchecked or unmade adds it here.
       rust-analyzer's "Run" and the places of a symbol are tested against
       the mock server, which CI has; rust-analyzer it has not. The same
       goes for the Structure panel and the breadcrumbs: the mock server's
-      symbols and the outline of Rust, no real server's
+      symbols and the outline of Rust, no real server's; and for the
+      places a symbol is used and the places that implement it
 - [ ] On screen: the Structure panel, the breadcrumbs in the title bar
       and the Problems panel. Tested in a headless window only
 - [ ] The Problems panel with a server that reports on a whole project:
@@ -80,6 +81,11 @@ something of its own unchecked or unmade adds it here.
       front only) and no problems but the servers': none from a build or
       a task's output. A problem's place in a file that is open is where
       the server last said, not where the text has moved to since
+- [ ] The other places of a symbol are lit only where a server names
+      them: a file with none has nothing lit, not even the same word. The
+      kinds a server gives them (read, written) are not told apart, and
+      the color is the matching bracket's, there being no token of their
+      own. Go to type definition and go to declaration are not there
 - [ ] A file undone back to what is on disk stays marked as changed
 - [ ] `cmd-q` quits without asking about files that are not saved. Their
       text is kept and comes back, but nothing says so before the quit
@@ -518,8 +524,9 @@ update. They come after phase 9, in this order unless one is needed sooner.
       below read the same outline
 - [x] A Problems panel: every diagnostic of the project, by file, of
       files that are not open too
-- [ ] The other places a symbol is used lit up; go to implementations;
-      breadcrumbs with the path and the symbol under the cursor
+- [x] The other places a symbol is used lit up; go to implementations;
+      breadcrumbs with the path and the symbol under the cursor. All three
+      for extensions' providers too
 
 ### Git history
 - [ ] The history as a graph, the history of one file, blame in the gutter
