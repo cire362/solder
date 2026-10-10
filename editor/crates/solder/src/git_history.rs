@@ -72,6 +72,7 @@ impl Repo {
             "--format=fuller",
             "--stat",
             "--patch",
+            "--diff-merges=first-parent",
             id,
             "--",
         ];
@@ -209,6 +210,15 @@ pub(crate) mod tests {
             graph
                 .iter()
                 .any(|r| r.graph.contains('\\') || r.graph.contains('/'))
+        );
+        let merge = graph.iter().find_map(|r| r.commit.as_ref()).unwrap();
+        let merged_patch = f.0.commit_patch(&merge.id, None).unwrap();
+        assert!(merged_patch.contains("diff --git a/side.txt b/side.txt"));
+        assert!(merged_patch.contains("+side"));
+        assert!(
+            !f.0.commit_patch(&merge.id, Some("after name.txt"))
+                .unwrap()
+                .contains("diff --git")
         );
         let file = f.0.history(Some("after name.txt"), 200).unwrap();
         let titles: Vec<_> = file

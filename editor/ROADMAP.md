@@ -30,10 +30,11 @@ something of its own unchecked or unmade adds it here.
 - [ ] Fetch with SSH or a credential helper against a hosted remote. The
       stash and fetch tests use local repositories; Git runs without
       terminal credential prompts here
-- [ ] Git history and blame in a real window, and a large repository.
+- [ ] Git history and blame in a large repository, and non-UTF-8 file blame.
       Rename and merge history, commit patches and unsaved blame are tested
-      with local repositories and a headless window. Other platforms and
-      non-UTF-8 file blame have not been checked
+      with local repositories and a headless window. The graph, opening a
+      commit patch and inserting text with blame enabled were checked in a
+      real macOS window; other platforms have not been checked
 - [ ] Published extensions. One has been run: the reader `vscode.ipynb`
       1.95.3, on a CI runner, and only for reading and saving. The check of
       the most installed extensions of Open VSX has not produced its list,
