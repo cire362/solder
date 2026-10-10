@@ -16,8 +16,8 @@ use crate::{
     document::Severity,
     editor::{
         ConfirmCompletion, Editor, EditorEvent, FindReferences, FormatDocument, GoToDefinition,
-        HideCompletions, NextDiagnostic, PrevDiagnostic, RenameSymbol, SelectNextCompletion,
-        SelectPrevCompletion, ShowCompletions, ShowHover,
+        GoToImplementation, HideCompletions, NextDiagnostic, PrevDiagnostic, RenameSymbol,
+        SelectNextCompletion, SelectPrevCompletion, ShowCompletions, ShowHover,
     },
     extension_store::ExtensionStore,
     lsp_store::{LspStore, ServerAction, from_range, to_position},
@@ -28,6 +28,9 @@ use crate::{
 
 /// How long the pointer rests before a hover request goes out.
 const HOVER_DELAY: Duration = Duration::from_millis(350);
+/// How long the cursor rests before the other places of the symbol under
+/// it are asked for.
+const OCCURRENCES_DELAY: Duration = Duration::from_millis(200);
 const COMPLETION_ROWS: usize = 10;
 const COMPLETION_ROW_HEIGHT: Pixels = px(24.);
 
@@ -929,6 +932,109 @@ impl Editor {
             .ok();
         })
         .detach();
+    }
+
+    /// The places that implement what is under the cursor: of a trait or
+    /// an interface, the types that are it.
+    pub(crate) fn go_to_implementation(
+        &mut self,
+        _: &GoToImplementation,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let head = self.newest_range().end;
+        let Some((encoding, request)) =
+            self.lsp_request::<lt::request::GotoImplementation>(cx, |id, enc, buf| {
+                lt::request::GotoImplementationParams {
+                    text_document_position_params: Self::position_params(id, enc, buf, head),
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                }
+            })
+        else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let found = locations(request.await.ok().flatten(), encoding);
+            this.update(cx, |_, cx| {
+                cx.emit(EditorEvent::OpenLocations {
+                    title: "Implementations".into(),
+                    locations: found,
+                    always_list: false,
+                })
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The cursor moved. What was lit stays while the cursor is still on
+    /// one of the places, and goes at once when it is not; what is under
+    /// it now is asked about once it has rested.
+    pub(crate) fn occurrences_moved(&mut self, cx: &mut Context<Self>) {
+        if self.is_single_line() || self.fit.is_some() {
+            return;
+        }
+        let head = self.newest_range().end;
+        let on_one = |place: &Range<usize>| place.start <= head && head <= place.end;
+        if !self.occurrences.iter().any(on_one) {
+            self.occurrences = Default::default();
+        }
+        let wanted = crate::settings::Settings::get(cx).occurrence_highlights;
+        let supported = wanted
+            && LspStore::global(cx).is_some_and(|store| {
+                store.read(cx).can_request(
+                    &self.document,
+                    <lt::request::DocumentHighlightRequest as lt::request::Request>::METHOD,
+                )
+            });
+        if !supported || self.selections.len() != 1 {
+            self.occurrences = Default::default();
+            self.occurrences_task = None;
+            return;
+        }
+        self.occurrences_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(OCCURRENCES_DELAY).await;
+            this.update(cx, |this, cx| this.ask_occurrences(cx)).ok();
+        }));
+    }
+
+    fn ask_occurrences(&mut self, cx: &mut Context<Self>) {
+        let head = self.newest_range().end;
+        let version = self.doc(cx).version();
+        let asked =
+            self.lsp_request::<lt::request::DocumentHighlightRequest>(cx, |id, enc, buf| {
+                lt::DocumentHighlightParams {
+                    text_document_position_params: Self::position_params(id, enc, buf, head),
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                }
+            });
+        let Some((encoding, request)) = asked else {
+            return;
+        };
+        self.occurrences_task = Some(cx.spawn(async move |this, cx| {
+            let found = request.await.ok().flatten().unwrap_or_default();
+            this.update(cx, |this, cx| {
+                // The answer is of where the cursor was, in the text as
+                // it was.
+                if this.doc(cx).version() != version
+                    || this.newest_range().end != head
+                    || !crate::settings::Settings::get(cx).occurrence_highlights
+                {
+                    return;
+                }
+                let buffer = this.buf(cx);
+                let mut places: Vec<Range<usize>> = found
+                    .iter()
+                    .map(|place| from_range(buffer, place.range, encoding))
+                    .collect();
+                places.sort_by_key(|place| place.start);
+                this.occurrences = std::sync::Arc::new(places);
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     pub(crate) fn find_references(

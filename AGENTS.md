@@ -42,6 +42,10 @@ stack and the measured performance numbers.
 - If you work in parallel with another agent, use a separate `git worktree`
   so neither of you touches the other's uncommitted files.
 - Tick the box in `editor/ROADMAP.md` in the same PR that finishes an item.
+  A tick says the item works and is tested, no more. What it leaves
+  unchecked (a platform, a screen, a published extension, a number that
+  was not measured) or unmade goes under "Not verified, not finished"
+  there, in the same PR, and comes out in the PR that checks or makes it.
 
 ## Ask before
 
@@ -146,6 +150,21 @@ Never guess a signature.
   a cursor lands in it. A lens is kept only if a
   click can do it: its command is one its server said it runs, or one
   of the few the editor does itself (`editor_lsp::LENS_COMMANDS`).
+- The outline of the file in front (`outline.rs`) is the workspace's,
+  one for the Structure panel and the breadcrumbs both: from the file's
+  server, else the language's outline off the UI thread. It is found a
+  moment after the file changed (`Workspace::keep_outline`), never per
+  key, and not at all while nothing on screen shows it. A new thing that
+  shows symbols of the file in front reads it; it does not ask again.
+  A server becoming ready or the set of servers changing also refreshes
+  it (`LspStoreEvent::ServersChanged`), so an early fallback does not stay
+  after the server has started. Symbol siblings are sorted by position
+  before the tree becomes a list.
+- What servers report of files is kept twice: in the document, for a
+  file that is open, where it moves with the text; and in
+  `LspStore::problems`, for every file a server names, open or not, as
+  the server said it (its own positions and encoding). The Problems
+  panel reads the second and only while its tab is in front.
 - Git goes through `git.rs`, which shells out to `git` with stable
   `--porcelain=v2 -z` formats. Everything in it blocks: call it from
   `cx.background_executor()`.

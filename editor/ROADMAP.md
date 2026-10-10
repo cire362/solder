@@ -11,6 +11,107 @@ this one does not have yet.
 
 Status: `[x]` done, `[~]` partial, `[ ]` not started.
 
+## Not verified, not finished
+
+A box above or below is ticked when the item works and is tested. What a
+ticked item still leaves open is kept here, so that "done" is never read as
+more than it is: what was never checked where it matters, and what was left
+out of something that otherwise works. An entry goes when it is checked or
+made, in the pull request that does it; a pull request that leaves
+something of its own unchecked or unmade adds it here.
+
+### Not verified
+- [ ] Published extensions. One has been run: the reader `vscode.ipynb`
+      1.95.3, on a CI runner, and only for reading and saving. The check of
+      the most installed extensions of Open VSX has not produced its list,
+      so which extensions work is not known. Everything else of phase 8 is
+      tested with extensions written for the tests
+- [ ] Linux and Windows. CI builds and runs the tests on Linux; nothing
+      was looked at in a window there or on Windows. Pages of extensions
+      (the system's browser), notebooks and everything of phase 10 were
+      seen on macOS only
+- [ ] On screen: folding, selection by column, the pin of a tab and the
+      line above a file that is only read. They are tested in a headless
+      window, with clicks and keys at the places they are drawn; no keys
+      could be sent to a real one. Indent guides and wrapped lines were
+      looked at
+- [ ] A real language server for the lenses the editor does itself:
+      rust-analyzer's "Run" and the places of a symbol are tested against
+      the mock server, which CI has; rust-analyzer it has not. The same
+      goes for the Structure panel and the breadcrumbs: the mock server's
+      symbols and the outline of Rust, no real server's; and for the
+      places a symbol is used and the places that implement it
+- [ ] Keyboard and mouse navigation of Structure, Problems, breadcrumbs,
+      symbol highlights and implementations in a real window. The panels,
+      breadcrumbs and highlights were looked at on macOS with the mock
+      server; input is tested in a headless window only
+- [ ] The Problems panel with a server that reports on a whole project:
+      it is tested with the mock server reporting on one file that is not
+      open. How it reads with the thousands of reports of a real build
+      was not looked at
+- [ ] A file over 64 MB (opened to be read) and one over 512 MB (not
+      read): the limits are tested with a small file and a small limit
+- [ ] Memory of the editor block of phase 10: 132 MB in three runs and 140
+      to 141 in two, against 131 to 132 on main in five. Not shown to be
+      the branch's, and not shown not to be
+      (`benchmarks/daily-editor.md`)
+- [ ] Not measured at all: an editor with extensions running, a notebook
+      open, a file with lenses, folding, a file of many megabytes with
+      wrapping on, a file in another encoding; Structure and Problems
+      with large lists, and symbol highlights while typing with a server
+- [ ] The numbers on the website (`src/components/performance.tsx`) are
+      placeholders, marked so. The measurements in `benchmarks/` are local
+      comparisons of a branch with main, not what the site may claim
+
+### Not finished
+- [ ] Wrapping goes by cells, a character each: rows of characters wider
+      than a cell (Chinese, Japanese, Korean) run past the edge, and so do
+      rows with inlay hints. Home and End go to the ends of the line, not
+      of the row. What `alt-z` chose is not kept with the tab
+- [ ] Folding is by indentation only: none from the grammar or a language
+      server, none for a block whose body is not indented. Folds are not
+      kept with the tabs of a project
+- [ ] Encodings other than UTF-8, UTF-16, Windows-1251 and Windows-1252
+      are shown with the wrong letters (saved byte for byte all the same).
+      Cyrillic is told from Western by a guess. A file with both line
+      endings keeps the one most of its lines have, not each line's own
+- [ ] The outline of a file with no server, or one whose server lists
+      nothing, is flat: the language's outline says where a symbol begins
+      and not what it is inside of. A symbol of the breadcrumbs is not a
+      place to go to by itself: a click opens the list of the file's
+      symbols
+- [ ] The Problems panel has no filter (by kind, by text, the file in
+      front only) and no problems but the servers': none from a build or
+      a task's output. A problem's place in a file that is open is where
+      the server last said, not where the text has moved to since
+- [ ] The other places of a symbol are lit only where a server names
+      them: a file with none has nothing lit, not even the same word. The
+      kinds a server gives them (read, written) are not told apart, and
+      the color is the matching bracket's, there being no token of their
+      own. Go to type definition and go to declaration are not there
+- [ ] A file undone back to what is on disk stays marked as changed
+- [ ] `cmd-q` quits without asking about files that are not saved. Their
+      text is kept and comes back, but nothing says so before the quit
+- [ ] Tabs closed are remembered while the window is open, not across a
+      restart
+- [ ] Jupyter: no kernel is started and the ipywidgets protocol is not
+      there, so a `.ipynb` is read, edited and saved but its cells run
+      only with an extension that brings a controller
+- [ ] Notebooks: language features inside a cell, text cells shown as
+      formatted text, a choice between several runners, renderer modules
+      that depend on one another, cell status bar items, `NotebookEdit`,
+      a notebook opened by an extension's code
+- [ ] A lens whose command is the client's is shown only for places of a
+      symbol and for rust-analyzer's "Run"; "Debug" and the rest are left
+      out
+- [ ] Pages of extensions under Wayland; a page inside the sidebar
+- [ ] The parts of VS Code's API each item of phase 8 names as not there
+      (problem matchers, tree checkboxes and reveal, quick diffs of source
+      control, test coverage, adapters on named pipes, a launch by name)
+- [ ] The site says "No Electron and no webview". The editor's own
+      interface has none; a page of an extension is drawn by the system's
+      browser. The wording is the owner's to decide
+
 ## 0. Editor core
 - [x] Rope buffer, undo/redo, multi-cursor, IME, clipboard
 - [x] Tree-sitter highlighting for Rust, TS/TSX, JS, JSON, CSS, Go, Python
@@ -253,8 +354,8 @@ to build them.
       extensions (and Prettier and ESLint). The host answers the editor as
       a language server does. Inlay hints and semantic colors were added
       to the editor for this, for every server, and so was the code lens:
-      at the end of its line, run by a click. Not tried against a
-      published extension yet: that is the release check below
+      above its line, run by a click. Not tried against a published
+      extension yet: that is the release check below
 - [x] Commands, menus and key bindings an extension contributes, in the
       palette and the keymap. Menus: the editor's (`editor/context`), which
       Solder had none of, and the file tree's (`explorer/context`).
@@ -421,11 +522,14 @@ update. They come after phase 9, in this order unless one is needed sooner.
       the language server, painted as an extension says (`labels-for-symbols`).
       Done ahead of the rest of the block, to close the item of phase 8. A
       file with no server that lists them has its language's outline
-- [ ] A Structure panel: the file's outline, from the server or from the
-      language's outline query
-- [ ] A Problems panel: every diagnostic of the project, by file
-- [ ] The other places a symbol is used lit up; go to implementations;
-      breadcrumbs with the path and the symbol under the cursor
+- [x] A Structure panel: the file's outline, from the server or from the
+      language's outline query. It follows the cursor; the breadcrumbs
+      below read the same outline
+- [x] A Problems panel: every diagnostic of the project, by file, of
+      files that are not open too
+- [x] The other places a symbol is used lit up; go to implementations;
+      breadcrumbs with the path and the symbol under the cursor. All three
+      for extensions' providers too
 
 ### Git history
 - [ ] The history as a graph, the history of one file, blame in the gutter

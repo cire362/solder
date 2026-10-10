@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import time
 
 docs = {}
 
@@ -79,8 +80,28 @@ def publish(uri):
         for m in re.finditer(word, text):
             diags.append({"range": rng(text, m.start(), m.end()), "severity": severity,
                           "message": f"found {word}", "source": TAG or "mock"})
+    # What another file had it report of this one stays reported when this
+    # one is opened.
+    diags += reported.get(uri, [])
     send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
           "params": {"uri": uri, "diagnostics": diags}})
+    # A file that says so has the server report on one that is not open,
+    # next to it, as a server that builds the project does: an error
+    # there for as long as the file says so, none once it does not.
+    other = uri.rsplit("/", 1)[0] + "/elsewhere.rs"
+    if "mock: elsewhere" in text:
+        reported[other] = [{
+            "range": {"start": {"line": 2, "character": 4}, "end": {"line": 2, "character": 9}},
+            "severity": 1, "message": "broken by the other file\nand a second line", "source": "mock"}]
+    elif other in reported and uri != other:
+        del reported[other]
+    else:
+        return
+    send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+          "params": {"uri": other, "diagnostics": reported.get(other, [])}})
+
+
+reported = {}
 
 
 def note(what, value):
@@ -110,6 +131,12 @@ while True:
     params = msg.get("params") or {}
     mid = msg.get("id")
     if method == "initialize":
+        # The test opens a file while the server is still starting, then
+        # lets it answer without changing the file or moving the cursor.
+        if "--initialize-gate" in sys.argv:
+            gate = sys.argv[sys.argv.index("--initialize-gate") + 1]
+            while not os.path.exists(gate):
+                time.sleep(0.01)
         note("initialize", params.get("initializationOptions"))
         send({"jsonrpc": "2.0", "id": mid, "result": {"capabilities": {
             "positionEncoding": "utf-16" if TAG else "utf-8",
@@ -117,6 +144,8 @@ while True:
             "completionProvider": {"triggerCharacters": ["."]},
             "hoverProvider": True,
             "definitionProvider": True,
+            "implementationProvider": True,
+            "documentHighlightProvider": True,
             "referencesProvider": True,
             "documentSymbolProvider": True,
             "workspaceSymbolProvider": True,
@@ -233,10 +262,31 @@ while True:
         start = text.find("helper")
         send({"jsonrpc": "2.0", "id": mid,
               "result": {"uri": uri, "range": rng(text, start, start + len("helper"))}})
+    elif method == "textDocument/implementation":
+        # Every `impl` of the word under the cursor.
+        uri = params["textDocument"]["uri"]
+        text = docs[uri]
+        word = word_at(text, offset(text, params["position"]))
+        found = [m for m in re.finditer(r"impl (\w+)", text) if m.group(1) == word]
+        send({"jsonrpc": "2.0", "id": mid, "result": [
+            {"uri": uri, "range": rng(text, m.start(1), m.end(1))} for m in found]})
+    elif method == "textDocument/documentHighlight":
+        # Every place the word under the cursor stands as a word.
+        uri = params["textDocument"]["uri"]
+        text = docs[uri]
+        word = word_at(text, offset(text, params["position"]))
+        found = re.finditer(r"\b%s\b" % re.escape(word), text) if word else []
+        send({"jsonrpc": "2.0", "id": mid, "result": [
+            {"range": rng(text, m.start(), m.end()), "kind": 1} for m in found]})
     elif method == "textDocument/documentSymbol":
         # Every function of the file, inside one module.
         uri = params["textDocument"]["uri"]
         text = docs[uri]
+        # A file that says so has none listed, as with a server that
+        # lists none for a kind of file.
+        if "mock: no symbols" in text:
+            send({"jsonrpc": "2.0", "id": mid, "result": None})
+            continue
         functions = [{
             "name": m.group(1), "kind": 12,
             "range": rng(text, m.start(), m.end()),

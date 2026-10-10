@@ -531,6 +531,8 @@ fn client_capabilities() -> ClientCapabilities {
             },
             "hover": { "contentFormat": ["markdown", "plaintext"] },
             "definition": { "linkSupport": true },
+            "implementation": { "linkSupport": true },
+            "documentHighlight": {},
             "typeDefinition": { "linkSupport": true },
             "references": {},
             "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },

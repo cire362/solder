@@ -615,6 +615,7 @@ module.exports = function build(core) {
     registerDefinitionProvider: (selector, provider) => register('definition', selector, provider),
     registerTypeDefinitionProvider: (selector, provider) => register('typeDefinition', selector, provider),
     registerImplementationProvider: (selector, provider) => register('implementation', selector, provider),
+    registerDocumentHighlightProvider: (selector, provider) => register('documentHighlight', selector, provider),
     registerDeclarationProvider: (selector, provider) => register('declaration', selector, provider),
     registerReferenceProvider: (selector, provider) => register('references', selector, provider),
     registerRenameProvider: (selector, provider) => register('rename', selector, provider),
@@ -653,6 +654,8 @@ module.exports = function build(core) {
       completionProvider: has('completion') ? { triggerCharacters: triggers('completion') } : undefined,
       hoverProvider: has('hover') || undefined,
       definitionProvider: has('definition') || undefined,
+      implementationProvider: has('implementation') || undefined,
+      documentHighlightProvider: has('documentHighlight') || undefined,
       referencesProvider: has('references') || undefined,
       renameProvider: has('rename') ? { prepareProvider: providers.some((entry) => entry.kind === 'rename' && entry.provider.prepareRename) } : undefined,
       documentFormattingProvider: has('format') || has('rangeFormat') || undefined,
@@ -756,6 +759,17 @@ module.exports = function build(core) {
     },
     'textDocument/definition': async ({ document, at }) =>
       locations(await first('definition', document, (provider) => provider.provideDefinition(document, at, never))),
+    'textDocument/implementation': async ({ document, at }) =>
+      locations(await first('implementation', document, (provider) => provider.provideImplementation(document, at, never))),
+    // The other places what is under the cursor is used. VS Code counts
+    // the kinds of them from nought, the protocol from one.
+    'textDocument/documentHighlight': async ({ document, at }) => {
+      const found = await first('documentHighlight', document, (provider) => provider.provideDocumentHighlights(document, at, never));
+      return [].concat(found || []).map((one) => ({
+        range: range(one.range),
+        kind: typeof one.kind === 'number' ? one.kind + 1 : undefined,
+      }));
+    },
     'textDocument/references': async ({ document, at, params }) => {
       const context = { includeDeclaration: !!(params.context && params.context.includeDeclaration) };
       const found = await every('references', document, (provider) => provider.provideReferences(document, at, context, never));

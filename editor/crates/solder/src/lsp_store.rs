@@ -231,6 +231,11 @@ fn supports(caps: &lt::ServerCapabilities, method: &str) -> bool {
         ),
         "textDocument/signatureHelp" => caps.signature_help_provider.is_some(),
         "textDocument/definition" => yes(&caps.definition_provider),
+        "textDocument/implementation" => !matches!(
+            caps.implementation_provider,
+            None | Some(lt::ImplementationProviderCapability::Simple(false))
+        ),
+        "textDocument/documentHighlight" => yes(&caps.document_highlight_provider),
         "textDocument/references" => yes(&caps.references_provider),
         "textDocument/documentSymbol" => yes(&caps.document_symbol_provider),
         "workspace/symbol" => yes(&caps.workspace_symbol_provider),
@@ -304,7 +309,26 @@ pub struct LspStore {
     /// number its extension gave it: what an extension registers in code
     /// answers for its languages as a server would.
     hosts: HashMap<ServerKey, usize>,
+    /// Every problem the servers reported, of files that are open and of
+    /// the others: by file, each server's apart, as it last said them.
+    problems: std::collections::BTreeMap<PathBuf, Vec<(ServerKey, Vec<Problem>)>>,
 }
+
+/// A problem a server reported in a file, as it said it: a file that is
+/// not open has no text here to place it in.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Problem {
+    pub range: lt::Range,
+    pub encoding: Encoding,
+    pub severity: Severity,
+    pub message: String,
+    pub source: Option<String>,
+}
+
+/// How many problems of one file from one server are kept, and of how
+/// many files: a project that does not build has more than are read.
+const PROBLEMS_OF_A_FILE: usize = 500;
+const FILES_WITH_PROBLEMS: usize = 2000;
 
 /// What the settings say of which servers start: the choice of each
 /// language, and the servers turned off by name.
@@ -330,9 +354,22 @@ pub enum LspStoreEvent {
         edit: lt::WorkspaceEdit,
         encoding: Encoding,
     },
+    /// What the servers report of the project's files changed.
+    ProblemsChanged,
+    /// Documents joined or left a server, or a server became ready.
+    ServersChanged,
 }
 
 impl gpui::EventEmitter<LspStoreEvent> for LspStore {}
+
+fn severity_of(said: Option<lt::DiagnosticSeverity>) -> Severity {
+    match said {
+        Some(lt::DiagnosticSeverity::ERROR) => Severity::Error,
+        Some(lt::DiagnosticSeverity::WARNING) => Severity::Warning,
+        Some(lt::DiagnosticSeverity::HINT) => Severity::Hint,
+        _ => Severity::Info,
+    }
+}
 
 struct GlobalLspStore(Entity<LspStore>);
 
@@ -471,6 +508,56 @@ impl LspStore {
 
     pub fn status(&self) -> Option<&SharedString> {
         self.status.as_ref()
+    }
+
+    /// The problems reported of each file, the files in the order of
+    /// their paths and a file's problems in the order they are in it.
+    pub fn problems(&self) -> Vec<(&Path, Vec<&Problem>)> {
+        let mut files = Vec::with_capacity(self.problems.len());
+        for (path, servers) in &self.problems {
+            let mut all: Vec<&Problem> = servers.iter().flat_map(|(_, said)| said).collect();
+            all.sort_by_key(|problem| (problem.range.start.line, problem.range.start.character));
+            files.push((path.as_path(), all));
+        }
+        files
+    }
+
+    /// Takes what a server says of a file in place of what it said last.
+    fn set_problems(
+        &mut self,
+        key: &ServerKey,
+        path: PathBuf,
+        said: Vec<Problem>,
+        cx: &mut Context<Self>,
+    ) {
+        let known = self.problems.contains_key(&path);
+        if said.is_empty() && !known {
+            return;
+        }
+        if !known && self.problems.len() >= FILES_WITH_PROBLEMS {
+            return;
+        }
+        let of_file = self.problems.entry(path.clone()).or_default();
+        of_file.retain(|(server, _)| server != key);
+        if !said.is_empty() {
+            of_file.push((key.clone(), said));
+        }
+        if of_file.is_empty() {
+            self.problems.remove(&path);
+        }
+        cx.emit(LspStoreEvent::ProblemsChanged);
+    }
+
+    /// A server is gone: what it said of the project's files went with it.
+    fn forget_problems(&mut self, key: &ServerKey, cx: &mut Context<Self>) {
+        let before: usize = self.problems.values().map(Vec::len).sum();
+        for of_file in self.problems.values_mut() {
+            of_file.retain(|(server, _)| server != key);
+        }
+        self.problems.retain(|_, of_file| !of_file.is_empty());
+        if before != self.problems.values().map(Vec::len).sum::<usize>() {
+            cx.emit(LspStoreEvent::ProblemsChanged);
+        }
     }
 
     /// The servers a document belongs to, the first being the one asked
@@ -763,6 +850,7 @@ impl LspStore {
         if let Some(ServerState::Running { server, .. }) = self.servers.remove(&key) {
             server.kill();
         }
+        self.forget_problems(&key, cx);
         for entry in self.docs.values_mut() {
             for attached in &mut entry.servers {
                 if attached.key == key {
@@ -781,6 +869,7 @@ impl LspStore {
         for id in self.docs.keys().copied().collect::<Vec<_>>() {
             self.attach(id, cx);
         }
+        cx.emit(LspStoreEvent::ServersChanged);
     }
 
     /// Which VS Code extensions answer for which languages changed, or
@@ -800,6 +889,7 @@ impl LspStore {
         for key in stale {
             self.hosts.remove(&key);
             self.servers.remove(&key);
+            self.forget_problems(&key, cx);
             for entry in self.docs.values_mut() {
                 for attached in &mut entry.servers {
                     if attached.key == key {
@@ -1052,6 +1142,7 @@ impl LspStore {
         for id in waiting {
             self.open(id, &key, cx);
         }
+        cx.emit(LspStoreEvent::ServersChanged);
         cx.notify();
     }
 
@@ -1343,6 +1434,21 @@ impl LspStore {
                 };
                 let encoding = server.encoding();
                 let name = key.name;
+                // Kept for every file it names, open or not: the list of
+                // the project's problems is of all of them.
+                if let Some(path) = lsp::uri_to_path(&params.uri) {
+                    let said = params.diagnostics.iter().take(PROBLEMS_OF_A_FILE);
+                    let said = said
+                        .map(|d| Problem {
+                            range: d.range,
+                            encoding,
+                            severity: severity_of(d.severity),
+                            message: d.message.clone(),
+                            source: d.source.clone(),
+                        })
+                        .collect();
+                    self.set_problems(key, path, said, cx);
+                }
                 for entry in self.docs.values() {
                     if entry.uri != params.uri || entry.servers.iter().all(|a| a.key != *key) {
                         continue;
@@ -1361,12 +1467,7 @@ impl LspStore {
                             .cloned();
                         let fresh = diagnostics.iter().map(|d| Diagnostic {
                             range: from_range(doc.text(), d.range, encoding),
-                            severity: match d.severity {
-                                Some(lt::DiagnosticSeverity::ERROR) => Severity::Error,
-                                Some(lt::DiagnosticSeverity::WARNING) => Severity::Warning,
-                                Some(lt::DiagnosticSeverity::HINT) => Severity::Hint,
-                                _ => Severity::Info,
-                            },
+                            severity: severity_of(d.severity),
                             message: d.message.clone(),
                             source: d.source.clone(),
                             server: name,
@@ -1483,6 +1584,15 @@ impl LspStore {
             }
             _ => {}
         }
+    }
+
+    /// Whether an open server answers this kind of request. Background
+    /// features do no work while nothing can answer them.
+    pub fn can_request(&self, document: &Entity<Document>, method: &str) -> bool {
+        self.docs.get(&document.entity_id()).is_some_and(|entry| {
+            self.opened(entry)
+                .any(|(_, server)| supports(&server.capabilities(), method))
+        })
     }
 
     /// Sends a request about `document` to one server: the first of its

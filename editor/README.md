@@ -148,6 +148,53 @@ closed before it, up to 32 back; a file that is open already or gone from
 disk is passed over. Closed tabs are remembered while the window is open,
 not across a restart.
 
+## Structure and breadcrumbs
+
+**Show structure** (in the palette, or the **Structure** tab of the left
+dock) lists the symbols of the file in front in the order they are written,
+each as far in as it is inside others, with the one the cursor is in marked.
+A click on one, or Enter with the arrows in the list, puts the cursor on
+its name. The **breadcrumbs** in the title bar say the same of the cursor:
+the way to the file from the project's folder, then the symbols it is in.
+
+Both read one outline. It comes from the file's language server where one
+lists symbols, and from the language's own outline where none does, or
+where the server lists nothing for the file. An outline of that second kind
+says only where each symbol begins: its symbols are one under another, none
+inside another, and each reaches to where the next begins. The outline is
+found again a quarter of a second after the file last changed, and not at
+all while neither the panel nor the breadcrumbs are on screen. Up to 5000
+symbols of a file are kept.
+When a server starts later, its outline replaces the fallback without an
+edit or a cursor move; changes made through another view refresh it too.
+
+**The other places a symbol is used** are lit up once the cursor has rested
+in its name for a fifth of a second: the file's server is asked, and what
+it names is drawn behind the text in the color of a matching bracket. They
+stay while the cursor moves among them, go at once when it leaves or the
+text changes, and are not asked for per key. `"occurrence_highlights":
+false` turns them off. `cmd-f12` goes to **the places that implement** what
+is under the cursor (the types that are a trait or an interface): to the
+one place where there is one, to a list where there are several.
+
+## Problems
+
+**Show problems** (in the palette, the **Problems** tab of the bottom dock,
+or a click on the count of problems in the status bar) lists what the
+language servers report of the project's files, by file: errors, warnings
+and the rest, in the order they are in each file. A file need not be open
+to be in the list. A server says what it finds in the files it read itself,
+and those reports used to be dropped for every file that had no tab. A
+click on a problem, or Enter on it, opens its file with the cursor on what
+the server pointed at; a click on a file's row, or the left and right
+arrows, folds its problems away and brings them back.
+
+The list is what servers said last, each server's own apart: a server that
+stops takes its problems with it. It is read only while its tab is in
+front. Up to 500 problems of a file from one server and 2000 files are
+kept. The dock does not stay open for this list alone: closing the last
+terminal closes the dock as before.
+
 ## Review changes
 
 Open the Git sidebar with `ctrl-shift-g` and click a file to compare both versions.
@@ -1005,7 +1052,7 @@ What is in the module today is what every extension starts from:
 | Watch files | `createFileSystemWatcher`, for the folders of the open windows: files made, changed and deleted, but for `.git` and `node_modules` |
 | Show pages (webviews) and editors of its own for kinds of files | A tab drawn by the system's browser; see below |
 | Read, run and write notebooks | A tab of cells, drawn by Solder: the extension reads the file, runs the cells and writes it back; see below |
-| Give language features in code (`vscode.languages`) | Completions, hovers, definitions, references, rename, formatting, code actions, document and project symbols, signature help, inlay hints, semantic colors, and diagnostics from its collections. A code lens is above its line, where a click runs it, and among the code actions of the line (`cmd-.`) |
+| Give language features in code (`vscode.languages`) | Completions, hovers, definitions, references, rename, formatting, code actions, document and project symbols, signature help, inlay hints, semantic colors, the places that implement a symbol, the other places it is used, and diagnostics from its collections. A code lens is above its line, where a click runs it, and among the code actions of the line (`cmd-.`) |
 
 **Show extension views** opens the **Views** panel. Trees an extension names
 are listed before its code starts; choosing one starts the approved code.
@@ -1325,11 +1372,11 @@ applied as soon as it is saved.
 {
   "left": {
     "width": 390,
-    "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions"]
+    "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions", "extension_views", "structure"]
   },
   "right": { "width": 380, "panels": ["chat", "agent"] },
-  "bottom": { "height": 280, "panels": ["terminal", "debug", "response", "results"] },
-  "title_bar": { "height": 38, "left": ["project"], "right": [] },
+  "bottom": { "height": 280, "panels": ["terminal", "problems", "debug", "response", "results"] },
+  "title_bar": { "height": 38, "left": ["project", "breadcrumbs"], "right": [] },
   "tab_bar": { "height": 34, "place": "top" },
   "status_bar": {
     "height": 26,
@@ -1405,6 +1452,7 @@ such as the branch, keep their actions after moving.
 |---|---|
 | `project` | the project's name |
 | `file` | the file in front, from the project's folder |
+| `breadcrumbs` | the way to the file in front from the project's folder, then the symbols the cursor is in, the outermost first; a click on the way shows the file in the tree, a click on a symbol opens the list of the file's symbols |
 | `branch` | the branch; a click opens the list of branches |
 | `position` | the line and column of the cursor, and how many cursors |
 | `indent` | spaces or tabs, and how many |

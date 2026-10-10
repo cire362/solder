@@ -979,6 +979,15 @@ exports.activate = (context) => {
         return builder.build();
       },
     }, legend),
+    vscode.languages.registerImplementationProvider('rust', {
+      provideImplementation: (document) => new vscode.Location(document.uri, new vscode.Range(1, 4, 1, 5)),
+    }),
+    vscode.languages.registerDocumentHighlightProvider('rust', {
+      provideDocumentHighlights: () => [
+        new vscode.DocumentHighlight(new vscode.Range(0, 3, 0, 7), vscode.DocumentHighlightKind.Write),
+        new vscode.DocumentHighlight(new vscode.Range(1, 4, 1, 5)),
+      ],
+    }),
     vscode.languages.registerCodeLensProvider('rust', {
       provideCodeLenses: () => [
         new vscode.CodeLens(new vscode.Range(0, 0, 0, 2), { title: 'Mark', command: 'demo.mark' }),
@@ -1148,6 +1157,21 @@ exports.activate = (context) => {
         };
         assert_eq!(run(14, 1)["result"], "late 1");
         assert_eq!(run(15, 7)["error"]["code"], -32603);
+        // The places that implement a symbol, and the other places it is
+        // used: the kinds of those are counted from one in the protocol.
+        assert_eq!(can["implementationProvider"], true);
+        assert_eq!(can["documentHighlightProvider"], true);
+        assert_eq!(
+            ask(16, "textDocument/implementation", at(0, 4))["result"],
+            json!([{ "uri": file, "range": range(1, 4, 1, 5) }])
+        );
+        assert_eq!(
+            ask(17, "textDocument/documentHighlight", at(0, 4))["result"],
+            json!([
+                { "range": range(0, 3, 0, 7), "kind": 3 },
+                { "range": range(1, 4, 1, 5), "kind": 1 },
+            ])
+        );
         // What it has no provider for, and a file it was not told of.
         assert!(
             ask(6, "textDocument/definition", at(0, 4))["result"]

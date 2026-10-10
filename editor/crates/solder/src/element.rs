@@ -1276,6 +1276,17 @@ fn layout(
             }
         }
     }
+    // The other places the symbol under the cursor is used.
+    let places = editor.occurrences.clone();
+    let first_place = places.partition_point(|place| place.end < visible.start);
+    for place in places[first_place..]
+        .iter()
+        .take_while(|place| place.start <= visible.end)
+    {
+        for rect in range_rects(place.clone()) {
+            highlights.push(fill(rect, theme.bracket));
+        }
+    }
     let matches = editor.search_matches.clone();
     let first_match = matches.partition_point(|m| m.end < visible.start);
     for (i, m) in matches.iter().enumerate().skip(first_match) {

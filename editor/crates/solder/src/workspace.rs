@@ -102,6 +102,8 @@ actions!(
         ShowPlugins,
         ShowExtensions,
         ShowExtensionViews,
+        ShowStructure,
+        ShowProblems,
         ImportSettings,
         ToggleChat,
         ShowAgent,
@@ -185,6 +187,9 @@ pub fn bind_keys(cx: &mut App) {
 
 const RECENT_LIMIT: usize = 20;
 
+/// How long after the last change of a file its outline is found again.
+const OUTLINE_DEBOUNCE: Duration = Duration::from_millis(250);
+
 /// Where to put the cursor after opening a file.
 #[derive(Clone)]
 pub enum Jump {
@@ -263,6 +268,16 @@ pub struct Workspace {
     ai_panel: Entity<crate::ai_panel::AiPanel>,
     extensions_panel: Entity<crate::extensions_panel::ExtensionsPanel>,
     extension_views: Entity<crate::extension_views::ExtensionViews>,
+    structure_panel: Entity<crate::outline::StructurePanel>,
+    problems_panel: Entity<crate::problems_panel::ProblemsPanel>,
+    /// The outline of the file in front, for the Structure panel and
+    /// the breadcrumbs: found only while one of them is on screen.
+    outline: Arc<Vec<crate::outline::Node>>,
+    /// Whose it is: the document, and the state of its text. And the one
+    /// it is being found for, a moment after that one last changed.
+    outline_of: Option<(EntityId, u64)>,
+    outline_wanted: Option<(EntityId, u64)>,
+    outline_task: Option<Task<()>>,
     chat: Entity<crate::chat_panel::ChatPanel>,
     agent: Entity<crate::agent_panel::AgentPanel>,
     /// Pushes started, for tests: the terminal running one may be gone.
@@ -459,6 +474,30 @@ impl Workspace {
             );
         let extension_views =
             cx.new(|cx| crate::extension_views::ExtensionViews::new(extensions.clone(), cx));
+        let structure_panel = cx.new(crate::outline::StructurePanel::new);
+        let problems_panel = {
+            let root = project.read(cx).root().to_path_buf();
+            cx.new(|cx| crate::problems_panel::ProblemsPanel::new(root, cx))
+        };
+        let problems_events = cx.subscribe_in(
+            &problems_panel,
+            window,
+            |this, _, event: &crate::problems_panel::ProblemsEvent, window, cx| {
+                let crate::problems_panel::ProblemsEvent::Open(path, jump) = event;
+                this.open_path(path.clone(), Some(jump.clone()), window, cx);
+            },
+        );
+        let structure_events = cx.subscribe_in(
+            &structure_panel,
+            window,
+            |this, _, event: &crate::outline::StructureEvent, window, cx| {
+                let crate::outline::StructureEvent::Jump(at) = event;
+                if let Some(editor) = this.active_editor().cloned() {
+                    editor.update(cx, |editor, cx| editor.select_range(*at..*at, cx));
+                    window.focus(&editor.focus_handle(cx));
+                }
+            },
+        );
         let extensions_panel =
             cx.new(|cx| crate::extensions_panel::ExtensionsPanel::new(extensions, cx));
         let weak = cx.entity().downgrade();
@@ -737,12 +776,26 @@ impl Workspace {
             }),
         ];
         let mut subscriptions = subscriptions;
+        subscriptions.push(structure_events);
+        subscriptions.push(problems_events);
         if let Some(store) = LspStore::global(cx) {
-            subscriptions.push(cx.subscribe(&store, |this, _, event, cx| match event {
-                crate::lsp_store::LspStoreEvent::ApplyEdit { edit, encoding } => {
-                    this.apply_workspace_edit(edit.clone(), *encoding, cx)
-                }
-            }));
+            subscriptions.push(
+                cx.subscribe_in(&store, window, |this, _, event, window, cx| match event {
+                    crate::lsp_store::LspStoreEvent::ApplyEdit { edit, encoding } => {
+                        this.apply_workspace_edit(edit.clone(), *encoding, cx)
+                    }
+                    // The panel of them hears it itself.
+                    crate::lsp_store::LspStoreEvent::ProblemsChanged => {}
+                    crate::lsp_store::LspStoreEvent::ServersChanged => {
+                        this.outline_of = None;
+                        this.outline_wanted = None;
+                        this.keep_outline(window, cx);
+                        if let Some(editor) = this.active_editor().cloned() {
+                            editor.update(cx, |editor, cx| editor.occurrences_moved(cx));
+                        }
+                    }
+                }),
+            );
         }
         let this = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -819,6 +872,12 @@ impl Workspace {
             ai_panel,
             extensions_panel,
             extension_views,
+            structure_panel,
+            problems_panel,
+            outline: Arc::default(),
+            outline_of: None,
+            outline_wanted: None,
+            outline_task: None,
             chat,
             agent,
             #[cfg(test)]
@@ -895,8 +954,13 @@ impl Workspace {
             &editor,
             window,
             |this, editor, event, window, cx| match event {
-                EditorEvent::TitleChanged | EditorEvent::SelectionsChanged => cx.notify(),
+                EditorEvent::TitleChanged => cx.notify(),
+                EditorEvent::SelectionsChanged => {
+                    this.keep_outline(window, cx);
+                    cx.notify()
+                }
                 EditorEvent::Edited | EditorEvent::Saved => {
+                    this.keep_outline(window, cx);
                     if this.file_diff.as_ref().is_some_and(|view| {
                         view.read(cx).scope == DiffScope::Working
                             && editor.read(cx).path(cx) == Some(view.read(cx).path.as_path())
@@ -1100,6 +1164,7 @@ impl Workspace {
         self.search_bar
             .update(cx, |bar, cx| bar.set_editor(Some(editor.clone()), cx));
         window.focus(&editor.focus_handle(cx));
+        self.keep_outline(window, cx);
         cx.notify();
     }
 
@@ -1197,6 +1262,7 @@ impl Workspace {
             self.search_bar
                 .update(cx, |bar, cx| bar.set_editor(None, cx));
             window.focus(&self.focus_handle);
+            self.keep_outline(window, cx);
             cx.notify();
             return;
         }
@@ -1818,15 +1884,16 @@ impl Workspace {
     }
 
     /// A panel has nothing left to show. The dock that showed it shows
-    /// the first of its panels that has, or closes.
+    /// the first of its panels that has, or closes. The list of problems
+    /// is always there to be opened, and is not what a dock stays open
+    /// for: the last terminal closed closes the dock.
     fn panel_gone(&mut self, panel: Panel, cx: &mut Context<Self>) {
         for place in Place::ALL {
             if *self.dock(place) == Some(panel) {
-                let next = Layout::get(cx)
-                    .panels(place)
-                    .iter()
-                    .copied()
-                    .find(|other| *other != panel && self.available(*other));
+                let stays = |other: &Panel| {
+                    *other != panel && *other != Panel::Problems && self.available(*other)
+                };
+                let next = Layout::get(cx).panels(place).iter().copied().find(stays);
                 *self.dock(place) = next;
                 self.docks_changed(next, cx);
             }
@@ -1845,6 +1912,8 @@ impl Workspace {
             Panel::Ai => self.ai_panel.focus_handle(cx),
             Panel::Extensions => self.extensions_panel.focus_handle(cx),
             Panel::ExtensionViews => self.extension_views.focus_handle(cx),
+            Panel::Structure => self.structure_panel.focus_handle(cx),
+            Panel::Problems => self.problems_panel.focus_handle(cx),
             Panel::Chat => self.chat.focus_handle(cx),
             Panel::Agent => self.agent.focus_handle(cx),
             Panel::Debug => self.debug_panel.focus_handle(cx),
@@ -2405,6 +2474,9 @@ impl Workspace {
     fn tell_panels(&mut self, now: Option<Panel>, cx: &mut Context<Self>) {
         let visible = self.shown(Panel::ExtensionViews);
         self.extension_views
+            .update(cx, |p, cx| p.set_visible(visible, cx));
+        let visible = self.shown(Panel::Problems);
+        self.problems_panel
             .update(cx, |p, cx| p.set_visible(visible, cx));
         let visible = self.shown(Panel::Services);
         self.services.update(cx, |s, cx| s.set_visible(visible, cx));
@@ -3337,6 +3409,138 @@ impl Workspace {
         self.toggle_modal(window, cx, move |_, cx| {
             crate::plugins_view::PluginsView::new(store, cx)
         });
+    }
+
+    fn show_problems(&mut self, _: &ShowProblems, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_panel(Panel::Problems, cx);
+        window.focus(&self.problems_panel.focus_handle(cx));
+    }
+
+    fn show_structure(&mut self, _: &ShowStructure, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_panel(Panel::Structure, cx);
+        self.keep_outline(window, cx);
+        window.focus(&self.structure_panel.focus_handle(cx));
+    }
+
+    /// Keeps the outline of the file in front: found again a moment
+    /// after the file changed or another came in front, and only while
+    /// the Structure panel or the breadcrumbs are there to show it.
+    fn keep_outline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shown =
+            self.shown(Panel::Structure) || Layout::get(cx).item_place(Item::Breadcrumbs).is_some();
+        if !shown {
+            return;
+        }
+        let front = self.active_editor().cloned();
+        let now = front.as_ref().map(|editor| {
+            let document = editor.read(cx).document();
+            (document.entity_id(), document.read(cx).version())
+        });
+        if now != self.outline_of && now != self.outline_wanted {
+            if self.outline_of.map(|of| of.0) != now.map(|of| of.0) {
+                // Old symbols must not navigate in the newly opened file
+                // while its outline is still being found.
+                self.outline = Arc::default();
+                self.structure_panel
+                    .update(cx, |panel, cx| panel.clear(now.is_some(), cx));
+            }
+            self.outline_wanted = now;
+            self.outline_task = match front.clone() {
+                Some(editor) => Some(self.find_outline(editor, window, cx)),
+                None => {
+                    self.set_outline(Arc::default(), None, cx);
+                    None
+                }
+            };
+        }
+        // The symbol the cursor is in.
+        let head = front.map(|editor| editor.read(cx).newest_range().end);
+        let current = head.and_then(|head| crate::outline::current(&self.outline, head));
+        self.structure_panel
+            .update(cx, |panel, cx| panel.set_current(current, window, cx));
+    }
+
+    fn set_outline(
+        &mut self,
+        nodes: Arc<Vec<crate::outline::Node>>,
+        of: Option<(EntityId, u64)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.outline = nodes.clone();
+        self.outline_of = of;
+        self.outline_wanted = of;
+        self.structure_panel
+            .update(cx, |panel, cx| panel.set(nodes, of.is_some(), cx));
+        cx.notify();
+    }
+
+    /// Asks for the symbols of a file: its language server where one
+    /// lists them, the language's own outline where none does.
+    fn find_outline(
+        &mut self,
+        editor: Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let document = editor.read(cx).document().clone();
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(OUTLINE_DEBOUNCE).await;
+            let Ok((version, asked)) = cx.update(|_, cx| {
+                let asked = LspStore::global(cx)
+                    .and_then(|store| store.read(cx).document_symbols(&document));
+                (document.read(cx).version(), asked)
+            }) else {
+                return;
+            };
+            let listed = match asked {
+                Some((_, encoding, request)) => {
+                    let listed = request.await.ok().flatten();
+                    listed.map(|listed| (listed, encoding))
+                }
+                None => None,
+            };
+            // The text went on while it was asked: a later asking is on
+            // its way.
+            let same = |cx: &App| document.read(cx).version() == version;
+            let mut nodes = Vec::new();
+            if let Some((listed, encoding)) = listed {
+                let Ok(Some(found)) = cx.update(|_, cx| {
+                    let text = document.read(cx).text();
+                    same(cx).then(|| crate::outline::of_document(listed, text, encoding))
+                }) else {
+                    return;
+                };
+                nodes = found;
+            }
+            // With no server, or one that lists nothing for this file:
+            // the outline of its language.
+            if nodes.is_empty() {
+                let file = cx.update(|_, cx| crate::symbols::file_of(&document, cx));
+                if let Some((path, source)) = file.ok().flatten() {
+                    let most = crate::outline::MOST;
+                    let outline = cx
+                        .background_executor()
+                        .spawn(async move { syntax::outline(&path, &source, most, || false) })
+                        .await;
+                    let Ok(Some(found)) = cx.update(|_, cx| {
+                        let text = document.read(cx).text();
+                        same(cx).then(|| crate::outline::of_outline(outline, text))
+                    }) else {
+                        return;
+                    };
+                    nodes = found;
+                }
+            }
+            this.update_in(cx, |this, window, cx| {
+                if !same(cx) {
+                    return;
+                }
+                let of = Some((document.entity_id(), version));
+                this.set_outline(Arc::new(nodes), of, cx);
+                this.keep_outline(window, cx);
+            })
+            .ok();
+        })
     }
 
     fn show_extension_views(
@@ -5369,6 +5573,8 @@ impl Workspace {
                             Panel::ExtensionViews => {
                                 this.show_extension_views(&ShowExtensionViews, window, cx)
                             }
+                            Panel::Structure => this.show_structure(&ShowStructure, window, cx),
+                            Panel::Problems => this.show_problems(&ShowProblems, window, cx),
                             Panel::Chat => this.show_right(false, window, cx),
                             Panel::Agent => this.show_right(true, window, cx),
                             _ => {}
@@ -5450,6 +5656,8 @@ impl Workspace {
                     Panel::Ai => d.pt_1().child(self.ai_panel.clone()),
                     Panel::Extensions => d.pt_1().child(self.extensions_panel.clone()),
                     Panel::ExtensionViews => d.child(self.extension_views.clone()),
+                    Panel::Structure => d.child(self.structure_panel.clone()),
+                    Panel::Problems => d.child(self.problems_panel.clone()),
                     Panel::Chat => d.pt_1().child(self.chat.clone()),
                     Panel::Agent => d.pt_1().child(self.agent.clone()),
                     Panel::Debug => d.child(self.debug_panel.clone()),
@@ -5535,6 +5743,46 @@ impl Workspace {
                 );
                 vec![says(name)]
             }
+            // The way to the file from the project's folder, then the
+            // symbols the cursor is in, the outermost first.
+            Item::Breadcrumbs => {
+                let Some(editor) = editor else {
+                    return Vec::new();
+                };
+                let e = editor.read(cx);
+                let Some(path) = e.path(cx) else {
+                    return Vec::new();
+                };
+                let root = self.root(cx);
+                let way = path.strip_prefix(&root).unwrap_or(path);
+                let way: Vec<String> = way
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                let mut parts = vec![does(
+                    ("breadcrumbs", 0),
+                    way.join(" \u{203a} "),
+                    theme.fg_muted,
+                    Box::new(RevealActiveFile),
+                )];
+                let of_this = self.outline_of.map(|(document, _)| document);
+                if of_this == Some(e.document().entity_id())
+                    && let Some(at) = crate::outline::current(&self.outline, e.newest_range().end)
+                {
+                    for (nth, at) in crate::outline::trail(&self.outline, at)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        parts.push(does(
+                            ("breadcrumbs", nth + 1),
+                            format!("\u{203a} {}", self.outline[at].name),
+                            theme.fg_muted,
+                            Box::new(GoToSymbol),
+                        ));
+                    }
+                }
+                parts
+            }
             Item::File => {
                 let title = self.front_title(cx);
                 let root = self.root(cx);
@@ -5615,7 +5863,15 @@ impl Workspace {
                         crate::editor_lsp::diagnostic_counts(e.read(cx).doc(cx));
                     crate::editor_lsp::status_text(errors, warnings)
                 })
-                .map(|text| says(text.to_string()))
+                // A click opens the list of the whole project's.
+                .map(|text| {
+                    does(
+                        ("item-problems", 0),
+                        text.to_string(),
+                        theme.fg_muted,
+                        Box::new(ShowProblems),
+                    )
+                })
                 .into_iter()
                 .collect(),
             Item::Activity => {
@@ -6109,6 +6365,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_plugins))
             .on_action(cx.listener(Self::show_extensions))
             .on_action(cx.listener(Self::show_extension_views))
+            .on_action(cx.listener(Self::show_structure))
+            .on_action(cx.listener(Self::show_problems))
             .on_action(cx.listener(Self::import_settings))
             .on_action(cx.listener(Self::debug_start))
             .on_action(cx.listener(Self::debug_pick))
@@ -6577,6 +6835,357 @@ mod tests {
         cx.simulate_keystrokes("down enter");
         cx.run_until_parked();
         assert_eq!(at(cx), (Some(other), 2, 14));
+    }
+
+    /// The Structure panel lists the symbols of the file in front, from
+    /// its language server or from the language's outline, and follows
+    /// the cursor; the breadcrumbs say the same of where the cursor is.
+    #[gpui::test]
+    fn the_structure_of_the_file_in_front_is_listed(cx: &mut TestAppContext) {
+        let root = fixture("structure");
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        let file = root.join("src/main.rs");
+        std::fs::write(&file, "fn helper() {}\nfn other() {\n    helper();\n}\n").unwrap();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let server = |command: &str, args: Vec<String>| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "rust-analyzer".into(),
+                settings::ServerOverride {
+                    command: Some(command.into()),
+                    args: Some(args),
+                    ..Default::default()
+                },
+            );
+            settings
+        };
+        cx.update(|_, cx| cx.set_global(server("python3", vec![script.display().to_string()])));
+        // As the window comes the breadcrumbs are in its title bar: here
+        // they are taken out first, so that nothing shows an outline.
+        ws.update(cx, |_, cx| {
+            let mut layout = Layout::get(cx).clone();
+            layout.title_bar.left = Some(vec![Item::Project]);
+            cx.set_global(layout);
+        });
+        ws.update_in(cx, |w, window, cx| {
+            let content = std::fs::read_to_string(&file).unwrap();
+            w.add_editor(Some(file.clone()), &content, None, window, cx)
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let panel = cx.read(|cx| ws.read(cx).structure_panel.clone());
+        let listed = |cx: &App| panel.read(cx).shown();
+        let crumbs = |cx: &mut VisualTestContext| -> Vec<String> {
+            ws.update(cx, |w, cx| {
+                let parts = w.bar_item(&Item::Breadcrumbs, cx);
+                parts.into_iter().map(|part| part.text).collect()
+            })
+        };
+        // Nothing was asked of the server while nothing showed an outline.
+        editor.update(cx, |editor, cx| editor.select_range(1..1, cx));
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).outline_wanted.is_none()));
+
+        // Shown, the panel lists the server's symbols, each as far in as
+        // it is inside others, with the one the cursor is in marked.
+        cx.dispatch_action(ShowStructure);
+        wait_for(cx, "the structure", &|cx| listed(cx).len() == 3);
+        assert_eq!(cx.read(|cx| listed(cx)), ["crate", ">   helper", "  other"]);
+        editor.update(cx, |editor, cx| editor.select_range(18..18, cx));
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| listed(cx)), ["crate", "  helper", ">   other"]);
+        // A click on a symbol puts the cursor on its name.
+        click(cx, "structure-1");
+        assert_eq!(cx.read(|cx| editor.read(cx).newest_range()), 3..3);
+        assert!(cx.read(|cx| listed(cx))[1].starts_with('>'));
+        // And so do the keys, in the list.
+        cx.dispatch_action(ShowStructure);
+        cx.simulate_keystrokes("down enter");
+        assert_eq!(cx.read(|cx| editor.read(cx).newest_range()), 18..18);
+        // What is typed is in the list a moment later.
+        cx.dispatch_action(crate::editor::MoveToEnd);
+        cx.simulate_input("fn third() {}\n");
+        wait_for(cx, "the new symbol", &|cx| listed(cx).len() == 4);
+        assert_eq!(cx.read(|cx| listed(cx))[3], "  third");
+
+        // The breadcrumbs: the way to the file, then the symbols the
+        // cursor is in, the outermost first.
+        ws.update(cx, |_, cx| {
+            let mut layout = Layout::get(cx).clone();
+            layout.title_bar.left = Some(vec![Item::Project, Item::Breadcrumbs]);
+            cx.set_global(layout);
+        });
+        editor.update(cx, |editor, cx| editor.select_range(18..18, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            crumbs(cx),
+            ["src \u{203a} main.rs", "\u{203a} crate", "\u{203a} other"]
+        );
+
+        // A file the server lists no symbols for has its language's
+        // outline.
+        let other = root.join("src/util/strings.rs");
+        std::fs::write(
+            &other,
+            "pub fn helper() {}\n\nstruct Words;\n// mock: no symbols\n",
+        )
+        .unwrap();
+        ws.update_in(cx, |w, window, cx| {
+            let content = std::fs::read_to_string(&other).unwrap();
+            w.add_editor(Some(other.clone()), &content, None, window, cx);
+            assert!(w.outline.is_empty());
+            assert!(w.structure_panel.read(cx).shown().is_empty());
+        });
+        wait_for(cx, "the outline", &|cx| {
+            listed(cx) == ["> helper (fn)", "Words (type)"]
+        });
+        assert_eq!(
+            crumbs(cx),
+            ["src \u{203a} util \u{203a} strings.rs", "\u{203a} helper"]
+        );
+        // With no file in front there is nothing to list.
+        ws.update_in(cx, |w, window, cx| {
+            while let Some(front) = w.active_editor().cloned() {
+                w.remove_tab(&front, window, cx);
+            }
+        });
+        cx.run_until_parked();
+        wait_for(cx, "an empty list", &|cx| listed(cx).is_empty());
+        assert!(crumbs(cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn the_outline_refreshes_when_a_server_becomes_ready(cx: &mut TestAppContext) {
+        let root = fixture("structure-starting");
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        let file = root.join("src/main.rs");
+        let text = "fn helper() {}\nfn other() {}\n";
+        std::fs::write(&file, text).unwrap();
+        let gate = root.join("ready");
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        cx.update(|_, cx| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "rust-analyzer".into(),
+                settings::ServerOverride {
+                    command: Some("python3".into()),
+                    args: Some(vec![
+                        script.display().to_string(),
+                        "--initialize-gate".into(),
+                        gate.display().to_string(),
+                    ]),
+                    ..Default::default()
+                },
+            );
+            cx.set_global(settings);
+        });
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(file), text, None, window, cx)
+        });
+        let panel = cx.read(|cx| ws.read(cx).structure_panel.clone());
+        cx.dispatch_action(ShowStructure);
+        wait_for(cx, "the outline while the server starts", &|cx| {
+            panel.read(cx).shown() == ["> helper (fn)", "other (fn)"]
+        });
+        std::fs::write(gate, "").unwrap();
+        wait_for(cx, "the server's outline without another edit", &|cx| {
+            panel.read(cx).shown() == ["crate", ">   helper", "  other"]
+        });
+    }
+
+    /// The Problems panel lists what the servers report of the project's
+    /// files, the ones that are not open too, and goes to a problem.
+    #[gpui::test]
+    fn the_problems_of_the_project_are_listed_by_file(cx: &mut TestAppContext) {
+        let root = fixture("problems");
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        let file = root.join("src/main.rs");
+        std::fs::write(
+            &file,
+            "fn helper() {}\n// TODO fix\nboom\n// mock: elsewhere\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/elsewhere.rs"),
+            "fn a() {}\n\nlet wrong = 1;\n",
+        )
+        .unwrap();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        cx.update(|_, cx| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "rust-analyzer".into(),
+                settings::ServerOverride {
+                    command: Some("python3".into()),
+                    args: Some(vec![script.display().to_string()]),
+                    ..Default::default()
+                },
+            );
+            cx.set_global(settings);
+        });
+        ws.update_in(cx, |w, window, cx| {
+            let content = std::fs::read_to_string(&file).unwrap();
+            w.add_editor(Some(file.clone()), &content, None, window, cx)
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let panel = cx.read(|cx| ws.read(cx).problems_panel.clone());
+        let listed = |cx: &App| panel.read(cx).shown();
+        wait_for(cx, "the diagnostics", &|cx| {
+            editor.read(cx).doc(cx).diagnostics().len() == 2
+        });
+        // While its tab is not in front the list is not kept up.
+        assert!(cx.read(|cx| listed(cx)).is_empty());
+
+        // Shown, it has both files: the open one with its two problems in
+        // the order they are in it, and one that was never opened.
+        cx.dispatch_action(ShowProblems);
+        wait_for(cx, "the problems", &|cx| listed(cx).len() == 5);
+        assert_eq!(
+            cx.read(|cx| listed(cx)),
+            [
+                "src/elsewhere.rs: 1 errors, 0 warnings, 0 others",
+                "  3:5 broken by the other file\nand a second line",
+                "src/main.rs: 1 errors, 1 warnings, 0 others",
+                "  2:4 found TODO",
+                "  3:1 found boom",
+            ]
+        );
+        assert!(cx.read(|cx| ws.read(cx).bottom == Some(Panel::Problems)));
+        // A click on a problem of the file that is not open opens it,
+        // with the cursor on what the server pointed at.
+        click(cx, "problem-1");
+        wait_for(cx, "the other file", &|cx| {
+            let front = ws.read(cx).active_editor();
+            front.is_some_and(|e| {
+                e.read(cx).path(cx) == Some(root.join("src/elsewhere.rs").as_path())
+            })
+        });
+        let front = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        wait_for(cx, "the cursor on it", &|cx| {
+            front.read(cx).newest_range() == (15..20)
+        });
+
+        // A file's problems are folded away by a click on it, or by the
+        // keys, and Enter on one goes to it.
+        cx.dispatch_action(ShowProblems);
+        click(cx, "problem-0");
+        assert_eq!(cx.read(|cx| listed(cx)).len(), 4);
+        cx.simulate_keystrokes("down down enter");
+        wait_for(cx, "the first file again", &|cx| {
+            let front = ws.read(cx).active_editor();
+            front.is_some_and(|e| e.read(cx).path(cx) == Some(file.as_path()))
+        });
+        assert_eq!(cx.read(|cx| editor.read(cx).newest_range()), 18..22);
+
+        // What is fixed is gone from the list as the server says so: the
+        // open file's problem, and the other file with it.
+        editor.update(cx, |editor, cx| {
+            editor.select_range(26..50, cx);
+            editor.insert("", cx);
+        });
+        wait_for(cx, "the fix", &|cx| listed(cx).len() == 2);
+        assert_eq!(
+            cx.read(|cx| listed(cx)),
+            [
+                "src/main.rs: 0 errors, 1 warnings, 0 others",
+                "  2:4 found TODO"
+            ]
+        );
+        // The count of the file in front, in the status bar, opens the
+        // list too.
+        ws.update_in(cx, |w, window, cx| {
+            w.toggle_terminal(&ToggleTerminal, window, cx)
+        });
+        cx.run_until_parked();
+        click(cx, "item-problems");
+        assert!(cx.read(|cx| ws.read(cx).bottom == Some(Panel::Problems)));
+    }
+
+    /// The other places the symbol under the cursor is used are lit up
+    /// once the cursor rests, and the places that implement it are gone
+    /// to. Against `tests/fixtures/mock_lsp.py`.
+    #[gpui::test]
+    fn a_symbol_s_other_places_are_lit_and_its_implementations_gone_to(cx: &mut TestAppContext) {
+        let root = fixture("occurrences");
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        let file = root.join("src/main.rs");
+        let text =
+            "trait Shape {}\nstruct Circle;\nimpl Shape for Circle {}\nfn area(c: &Circle) {}\n";
+        std::fs::write(&file, text).unwrap();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let with = |lit: bool| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "rust-analyzer".into(),
+                settings::ServerOverride {
+                    command: Some("python3".into()),
+                    args: Some(vec![script.display().to_string()]),
+                    ..Default::default()
+                },
+            );
+            settings.occurrence_highlights = lit;
+            settings
+        };
+        cx.update(|_, cx| cx.set_global(with(true)));
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(file.clone()), text, None, window, cx)
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let lit = |cx: &App| editor.read(cx).occurrences.to_vec();
+        wait_for(cx, "the server", &|cx| {
+            LspStore::global(cx).is_some_and(|store| {
+                let document = editor.read(cx).document().clone();
+                store.read(cx).document_symbols(&document).is_some()
+            })
+        });
+
+        // With the cursor at rest in a name, every place it stands is lit.
+        editor.update(cx, |editor, cx| editor.select_range(24..24, cx));
+        assert!(cx.read(|cx| lit(cx)).is_empty());
+        wait_for(cx, "the places of Circle", &|cx| lit(cx).len() == 3);
+        assert_eq!(cx.read(|cx| lit(cx)), [22..28, 45..51, 67..73]);
+        // Moved to another of them, they stay lit; moved off them, they
+        // go at once, and the places of what is there now are lit.
+        editor.update(cx, |editor, cx| editor.select_range(47..47, cx));
+        assert_eq!(cx.read(|cx| lit(cx)).len(), 3);
+        editor.update(cx, |editor, cx| editor.select_range(58..58, cx));
+        assert!(cx.read(|cx| lit(cx)).is_empty());
+        wait_for(cx, "the place of area", &|cx| {
+            lit(cx).as_slice() == std::slice::from_ref(&(58..62))
+        });
+        // What is typed takes them away: they were of the text before.
+        let focus = cx.read(|cx| editor.focus_handle(cx));
+        cx.update(|window, _| window.focus(&focus));
+        cx.simulate_input("x");
+        assert!(cx.read(|cx| lit(cx)).is_empty());
+        wait_for(cx, "the place of the new name", &|cx| {
+            lit(cx).as_slice() == std::slice::from_ref(&(58..63))
+        });
+        // Turned off with the cursor still there, nothing stays lit.
+        cx.update(|_, cx| cx.set_global(with(false)));
+        cx.run_until_parked();
+        assert!(cx.read(|cx| lit(cx)).is_empty());
+        assert!(cx.read(|cx| editor.read(cx).occurrences_task.is_none()));
+        // Turned back on, they return without another cursor movement.
+        cx.update(|_, cx| cx.set_global(with(true)));
+        wait_for(cx, "the places after switching on", &|cx| {
+            !lit(cx).is_empty()
+        });
+
+        // The places that implement a trait: with the cursor on its name
+        // the key goes to its `impl`.
+        editor.update(cx, |editor, cx| editor.select_range(8..8, cx));
+        cx.simulate_keystrokes("secondary-f12");
+        wait_for(cx, "the implementation", &|cx| {
+            editor.read(cx).newest_range() == (35..40)
+        });
     }
 
     /// Runs the real client against `tests/fixtures/mock_lsp.py` over stdio.
@@ -17283,7 +17892,8 @@ exports.activate = (context) => {
                 Api,
                 Ai,
                 Extensions,
-                ExtensionViews
+                ExtensionViews,
+                Structure
             ]
         );
         assert_eq!(docks(cx).0, Some(Files));
