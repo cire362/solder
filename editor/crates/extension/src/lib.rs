@@ -14,6 +14,7 @@
 //! runs the code of a VS Code extension in a Node process of its own.
 
 pub mod catalog;
+pub mod census;
 pub mod gate;
 pub mod host;
 pub mod icons;

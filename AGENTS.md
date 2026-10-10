@@ -244,6 +244,11 @@ Never guess a signature.
   built: navigation, new windows, downloads, permissions, and files
   outside the folders the extension named. A new thing a page may do
   is a new line there, with a test of what it refuses.
+  Whether published extensions work is found by `extension::census`,
+  which installs and starts them. It runs their code, so it belongs to
+  the workflow that runs it on a runner with no secrets: do not run it
+  against Open VSX on a machine that matters, and test it against a
+  catalog served locally, as its own test does.
 
 ### Performance rules
 

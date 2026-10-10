@@ -1,0 +1,55 @@
+name: Extensions of Open VSX
+
+# The check of a release: the most installed extensions of Open VSX are
+# installed, started and asked what they do, and the list of what works is
+# the result. It runs the code of third parties, which has no sandbox, so
+# it runs here, on a machine that is thrown away, with no secrets and with
+# leave to read the repository and nothing more.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      count:
+        description: How many of the most installed to try
+        default: "50"
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    name: What works
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: editor
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # cmake is for wasmtime, which the crate that reads extensions has.
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config cmake
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: editor
+      - name: Install, start and ask
+        env:
+          COUNT: ${{ inputs.count || '50' }}
+        run: |
+          cargo run --locked --release -p extension --bin extension-census -- \
+            --count "$COUNT" --out "$RUNNER_TEMP/extensions.md"
+      - name: The list
+        run: cat "$RUNNER_TEMP/extensions.md" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extensions
+          path: ${{ runner.temp }}/extensions.md

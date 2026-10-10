@@ -948,6 +948,23 @@ file finder work in it.
 
 Not there: notebooks, pages brought back after a restart, a page inside
 the sidebar itself, and pages under Wayland, where the tab says so.
+
+Which extensions work is not claimed from the list above: it is found out.
+With each release the fifty most installed extensions of Open VSX are
+installed, their code is started with a made-up project to look at, and
+each is asked for what it said it does, the way the editor asks (a hover,
+a completion, the formatting of a file of its language). The result is a
+page: what Solder takes from each without running anything, whether its
+code started, what it registered, what it answered, and every part of VS
+Code's API it asked for that Solder does not have. The page is the summary
+and the artifact of the **Extensions of Open VSX** workflow, which can also
+be run by hand. It runs the code of third parties with no sandbox, so it
+runs on a CI machine with no secrets, and is not something to run on your
+own:
+
+```sh
+cargo run --release -p extension --bin extension-census -- --count 50 --out extensions.md
+```
 Disposing a decoration type or disabling the extension removes its marks
 without removing a language server's hints. Tree checkboxes, programmatic
 reveal, source-control quick diffs, test coverage and cancellation, and

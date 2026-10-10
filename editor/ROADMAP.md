@@ -282,9 +282,14 @@ to build them.
       browser is made when the first page opens. Not there: notebooks
       (left out, as phase 10 says), pages kept across restarts, pages on
       Wayland
-- [ ] A check that runs with each release: the most installed extensions of
+- [x] A check that runs with each release: the most installed extensions of
       Open VSX are installed, activated and asked for their main feature, and
-      the result is the list of what works
+      the result is the list of what works. `extension-census`, run by the
+      **Extensions of Open VSX** workflow on a release or by hand; tested
+      against a catalog served locally. It has not been run against Open
+      VSX itself yet: it runs the code of third parties, so its first list
+      is the first run of the workflow, not something made on a
+      developer's machine
 
 ### What will not run
 Not tasks, but said so nobody waits for them: slash commands of Zed
