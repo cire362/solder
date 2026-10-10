@@ -581,7 +581,14 @@ impl DebugStore {
             extensions.read(cx).debug_session(true, session);
         }
         let conn_events = conn.clone();
+        let (launch_sent, ready) = futures::channel::oneshot::channel();
         let task = cx.spawn(async move |this, cx| {
+            // Configuration follows launch even if initialized and the
+            // initialize reply wake different tasks in the same cycle.
+            if ready.await.is_err() {
+                return;
+            }
+
             while let Some(message) = incoming.next().await {
                 let alive = this
                     .update(cx, |this, cx| {
@@ -629,6 +636,7 @@ impl DebugStore {
             // The answer to launch comes only after configurationDone, which
             // waits for `initialized`: do not wait for it here.
             let launched = conn.request(&kind, arguments);
+            let _ = launch_sent.send(());
             if let Err(e) = launched.await {
                 this.update(cx, |this, cx| {
                     this.log("stderr", e.to_string());
