@@ -62,6 +62,26 @@ on screen are inside, in steps of the file's own indent. A blank row is as
 deep as the deeper of the rows with text around it. `"indent_guides":
 false` in the settings turns them off.
 
+A block is **folded** under its first line: the lines after it that are
+indented deeper than it, up to the last of them with text, are taken off
+the screen, and a mark after the line says they are there. This goes by
+indentation alone, so it is the same in every language, and a closing
+brace on its own line stays in view.
+
+| | |
+|---|---|
+| `cmd-k cmd-[` | Fold the block the cursor is in |
+| `cmd-k cmd-]` | Unfold at the cursor's line |
+| `cmd-k cmd-0`, `cmd-k cmd-j` | Fold every block that is in no other; unfold all |
+| A click between a line's number and its text | Fold or unfold there. Lines that can be folded show a mark while the pointer is over the gutter |
+| A click on the mark after a folded line | Unfold |
+
+The cursor steps over what is folded. A cursor that is put inside it (a
+definition gone to, a match found, an undo) opens it, and so does an edit
+of its lines; an edit elsewhere moves it with its lines. Folds are of one
+view of the file and are not kept when its tab is closed. `cmd-alt-[` and
+`cmd-alt-]`, which fold in other editors, move between changes here.
+
 A **selection by column** is a rectangle of cursors, one on each line it
 crosses. With the mouse, hold `shift` and `alt` and click or drag: the
 rectangle goes from the cursor to the pointer. Or drag with the middle

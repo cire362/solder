@@ -23,7 +23,7 @@ use crate::{
 /// Longest slice of a single line that gets shaped. Minified bundles can have
 /// megabyte-long lines; nobody reads past this without wrapping.
 const MAX_SHAPED_BYTES: usize = 16 * 1024;
-const GUTTER_PADDING: Pixels = px(16.);
+pub(crate) const GUTTER_PADDING: Pixels = px(16.);
 
 pub struct EditorElement {
     editor: Entity<Editor>,
@@ -38,53 +38,169 @@ impl EditorElement {
 /// What stands between two lenses of one line.
 const LENS_GAP: &str = "  |  ";
 
-/// The lines of the file that have a row of lenses above them, in order
-/// and each once. With any, a line is no longer drawn in the row of its
-/// own number: everything that turns a line into a height asks here.
+/// Which row on screen each line of the file is drawn in. A line is not
+/// in the row of its own number once some lines have a row of lenses
+/// above them, or are folded away: everything that turns a line into a
+/// height, or a height into a line, asks here.
 #[derive(Clone, Default)]
-pub struct Rows(Arc<Vec<usize>>);
+pub struct Rows {
+    /// The lines with a row of lenses above them, in order and each
+    /// once. None of them is folded away.
+    lensed: Arc<Vec<usize>>,
+    /// The lines that are folded away: runs of them in order, none
+    /// touching another or holding the first line, each with how many
+    /// lines are folded away before it.
+    hidden: Arc<Vec<(Range<usize>, usize)>>,
+    /// How many lines the text has.
+    lines: usize,
+}
 
 impl Rows {
-    /// The lines of these lenses, in a text.
-    pub(crate) fn of_lenses(lenses: &[crate::document::Lens], buffer: &Buffer) -> Self {
-        let mut rows: Vec<usize> = lenses
-            .iter()
-            .map(|lens| buffer.offset_to_point(lens.offset.min(buffer.len())).row)
-            .collect();
-        rows.sort_unstable();
-        rows.dedup();
-        Self(Arc::new(rows))
+    /// The rows of a text of `lines` lines, some with lenses above them
+    /// and some folded away. Runs of folded lines come sorted and apart.
+    pub(crate) fn new(mut lensed: Vec<usize>, folded: &[Range<usize>], lines: usize) -> Self {
+        let mut before = 0;
+        let mut hidden = Vec::with_capacity(folded.len());
+        for run in folded {
+            let run = run.start.max(1)..run.end.min(lines);
+            if run.start < run.end {
+                hidden.push((run.clone(), before));
+                before += run.len();
+            }
+        }
+        lensed.sort_unstable();
+        lensed.dedup();
+        let inside = |row: &usize| hidden.iter().any(|(run, _)| run.contains(row));
+        lensed.retain(|row| !inside(row));
+        Self {
+            lensed: Arc::new(lensed),
+            hidden: Arc::new(hidden),
+            lines,
+        }
     }
 
-    /// How many rows there are above the lines.
-    fn added(&self) -> usize {
-        self.0.len()
+    fn is_plain(&self) -> bool {
+        self.lensed.is_empty() && self.hidden.is_empty()
     }
 
-    /// The row on screen a line of the file is drawn in.
+    /// The run of folded lines a line is in, if it is in one.
+    fn fold_of(&self, row: usize) -> Option<&Range<usize>> {
+        let at = self.hidden.partition_point(|(run, _)| run.end <= row);
+        let (run, _) = self.hidden.get(at)?;
+        run.contains(&row).then_some(run)
+    }
+
+    pub(crate) fn is_hidden(&self, row: usize) -> bool {
+        self.fold_of(row).is_some()
+    }
+
+    /// Whether lines are folded away right after this one.
+    pub(crate) fn is_folded(&self, row: usize) -> bool {
+        self.fold_of(row + 1)
+            .is_some_and(|run| run.start == row + 1)
+    }
+
+    /// How many rows there are on screen for the whole text.
+    fn count(&self) -> usize {
+        let folded = self
+            .hidden
+            .last()
+            .map_or(0, |(run, before)| before + run.len());
+        self.lines.max(1) + self.lensed.len() - folded
+    }
+
+    /// The row on screen a line of the file is drawn in. A line that is
+    /// folded away is where the line it is folded under is.
     fn shown(&self, row: usize) -> usize {
-        row + self.0.partition_point(|lensed| *lensed <= row)
+        if self.is_plain() {
+            return row;
+        }
+        let row = match self.fold_of(row) {
+            Some(run) => run.start - 1,
+            None => row,
+        };
+        let at = self.hidden.partition_point(|(run, _)| run.end <= row);
+        let folded = match at.checked_sub(1) {
+            Some(last) => self.hidden[last].1 + self.hidden[last].0.len(),
+            None => 0,
+        };
+        row + self.lensed.partition_point(|lensed| *lensed <= row) - folded
     }
 
     /// The line a row on screen belongs to, and whether the row is the
     /// lenses above that line and not the line itself.
     fn line(&self, shown: usize) -> (usize, bool) {
-        // The lenses of the nth such line are in row `line + n`.
-        let (mut low, mut high) = (0, self.0.len());
+        if self.is_plain() {
+            return (shown, false);
+        }
+        // The first line drawn at or after that row: the line itself, or
+        // the one whose lenses the row is.
+        let (mut low, mut high) = (0, self.lines);
         while low < high {
             let middle = (low + high) / 2;
-            if self.0[middle] + middle <= shown {
+            if self.shown(middle) < shown {
                 low = middle + 1;
             } else {
                 high = middle;
             }
         }
-        match low.checked_sub(1) {
-            Some(last) if self.0[last] + last == shown => (self.0[last], true),
-            _ => (shown - low, false),
+        match low < self.lines {
+            true => (low, self.shown(low) > shown),
+            // Past the last line: as far past it as the row is.
+            false => (self.lines + shown.saturating_sub(self.count()), false),
         }
     }
+
+    /// The lines of a range that are not folded away, as runs in order.
+    fn runs(&self, range: Range<usize>) -> Vec<Range<usize>> {
+        let mut runs = Vec::new();
+        let mut from = range.start;
+        let first = self
+            .hidden
+            .partition_point(|(run, _)| run.end <= range.start);
+        for (hidden, _) in &self.hidden[first..] {
+            if hidden.start >= range.end {
+                break;
+            }
+            if hidden.start > from {
+                runs.push(from..hidden.start);
+            }
+            from = from.max(hidden.end);
+        }
+        if from < range.end {
+            runs.push(from..range.end);
+        }
+        runs
+    }
 }
+
+/// Where a line is among the lines that were shaped: they are the lines
+/// of these runs, one after another.
+fn index_in(runs: &[Range<usize>], row: usize) -> Option<usize> {
+    let mut before = 0;
+    for run in runs {
+        if run.contains(&row) {
+            return Some(before + row - run.start);
+        }
+        before += run.len();
+    }
+    None
+}
+
+/// The lines of a range that were shaped, each with where it is among
+/// them.
+fn within(runs: &[Range<usize>], rows: Range<usize>) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut before = 0;
+    runs.iter().flat_map(move |run| {
+        let (from, to) = (run.start.max(rows.start), run.end.min(rows.end));
+        let at = before;
+        before += run.len();
+        (from..to.max(from)).map(move |row| (at + row - run.start, row))
+    })
+}
+
+/// What is drawn after a line that lines are folded under.
+const FOLD_MARK: &str = " \u{22ef} ";
 
 /// The lenses of one line as they are drawn above it: their words, how
 /// far in they start (the line's own indent), and which bytes of the
@@ -187,14 +303,21 @@ pub struct LayoutSnapshot {
     pub text_left: Pixels,
     pub line_height: Pixels,
     pub em_width: Pixels,
-    pub first_row: usize,
+    /// The lines that were shaped: those of `runs`, one after another.
     pub lines: Vec<DisplayLine>,
-    /// Which lines have a row of lenses above them, and those rows.
+    /// The lines on screen that are not folded away, as runs in order.
+    pub runs: Vec<Range<usize>>,
+    /// Which row each line is drawn in, and the rows of lenses.
     pub rows: Rows,
     pub lens_rows: Vec<LensRow>,
 }
 
 impl LayoutSnapshot {
+    /// A line as it was shaped, if it is on screen.
+    pub(crate) fn line(&self, row: usize) -> Option<&DisplayLine> {
+        self.lines.get(index_in(&self.runs, row)?)
+    }
+
     /// The row on screen under a height, counted from the first.
     fn shown_at(&self, scroll: Point<Pixels>, y: Pixels) -> usize {
         let row = ((y - self.bounds.top() + scroll.y) / self.line_height).floor();
@@ -253,10 +376,7 @@ impl LayoutSnapshot {
     ) -> usize {
         let row = self.row_at(buffer, scroll, position.y);
         let x = position.x - self.text_left + scroll.x;
-        let col = match row
-            .checked_sub(self.first_row)
-            .and_then(|i| self.lines.get(i))
-        {
+        let col = match self.line(row) {
             Some(line) => line.collapse(line.shaped.closest_index_for_x(x)),
             None => {
                 let cells = (x / self.em_width).round().max(0.) as usize;
@@ -282,7 +402,7 @@ impl LayoutSnapshot {
         if row >= buffer.line_count() || lenses {
             return None;
         }
-        let line = self.lines.get(row.checked_sub(self.first_row)?)?;
+        let line = self.line(row)?;
         let x = position.x - self.text_left + scroll.x;
         if x > line.shaped.width {
             return None;
@@ -298,7 +418,7 @@ impl LayoutSnapshot {
         offset: usize,
     ) -> Option<Bounds<Pixels>> {
         let p = buffer.offset_to_point(offset);
-        let line = self.lines.get(p.row.checked_sub(self.first_row)?)?;
+        let line = self.line(p.row)?;
         let x = self.text_left + line.x_for(p.column) - scroll.x;
         let y = self.top_of(p.row) - scroll.y;
         Some(Bounds::new(
@@ -446,8 +566,8 @@ impl Element for EditorElement {
                 for quad in state.selections.drain(..) {
                     window.paint_quad(quad);
                 }
-                for (i, line) in layout.lines.iter().enumerate() {
-                    let row = layout.first_row + i;
+                let drawn = layout.runs.iter().cloned().flatten();
+                for (row, line) in drawn.zip(&layout.lines) {
                     let origin = point(layout.text_left - scroll.x, layout.top_of(row) - scroll.y);
                     line.shaped
                         .paint(origin, layout.line_height, window, cx)
@@ -528,9 +648,22 @@ fn layout(
     let cursor_row = buffer.offset_to_point(newest_head).row;
     // The lines that have their lenses above them. An editor as tall as
     // its text has no server, and a field has one line.
-    let rows = match single_line || editor.fit.is_some() || doc.lenses().is_empty() {
+    editor.reveal_selections();
+    let folded = editor.folded_rows(buffer);
+    let plain = doc.lenses().is_empty() && folded.is_empty();
+    let rows = match single_line || editor.fit.is_some() || plain {
         true => Rows::default(),
-        false => Rows::of_lenses(doc.lenses(), buffer),
+        false => {
+            let lensed = |lens: &crate::document::Lens| {
+                let point = buffer.offset_to_point(lens.offset.min(buffer.len()));
+                point.row
+            };
+            Rows::new(
+                doc.lenses().iter().map(lensed).collect(),
+                &folded,
+                line_count,
+            )
+        }
     };
     if editor.autoscroll {
         let margin = if single_line {
@@ -545,7 +678,11 @@ fn layout(
             scroll.y = top + lh + margin - height;
         }
     }
-    let max_y = lh * (line_count + rows.added()).saturating_sub(1) as f32;
+    let shown_rows = match rows.is_plain() {
+        true => line_count,
+        false => rows.count(),
+    };
+    let max_y = lh * shown_rows.saturating_sub(1) as f32;
     scroll.y = clamp(scroll.y, px(0.), max_y);
 
     let line_at = |y: Pixels| rows.line((y / lh).floor().max(0.) as usize).0;
@@ -571,8 +708,21 @@ fn layout(
     } else {
         buffer.len()
     };
+    // The lines between the first and the last on screen that are not
+    // folded away: only they are shaped, and colored.
+    let runs = rows.runs(first_row..end_row);
+    let parts: Vec<Range<usize>> = runs
+        .iter()
+        .map(|run| {
+            let end = match run.end < line_count {
+                true => buffer.line_start(run.end),
+                false => buffer.len(),
+            };
+            buffer.line_start(run.start)..end
+        })
+        .collect();
 
-    let spans = highlights(editor, doc, visible.clone());
+    let spans = highlights(editor, doc, parts);
 
     // Diagnostics on screen, most severe first so they win overlaps.
     let mut visible_diagnostics: Vec<&Diagnostic> = doc
@@ -610,13 +760,20 @@ fn layout(
         ));
     }
 
-    let mut lines = Vec::with_capacity(end_row - first_row);
+    let mut lines = Vec::with_capacity(runs.iter().map(|run| run.len()).sum());
     let mut span_ix = spans.partition_point(|(r, _)| r.end <= visible.start);
     // What a language server puts into the rows on screen.
     let inlays = doc.inlays();
     let mut inlay_ix = inlays.partition_point(|inlay| inlay.offset < visible.start);
-    for row in first_row..end_row {
+    for row in runs.iter().cloned().flatten() {
         let line_start = buffer.line_start(row);
+        // What is of the lines folded away before this one is passed.
+        while spans.get(span_ix).is_some_and(|(r, _)| r.end <= line_start) {
+            span_ix += 1;
+        }
+        while inlays.get(inlay_ix).is_some_and(|i| i.offset < line_start) {
+            inlay_ix += 1;
+        }
         let full = buffer.line_str(row);
         let mut len = full.len().min(MAX_SHAPED_BYTES);
         while !full.is_char_boundary(len) {
@@ -644,6 +801,10 @@ fn layout(
             }
             inlay_ix += 1;
         }
+        // Lines folded under this one are said after it.
+        if rows.is_folded(row) && len == full.len() && !editor.masked {
+            hints.push((len, FOLD_MARK));
+        }
         lines.push(shape_row(
             text,
             line_start,
@@ -660,7 +821,7 @@ fn layout(
     let mut lens_rows = Vec::new();
     let lenses = doc.lenses();
     let mut lens_ix = lenses.partition_point(|lens| lens.offset < visible.start);
-    while let Some(lens) = lenses.get(lens_ix).filter(|_| rows.added() > 0) {
+    while let Some(lens) = lenses.get(lens_ix).filter(|_| !rows.lensed.is_empty()) {
         let row = buffer.offset_to_point(lens.offset.min(buffer.len())).row;
         if row >= end_row {
             break;
@@ -679,7 +840,8 @@ fn layout(
             words.push_str(title);
             lens_ix += 1;
         }
-        let Some(line) = row.checked_sub(first_row).and_then(|at| lines.get(at)) else {
+        let shaped = index_in(&runs, row).and_then(|at| lines.get(at));
+        let Some(line) = shaped.filter(|_| !rows.is_hidden(row)) else {
             continue;
         };
         let full = buffer.line_str(row);
@@ -705,8 +867,7 @@ fn layout(
     // Horizontal: keep the newest cursor in view, then clamp to content width.
     let text_width = text_bounds.size.width;
     if editor.autoscroll
-        && let Some(line) = lines.get(cursor_row.saturating_sub(first_row))
-        && cursor_row >= first_row
+        && let Some(line) = index_in(&runs, cursor_row).and_then(|at| lines.get(at))
     {
         let col = newest_head - buffer.line_start(cursor_row);
         let x = line.x_for(col);
@@ -743,8 +904,8 @@ fn layout(
         let start = buffer.offset_to_point(r.start);
         let end = buffer.offset_to_point(r.end);
         let mut rects = Vec::new();
-        for row in start.row.max(first_row)..=end.row.min(end_row - 1) {
-            let line = &lines[row - first_row];
+        for (at, row) in within(&runs, start.row..end.row + 1) {
+            let line = &lines[at];
             let x0 = if row == start.row {
                 line.x_for(start.column)
             } else {
@@ -779,9 +940,9 @@ fn layout(
             break;
         }
         let head = buffer.offset_to_point(s.head);
-        if head.row >= first_row && head.row < end_row {
+        if let Some(at) = index_in(&runs, head.row) {
             cursor_rows.push(head.row);
-            let line = &lines[head.row - first_row];
+            let line = &lines[at];
             if focused {
                 cursors.push(fill(
                     Bounds::new(
@@ -822,14 +983,14 @@ fn layout(
         let at = buffer.offset_to_point(g.offset);
         for (i, text) in g.text.split('\n').enumerate() {
             let row = at.row + i;
-            if row < first_row || row >= end_row {
-                if row >= end_row {
-                    break;
-                }
-                continue;
+            if row >= end_row {
+                break;
             }
+            let Some(shaped) = index_in(&runs, row) else {
+                continue;
+            };
             let x = if i == 0 {
-                text_x(lines[at.row - first_row].x_for(at.column))
+                text_x(lines[shaped].x_for(at.column))
             } else {
                 ghost_background.push(fill(
                     Bounds::new(
@@ -867,8 +1028,11 @@ fn layout(
             "\t" => text::TAB_SIZE,
             spaces => spaces.len().max(1),
         };
-        let levels = guide_levels(buffer, first_row..end_row, unit);
-        for (row, levels) in (first_row..end_row).zip(levels) {
+        let drawn = runs.iter().cloned().flatten();
+        let levels = runs
+            .iter()
+            .flat_map(|run| guide_levels(buffer, run.clone(), unit));
+        for (row, levels) in drawn.zip(levels.collect::<Vec<_>>()) {
             // The row of its lenses is inside the same as the line.
             let shown = rows.shown(row);
             let lensed = shown > 0 && rows.line(shown - 1).1;
@@ -899,7 +1063,7 @@ fn layout(
             if decoration.whole_line {
                 let start = buffer.offset_to_point(decoration.range.start).row;
                 let end = buffer.offset_to_point(decoration.range.end).row;
-                for row in start.max(first_row)..=end.min(end_row - 1) {
+                for (_, row) in within(&runs, start..end + 1) {
                     highlights.push(fill(
                         Bounds::new(point(text_left, row_y(row)), size(text_width, lh)),
                         color,
@@ -1111,7 +1275,32 @@ fn layout(
             }
         }
     }
-    for row in (first_row..end_row).filter(|_| !single_line) {
+    // A line that lines are folded under, or could be, has a mark
+    // between its number and its text: always where they are, and while
+    // the pointer is over the gutter where they could be.
+    let fold_marks = !single_line && editor.fit.is_none();
+    for row in runs.iter().cloned().flatten().filter(|_| !single_line) {
+        let mark = match (rows.is_folded(row), editor.gutter_hovered) {
+            _ if !fold_marks => None,
+            (true, _) => Some("\u{25b8}"),
+            (false, true) if crate::editor::fold_under(buffer, row).is_some() => Some("\u{25be}"),
+            _ => None,
+        };
+        if let Some(mark) = mark {
+            let run = TextRun {
+                len: mark.len(),
+                font: code_font.clone(),
+                color: theme.fg_subtle,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let shaped = window
+                .text_system()
+                .shape_line(mark.into(), font_size, &[run], None);
+            let origin = point(text_left - (GUTTER_PADDING + shaped.width) / 2., row_y(row));
+            gutter.push((shaped, origin));
+        }
         let active = cursor_rows.contains(&row);
         let label: SharedString = (row + 1).to_string().into();
         let run = TextRun {
@@ -1139,8 +1328,8 @@ fn layout(
             text_left,
             line_height: lh,
             em_width: em,
-            first_row,
             lines,
+            runs,
             rows,
             lens_rows,
         }),
@@ -1191,7 +1380,7 @@ fn guide_levels(buffer: &Buffer, rows: Range<usize>, unit: usize) -> Vec<usize> 
 }
 
 /// How far in a row's text begins, in cells; nothing for a blank row.
-fn indent_cells(line: &str) -> Option<usize> {
+pub(crate) fn indent_cells(line: &str) -> Option<usize> {
     let mut cells = 0;
     for c in line.chars() {
         match c {
@@ -1221,27 +1410,33 @@ fn clamp(v: Pixels, lo: Pixels, hi: Pixels) -> Pixels {
     }
 }
 
+/// The colors of the parts of the text that are on screen, in order.
+/// What is folded away between them is not asked about.
 fn highlights(
     editor: &mut Editor,
     doc: &Document,
-    range: Range<usize>,
+    parts: Vec<Range<usize>>,
 ) -> Arc<Vec<(Range<usize>, HighlightKind)>> {
     let key = (
         doc.version(),
         doc.syntax_generation(),
         doc.semantic_generation(),
-        range.clone(),
+        parts,
     );
     if let Some(cache) = &editor.highlight_cache
         && cache.key == key
     {
         return cache.spans.clone();
     }
-    let from_grammar = doc
-        .syntax()
-        .map(|tree| tree.highlights(doc.text().rope(), range.clone()))
-        .unwrap_or_default();
-    let spans = Arc::new(overlaid(from_grammar, doc.semantic(), &range));
+    let mut colored = Vec::new();
+    for range in &key.3 {
+        let from_grammar = doc
+            .syntax()
+            .map(|tree| tree.highlights(doc.text().rope(), range.clone()))
+            .unwrap_or_default();
+        colored.extend(overlaid(from_grammar, doc.semantic(), range));
+    }
+    let spans = Arc::new(colored);
     editor.highlight_cache = Some(HighlightCache {
         key,
         spans: spans.clone(),
@@ -1476,7 +1671,7 @@ mod tests {
 
     #[test]
     fn lens_rows_map_both_ways_without_changing_file_lines() {
-        let rows = Rows(Arc::new(vec![0, 2, 3, 90]));
+        let rows = Rows::new(vec![0, 2, 3, 90], &[], 100);
         let expected = [
             (0, true),
             (0, false),
@@ -1494,6 +1689,45 @@ mod tests {
             assert_eq!(rows.line(rows.shown(line)), (line, false));
         }
         assert_eq!(Rows::default().line(42), (42, false));
+    }
+
+    #[test]
+    fn folded_lines_have_no_row_and_are_where_their_line_is() {
+        // Ten lines: 2 to 4 are folded under 1, 7 and 8 under 6, and
+        // line 6 has lenses above it. A lens of a folded line is none.
+        let rows = Rows::new(vec![3, 6], &[2..5, 7..9], 10);
+        let shown: Vec<usize> = (0..10).map(|line| rows.shown(line)).collect();
+        assert_eq!(shown, [0, 1, 1, 1, 1, 2, 4, 4, 4, 5]);
+        let lines: Vec<(usize, bool)> = (0..7).map(|row| rows.line(row)).collect();
+        assert_eq!(
+            lines,
+            [
+                (0, false),
+                (1, false),
+                (5, false),
+                (6, true),
+                (6, false),
+                (9, false),
+                (10, false)
+            ]
+        );
+        assert_eq!(rows.count(), 6);
+        assert!(rows.is_folded(1) && rows.is_folded(6) && !rows.is_folded(5));
+        assert!(rows.is_hidden(2) && rows.is_hidden(8) && !rows.is_hidden(9));
+        // The lines of a range that are drawn, and where each is among
+        // the ones shaped.
+        assert_eq!(rows.runs(0..10), [0..2, 5..7, 9..10]);
+        assert_eq!(rows.runs(3..8), vec![5..7]);
+        let runs = rows.runs(0..10);
+        assert_eq!(index_in(&runs, 6), Some(3));
+        assert_eq!(index_in(&runs, 3), None);
+        let some: Vec<(usize, usize)> = within(&runs, 1..10).collect();
+        assert_eq!(some, [(1, 1), (2, 5), (3, 6), (4, 9)]);
+        // The first line is never folded away, and a run past the end
+        // is cut to the text.
+        let odd = Rows::new(Vec::new(), &[0..2, 8..40], 10);
+        assert_eq!(odd.runs(0..10), [0..1, 2..8]);
+        assert_eq!(odd.count(), 7);
     }
 
     #[test]

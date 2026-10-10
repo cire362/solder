@@ -69,6 +69,10 @@ actions!(
         ColumnSelectDown,
         ColumnSelectLeft,
         ColumnSelectRight,
+        Fold,
+        Unfold,
+        FoldAll,
+        UnfoldAll,
         SelectNextOccurrence,
         MoveLineUp,
         MoveLineDown,
@@ -155,6 +159,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-alt-shift-down", ColumnSelectDown, full),
         KeyBinding::new("secondary-alt-shift-left", ColumnSelectLeft, full),
         KeyBinding::new("secondary-alt-shift-right", ColumnSelectRight, full),
+        // The keys other editors fold with move between changes here.
+        KeyBinding::new("secondary-k secondary-[", Fold, full),
+        KeyBinding::new("secondary-k secondary-]", Unfold, full),
+        KeyBinding::new("secondary-k secondary-0", FoldAll, full),
+        KeyBinding::new("secondary-k secondary-j", UnfoldAll, full),
     ]);
     let completions = Some("Editor && showing_completions");
     cx.bind_keys([
@@ -288,14 +297,32 @@ struct Drag {
 
 /// Highlights for the rows on screen, reused until the text, tree or viewport changes.
 pub(crate) struct HighlightCache {
-    /// The text's version, the tree's, the server's colors', and the rows.
-    pub key: (u64, u64, u64, Range<usize>),
+    /// The text's version, the tree's, the server's colors', and the
+    /// parts of the text that are on screen.
+    pub key: (u64, u64, u64, Vec<Range<usize>>),
     pub spans: Arc<Vec<(Range<usize>, HighlightKind)>>,
 }
 
 /// Told where the row of the cursor is in the window (its top and its
 /// bottom), when that row is to be brought into view.
 pub(crate) type Reveal = std::rc::Rc<dyn Fn(Pixels, Pixels, &mut App)>;
+
+/// The lines folded under a line: the ones after it that are indented
+/// deeper than it is, up to the last of them that has text. Nothing for
+/// a blank line, or one with nothing deeper after it.
+pub(crate) fn fold_under(buffer: &Buffer, row: usize) -> Option<Range<usize>> {
+    let deep = |row: usize| crate::element::indent_cells(&buffer.line_str(row));
+    let own = deep(row)?;
+    let mut last = None;
+    for at in row + 1..buffer.line_count() {
+        match deep(at) {
+            Some(cells) if cells <= own => break,
+            Some(_) => last = Some(at),
+            None => {}
+        }
+    }
+    last.map(|last| row + 1..last + 1)
+}
 
 pub struct Editor {
     pub(crate) mode: EditorMode,
@@ -321,6 +348,12 @@ pub struct Editor {
     /// The rectangle the selections are, while they are one: moving a
     /// corner makes them again from it. Any other change of them ends it.
     pub(crate) column: Option<Column>,
+    /// The parts of the text that are folded away: of each, the bytes
+    /// from the start of its first line to the end of its last. In
+    /// order, and none inside another. They are of this view alone.
+    pub(crate) folds: Vec<Range<usize>>,
+    /// The pointer is over the gutter: lines that can be folded say so.
+    pub(crate) gutter_hovered: bool,
     /// Ranges painted as search results, sorted. Set by the find bar.
     pub(crate) search_matches: Arc<Vec<Range<usize>>>,
     pub(crate) active_match: Option<usize>,
@@ -372,6 +405,7 @@ impl Editor {
     pub fn for_document(document: Entity<Document>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&document, |this, _, event, cx| match event {
             DocumentEvent::Edited { edits, origin } => {
+                this.folds_follow(edits);
                 if *origin != Some(cx.entity_id()) {
                     this.follow_edits(edits, cx);
                     // Text changed under the suggestion.
@@ -405,6 +439,8 @@ impl Editor {
             marked_range: None,
             drag: None,
             column: None,
+            folds: Vec::new(),
+            gutter_hovered: false,
             search_matches: Arc::default(),
             active_match: None,
             completion: None,
@@ -513,6 +549,7 @@ impl Editor {
         let end = self.buf(cx).clip_offset(range.end);
         self.document.update(cx, |d, _| d.seal_history());
         self.set_selections(vec![Selection::new(start, end)], 0);
+        self.reveal_selections();
         self.selections_changed(cx);
     }
 
@@ -529,6 +566,7 @@ impl Editor {
             .collect::<Vec<_>>();
         let newest = selections.len() - 1;
         self.set_selections(selections, newest);
+        self.reveal_selections();
         self.selections_changed(cx);
     }
 
@@ -651,6 +689,169 @@ impl Editor {
         self.selections = merged;
         self.newest = newest.min(self.selections.len() - 1);
         self.column = None;
+    }
+
+    // ---------------------------------------------------------------- folds
+
+    /// The lines that are folded away, as runs in order.
+    pub(crate) fn folded_rows(&self, buffer: &Buffer) -> Vec<Range<usize>> {
+        let rows = |fold: &Range<usize>| {
+            let first = buffer.offset_to_point(fold.start).row;
+            first..buffer.offset_to_point(fold.end).row + 1
+        };
+        self.folds.iter().map(rows).collect()
+    }
+
+    /// Folds the lines under a line away, if it has any. A fold inside
+    /// them is taken into this one.
+    pub(crate) fn fold_row(&mut self, row: usize, cx: &mut Context<Self>) -> bool {
+        if self.is_single_line() || self.fit.is_some() {
+            return false;
+        }
+        let buffer = self.buf(cx);
+        let Some(under) = fold_under(buffer, row) else {
+            return false;
+        };
+        let last = under.end - 1;
+        let fold = buffer.line_start(under.start)..buffer.line_start(last) + buffer.line_len(last);
+        self.folds
+            .retain(|known| known.end < fold.start || known.start > fold.end);
+        let at = self.folds.partition_point(|known| known.start < fold.start);
+        // A cursor in what is folded goes to the end of the line it is
+        // folded under, where it can still be seen.
+        let header = buffer.line_start(row) + buffer.line_len(row);
+        let inside = |offset: usize| (fold.start..=fold.end).contains(&offset);
+        let moved: Vec<Selection> = self
+            .selections
+            .iter()
+            .map(|s| match (inside(s.anchor), inside(s.head)) {
+                (false, false) => *s,
+                (true, true) => Selection::new(header, header),
+                (true, false) => Selection::new(header, s.head),
+                (false, true) => Selection::new(s.anchor, header),
+            })
+            .collect();
+        self.folds.insert(at, fold);
+        self.set_selections(moved, self.newest);
+        self.autoscroll = true;
+        cx.notify();
+        true
+    }
+
+    /// Brings back the lines folded under a line. False if none are.
+    pub(crate) fn unfold_row(&mut self, row: usize, cx: &mut Context<Self>) -> bool {
+        let buffer = self.buf(cx);
+        let first = match row + 1 < buffer.line_count() {
+            true => buffer.line_start(row + 1),
+            false => return false,
+        };
+        let before = self.folds.len();
+        self.folds.retain(|fold| fold.start != first);
+        cx.notify();
+        self.folds.len() != before
+    }
+
+    /// Folds or unfolds at a line, whichever it is not.
+    pub(crate) fn toggle_fold(&mut self, row: usize, cx: &mut Context<Self>) -> bool {
+        self.unfold_row(row, cx) || self.fold_row(row, cx)
+    }
+
+    /// The line the cursor's block begins at: its own if lines are under
+    /// it, else the nearest line above that is less indented and has
+    /// some under it.
+    fn fold_line(&self, cx: &App) -> Option<usize> {
+        let buffer = self.buf(cx);
+        let mut row = buffer.offset_to_point(self.newest_selection().head).row;
+        if fold_under(buffer, row).is_some() {
+            return Some(row);
+        }
+        let deep = |row: usize| crate::element::indent_cells(&buffer.line_str(row));
+        let mut own = deep(row);
+        while row > 0 {
+            row -= 1;
+            let Some(cells) = deep(row) else {
+                continue;
+            };
+            if own.is_none_or(|own| cells < own) {
+                if fold_under(buffer, row).is_some() {
+                    return Some(row);
+                }
+                own = Some(cells);
+            }
+        }
+        None
+    }
+
+    fn fold(&mut self, _: &Fold, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(row) = self.fold_line(cx) {
+            self.fold_row(row, cx);
+        }
+    }
+
+    fn unfold(&mut self, _: &Unfold, _: &mut Window, cx: &mut Context<Self>) {
+        let row = self
+            .buf(cx)
+            .offset_to_point(self.newest_selection().head)
+            .row;
+        self.unfold_row(row, cx);
+    }
+
+    /// Folds every block that is not inside another.
+    fn fold_all(&mut self, _: &FoldAll, _: &mut Window, cx: &mut Context<Self>) {
+        let lines = self.buf(cx).line_count();
+        let mut row = 0;
+        while row < lines {
+            row = match fold_under(self.buf(cx), row) {
+                Some(under) => {
+                    self.fold_row(row, cx);
+                    under.end
+                }
+                None => row + 1,
+            };
+        }
+    }
+
+    fn unfold_all(&mut self, _: &UnfoldAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.folds.clear();
+        self.autoscroll = true;
+        cx.notify();
+    }
+
+    /// Folds move with the text around them; one whose own lines are
+    /// changed comes open, so that what was changed is seen.
+    fn folds_follow(&mut self, edits: &[text::Edit]) {
+        if self.folds.is_empty() {
+            return;
+        }
+        for edit in edits {
+            self.folds.retain_mut(|fold| {
+                if edit.start <= fold.end && edit.old_end >= fold.start {
+                    return false;
+                }
+                let one = std::slice::from_ref(edit);
+                *fold = map_offset(fold.start, one)..map_offset(fold.end, one);
+                true
+            });
+        }
+    }
+
+    /// A cursor is never in what is folded away: where one is put there
+    /// (a place gone to, a match found), that fold comes open. Asked
+    /// where cursors are moved, and again before every frame: after an
+    /// edit the folds are where the text now is only once the document
+    /// has said what changed.
+    pub(crate) fn reveal_selections(&mut self) {
+        if self.folds.is_empty() {
+            return;
+        }
+        let selections = &self.selections;
+        let holds = |fold: &Range<usize>| {
+            let inside = |offset: usize| (fold.start..=fold.end).contains(&offset);
+            selections
+                .iter()
+                .any(|s| inside(s.head) || inside(s.anchor))
+        };
+        self.folds.retain(|fold| !holds(fold));
     }
 
     /// Makes the selections a rectangle: on each of its lines, the part
@@ -814,6 +1015,7 @@ impl Editor {
             })
             .collect();
         self.set_selections(moved, self.newest);
+        self.reveal_selections();
         self.document.update(cx, |d, _| d.seal_history());
         self.selections_changed(cx);
     }
@@ -1159,7 +1361,7 @@ impl Editor {
             cx.propagate();
             return;
         }
-        self.move_selections(false, cx, |b, s| b.move_vertically(s.head, s.goal, -1));
+        self.move_rows(false, -1, cx);
     }
 
     fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
@@ -1167,7 +1369,30 @@ impl Editor {
             cx.propagate();
             return;
         }
-        self.move_selections(false, cx, |b, s| b.move_vertically(s.head, s.goal, 1));
+        self.move_rows(false, 1, cx);
+    }
+
+    /// Moves every cursor up or down by lines, over what is folded away:
+    /// a cursor that would land there goes on to the first line past it.
+    fn move_rows(&mut self, extend: bool, rows: isize, cx: &mut Context<Self>) {
+        let folds = self.folds.clone();
+        let folded = move |offset: usize| {
+            folds
+                .iter()
+                .any(|fold| fold.contains(&offset) || fold.end == offset)
+        };
+        self.move_selections(extend, cx, move |b, s| {
+            let (mut to, mut goal) = b.move_vertically(s.head, s.goal, rows);
+            while folded(to) {
+                let (next, kept) = b.move_vertically(to, goal, rows.signum());
+                if next == to {
+                    // Folded to the end of the text: nowhere to go on to.
+                    return (s.head, s.goal);
+                }
+                (to, goal) = (next, kept);
+            }
+            (to, goal)
+        });
     }
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
@@ -1187,7 +1412,7 @@ impl Editor {
             cx.propagate();
             return;
         }
-        self.move_selections(true, cx, |b, s| b.move_vertically(s.head, s.goal, -1));
+        self.move_rows(true, -1, cx);
     }
 
     fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
@@ -1195,7 +1420,7 @@ impl Editor {
             cx.propagate();
             return;
         }
-        self.move_selections(true, cx, |b, s| b.move_vertically(s.head, s.goal, 1));
+        self.move_rows(true, 1, cx);
     }
 
     fn move_word_left(&mut self, _: &MoveWordLeft, _: &mut Window, cx: &mut Context<Self>) {
@@ -1275,7 +1500,7 @@ impl Editor {
             return;
         }
         let rows = self.visible_rows();
-        self.move_selections(false, cx, |b, s| b.move_vertically(s.head, s.goal, -rows));
+        self.move_rows(false, -rows, cx);
     }
 
     fn page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
@@ -1284,7 +1509,7 @@ impl Editor {
             return;
         }
         let rows = self.visible_rows();
-        self.move_selections(false, cx, |b, s| b.move_vertically(s.head, s.goal, rows));
+        self.move_rows(false, rows, cx);
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -1962,8 +2187,29 @@ impl Editor {
                 return;
             }
             let row = layout.row_at(self.buf(cx), self.scroll, event.position.y);
+            // Between the numbers and the text is where a line is folded.
+            let folding = event.position.x >= layout.text_left - crate::element::GUTTER_PADDING;
+            if folding && self.fit.is_none() {
+                self.toggle_fold(row, cx);
+                return;
+            }
             self.toggle_breakpoint_at(row, cx);
             return;
+        }
+        // A click on the mark after a line brings back what is folded
+        // under it.
+        if let Some(layout) = &self.layout {
+            let row = layout.row_at(self.buf(cx), self.scroll, event.position.y);
+            let past = layout.line(row).is_some_and(|line| {
+                let x = event.position.x - layout.text_left + self.scroll.x;
+                x > line.x_for(self.buf(cx).line_len(row))
+            });
+            if past
+                && !layout.is_lens_row(self.scroll, event.position.y)
+                && self.unfold_row(row, cx)
+            {
+                return;
+            }
         }
         // A click on a lens does what it offers, and moves no cursor.
         let lens = self.layout.as_ref();
@@ -2021,6 +2267,14 @@ impl Editor {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // Over the gutter, the lines that can be folded say so.
+        let over_gutter = self.layout.as_ref().is_some_and(|layout| {
+            layout.bounds.contains(&event.position) && event.position.x < layout.text_left
+        });
+        if over_gutter != self.gutter_hovered && !self.is_single_line() {
+            self.gutter_hovered = over_gutter;
+            cx.notify();
+        }
         let Some(drag) = self.drag.as_ref() else {
             if event.pressed_button.is_none() && !self.is_single_line() {
                 self.hover_at(event.position, cx);
@@ -2304,6 +2558,10 @@ impl Render for Editor {
             .on_action(cx.listener(Self::column_select_down))
             .on_action(cx.listener(Self::column_select_left))
             .on_action(cx.listener(Self::column_select_right))
+            .on_action(cx.listener(Self::fold))
+            .on_action(cx.listener(Self::unfold))
+            .on_action(cx.listener(Self::fold_all))
+            .on_action(cx.listener(Self::unfold_all))
             .on_action(cx.listener(Self::select_next_occurrence))
             .on_action(cx.listener(Self::move_line_up))
             .on_action(cx.listener(Self::move_line_down))
@@ -2522,6 +2780,120 @@ mod tests {
         let away = at(cx, 3, 9.);
         cx.simulate_mouse_move(away, None, gpui::Modifiers::default());
         assert_eq!(cursors(&editor, cx), [4..6, 18..20]);
+    }
+
+    #[gpui::test]
+    fn blocks_are_folded_away_and_brought_back(cx: &mut TestAppContext) {
+        let lines = "fn a() {\n    let x = 1;\n    if x > 0 {\n        y();\n    }\n\n    z();\n}\nfn b() {}\n";
+        let (editor, cx) = setup(cx, "/tmp/folds.rs", lines);
+        // What is under a line is what is indented deeper than it, up to
+        // the last such line with text.
+        let under = |row: usize, cx: &mut VisualTestContext| {
+            cx.read(|cx| fold_under(editor.read(cx).buf(cx), row))
+        };
+        assert_eq!(under(0, cx), Some(1..7));
+        assert_eq!(under(2, cx), Some(3..4));
+        assert_eq!(
+            (under(1, cx), under(5, cx), under(8, cx)),
+            (None, None, None)
+        );
+        let folded = |cx: &mut VisualTestContext| {
+            cx.read(|cx| {
+                let editor = editor.read(cx);
+                editor.folded_rows(editor.buf(cx))
+            })
+        };
+        // The lines on screen, as the runs of them that are drawn.
+        let drawn = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.read(|cx| editor.read(cx).layout.as_ref().unwrap().runs.clone())
+        };
+
+        // With the cursor inside a block, the key folds the block: its
+        // lines are gone from the screen, and the cursor is at the end
+        // of the line they are under.
+        editor.update(cx, |editor, cx| editor.select_range(48..48, cx));
+        cx.simulate_keystrokes("secondary-k secondary-[");
+        assert_eq!(folded(cx), vec![3..4]);
+        assert_eq!(cursors(&editor, cx), vec![38..38]);
+        assert_eq!(drawn(cx), [0..3, 4..10]);
+        // The line says something is under it: a mark after its text.
+        let (text_end, row_end) = cx.read(|cx| {
+            let layout = editor.read(cx).layout.as_ref().unwrap();
+            let line = layout.line(2).unwrap();
+            (line.x_for(14), line.shaped.width)
+        });
+        assert!(row_end > text_end, "{row_end:?} {text_end:?}");
+        // The cursor steps over what is folded, both ways, and keeps to
+        // its column.
+        cx.simulate_keystrokes("down");
+        assert_eq!(cursors(&editor, cx), vec![57..57]);
+        cx.simulate_keystrokes("up");
+        assert_eq!(cursors(&editor, cx), vec![38..38]);
+        assert_eq!(folded(cx), vec![3..4]);
+        // Typed after the line, the fold stays where its lines are.
+        cx.simulate_input(" // why");
+        assert_eq!(folded(cx), vec![3..4]);
+        // The key on its line opens it; folded again, a cursor put inside
+        // (a place gone to) opens it too.
+        cx.simulate_keystrokes("secondary-k secondary-]");
+        assert!(folded(cx).is_empty());
+        cx.simulate_keystrokes("secondary-k secondary-[");
+        assert_eq!(folded(cx), vec![3..4]);
+        editor.update(cx, |editor, cx| editor.select_range(57..57, cx));
+        assert!(folded(cx).is_empty());
+
+        // Folded by a click between the number and the text, and opened
+        // by a click on the mark after the line.
+        let at = |cx: &mut VisualTestContext, row: usize, gutter: bool| {
+            cx.run_until_parked();
+            cx.read(|cx| {
+                let layout = editor.read(cx).layout.as_ref().unwrap();
+                let x = match gutter {
+                    true => layout.text_left - px(8.),
+                    false => {
+                        let line = layout.line(row).unwrap();
+                        layout.text_left + line.shaped.width - layout.em_width
+                    }
+                };
+                gpui::point(x, layout.top_of(row) + layout.line_height / 2.)
+            })
+        };
+        let none = gpui::Modifiers::default();
+        let click = at(cx, 0, true);
+        cx.simulate_click(click, none);
+        assert_eq!(folded(cx), vec![1..7]);
+        assert_eq!(drawn(cx), [0..1, 7..10]);
+        // The inner block was taken into the outer: one fold, not two.
+        let click = at(cx, 0, false);
+        cx.simulate_click(click, none);
+        assert!(folded(cx).is_empty());
+        // A click in the gutter left of that still sets a breakpoint and
+        // folds nothing.
+        let far = cx.read(|cx| {
+            let layout = editor.read(cx).layout.as_ref().unwrap();
+            gpui::point(layout.bounds.left() + px(6.), layout.top_of(0) + px(4.))
+        });
+        cx.simulate_click(far, none);
+        assert!(folded(cx).is_empty());
+
+        // Every block that is in no other, at once; an edit before them
+        // moves them with their lines, and one inside opens it.
+        cx.simulate_keystrokes("secondary-k secondary-0");
+        assert_eq!(folded(cx), vec![1..7]);
+        editor.update(cx, |editor, cx| {
+            editor.select_range(0..0, cx);
+            editor.insert("// first\n", cx);
+        });
+        assert_eq!(folded(cx), vec![2..8]);
+        cx.simulate_keystrokes("secondary-k secondary-j");
+        assert!(folded(cx).is_empty());
+        cx.simulate_keystrokes("secondary-k secondary-0");
+        let document = cx.read(|cx| editor.read(cx).document().clone());
+        document.update(cx, |document, cx| {
+            document.edit(vec![(30..30, "!".to_string())], &[], None, cx);
+        });
+        assert!(folded(cx).is_empty());
     }
 
     #[gpui::test]
