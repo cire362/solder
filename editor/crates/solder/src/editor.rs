@@ -73,6 +73,7 @@ actions!(
         Unfold,
         FoldAll,
         UnfoldAll,
+        ToggleSoftWrap,
         SelectNextOccurrence,
         MoveLineUp,
         MoveLineDown,
@@ -164,6 +165,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-k secondary-]", Unfold, full),
         KeyBinding::new("secondary-k secondary-0", FoldAll, full),
         KeyBinding::new("secondary-k secondary-j", UnfoldAll, full),
+        KeyBinding::new("alt-z", ToggleSoftWrap, full),
     ]);
     let completions = Some("Editor && showing_completions");
     cx.bind_keys([
@@ -307,6 +309,10 @@ pub(crate) struct HighlightCache {
 /// bottom), when that row is to be brought into view.
 pub(crate) type Reveal = std::rc::Rc<dyn Fn(Pixels, Pixels, &mut App)>;
 
+/// The lines of a text that take more than one row, each with how many
+/// more.
+pub(crate) type LongLines = Arc<Vec<(usize, usize)>>;
+
 /// The lines folded under a line: the ones after it that are indented
 /// deeper than it is, up to the last of them that has text. Nothing for
 /// a blank line, or one with nothing deeper after it.
@@ -354,6 +360,15 @@ pub struct Editor {
     pub(crate) folds: Vec<Range<usize>>,
     /// The pointer is over the gutter: lines that can be folded say so.
     pub(crate) gutter_hovered: bool,
+    /// Whether lines too long for the window go on in the next row, where
+    /// this view says other than the settings do.
+    pub(crate) wrap: Option<bool>,
+    /// How many cells wide the text was wrapped to when it was last
+    /// drawn, if it was wrapped: the cursor moves by those rows.
+    pub(crate) wrap_cols: Option<usize>,
+    /// The lines that take more than one row, for a state of the text
+    /// and a width: found once for both, not for every frame.
+    wrap_cache: Option<(u64, usize, LongLines)>,
     /// Ranges painted as search results, sorted. Set by the find bar.
     pub(crate) search_matches: Arc<Vec<Range<usize>>>,
     pub(crate) active_match: Option<usize>,
@@ -441,6 +456,9 @@ impl Editor {
             column: None,
             folds: Vec::new(),
             gutter_hovered: false,
+            wrap: None,
+            wrap_cols: None,
+            wrap_cache: None,
             search_matches: Arc::default(),
             active_match: None,
             completion: None,
@@ -689,6 +707,40 @@ impl Editor {
         self.selections = merged;
         self.newest = newest.min(self.selections.len() - 1);
         self.column = None;
+    }
+
+    // ---------------------------------------------------------------- wrapping
+
+    /// Whether lines too long for the window go on in the next row.
+    pub(crate) fn wraps(&self, settings: &crate::settings::Settings) -> bool {
+        self.wrap.unwrap_or(settings.soft_wrap)
+    }
+
+    /// The lines that take more than one row at a width, each with how
+    /// many more. Found again only when the text or the width changed.
+    pub(crate) fn wrapped_lines(&mut self, buffer: &Buffer, cols: usize) -> LongLines {
+        let key = (buffer.version(), cols);
+        if let Some((version, width, lines)) = &self.wrap_cache
+            && (*version, *width) == key
+        {
+            return lines.clone();
+        }
+        let limit = crate::element::MAX_SHAPED_BYTES;
+        let lines = Arc::new(text::wrap::wrapped_lines(buffer.rope(), cols, limit));
+        self.wrap_cache = Some((key.0, key.1, lines.clone()));
+        lines
+    }
+
+    fn toggle_soft_wrap(&mut self, _: &ToggleSoftWrap, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_single_line() {
+            cx.propagate();
+            return;
+        }
+        let now = self.wraps(crate::settings::Settings::get(cx));
+        self.wrap = Some(!now);
+        // What was scrolled to the side is not there to be seen any more.
+        self.autoscroll = true;
+        cx.notify();
     }
 
     // ---------------------------------------------------------------- folds
@@ -951,7 +1003,14 @@ impl Editor {
     /// end of the line.
     fn cell_at(&self, position: Point<Pixels>, cx: &App) -> Option<(usize, usize)> {
         let layout = self.layout.as_ref()?;
-        let row = layout.row_at(self.buf(cx), self.scroll, position.y);
+        let buffer = self.buf(cx);
+        // Where lines go on in further rows, a cell of the screen is not
+        // a cell of its line: the place in the text under the pointer.
+        if self.wrap_cols.is_some() {
+            let point = buffer.offset_to_point(self.offset_at(position, cx)?);
+            return Some((point.row, buffer.display_column(point)));
+        }
+        let row = layout.row_at(buffer, self.scroll, position.y);
         let x = position.x - layout.text_left + self.scroll.x;
         Some((row, (x / layout.em_width).round().max(0.) as usize))
     }
@@ -1381,10 +1440,18 @@ impl Editor {
                 .iter()
                 .any(|fold| fold.contains(&offset) || fold.end == offset)
         };
+        // Where lines go on in further rows, a step is a row of the
+        // screen, not a line of the file.
+        let cols = self.wrap_cols;
+        let limit = crate::element::MAX_SHAPED_BYTES;
+        let step = move |b: &Buffer, from: usize, goal: SelectionGoal, rows: isize| match cols {
+            Some(cols) => b.move_wrapped(from, goal, rows, cols, limit),
+            None => b.move_vertically(from, goal, rows),
+        };
         self.move_selections(extend, cx, move |b, s| {
-            let (mut to, mut goal) = b.move_vertically(s.head, s.goal, rows);
+            let (mut to, mut goal) = step(b, s.head, s.goal, rows);
             while folded(to) {
-                let (next, kept) = b.move_vertically(to, goal, rows.signum());
+                let (next, kept) = step(b, to, goal, rows.signum());
                 if next == to {
                     // Folded to the end of the text: nowhere to go on to.
                     return (s.head, s.goal);
@@ -2200,9 +2267,11 @@ impl Editor {
         // under it.
         if let Some(layout) = &self.layout {
             let row = layout.row_at(self.buf(cx), self.scroll, event.position.y);
+            let part = layout.part_at(self.scroll, event.position.y);
             let past = layout.line(row).is_some_and(|line| {
                 let x = event.position.x - layout.text_left + self.scroll.x;
-                x > line.x_for(self.buf(cx).line_len(row))
+                let (last, end) = line.place_for(self.buf(cx).line_len(row));
+                part == last && x > end
             });
             if past
                 && !layout.is_lens_row(self.scroll, event.position.y)
@@ -2562,6 +2631,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::unfold))
             .on_action(cx.listener(Self::fold_all))
             .on_action(cx.listener(Self::unfold_all))
+            .on_action(cx.listener(Self::toggle_soft_wrap))
             .on_action(cx.listener(Self::select_next_occurrence))
             .on_action(cx.listener(Self::move_line_up))
             .on_action(cx.listener(Self::move_line_down))
@@ -2894,6 +2964,102 @@ mod tests {
             document.edit(vec![(30..30, "!".to_string())], &[], None, cx);
         });
         assert!(folded(cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn lines_too_long_for_the_window_go_on_in_the_next_row(cx: &mut TestAppContext) {
+        let long = "word ".repeat(120);
+        let lines = format!("{long}\n    {long}\nshort\n");
+        let (editor, cx) = setup(cx, "/tmp/wrapped.txt", &lines);
+        let drawn = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.read(|cx| {
+                let editor = editor.read(cx);
+                let layout = editor.layout.as_ref().unwrap();
+                let parts: Vec<usize> = (0..3)
+                    .map(|row| layout.line(row).unwrap().parts())
+                    .collect();
+                let tops: Vec<Pixels> = (0..3).map(|row| layout.top_of(row)).collect();
+                (parts, tops, layout.line_height, editor.wrap_cols)
+            })
+        };
+        // As it comes, a line is one row however long, and what does not
+        // fit is to the side.
+        let (parts, tops, lh, cols) = drawn(cx);
+        assert_eq!((parts, cols), (vec![1, 1, 1], None));
+        assert_eq!(tops[1] - tops[0], lh);
+
+        // The key makes this view go on in the next row: each line takes
+        // as many rows as its text does at the width of the window, and
+        // the line after it begins below them all.
+        cx.simulate_keystrokes("alt-z");
+        let (parts, tops, lh, cols) = drawn(cx);
+        let cols = cols.expect("the text is wrapped");
+        let first = text::wrap::wrap_points(&long, cols);
+        let second = text::wrap::wrap_points(&format!("    {long}"), cols);
+        assert!(first.len() > 1 && second.len() > first.len() - 1);
+        assert_eq!(parts, [first.len() + 1, second.len() + 1, 1]);
+        assert_eq!(tops[1] - tops[0], lh * (first.len() + 1) as f32);
+        assert_eq!(tops[2] - tops[1], lh * (second.len() + 1) as f32);
+        assert_eq!(cx.read(|cx| editor.read(cx).scroll.x), px(0.));
+
+        // The cursor moves by rows of the screen: down from the start of
+        // the line is the start of its second row, not the next line.
+        editor.update(cx, |editor, cx| editor.select_range(0..0, cx));
+        cx.simulate_keystrokes("down");
+        assert_eq!(cursors(&editor, cx), vec![first[0]..first[0]]);
+        cx.simulate_keystrokes("down");
+        assert_eq!(cursors(&editor, cx), vec![first[1]..first[1]]);
+        cx.simulate_keystrokes("up up");
+        assert_eq!(cursors(&editor, cx), vec![0..0]);
+        // A click in a row goes where it points: three cells into the
+        // third row of the first line.
+        let (at, cursor_at) = cx.read(|cx| {
+            let editor = editor.read(cx);
+            let layout = editor.layout.as_ref().unwrap();
+            let click = gpui::point(
+                layout.text_left + layout.em_width * 3.,
+                layout.top_of(0) + layout.line_height * 2.5,
+            );
+            // And a place in the text is where its row is drawn.
+            let bounds = layout.bounds_for_offset(editor.buf(cx), editor.scroll, first[1] + 3);
+            (click, bounds.unwrap().origin)
+        });
+        cx.simulate_click(at, gpui::Modifiers::default());
+        assert_eq!(cursors(&editor, cx), vec![first[1] + 3..first[1] + 3]);
+        assert_eq!(cursor_at.y, tops[0] + lh * 2.);
+        // The rows of a line that begins four cells in are drawn four
+        // cells in: the start of its second row is that far along.
+        let hung = cx.read(|cx| {
+            let editor = editor.read(cx);
+            let layout = editor.layout.as_ref().unwrap();
+            (
+                layout.line(1).unwrap().place_for(second[0]),
+                layout.em_width,
+            )
+        });
+        assert_eq!(hung.0, (1, hung.1 * 4.));
+        // Typing at the end of a row that is full moves what follows on.
+        let before = drawn(cx).0;
+        editor.update(cx, |editor, cx| editor.select_range(0..0, cx));
+        cx.simulate_input(&"x".repeat(cols));
+        assert_eq!(drawn(cx).0[0], before[0] + 1);
+
+        // The key again, and the lines are one row each as before. With
+        // the setting on, a view wraps without being told.
+        cx.simulate_keystrokes("alt-z");
+        assert_eq!(drawn(cx).0, [1, 1, 1]);
+        cx.update(|_, cx| {
+            cx.set_global(crate::settings::Settings {
+                soft_wrap: true,
+                ..Default::default()
+            });
+        });
+        editor.update(cx, |editor, cx| {
+            editor.wrap = None;
+            cx.notify();
+        });
+        assert!(drawn(cx).0[0] > 1);
     }
 
     #[gpui::test]

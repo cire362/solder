@@ -136,7 +136,12 @@ Never guess a signature.
   screen. A line is not in the row of its own number either: a lens has
   a row above its line and folded lines have none, so every height comes
   from `element::Rows`, and only the lines of its `runs` are shaped
-  (`LayoutSnapshot::line`, never an index into `lines` by row). A fold is
+  (`LayoutSnapshot::line`, never an index into `lines` by row). A line
+  too long for the window takes several rows (`DisplayLine::parts`), by
+  `text::wrap`, which wraps by cells so that how many rows a line takes
+  is known from its text alone, for lines that are not drawn too: what
+  is drawn must agree with it, so a place in a line is a row and a
+  distance along it (`DisplayLine::place_for`), never an x alone. A fold is
   the editor's (`Editor::folds`, bytes that follow edits), opened where
   a cursor lands in it. A lens is kept only if a
   click can do it: its command is one its server said it runs, or one

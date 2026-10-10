@@ -82,6 +82,19 @@ of its lines; an edit elsewhere moves it with its lines. Folds are of one
 view of the file and are not kept when its tab is closed. `cmd-alt-[` and
 `cmd-alt-]`, which fold in other editors, move between changes here.
 
+**Lines too long for the window** go on in the next row when wrapping is
+on: `alt-z` turns it on and off for the view in front, and `"soft_wrap":
+true` in the settings turns it on for every file. A row ends after the
+last space that fits, and inside a word only where the word alone is
+longer than a row. The rows a line goes on in are drawn as far in as the
+line begins, so they are seen to belong to it. Nothing is to the side
+then, and the cursor moves up and down by rows of the screen. A line is
+wrapped by cells, not by what its letters measure: every character is one
+cell. So a row of characters wider than a cell (Chinese, Japanese, Korean)
+runs past the edge, and so does a row with inlay hints in it, which are
+not counted. Home and End go to the ends of the line, not of the row. The
+choice made with `alt-z` is not kept when the tab is closed.
+
 A **selection by column** is a rectangle of cursors, one on each line it
 crosses. With the mouse, hold `shift` and `alt` and click or drag: the
 rectangle goes from the cursor to the pointer. Or drag with the middle

@@ -399,7 +399,10 @@ against what Solder has: these are the parts it lacked. Each block is one
 update. They come after phase 9, in this order unless one is needed sooner.
 
 ### The editor
-- [ ] Folding of blocks, indent guides, lines wrapped at the window's edge
+- [x] Folding of blocks, indent guides, lines wrapped at the window's edge.
+      Folding goes by indentation, the same in every language; wrapping
+      goes by cells, so rows of characters wider than a cell run past the
+      edge
 - [x] Selection by column (a rectangle of cursors): `shift-alt` and the
       mouse, the middle button, or `cmd-alt-shift` and the arrows
 - [x] Pinned tabs; the tab closed last opened again (`cmd-shift-t`). Tabs,

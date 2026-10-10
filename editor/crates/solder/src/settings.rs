@@ -91,6 +91,8 @@ pub struct Settings {
     pub code_lens: bool,
     /// A thin line down each level of indentation.
     pub indent_guides: bool,
+    /// Lines too long for the window go on in the next row.
+    pub soft_wrap: bool,
     /// The icon theme of an installed extension, by name: pictures next
     /// to file names in the tree and on tabs. None by default.
     pub icon_theme: Option<String>,
@@ -301,6 +303,7 @@ impl Default for Settings {
             semantic_highlighting: true,
             code_lens: true,
             indent_guides: true,
+            soft_wrap: false,
             icon_theme: None,
             context_servers: BTreeMap::new(),
             other: BTreeMap::new(),
