@@ -1,5 +1,35 @@
 # VS Code host benchmark
 
+## The whole block, with the browser view
+
+Baseline: main `9ebbc68`. Branch: `feat/vscode-host` at `7d21fcf`, all nine items of "VS Code extensions: their code", `wry` linked in.
+Release builds outside iCloud, the project's packages cleaned between the two (two checkouts in one target folder take each other's crates otherwise). Same Rust fixture, isolated HOME, default settings and layout, no extension installed, so no host and no browser: this is what the block costs someone who uses none of it.
+One warm-up each, two rounds of 21 interleaved launches, the order reversed in round two.
+
+Startup milliseconds, q1 / median / q3:
+
+- Round 1, main: 91.4 / 93.8 / 96.2
+- Round 1, vscode-host: 90.0 / 91.0 / 93.6
+- Round 2, main: 91.6 / 93.3 / 95.6
+- Round 2, vscode-host: 90.6 / 93.2 / 95.5
+
+Typing: 300 inputs per run, 16 ms apart, three interleaved runs each.
+
+- main: input_p50_ms=12 input_p99_ms=21 frame_p50_ms=1.2 frame_p99_ms=1.8 memory_mb=131
+- main: input_p50_ms=12 input_p99_ms=20 frame_p50_ms=1.1 frame_p99_ms=1.8 memory_mb=132
+- main: input_p50_ms=12 input_p99_ms=21 frame_p50_ms=1.2 frame_p99_ms=1.8 memory_mb=131
+- vscode-host: input_p50_ms=12 input_p99_ms=22 frame_p50_ms=1.1 frame_p99_ms=1.8 memory_mb=131
+- vscode-host: input_p50_ms=12 input_p99_ms=20 frame_p50_ms=1.3 frame_p99_ms=1.8 memory_mb=131
+- vscode-host: input_p50_ms=13 input_p99_ms=20 frame_p50_ms=1.1 frame_p99_ms=1.8 memory_mb=131
+
+Binary: 50 255 760 bytes on main, 51 495 376 on the branch.
+
+Not measured: an editor with extensions running. A page of an extension open in a debug build took the process from about 119 MB to 143 MB; that is one look at one page, not a measurement.
+
+Collected on arm64 macOS on 2026-10-10. Local comparisons, not changes to the website's performance claims.
+
+## Earlier, at the views and decorations
+
 Baseline: origin/main `9ebbc68`. Branch: `feat/vscode-host`, feature commit `9fb658e`, plus the picker padding correction, with native extension views and decorations.
 Release builds outside iCloud; all workspace packages rebuilt between versions. Same Rust fixture, isolated HOME, default settings/layout, no extension hosts.
 `editor/scripts/bench.sh` ran on both versions. The samples below were collected after checks and compilation completed: one warm-up each, two rounds of 21 interleaved launches each, reversed order in round two.
