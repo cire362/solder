@@ -86,6 +86,10 @@ actions!(
         SplitRight,
         TogglePinTab,
         ReopenClosedTab,
+        ReopenWithEncoding,
+        SaveWithEncoding,
+        UseLfLineEndings,
+        UseCrlfLineEndings,
         FocusNextPane,
         FocusPrevPane,
         ToggleTerminal,
@@ -969,6 +973,23 @@ impl Workspace {
         })
     }
 
+    /// Adds an editor for a file as it was read from disk: in the
+    /// encoding it is in, and only to be read where it cannot be edited.
+    pub fn add_loaded(
+        &mut self,
+        path: PathBuf,
+        loaded: &crate::document::Loaded,
+        jump: Option<Jump>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = cx.new(|cx| Editor::open(path, loaded, cx));
+        self.add_tab(editor.clone(), window, cx);
+        if let Some(jump) = jump {
+            apply_jump(&editor, jump, cx);
+        }
+    }
+
     /// Adds an editor for text already in memory. Used at startup so the first
     /// frame shows the file, and after background reads.
     pub fn add_editor(
@@ -1022,19 +1043,19 @@ impl Workspace {
         }
         let read_path = path.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let content = cx
+            let loaded = cx
                 .background_executor()
-                .spawn(async move { std::fs::read(&read_path) })
+                .spawn(async move { crate::document::load(&read_path) })
                 .await;
-            let content = match content {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            let loaded = match loaded {
+                Ok(loaded) => loaded,
                 Err(err) => {
                     eprintln!("could not open {}: {err}", path.display());
                     return;
                 }
             };
             this.update_in(cx, |this, window, cx| {
-                this.add_editor(Some(path), &content, jump, window, cx)
+                this.add_loaded(path, &loaded, jump, window, cx)
             })
             .ok();
         })
@@ -1180,6 +1201,28 @@ impl Workspace {
         self.activate(p, next, window, cx);
     }
 
+    /// The list of encodings, for the file in front: to read it again as
+    /// one of them, or to save it as one.
+    fn choose_encoding(&mut self, reopen: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor() else {
+            return;
+        };
+        let document = editor.read(cx).document().clone();
+        self.toggle_modal(window, cx, move |window, cx| {
+            let picker = crate::encoding_picker::EncodingPicker::new(document, reopen);
+            Picker::new(picker, window, cx)
+        });
+    }
+
+    /// What the lines of the file in front end with when it is saved.
+    fn set_line_ending(&mut self, ending: text::LineEnding, cx: &mut Context<Self>) {
+        if let Some(editor) = self.active_editor() {
+            let document = editor.read(cx).document().clone();
+            document.update(cx, |document, cx| document.set_line_ending(ending, cx));
+            cx.notify();
+        }
+    }
+
     /// Pins the tab in front, or lets it go. The pinned tabs of a pane
     /// are its first, in the order they were pinned.
     fn toggle_pin_tab(&mut self, _: &TogglePinTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -1233,20 +1276,19 @@ impl Workspace {
         };
         let path = file.path.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let text = cx
+            let loaded = cx
                 .background_executor()
-                .spawn(async move { std::fs::read(&path) })
+                .spawn(async move { crate::document::load(&path) })
                 .await;
             this.update_in(cx, |this, window, cx| {
-                let Ok(bytes) = text else {
+                let Ok(loaded) = loaded else {
                     // Gone: the one closed before it, then.
                     this.reopen_closed_tab(&ReopenClosedTab, window, cx);
                     return;
                 };
                 this.close_file_diff(window, cx);
                 this.active_pane = pane.min(this.panes.len() - 1);
-                let text = String::from_utf8_lossy(&bytes);
-                this.add_editor(Some(file.path.clone()), &text, None, window, cx);
+                this.add_loaded(file.path.clone(), &loaded, None, window, cx);
                 if let Some(editor) = this.active_editor().cloned() {
                     file.put(&editor, cx);
                     if file.pinned {
@@ -3768,16 +3810,28 @@ impl Workspace {
             }
             cx.background_executor()
                 .spawn(async move {
-                    let Ok(bytes) = std::fs::read(&path) else {
+                    // Read and written in what the file is in, as an open
+                    // one is: an edit of a file that is not UTF-8 is not
+                    // to turn the rest of it into something else.
+                    let Ok(loaded) = crate::document::load(&path) else {
                         return;
                     };
-                    let mut buffer = text::Buffer::new(&String::from_utf8_lossy(&bytes));
+                    if loaded.read_only.is_some() {
+                        eprintln!("not edited, it cannot be: {}", path.display());
+                        return;
+                    }
+                    let mut buffer = text::Buffer::new(&loaded.text);
                     let edits: Vec<_> = edits
                         .into_iter()
                         .map(|e| (from_range(&buffer, e.range, encoding), e.new_text))
                         .collect();
                     buffer.edit(edits, &[], std::time::Instant::now());
-                    if let Err(err) = std::fs::write(&path, buffer.text_for_save()) {
+                    let written = text::encoding::encode(&buffer.text_for_save(), loaded.encoding)
+                        .map_err(|c| {
+                            format!("{c:?} cannot be written in {}", loaded.encoding.name())
+                        })
+                        .and_then(|bytes| std::fs::write(&path, bytes).map_err(|e| e.to_string()));
+                    if let Err(err) = written {
                         eprintln!("could not write {}: {err}", path.display());
                     }
                 })
@@ -4129,13 +4183,15 @@ impl Workspace {
             if dirty {
                 continue;
             }
+            // Read as what the file was opened as.
+            let written_in = document.read(cx).encoding();
             cx.spawn(async move |_, cx| {
                 let content = cx
                     .background_executor()
                     .spawn(async move { std::fs::read(&path) })
                     .await;
                 if let Ok(bytes) = content {
-                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    let text = text::encoding::decode_as(&bytes, written_in);
                     document
                         .update(cx, |d, cx| {
                             if !d.is_dirty() {
@@ -5206,7 +5262,27 @@ impl Workspace {
                             d.child(notebook.clone())
                         } else {
                             match pane.active_editor() {
-                                Some(editor) => d.child(editor.clone()),
+                                // What is to be said of the file above
+                                // it: why it is only read, or not saved.
+                                Some(editor) => {
+                                    let notice = editor.read(cx).doc(cx).notice().cloned();
+                                    d.flex()
+                                        .flex_col()
+                                        .children(notice.map(|notice| {
+                                            div()
+                                                .debug_selector(move || format!("file-notice-{p}"))
+                                                .flex_none()
+                                                .px_3()
+                                                .py_1()
+                                                .border_b(theme.shape.border)
+                                                .border_color(theme.line)
+                                                .bg(theme.bg_elev)
+                                                .text_size(UI_FONT_SIZE)
+                                                .text_color(theme.warning)
+                                                .child(notice)
+                                        }))
+                                        .child(div().flex_1().min_h_0().child(editor.clone()))
+                                }
                                 None => d.child(self.render_empty(window, cx)),
                             }
                         }
@@ -5493,6 +5569,26 @@ impl Workspace {
                 .map(|e| says(e.read(cx).doc(cx).indent_label().to_string()))
                 .into_iter()
                 .collect(),
+            // Said only where it is not what every file is taken to be.
+            Item::Encoding => {
+                let Some(editor) = editor else {
+                    return Vec::new();
+                };
+                let doc = editor.read(cx).doc(cx);
+                let mut parts = Vec::new();
+                if doc.encoding() != text::encoding::Encoding::Utf8 {
+                    parts.push(does(
+                        ("encoding", 0),
+                        doc.encoding().name().to_string(),
+                        theme.fg_muted,
+                        Box::new(ReopenWithEncoding),
+                    ));
+                }
+                if doc.line_ending() == text::LineEnding::CrLf {
+                    parts.push(says("CRLF".into()));
+                }
+                parts
+            }
             Item::Language => editor
                 .map(|e| {
                     let name = e.read(cx).doc(cx).language_name();
@@ -5941,6 +6037,18 @@ impl Render for Workspace {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::toggle_pin_tab))
+            .on_action(cx.listener(|this, _: &ReopenWithEncoding, window, cx| {
+                this.choose_encoding(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SaveWithEncoding, window, cx| {
+                this.choose_encoding(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &UseLfLineEndings, _, cx| {
+                this.set_line_ending(text::LineEnding::Lf, cx)
+            }))
+            .on_action(cx.listener(|this, _: &UseCrlfLineEndings, _, cx| {
+                this.set_line_ending(text::LineEnding::CrLf, cx)
+            }))
             .on_action(cx.listener(Self::reopen_closed_tab))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
@@ -13457,6 +13565,176 @@ exports.activate = (context) => {
         });
         cx.run_until_parked();
         assert_eq!(cx.read(|cx| pages(cx)), (Vec::new(), None));
+    }
+
+    /// A file is saved in the encoding and with the line endings it was
+    /// read in; what cannot be written in that encoding is said, and a
+    /// file that is no text or is too large is only read.
+    #[gpui::test]
+    fn a_file_is_saved_as_it_was_written(cx: &mut TestAppContext) {
+        use text::{
+            LineEnding,
+            encoding::{Encoding, encode},
+        };
+        let root = fixture("encodings");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let open = |cx: &mut VisualTestContext, name: &str| {
+            let path = root.join(name);
+            ws.update_in(cx, |w, window, cx| {
+                w.open_path(path.clone(), None, window, cx)
+            });
+            wait_for(cx, "the file", &|cx| {
+                let front = ws.read(cx).active_editor();
+                front.is_some_and(|e| e.read(cx).path(cx) == Some(path.as_path()))
+            });
+            cx.read(|cx| ws.read(cx).active_editor().unwrap().clone())
+        };
+        let state = |cx: &App| {
+            let editor = ws.read(cx).active_editor().unwrap().read(cx);
+            let doc = editor.doc(cx);
+            let notice = doc.notice().map(|notice| notice.to_string());
+            (doc.encoding(), doc.line_ending(), notice)
+        };
+        let bar = |cx: &mut VisualTestContext| -> Vec<String> {
+            ws.update(cx, |w, cx| {
+                let parts = w.bar_item(&Item::Encoding, cx);
+                parts.into_iter().map(|part| part.text).collect()
+            })
+        };
+        let saved = |cx: &mut VisualTestContext, name: &str, bytes: Vec<u8>| {
+            let path = root.join(name);
+            wait_for(cx, "the save", &|_| std::fs::read(&path).unwrap() == bytes);
+        };
+
+        // Cyrillic in one byte a letter, lines ending as on Windows.
+        let russian = "// Привет, мир\r\nfn main() {}\r\n";
+        std::fs::write(
+            root.join("old.rs"),
+            encode(russian, Encoding::Windows1251).unwrap(),
+        )
+        .unwrap();
+        let editor = open(cx, "old.rs");
+        assert_eq!(active_text(&ws, cx), "// Привет, мир\nfn main() {}\n");
+        assert_eq!(
+            cx.read(|cx| state(cx)),
+            (Encoding::Windows1251, LineEnding::CrLf, None)
+        );
+        // The bar says what is not the usual, and nothing of a usual file.
+        assert_eq!(bar(cx), ["Windows-1251", "CRLF"]);
+        // Edited and saved, it is what it was but for the edit.
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("secondary-s");
+        let edited = "!// Привет, мир\r\nfn main() {}\r\n";
+        saved(cx, "old.rs", encode(edited, Encoding::Windows1251).unwrap());
+        // A letter the encoding has no byte for: the file is not saved,
+        // and the reason is above the text.
+        cx.simulate_input("é");
+        cx.simulate_keystrokes("secondary-s");
+        wait_for(cx, "the reason", &|cx| state(cx).2.is_some());
+        let reason = cx.read(|cx| state(cx)).2.unwrap();
+        assert_eq!(
+            reason,
+            "Not saved: 'é' cannot be written in Windows-1251. Save with another encoding."
+        );
+        bounds_soon(cx, "file-notice-0");
+        assert!(cx.read(|cx| editor.read(cx).doc(cx).is_dirty()));
+        assert_eq!(
+            std::fs::read(root.join("old.rs")).unwrap(),
+            encode(edited, Encoding::Windows1251).unwrap()
+        );
+        // Saved with another encoding, chosen from the list: the reason
+        // goes, and the endings of its lines stay.
+        cx.dispatch_action(SaveWithEncoding);
+        wait_for(cx, "the list", &|cx| ws.read(cx).modal.is_some());
+        cx.simulate_input("utf");
+        cx.simulate_keystrokes("enter");
+        saved(
+            cx,
+            "old.rs",
+            "!é// Привет, мир\r\nfn main() {}\r\n".as_bytes().to_vec(),
+        );
+        assert_eq!(
+            cx.read(|cx| state(cx)),
+            (Encoding::Utf8, LineEnding::CrLf, None)
+        );
+        assert_eq!(bar(cx), ["CRLF"]);
+        // The endings are changed by a command, which leaves the file to
+        // be saved.
+        cx.dispatch_action(UseLfLineEndings);
+        assert!(cx.read(|cx| editor.read(cx).doc(cx).is_dirty()));
+        cx.simulate_keystrokes("secondary-s");
+        saved(
+            cx,
+            "old.rs",
+            "!é// Привет, мир\nfn main() {}\n".as_bytes().to_vec(),
+        );
+        assert!(bar(cx).is_empty());
+
+        // Read again as written in something else, from what is on disk.
+        std::fs::write(
+            root.join("guess.txt"),
+            encode("тест\n", Encoding::Windows1251).unwrap(),
+        )
+        .unwrap();
+        open(cx, "guess.txt");
+        cx.dispatch_action(ReopenWithEncoding);
+        wait_for(cx, "the list", &|cx| ws.read(cx).modal.is_some());
+        cx.simulate_input("1252");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the file read again", &|cx| {
+            state(cx).0 == Encoding::Windows1252
+        });
+        assert_eq!(active_text(&ws, cx), "òåñò\n");
+
+        // Two bytes a letter, with its mark: kept through an edit.
+        std::fs::write(
+            root.join("wide.txt"),
+            encode("wide 行\n", Encoding::Utf16Le).unwrap(),
+        )
+        .unwrap();
+        open(cx, "wide.txt");
+        assert_eq!(active_text(&ws, cx), "wide 行\n");
+        cx.simulate_input("x");
+        cx.simulate_keystrokes("secondary-s");
+        saved(
+            cx,
+            "wide.txt",
+            encode("xwide 行\n", Encoding::Utf16Le).unwrap(),
+        );
+
+        // No text at all: shown, with the reason it is not edited.
+        std::fs::write(root.join("tool.bin"), b"\x7FELF\0\x01\x02\xFF").unwrap();
+        let binary = open(cx, "tool.bin");
+        let reason = cx.read(|cx| state(cx)).2.unwrap();
+        assert!(reason.starts_with("This is not a text file"), "{reason}");
+        cx.simulate_input("x");
+        assert_eq!(cx.read(|cx| binary.read(cx).text(cx)).chars().count(), 8);
+        cx.simulate_keystrokes("secondary-s");
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read(root.join("tool.bin")).unwrap(),
+            b"\x7FELF\0\x01\x02\xFF"
+        );
+
+        // Too large to edit: read, and said. The size that is too large
+        // is given here, so the test needs no file of that size.
+        let large = crate::document::Loaded::within(&[b'a'; 2048], 1024);
+        assert_eq!(
+            large.read_only.as_deref(),
+            Some("This file is 2 KB: too large to edit. It is open for reading.")
+        );
+        ws.update_in(cx, |w, window, cx| {
+            w.add_loaded(root.join("large.txt"), &large, None, window, cx)
+        });
+        cx.simulate_input("x");
+        assert_eq!(active_text(&ws, cx).len(), 2048);
+        assert!(
+            cx.read(|cx| state(cx))
+                .2
+                .unwrap()
+                .contains("too large to edit")
+        );
     }
 
     /// A pinned tab is kept before the others and is not closed by the

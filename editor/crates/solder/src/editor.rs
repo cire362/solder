@@ -344,6 +344,15 @@ pub type SchemaSource = std::rc::Rc<dyn Fn(&App) -> Option<(db::Engine, Arc<db::
 
 impl Editor {
     /// An editor on a new document.
+    /// An editor of a file as it was read from disk.
+    pub fn open(path: PathBuf, loaded: &crate::document::Loaded, cx: &mut Context<Self>) -> Self {
+        let document = cx.new(|cx| Document::open(path, loaded, cx));
+        crate::lsp_store::LspStore::register(&document, cx);
+        crate::plugin_store::PluginStore::register(&document, cx);
+        crate::extension_store::ExtensionStore::register(&document, cx);
+        Self::for_document(document, cx)
+    }
+
     pub fn new(path: Option<PathBuf>, content: &str, cx: &mut Context<Self>) -> Self {
         let has_path = path.is_some();
         let document = cx.new(|cx| Document::new(path, content, cx));

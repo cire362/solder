@@ -67,6 +67,28 @@ takes as many as it is wide, and a corner may be past the end of its line.
 A line that ends before the left edge gets no cursor, unless the rectangle
 has no width yet.
 
+A file is **saved as it was written**. It is read in the encoding it is
+in and saved in that one: UTF-8 with or without its mark, UTF-16 with its
+mark, Windows-1251 and Windows-1252. The last two give a character for
+every byte, so a file in another single-byte encoding is shown with the
+wrong letters and still saved byte for byte as it was read. What a file
+that is not UTF-8 is in is told by its letters: words of them are Cyrillic,
+single ones among ASCII letters are Western. Where that is wrong,
+**Workspace: Reopen with encoding** reads the file again as another, and
+**Workspace: Save with encoding** saves it as another from then on. A
+letter the encoding has no byte for is never written as another one: the
+file is not saved, and a line above the text says which letter. Lines end
+in the file as they did: a file with both endings keeps the one most of
+its lines have. **Workspace: Use LF line endings** and **Use CRLF line
+endings** change it. The status bar names the encoding and `CRLF` where
+they are not UTF-8 and LF.
+
+A file that is no text (it has a zero byte) is shown and cannot be edited,
+and so is one larger than 64 MB; one larger than 512 MB is not read. The
+line above the text says which and why. Edits a language server or an
+extension makes to a file that is not open are written in that file's own
+encoding too.
+
 A tab can be **pinned** (`cmd-k shift-enter`, or **Workspace: Toggle pin
 tab** in the palette): it goes before the tabs that are not, shows a pin
 where they have their cross, and `cmd-w` and the middle button leave it
@@ -1262,7 +1284,7 @@ applied as soon as it is saved.
   "tab_bar": { "height": 34, "place": "top" },
   "status_bar": {
     "height": 26,
-    "left": ["position", "indent", "language", "problems", "activity", "connection"],
+    "left": ["position", "indent", "encoding", "language", "problems", "activity", "connection"],
     "right": ["extensions", "plugins", "performance"]
   },
   "hidden": [],
@@ -1337,6 +1359,7 @@ such as the branch, keep their actions after moving.
 | `branch` | the branch; a click opens the list of branches |
 | `position` | the line and column of the cursor, and how many cursors |
 | `indent` | spaces or tabs, and how many |
+| `encoding` | what the file is written in and `CRLF`, each only where it is not the usual (UTF-8, lines ending with LF); a click opens the list of encodings |
 | `language` | the language of the file |
 | `problems` | how many errors and warnings the file has |
 | `activity` | a language server starting, files being read |

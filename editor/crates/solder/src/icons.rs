@@ -270,6 +270,7 @@ pub fn item(item: &Item) -> &'static str {
         Item::Branch => "git-branch",
         Item::Position => "cursor-text",
         Item::Indent => "text-indent",
+        Item::Encoding => "file",
         Item::Language => "code",
         Item::Problems => "warning-circle",
         Item::Activity => "spinner-gap",

@@ -406,8 +406,11 @@ update. They come after phase 9, in this order unless one is needed sooner.
       split panes, cursors and scroll positions return per project, along
       with notebooks and pages whose extensions provide a serializer
 - [ ] Unsaved text kept aside as it is typed and offered back after a crash
-- [ ] Line endings and encoding of a file kept as they were; files too large
-      to edit opened for reading, with the reason said
+- [x] Line endings and encoding of a file kept as they were; files too large
+      to edit opened for reading, with the reason said. The encodings are
+      UTF-8, UTF-16 and two single-byte ones written here, with no
+      dependency: any other single-byte file is saved byte for byte but
+      shown with the wrong letters
 
 ### Symbols and problems
 - [x] Symbols of the file (`cmd-shift-o`) and of the project (`cmd-t`), from

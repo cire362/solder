@@ -75,6 +75,12 @@ Never guess a signature.
 - `Document` (`document.rs`) owns a file: text, syntax tree, undo history,
   diagnostics. `Editor` (`editor.rs`) is a *view* of a document: selections,
   scroll, popovers. Several editors can show one document (split panes).
+- A file an editor shows is read with `document::load`, never with
+  `from_utf8_lossy`: it finds what the file is written in
+  (`text::encoding`), and the document saves in that same encoding. A
+  character the encoding has no byte for stops the save and is said
+  (`Document::notice`); it is not replaced. Code that edits a file on
+  disk without opening it reads and writes the same way.
 - Edits go through `Document::edit`/`apply_edits` with the `EntityId` of the
   **editor** that made them as `origin`. Passing the document's id made the
   editor move its own cursor twice; this bug happened once.

@@ -278,7 +278,7 @@ impl Workspace {
             let read = cx.background_executor().spawn(async move {
                 let saved = read(&path, &root)?;
                 let files = saved.panes.iter().map(|pane| pane.iter().map(|file| {
-                    std::fs::read(&file.path).ok().map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    crate::document::load(&file.path).ok()
                 }).collect::<Vec<_>>()).collect::<Vec<_>>();
                 Some((saved, files))
             }).await;
@@ -303,7 +303,7 @@ impl Workspace {
                         let document = this.document_for_path(&file.path, cx);
                         let editor = match document {
                             Some(document) => cx.new(|cx| Editor::for_document(document, cx)),
-                            None => cx.new(|cx| Editor::new(Some(file.path.clone()), &text, cx)),
+                            None => cx.new(|cx| Editor::open(file.path.clone(), &text, cx)),
                         };
                         // Reuse a CLI-opened view instead of duplicating it.
                         let known = this.panes[pane].tabs.iter().position(|tab| tab.editor.read(cx).path(cx) == Some(file.path.as_path()));
