@@ -271,7 +271,7 @@ impl Page {
         // The windows of tests are backed by no window of the system, and
         // asking one for its handle panics: no browser is made in tests,
         // where a page is its model and what is sent to it.
-        if cfg!(test) || window.window_handle().is_err() {
+        if cfg!(test) || HasWindowHandle::window_handle(window).is_err() {
             return;
         }
         match self.build(rectangle, window) {
@@ -287,7 +287,9 @@ impl Page {
         #[cfg(target_os = "linux")]
         {
             if !matches!(
-                window.window_handle().map(|h| h.as_raw()),
+                // The system's handle, by the trait's name: called as a
+                // method, a window gives GPUI's own handle of the same name.
+                HasWindowHandle::window_handle(window).map(|h| h.as_raw()),
                 Ok(wry::raw_window_handle::RawWindowHandle::Xlib(_)
                     | wry::raw_window_handle::RawWindowHandle::Xcb(_))
             ) {
