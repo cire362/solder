@@ -304,6 +304,8 @@ package; generated tests and repeated names may have no source jump. Cargo
 doctests, custom harnesses, nested Go modules and Python pytest are not built-in
 runners here. Output keeps at most 1 MB per stream and displays its first 2,000
 lines. Extension test runners keep their own discovery and run profiles.
+Long output lines are clipped to the panel width; hover to read the full line.
+Python's internal result messages are kept out of the displayed output.
 
 A discovery whose output exceeds the limit is reported as incomplete rather
 than silently offering only part of the test list. In `unittest`, expected
