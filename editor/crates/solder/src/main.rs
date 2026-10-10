@@ -115,6 +115,9 @@ fn main() {
     // Read the file before the window exists, so the first frame is already
     // an editable file rather than an empty workspace.
     let initial = file.and_then(|path| {
+        if path.extension().is_some_and(|ext| ext == "ipynb") {
+            return Some((path, String::new()));
+        }
         let bytes = std::fs::read(&path).ok()?;
         Some((path, String::from_utf8_lossy(&bytes).into_owned()))
     });
@@ -189,6 +192,7 @@ pub fn open_workspace_window(
                     }
                 });
             }
+            workspace.update(cx, |w, cx| w.start_session(window, cx));
             workspace
         },
     )

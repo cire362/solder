@@ -990,6 +990,15 @@ unknown fields when editing and saving. It does not start a kernel: reading
 and saving a Jupyter file is independent of running its cells. A file over
 64 MB is refused with a reason.
 
+Files, split panes, cursors, scroll positions and notebook tabs are remembered
+per project in `sessions/` beside the settings. Pages of extensions return
+through `registerWebviewPanelSerializer`, with the last `setState` value;
+a custom editor is reopened through its provider. Extensions whose code is
+not allowed are not started for restoration. Missing files are skipped.
+Untitled text and terminal sessions are not restored, and this is not a
+backup of unsaved edits. State is written off the UI thread, in order, once
+per second when it changed and when the window closes.
+
 Which extensions work is not claimed from the list above: it is found out.
 With each release the fifty most installed extensions of Open VSX are
 installed, their code is started with a made-up project to look at, and

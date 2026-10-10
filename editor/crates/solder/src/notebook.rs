@@ -194,6 +194,10 @@ impl Notebook {
         self.dirty
     }
 
+    pub(crate) fn reader(&self) -> (String, String) {
+        (self.extension.clone(), self.kind.clone())
+    }
+
     pub fn is(&self, path: &Path, extension: &str, kind: &str) -> bool {
         self.path == path && self.extension == extension && self.kind == kind
     }

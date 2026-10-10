@@ -9,7 +9,7 @@ use gpui::{
     App, Bounds, Context, Element, ElementId, Entity, GlobalElementId, InspectorElementId,
     IntoElement, LayoutId, Pixels, Style, Window, div, prelude::*, relative,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
@@ -27,15 +27,18 @@ pub type Key = (String, String);
 const PAGE_LIMIT: usize = 8 * 1024 * 1024;
 const RESOURCE_LIMIT: u64 = 32 * 1024 * 1024;
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Options {
     enable_scripts: bool,
     local_resource_roots: Vec<PathBuf>,
 }
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Model {
+    pub view_type: String,
+    pub document_uri: Option<String>,
+    pub initial_state: Value,
     pub title: String,
     pub html: String,
     pub column: i32,
@@ -86,6 +89,13 @@ pub struct Page {
 }
 
 impl Page {
+    pub(crate) fn state(&self) -> Value {
+        self.source.lock().unwrap().state.clone()
+    }
+
+    pub(crate) fn options(&self) -> Value {
+        serde_json::to_value(&self.model.options).unwrap_or_default()
+    }
     pub fn new(key: Key, model: Model, cx: &mut Context<Self>) -> Self {
         let (sender, inbox) = mpsc::sync_channel(128);
         cx.on_release(|page, cx| {
@@ -114,6 +124,7 @@ impl Page {
             key,
             model: model.clone(),
             source: Arc::new(Mutex::new(Source {
+                state: model.initial_state.clone(),
                 model,
                 ..Default::default()
             })),

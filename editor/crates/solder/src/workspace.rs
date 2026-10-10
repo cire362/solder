@@ -208,6 +208,9 @@ struct Tab {
     _subscriptions: [Subscription; 2],
 }
 
+#[path = "session.rs"]
+mod session;
+
 /// A column of tabs. The workspace lays panes out left to right.
 #[derive(Default)]
 struct Pane {
@@ -276,6 +279,9 @@ pub struct Workspace {
     panes: Vec<Pane>,
     active_pane: usize,
     recent: VecDeque<Arc<str>>,
+    session_writer: Option<session::Writer>,
+    _session_tick: Option<Task<()>>,
+    restoring: bool,
     /// The panel each dock shows; `None` for a dock that is closed. Which
     /// dock a panel is in is the layout's to say.
     left: Option<Panel>,
@@ -758,6 +764,9 @@ impl Workspace {
             panes: vec![Pane::default()],
             active_pane: 0,
             recent: VecDeque::new(),
+            session_writer: None,
+            _session_tick: None,
+            restoring: false,
             left,
             right,
             bottom,
@@ -1158,6 +1167,15 @@ impl Workspace {
             .cloned()
             .collect();
         if dirty.is_empty() && books.is_empty() {
+            if self.session_writer.is_some() {
+                let saved = self.keep_session(cx);
+                cx.spawn_in(window, async move |_, cx| {
+                    saved.await;
+                    cx.update(|window, _| window.remove_window()).ok();
+                })
+                .detach();
+                return false;
+            }
             return true;
         }
         let message = match (dirty.as_slice(), books.as_slice()) {
@@ -1205,6 +1223,10 @@ impl Workspace {
                 _ => false,
             };
             if close {
+                let saved = this.update(cx, |this, cx| this.keep_session(cx));
+                if let Ok(saved) = saved {
+                    saved.await;
+                }
                 this.update_in(cx, |this, window, cx| {
                     // Nothing left to ask about; close for real.
                     this.panes = vec![Pane::default()];
@@ -13242,6 +13264,83 @@ exports.activate = (context) => {
         });
         cx.run_until_parked();
         assert_eq!(cx.read(|cx| pages(cx)), (Vec::new(), None));
+    }
+
+    #[gpui::test]
+    fn project_tabs_and_cursors_are_restored_with_missing_files_skipped(cx: &mut TestAppContext) {
+        let root = fixture("session-tabs");
+        let saved = db::testing::dir("session-state").join("session.json");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(
+                Some(root.join("src/main.rs")),
+                "fn main() {}",
+                None,
+                window,
+                cx,
+            );
+            w.active_editor()
+                .unwrap()
+                .update(cx, |e, cx| e.select_ranges(&[3..3, 8..10], cx));
+            w.split_right(&SplitRight, window, cx);
+            w.add_editor(Some(root.join("README.md")), "readme", None, window, cx);
+            w.add_editor(Some(root.join("gone.txt")), "gone", None, window, cx);
+            w.activate(1, 1, window, cx);
+        });
+        let snapshot = cx.read(|cx| ws.read(cx).snapshot(cx));
+        std::fs::write(&saved, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        ws.update_in(cx, |w, window, cx| {
+            w.panes = vec![Pane::default()];
+            w.active_pane = 0;
+            w.restore_session(saved.clone(), window, cx);
+        });
+        wait_for(cx, "restored tabs", &|cx| !ws.read(cx).restoring);
+        assert_eq!(
+            cx.read(|cx| ws
+                .read(cx)
+                .panes
+                .iter()
+                .map(|p| p.tabs.len())
+                .collect::<Vec<_>>()),
+            [1, 2]
+        );
+        assert_eq!(
+            cx.read(|cx| ws
+                .read(cx)
+                .active_editor()
+                .unwrap()
+                .read(cx)
+                .doc(cx)
+                .title()),
+            "README.md"
+        );
+        let cursors = cx.read(|cx| {
+            ws.read(cx).panes[0].tabs[0]
+                .editor
+                .read(cx)
+                .selections
+                .clone()
+        });
+        assert_eq!(
+            cursors
+                .iter()
+                .map(|s| (s.anchor, s.head))
+                .collect::<Vec<_>>(),
+            [(3, 3), (8, 10)]
+        );
+        // A project never restores another project's paths, even if a
+        // copied state file has the right file name.
+        ws.update_in(cx, |w, window, cx| {
+            let mut value = serde_json::to_value(&snapshot).unwrap();
+            value["root"] = "another-project".into();
+            std::fs::write(&saved, serde_json::to_vec(&value).unwrap()).unwrap();
+            w.restore_session(saved, window, cx);
+        });
+        wait_for(cx, "the other project to be ignored", &|cx| {
+            !ws.read(cx).restoring
+        });
+        assert_eq!(cx.read(|cx| ws.read(cx).panes[1].tabs.len()), 2);
     }
 
     #[gpui::test]

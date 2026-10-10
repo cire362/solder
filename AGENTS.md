@@ -108,6 +108,12 @@ Never guess a signature.
   of a server Solder knows; options are read once, at the start, so such a
   server is started again (`LspStore::restart`) when they change, and a
   start that finishes after a later one began is dropped.
+- Project tabs and view positions are kept by `workspace::session` in the
+  settings folder. Its writer serializes disk writes on one thread; reads
+  and file loads are off the UI thread too. Extension pages are restored
+  through their serializers, never by replaying old HTML, and permission
+  to run an extension is still checked. Missing files are skipped; this is
+  not a backup of unsaved text.
 - Language-server requests triggered by typing must run after the current
   effect cycle (`cx.defer`), so the `didChange` for what was just typed
   reaches the server first. See `Editor::after_typing`.

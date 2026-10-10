@@ -1493,6 +1493,12 @@ exports.activate = (context) => {
   const log = (...all) => out.appendLine(all.map((one) => (typeof one === 'string' ? one : JSON.stringify(one))).join(' '));
   let panel;
   context.subscriptions.push(
+    vscode.window.registerWebviewPanelSerializer('demo.saved', {
+      async deserializeWebviewPanel(page, state) {
+        page.webview.html = `<p>restored ${state.count}</p>`;
+        log('restored', state);
+      },
+    }),
     vscode.commands.registerCommand('demo.page', () => {
       panel = vscode.window.createWebviewPanel('demo.page', 'Demo page', vscode.ViewColumn.Two,
         { enableScripts: true, localResourceRoots: [context.extensionUri] });
@@ -1553,17 +1559,34 @@ exports.activate = (context) => {
             .any(|(method, params)| method == "view" && params["kind"] == "webview");
         assert!(listed && pages().is_empty());
 
+        assert!(
+            host.request("webview.restore", json!({"viewType":"unknown"}), SOON)
+                .is_err()
+        );
+        host.request(
+            "webview.restore",
+            json!({"viewType":"demo.saved","title":"Saved","state":{"count":7}}),
+            SOON,
+        )
+        .unwrap();
+        written(&said, r#"restored {"count":7}"#);
+        assert_eq!(pages().last().unwrap()["html"], "<p>restored 7</p>");
+        host.notify("webview.closed", json!({"id":"page1"}));
+        // The next test's page names are relative to the first created.
         // A page: what it is called, where it goes, what it may do, and
         // then its text. What it may read is under a name of its own.
         host.request("executeCommand", json!({ "id": "demo.page" }), SOON)
             .unwrap();
-        written(&said, "uri true page1 solder-resource://page1");
-        let made = pages();
+        written(&said, "uri true page2 solder-resource://page2");
+        let made = pages()
+            .into_iter()
+            .filter(|page| page["id"] == "page2")
+            .collect::<Vec<_>>();
         let folder = dir.join("ext").display().to_string();
         assert_eq!(
             made[0],
             json!({
-                "id": "page1", "viewType": "demo.page", "title": "Demo page", "column": 2, "html": "",
+                "id": "page2", "viewType": "demo.page", "title": "Demo page", "column": 2, "html": "",
                 "options": { "enableScripts": true, "localResourceRoots": [folder] },
             })
         );
@@ -1575,22 +1598,22 @@ exports.activate = (context) => {
             .iter()
             .find(|(method, _)| method == "webview.post")
             .map(|(_, params)| params.clone());
-        assert_eq!(post, Some(json!({ "id": "page1", "message": { "n": 1 } })));
+        assert_eq!(post, Some(json!({ "id": "page2", "message": { "n": 1 } })));
         host.notify(
             "webview.message",
-            json!({ "id": "page1", "message": { "hi": 1 } }),
+            json!({ "id": "page2", "message": { "hi": 1 } }),
         );
         written(&said, r#"got {"hi":1}"#);
         host.notify(
             "webview.state",
-            json!({ "id": "page1", "visible": false, "active": false }),
+            json!({ "id": "page2", "visible": false, "active": false }),
         );
         written(&said, "state false false");
-        host.notify("webview.closed", json!({ "id": "page1" }));
+        host.notify("webview.closed", json!({ "id": "page2" }));
         written(&said, "disposed");
         assert_eq!(
             pages().last(),
-            Some(&json!({ "id": "page1", "gone": true }))
+            Some(&json!({ "id": "page2", "gone": true }))
         );
         // Gone, it takes no more messages.
         let posted = host.request("executeCommand", json!({ "id": "demo.post" }), SOON);

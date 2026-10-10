@@ -283,7 +283,7 @@ to build them.
       browser is made when the first page opens. A notebook is not a
       page: a tab of cells drawn by Solder, each cell an editor, with the
       words and pictures its run put out under it; the extension reads,
-      runs and writes it. Not there: pages kept across restarts, pages on
+      runs and writes it. Pages return through their serializer. Not there: pages on
       Wayland, outputs of a notebook that are pages of their own (HTML,
       widgets), running Jupyter kernels. Format 4 `.ipynb` files are read and saved by
       the editor, with metadata, attachments and outputs preserved
@@ -399,8 +399,9 @@ update. They come after phase 9, in this order unless one is needed sooner.
 ### The editor
 - [ ] Folding of blocks, indent guides, lines wrapped at the window's edge
 - [ ] Selection by column (a rectangle of cursors)
-- [ ] Tabs and cursors restored when a project is opened again; pinned tabs;
-      the tab closed last opened again (`cmd-shift-t`)
+- [ ] Pinned tabs; the tab closed last opened again (`cmd-shift-t`). Tabs,
+      split panes, cursors and scroll positions now return per project,
+      along with notebooks and pages whose extensions provide a serializer
 - [ ] Unsaved text kept aside as it is typed and offered back after a crash
 - [ ] Line endings and encoding of a file kept as they were; files too large
       to edit opened for reading, with the reason said

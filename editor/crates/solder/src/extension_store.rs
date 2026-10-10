@@ -1209,7 +1209,15 @@ impl ExtensionStore {
             });
             // Read-only providers can return a never-resolving promise while
             // their host still answers pings. Commands may wait for input.
-            if matches!(method, "view.children" | "view.refresh" | "files.decorate") {
+            if matches!(
+                method,
+                "view.children"
+                    | "view.refresh"
+                    | "files.decorate"
+                    | "webview.restore"
+                    | "customEditor.open"
+                    | "notebook.open"
+            ) {
                 match futures::future::select(rx, executor.timer(Duration::from_secs(30))).await {
                     futures::future::Either::Left((answer, _)) => {
                         answer.unwrap_or_else(|_| Err(STOPPED.into()))
