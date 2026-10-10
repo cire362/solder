@@ -166,6 +166,24 @@ found again a quarter of a second after the file last changed, and not at
 all while neither the panel nor the breadcrumbs are on screen. Up to 5000
 symbols of a file are kept.
 
+## Problems
+
+**Show problems** (in the palette, the **Problems** tab of the bottom dock,
+or a click on the count of problems in the status bar) lists what the
+language servers report of the project's files, by file: errors, warnings
+and the rest, in the order they are in each file. A file need not be open
+to be in the list. A server says what it finds in the files it read itself,
+and those reports used to be dropped for every file that had no tab. A
+click on a problem, or Enter on it, opens its file with the cursor on what
+the server pointed at; a click on a file's row, or the left and right
+arrows, folds its problems away and brings them back.
+
+The list is what servers said last, each server's own apart: a server that
+stops takes its problems with it. It is read only while its tab is in
+front. Up to 500 problems of a file from one server and 2000 files are
+kept. The dock does not stay open for this list alone: closing the last
+terminal closes the dock as before.
+
 ## Review changes
 
 Open the Git sidebar with `ctrl-shift-g` and click a file to compare both versions.
@@ -1346,7 +1364,7 @@ applied as soon as it is saved.
     "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions", "extension_views", "structure"]
   },
   "right": { "width": 380, "panels": ["chat", "agent"] },
-  "bottom": { "height": 280, "panels": ["terminal", "debug", "response", "results"] },
+  "bottom": { "height": 280, "panels": ["terminal", "problems", "debug", "response", "results"] },
   "title_bar": { "height": 38, "left": ["project", "breadcrumbs"], "right": [] },
   "tab_bar": { "height": 34, "place": "top" },
   "status_bar": {

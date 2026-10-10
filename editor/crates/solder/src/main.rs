@@ -61,6 +61,7 @@ mod perf;
 mod picker;
 mod plugin_store;
 mod plugins_view;
+mod problems_panel;
 mod project;
 mod project_panel;
 mod project_search;

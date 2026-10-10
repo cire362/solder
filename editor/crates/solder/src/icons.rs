@@ -248,6 +248,7 @@ pub fn panel(panel: Panel) -> &'static str {
         Panel::Extensions => "puzzle-piece",
         Panel::ExtensionViews => "puzzle-piece",
         Panel::Structure => "list",
+        Panel::Problems => "warning-circle",
         Panel::Chat => "chat-circle",
         Panel::Agent => "robot",
         Panel::Terminal => "terminal-window",

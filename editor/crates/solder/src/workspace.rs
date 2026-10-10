@@ -103,6 +103,7 @@ actions!(
         ShowExtensions,
         ShowExtensionViews,
         ShowStructure,
+        ShowProblems,
         ImportSettings,
         ToggleChat,
         ShowAgent,
@@ -268,6 +269,7 @@ pub struct Workspace {
     extensions_panel: Entity<crate::extensions_panel::ExtensionsPanel>,
     extension_views: Entity<crate::extension_views::ExtensionViews>,
     structure_panel: Entity<crate::outline::StructurePanel>,
+    problems_panel: Entity<crate::problems_panel::ProblemsPanel>,
     /// The outline of the file in front, for the Structure panel and
     /// the breadcrumbs: found only while one of them is on screen.
     outline: Arc<Vec<crate::outline::Node>>,
@@ -473,6 +475,18 @@ impl Workspace {
         let extension_views =
             cx.new(|cx| crate::extension_views::ExtensionViews::new(extensions.clone(), cx));
         let structure_panel = cx.new(crate::outline::StructurePanel::new);
+        let problems_panel = {
+            let root = project.read(cx).root().to_path_buf();
+            cx.new(|cx| crate::problems_panel::ProblemsPanel::new(root, cx))
+        };
+        let problems_events = cx.subscribe_in(
+            &problems_panel,
+            window,
+            |this, _, event: &crate::problems_panel::ProblemsEvent, window, cx| {
+                let crate::problems_panel::ProblemsEvent::Open(path, jump) = event;
+                this.open_path(path.clone(), Some(jump.clone()), window, cx);
+            },
+        );
         let structure_events = cx.subscribe_in(
             &structure_panel,
             window,
@@ -763,11 +777,14 @@ impl Workspace {
         ];
         let mut subscriptions = subscriptions;
         subscriptions.push(structure_events);
+        subscriptions.push(problems_events);
         if let Some(store) = LspStore::global(cx) {
             subscriptions.push(cx.subscribe(&store, |this, _, event, cx| match event {
                 crate::lsp_store::LspStoreEvent::ApplyEdit { edit, encoding } => {
                     this.apply_workspace_edit(edit.clone(), *encoding, cx)
                 }
+                // The panel of them hears it itself.
+                crate::lsp_store::LspStoreEvent::ProblemsChanged => {}
             }));
         }
         let this = cx.weak_entity();
@@ -846,6 +863,7 @@ impl Workspace {
             extensions_panel,
             extension_views,
             structure_panel,
+            problems_panel,
             outline: Arc::default(),
             outline_of: None,
             outline_wanted: None,
@@ -1855,15 +1873,16 @@ impl Workspace {
     }
 
     /// A panel has nothing left to show. The dock that showed it shows
-    /// the first of its panels that has, or closes.
+    /// the first of its panels that has, or closes. The list of problems
+    /// is always there to be opened, and is not what a dock stays open
+    /// for: the last terminal closed closes the dock.
     fn panel_gone(&mut self, panel: Panel, cx: &mut Context<Self>) {
         for place in Place::ALL {
             if *self.dock(place) == Some(panel) {
-                let next = Layout::get(cx)
-                    .panels(place)
-                    .iter()
-                    .copied()
-                    .find(|other| *other != panel && self.available(*other));
+                let stays = |other: &Panel| {
+                    *other != panel && *other != Panel::Problems && self.available(*other)
+                };
+                let next = Layout::get(cx).panels(place).iter().copied().find(stays);
                 *self.dock(place) = next;
                 self.docks_changed(next, cx);
             }
@@ -1883,6 +1902,7 @@ impl Workspace {
             Panel::Extensions => self.extensions_panel.focus_handle(cx),
             Panel::ExtensionViews => self.extension_views.focus_handle(cx),
             Panel::Structure => self.structure_panel.focus_handle(cx),
+            Panel::Problems => self.problems_panel.focus_handle(cx),
             Panel::Chat => self.chat.focus_handle(cx),
             Panel::Agent => self.agent.focus_handle(cx),
             Panel::Debug => self.debug_panel.focus_handle(cx),
@@ -2443,6 +2463,9 @@ impl Workspace {
     fn tell_panels(&mut self, now: Option<Panel>, cx: &mut Context<Self>) {
         let visible = self.shown(Panel::ExtensionViews);
         self.extension_views
+            .update(cx, |p, cx| p.set_visible(visible, cx));
+        let visible = self.shown(Panel::Problems);
+        self.problems_panel
             .update(cx, |p, cx| p.set_visible(visible, cx));
         let visible = self.shown(Panel::Services);
         self.services.update(cx, |s, cx| s.set_visible(visible, cx));
@@ -3375,6 +3398,11 @@ impl Workspace {
         self.toggle_modal(window, cx, move |_, cx| {
             crate::plugins_view::PluginsView::new(store, cx)
         });
+    }
+
+    fn show_problems(&mut self, _: &ShowProblems, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_panel(Panel::Problems, cx);
+        window.focus(&self.problems_panel.focus_handle(cx));
     }
 
     fn show_structure(&mut self, _: &ShowStructure, window: &mut Window, cx: &mut Context<Self>) {
@@ -5528,6 +5556,7 @@ impl Workspace {
                                 this.show_extension_views(&ShowExtensionViews, window, cx)
                             }
                             Panel::Structure => this.show_structure(&ShowStructure, window, cx),
+                            Panel::Problems => this.show_problems(&ShowProblems, window, cx),
                             Panel::Chat => this.show_right(false, window, cx),
                             Panel::Agent => this.show_right(true, window, cx),
                             _ => {}
@@ -5610,6 +5639,7 @@ impl Workspace {
                     Panel::Extensions => d.pt_1().child(self.extensions_panel.clone()),
                     Panel::ExtensionViews => d.child(self.extension_views.clone()),
                     Panel::Structure => d.child(self.structure_panel.clone()),
+                    Panel::Problems => d.child(self.problems_panel.clone()),
                     Panel::Chat => d.pt_1().child(self.chat.clone()),
                     Panel::Agent => d.pt_1().child(self.agent.clone()),
                     Panel::Debug => d.child(self.debug_panel.clone()),
@@ -5815,7 +5845,15 @@ impl Workspace {
                         crate::editor_lsp::diagnostic_counts(e.read(cx).doc(cx));
                     crate::editor_lsp::status_text(errors, warnings)
                 })
-                .map(|text| says(text.to_string()))
+                // A click opens the list of the whole project's.
+                .map(|text| {
+                    does(
+                        ("item-problems", 0),
+                        text.to_string(),
+                        theme.fg_muted,
+                        Box::new(ShowProblems),
+                    )
+                })
                 .into_iter()
                 .collect(),
             Item::Activity => {
@@ -6310,6 +6348,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_extensions))
             .on_action(cx.listener(Self::show_extension_views))
             .on_action(cx.listener(Self::show_structure))
+            .on_action(cx.listener(Self::show_problems))
             .on_action(cx.listener(Self::import_settings))
             .on_action(cx.listener(Self::debug_start))
             .on_action(cx.listener(Self::debug_pick))
@@ -6893,6 +6932,116 @@ mod tests {
         cx.run_until_parked();
         wait_for(cx, "an empty list", &|cx| listed(cx).is_empty());
         assert!(crumbs(cx).is_empty());
+    }
+
+    /// The Problems panel lists what the servers report of the project's
+    /// files, the ones that are not open too, and goes to a problem.
+    #[gpui::test]
+    fn the_problems_of_the_project_are_listed_by_file(cx: &mut TestAppContext) {
+        let root = fixture("problems");
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        let file = root.join("src/main.rs");
+        std::fs::write(
+            &file,
+            "fn helper() {}\n// TODO fix\nboom\n// mock: elsewhere\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/elsewhere.rs"),
+            "fn a() {}\n\nlet wrong = 1;\n",
+        )
+        .unwrap();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        cx.update(|_, cx| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "rust-analyzer".into(),
+                settings::ServerOverride {
+                    command: Some("python3".into()),
+                    args: Some(vec![script.display().to_string()]),
+                    ..Default::default()
+                },
+            );
+            cx.set_global(settings);
+        });
+        ws.update_in(cx, |w, window, cx| {
+            let content = std::fs::read_to_string(&file).unwrap();
+            w.add_editor(Some(file.clone()), &content, None, window, cx)
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let panel = cx.read(|cx| ws.read(cx).problems_panel.clone());
+        let listed = |cx: &App| panel.read(cx).shown();
+        wait_for(cx, "the diagnostics", &|cx| {
+            editor.read(cx).doc(cx).diagnostics().len() == 2
+        });
+        // While its tab is not in front the list is not kept up.
+        assert!(cx.read(|cx| listed(cx)).is_empty());
+
+        // Shown, it has both files: the open one with its two problems in
+        // the order they are in it, and one that was never opened.
+        cx.dispatch_action(ShowProblems);
+        wait_for(cx, "the problems", &|cx| listed(cx).len() == 5);
+        assert_eq!(
+            cx.read(|cx| listed(cx)),
+            [
+                "src/elsewhere.rs: 1 errors, 0 warnings, 0 others",
+                "  3:5 broken by the other file\nand a second line",
+                "src/main.rs: 1 errors, 1 warnings, 0 others",
+                "  2:4 found TODO",
+                "  3:1 found boom",
+            ]
+        );
+        assert!(cx.read(|cx| ws.read(cx).bottom == Some(Panel::Problems)));
+        // A click on a problem of the file that is not open opens it,
+        // with the cursor on what the server pointed at.
+        click(cx, "problem-1");
+        wait_for(cx, "the other file", &|cx| {
+            let front = ws.read(cx).active_editor();
+            front.is_some_and(|e| {
+                e.read(cx).path(cx) == Some(root.join("src/elsewhere.rs").as_path())
+            })
+        });
+        let front = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        wait_for(cx, "the cursor on it", &|cx| {
+            front.read(cx).newest_range() == (15..20)
+        });
+
+        // A file's problems are folded away by a click on it, or by the
+        // keys, and Enter on one goes to it.
+        cx.dispatch_action(ShowProblems);
+        click(cx, "problem-0");
+        assert_eq!(cx.read(|cx| listed(cx)).len(), 4);
+        cx.simulate_keystrokes("down down enter");
+        wait_for(cx, "the first file again", &|cx| {
+            let front = ws.read(cx).active_editor();
+            front.is_some_and(|e| e.read(cx).path(cx) == Some(file.as_path()))
+        });
+        assert_eq!(cx.read(|cx| editor.read(cx).newest_range()), 18..22);
+
+        // What is fixed is gone from the list as the server says so: the
+        // open file's problem, and the other file with it.
+        editor.update(cx, |editor, cx| {
+            editor.select_range(26..50, cx);
+            editor.insert("", cx);
+        });
+        wait_for(cx, "the fix", &|cx| listed(cx).len() == 2);
+        assert_eq!(
+            cx.read(|cx| listed(cx)),
+            [
+                "src/main.rs: 0 errors, 1 warnings, 0 others",
+                "  2:4 found TODO"
+            ]
+        );
+        // The count of the file in front, in the status bar, opens the
+        // list too.
+        ws.update_in(cx, |w, window, cx| {
+            w.toggle_terminal(&ToggleTerminal, window, cx)
+        });
+        cx.run_until_parked();
+        click(cx, "item-problems");
+        assert!(cx.read(|cx| ws.read(cx).bottom == Some(Panel::Problems)));
     }
 
     /// Runs the real client against `tests/fixtures/mock_lsp.py` over stdio.

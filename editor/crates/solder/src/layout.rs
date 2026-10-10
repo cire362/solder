@@ -97,6 +97,8 @@ pub enum Panel {
     ExtensionViews,
     /// The outline of the file in front.
     Structure,
+    /// What the language servers report of the project's files.
+    Problems,
     Chat,
     Agent,
     /// The terminals: each has a tab of its own where this panel is.
@@ -129,7 +131,7 @@ impl Place {
 }
 
 impl Panel {
-    pub const ALL: [Panel; 16] = [
+    pub const ALL: [Panel; 17] = [
         Panel::Files,
         Panel::Search,
         Panel::Git,
@@ -143,6 +145,7 @@ impl Panel {
         Panel::Chat,
         Panel::Agent,
         Panel::Terminal,
+        Panel::Problems,
         Panel::Debug,
         Panel::Response,
         Panel::Results,
@@ -161,6 +164,7 @@ impl Panel {
             Panel::Extensions => "Extensions",
             Panel::ExtensionViews => "Views",
             Panel::Structure => "Structure",
+            Panel::Problems => "Problems",
             Panel::Chat => "Chat",
             Panel::Agent => "Agent",
             Panel::Terminal => "Terminal",
@@ -183,6 +187,7 @@ impl Panel {
             Panel::Extensions => "extensions",
             Panel::ExtensionViews => "extension_views",
             Panel::Structure => "structure",
+            Panel::Problems => "problems",
             Panel::Chat => "chat",
             Panel::Agent => "agent",
             Panel::Terminal => "terminal",
@@ -196,7 +201,9 @@ impl Panel {
     pub fn home(self) -> Place {
         match self {
             Panel::Chat | Panel::Agent => Place::Right,
-            Panel::Terminal | Panel::Results | Panel::Response | Panel::Debug => Place::Bottom,
+            Panel::Terminal | Panel::Results | Panel::Response | Panel::Debug | Panel::Problems => {
+                Place::Bottom
+            }
             _ => Place::Left,
         }
     }
@@ -1806,7 +1813,7 @@ mod tests {
         assert!(!layout.left.panels.contains(&Git));
         let layout = layout.moved(Terminal, Place::Right, Some(Agent));
         assert_eq!(layout.right.panels, [Chat, Terminal, Agent, Git]);
-        assert_eq!(layout.bottom.panels, [Debug, Response, Results]);
+        assert_eq!(layout.bottom.panels, [Problems, Debug, Response, Results]);
         // Along its own dock.
         let layout = layout.moved(Git, Place::Right, Some(Chat));
         assert_eq!(layout.right.panels, [Git, Chat, Terminal, Agent]);
@@ -1822,7 +1829,10 @@ mod tests {
         assert_eq!(hidden.place(Chat), None);
         let back = hidden.moved(Chat, Place::Bottom, None);
         assert!(back.hidden.is_empty());
-        assert_eq!(back.bottom.panels, [Debug, Response, Results, Chat]);
+        assert_eq!(
+            back.bottom.panels,
+            [Problems, Debug, Response, Results, Chat]
+        );
         // What was open goes on being so where it is now.
         let open = parse(r#"{ "open": ["files", "chat"] }"#).unwrap();
         let moved = open.moved(Chat, Place::Bottom, None);
@@ -1897,7 +1907,10 @@ mod tests {
             ]
         );
         assert_eq!(standard.right.panels, [Chat, Agent]);
-        assert_eq!(standard.bottom.panels, [Terminal, Debug, Response, Results]);
+        assert_eq!(
+            standard.bottom.panels,
+            [Terminal, Problems, Debug, Response, Results]
+        );
         assert_eq!(standard.place(Terminal), Some(Place::Bottom));
         assert_eq!(standard.place(Git), Some(Place::Left));
         assert_eq!(standard.place(Agent), Some(Place::Right));
@@ -1929,7 +1942,10 @@ mod tests {
             ]
         );
         assert_eq!(layout.right.panels, [Search, Terminal]);
-        assert_eq!(layout.bottom.panels, [Agent, Debug, Response, Results]);
+        assert_eq!(
+            layout.bottom.panels,
+            [Agent, Problems, Debug, Response, Results]
+        );
         assert_eq!(layout.hidden, [Api, Ai]);
         assert_eq!(layout.place(Terminal), Some(Place::Right));
         assert_eq!(layout.place(Agent), Some(Place::Bottom));
@@ -1957,6 +1973,6 @@ mod tests {
         .unwrap();
         assert!(empty.left.panels.is_empty());
         assert_eq!(empty.right.panels.len(), 12);
-        assert_eq!(empty.bottom.panels.len(), 4);
+        assert_eq!(empty.bottom.panels.len(), 5);
     }
 }

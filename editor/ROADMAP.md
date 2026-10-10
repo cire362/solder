@@ -40,8 +40,12 @@ something of its own unchecked or unmade adds it here.
       the mock server, which CI has; rust-analyzer it has not. The same
       goes for the Structure panel and the breadcrumbs: the mock server's
       symbols and the outline of Rust, no real server's
-- [ ] On screen: the Structure panel and the breadcrumbs in the title
-      bar. Tested in a headless window only
+- [ ] On screen: the Structure panel, the breadcrumbs in the title bar
+      and the Problems panel. Tested in a headless window only
+- [ ] The Problems panel with a server that reports on a whole project:
+      it is tested with the mock server reporting on one file that is not
+      open. How it reads with the thousands of reports of a real build
+      was not looked at
 - [ ] A file over 64 MB (opened to be read) and one over 512 MB (not
       read): the limits are tested with a small file and a small limit
 - [ ] Memory of the editor block of phase 10: 132 MB in three runs and 140
@@ -72,6 +76,10 @@ something of its own unchecked or unmade adds it here.
       and not what it is inside of. A symbol of the breadcrumbs is not a
       place to go to by itself: a click opens the list of the file's
       symbols
+- [ ] The Problems panel has no filter (by kind, by text, the file in
+      front only) and no problems but the servers': none from a build or
+      a task's output. A problem's place in a file that is open is where
+      the server last said, not where the text has moved to since
 - [ ] A file undone back to what is on disk stays marked as changed
 - [ ] `cmd-q` quits without asking about files that are not saved. Their
       text is kept and comes back, but nothing says so before the quit
@@ -508,7 +516,8 @@ update. They come after phase 9, in this order unless one is needed sooner.
 - [x] A Structure panel: the file's outline, from the server or from the
       language's outline query. It follows the cursor; the breadcrumbs
       below read the same outline
-- [ ] A Problems panel: every diagnostic of the project, by file
+- [x] A Problems panel: every diagnostic of the project, by file, of
+      files that are not open too
 - [ ] The other places a symbol is used lit up; go to implementations;
       breadcrumbs with the path and the symbol under the cursor
 

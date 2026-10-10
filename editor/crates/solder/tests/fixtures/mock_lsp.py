@@ -79,8 +79,28 @@ def publish(uri):
         for m in re.finditer(word, text):
             diags.append({"range": rng(text, m.start(), m.end()), "severity": severity,
                           "message": f"found {word}", "source": TAG or "mock"})
+    # What another file had it report of this one stays reported when this
+    # one is opened.
+    diags += reported.get(uri, [])
     send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
           "params": {"uri": uri, "diagnostics": diags}})
+    # A file that says so has the server report on one that is not open,
+    # next to it, as a server that builds the project does: an error
+    # there for as long as the file says so, none once it does not.
+    other = uri.rsplit("/", 1)[0] + "/elsewhere.rs"
+    if "mock: elsewhere" in text:
+        reported[other] = [{
+            "range": {"start": {"line": 2, "character": 4}, "end": {"line": 2, "character": 9}},
+            "severity": 1, "message": "broken by the other file\nand a second line", "source": "mock"}]
+    elif other in reported and uri != other:
+        del reported[other]
+    else:
+        return
+    send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+          "params": {"uri": other, "diagnostics": reported.get(other, [])}})
+
+
+reported = {}
 
 
 def note(what, value):

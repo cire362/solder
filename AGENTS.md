@@ -156,6 +156,11 @@ Never guess a signature.
   moment after the file changed (`Workspace::keep_outline`), never per
   key, and not at all while nothing on screen shows it. A new thing that
   shows symbols of the file in front reads it; it does not ask again.
+- What servers report of files is kept twice: in the document, for a
+  file that is open, where it moves with the text; and in
+  `LspStore::problems`, for every file a server names, open or not, as
+  the server said it (its own positions and encoding). The Problems
+  panel reads the second and only while its tab is in front.
 - Git goes through `git.rs`, which shells out to `git` with stable
   `--porcelain=v2 -z` formats. Everything in it blocks: call it from
   `cx.background_executor()`.
