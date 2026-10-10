@@ -180,6 +180,19 @@ Never guess a signature.
   and a new module, never an edit to an old one, since extensions built for
   the old one stay in the catalog. Keep `wasmtime` and `wasmtime-wasi` on
   the version tree-sitter brings.
+  The code of a VS Code extension has no sandbox, so it asks first
+  (`Extension::outside`, `manifest::NODE_CODE`) and runs only once allowed
+  (`ExtensionStore::may_run`). Each extension has a Node process of its own
+  (`crates/extension/src/vscode.rs`), started with `host/host.js`, which is
+  in the binary and gives the extension its `vscode` module; the two talk
+  in JSON, a message a line. Everything in `vscode.rs` blocks: the store
+  starts a host on a thread of its own, hears it through a channel
+  (`ExtensionStore::heard`), and asks with `VsHost::ask`, which does not
+  wait. Nothing of the editor waits for an extension: one that stops
+  answering is ended by its watch. Ending a process waits for it, so it is
+  never done on the UI thread (`stop_code`). A part of VS Code's API that
+  is not in `host.js` must not throw: `namespace()` there gives a stand-in
+  and tells the editor what was asked for.
 
 ### Performance rules
 

@@ -169,7 +169,7 @@ pub trait World: Send + Sync + 'static {
     /// Gets a Node.js of Solder's own for a machine that has none, and
     /// gives its path. A world that cannot says so.
     fn install_node(&self) -> Result<String, String> {
-        Err("Node.js was not found, and this language server needs it".into())
+        Err("Node.js was not found, and this extension needs it".into())
     }
     fn npm_latest(&self, package: &str) -> Result<String, String>;
     /// Installs a package under `dir/node_modules`.

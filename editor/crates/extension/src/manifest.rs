@@ -114,8 +114,12 @@ pub enum Code {
     Zed {
         api: String,
     },
-    /// A Node program written against VS Code's API. It does not run here.
-    Node,
+    /// A Node program written against VS Code's API: the file it starts
+    /// from, and what it waits for to be started (`onLanguage:rust`, `*`).
+    Node {
+        main: PathBuf,
+        wakes: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -186,17 +190,34 @@ pub struct Debugger {
     pub initial: Option<Value>,
 }
 
+/// What the user is asked before the code of a VS Code extension runs.
+pub const NODE_CODE: &str = "Run its code with Node.js, outside a sandbox";
+
 impl Extension {
     /// Whether its code runs in Solder's host.
     pub fn runs_code(&self) -> bool {
         matches!(&self.code, Code::Zed { api } if crate::host::runs(api))
     }
 
+    /// The file its Node code starts from and the events it waits for, if
+    /// it is a VS Code extension with code.
+    pub fn node(&self) -> Option<(&Path, &[String])> {
+        match &self.code {
+            Code::Node { main, wakes } => Some((main, wakes)),
+            _ => None,
+        }
+    }
+
     /// What it does outside a sandbox once installed, each in a sentence
     /// for the user: the language servers its code downloads and starts,
-    /// and the commands its manifest declares. Empty for an extension that
-    /// is only data, and for code Solder does not run.
+    /// and the commands its manifest declares. The code of a VS Code
+    /// extension has no sandbox at all, which is the one thing it says.
+    /// Empty for an extension that is only data, and for code Solder does
+    /// not run.
     pub fn outside(&self) -> Vec<String> {
+        if self.node().is_some() {
+            return vec![NODE_CODE.to_string()];
+        }
         if !self.runs_code() {
             return Vec::new();
         }
@@ -591,6 +612,40 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
     })
 }
 
+/// What a VS Code extension waits for to be started: what its manifest
+/// says, and what VS Code reads from what it contributes (a command it
+/// declares starts it, and so does a file of a language it brings).
+fn wakes(manifest: &Value) -> Vec<String> {
+    let mut wakes = strings(&manifest["activationEvents"]);
+    let contributes = &manifest["contributes"];
+    for (list, key, event) in [
+        ("commands", "command", "onCommand"),
+        ("languages", "id", "onLanguage"),
+        ("debuggers", "type", "onDebugResolve"),
+        ("customEditors", "viewType", "onCustomEditor"),
+        ("taskDefinitions", "type", "onTaskType"),
+    ] {
+        for entry in contributes[list].as_array().into_iter().flatten() {
+            let name = text(&entry[key]);
+            if !name.is_empty() {
+                wakes.push(format!("{event}:{name}"));
+            }
+        }
+    }
+    // Views are listed by the place each is shown in.
+    for views in contributes["views"].as_object().into_iter().flatten() {
+        for view in views.1.as_array().into_iter().flatten() {
+            let id = text(&view["id"]);
+            if !id.is_empty() {
+                wakes.push(format!("onView:{id}"));
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    wakes.retain(|event| !event.trim().is_empty() && seen.insert(event.clone()));
+    wakes
+}
+
 /// What a VS Code language's configuration says about typing in it, in
 /// the terms the editor has for that: comments, the pairs that close
 /// themselves and stand a line apart, and the two patterns of indentation.
@@ -806,11 +861,28 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         configure(&mut language, &config);
         languages.push(language);
     }
-    let code = if manifest["main"].is_string() || manifest["browser"].is_string() {
-        missing.push("Its code, which needs VS Code".into());
-        Code::Node
-    } else {
-        Code::None
+    // Its code starts from `main`, with or without the ending. Code made
+    // for a browser alone has nothing Node can start.
+    let main = manifest["main"].as_str().and_then(|main| {
+        [main.to_string(), format!("{main}.js")]
+            .iter()
+            .filter_map(|main| inside(dir, main))
+            .find(|main| main.is_file())
+    });
+    let code = match main {
+        Some(main) => Code::Node {
+            main,
+            wakes: wakes(&manifest),
+        },
+        None if manifest["main"].is_string() => {
+            missing.push("Its code (the file it starts from is not there)".into());
+            Code::None
+        }
+        None if manifest["browser"].is_string() => {
+            missing.push("Its code, which is made for a browser".into());
+            Code::None
+        }
+        None => Code::None,
     };
     // The settings it declares: one group of them, or several.
     let mut settings: Vec<Setting> = Vec::new();

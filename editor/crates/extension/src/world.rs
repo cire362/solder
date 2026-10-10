@@ -243,7 +243,7 @@ impl World for System {
     fn node(&self) -> Result<String, String> {
         self.which("node")
             .or_else(|| Some(self.own_node()?.to_string_lossy().into_owned()))
-            .ok_or_else(|| "Node.js was not found, and this language server needs it".to_string())
+            .ok_or_else(|| "Node.js was not found, and this extension needs it".to_string())
     }
 
     /// Downloads the newest long-term release of Node.js for this machine
@@ -260,7 +260,7 @@ impl World for System {
         let home = self
             .node_home
             .as_ref()
-            .ok_or("Node.js was not found, and this language server needs it")?;
+            .ok_or("Node.js was not found, and this extension needs it")?;
         let os = match std::env::consts::OS {
             "macos" => "darwin",
             "linux" => "linux",

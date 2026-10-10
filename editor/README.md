@@ -6,7 +6,8 @@ The native editor behind the website in `../src`. Rust, GPU-rendered UI, no Elec
 crates/
   text/     rope buffer, edits, undo history, cursor movement (no UI, fully unit-tested)
   extension/ extensions of Zed and VS Code: manifests, the two catalogs, installing,
-            and the sandbox that runs a Zed extension's code to get its language server
+            the sandbox that runs a Zed extension's code to get its language server,
+            and the Node host that runs a VS Code extension's code
   syntax/   tree-sitter parsing and highlighting for Rust, TS/TSX, JS, JSON, CSS, Go, Python,
             C, C++, Markdown, YAML and shell, and for the languages of extensions
             (grammars in WebAssembly)
@@ -737,9 +738,10 @@ Measured on an M4, release build, counting words on every change:
 | A 2 000 character file | 0.2 ms | 0.5 ms | 2.4 ms |
 | A 30 000 character file | 1.7 ms | 4.8 ms | 32 ms |
 
-The registry and extensions of other editors are not there yet: VS Code
-extensions are Node programs with full access to the machine, and Zed's use the
-WebAssembly Component Model, which this interpreter does not run.
+The registry is not there yet. Extensions of other editors do not run in this
+host: VS Code extensions are Node programs with full access to the machine, and
+Zed's use the WebAssembly Component Model, which this interpreter does not run.
+Each kind has a host of its own, described under Extensions below.
 
 ## Extensions
 
@@ -756,7 +758,7 @@ here.
 | From | Solder uses | Does not run here |
 |---|---|---|
 | A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, icon themes, its language servers, its debug adapters, its context servers | |
-| A VS Code extension | Languages (colors from its TextMate grammar; comments, pairs and indentation from its language configuration), themes (JSON and the older `.tmTheme`), icon themes drawn with pictures, snippets, debuggers whose manifest names the adapter's program | Its code, icon themes drawn with a font, debuggers only its code can start, everything the code would add |
+| A VS Code extension | Languages (colors from its TextMate grammar; comments, pairs and indentation from its language configuration), themes (JSON and the older `.tmTheme`), icon themes drawn with pictures, snippets, debuggers whose manifest names the adapter's program, and its code, once you allow it | Icon themes drawn with a font, debuggers only its code can start, and what its code asks of VS Code that Solder does not have yet |
 
 A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
 It is compiled on the first file that needs it and runs in wasmtime inside
@@ -856,6 +858,30 @@ their own names, as in VS Code: `"prettier.tabWidth": 2`, or as objects inside
 objects. The Extensions tab lists them with what each is now: what you set,
 or what the extension says it is when not set. They are what its code will be
 handed when it asks for its configuration; nothing else reads them yet.
+
+The code of a VS Code extension is a Node program written against VS Code's
+API. Unlike a Zed extension's it has no sandbox: it can do what your account
+can. So an extension with code is downloaded and then waits, the tab says
+**Run its code with Node.js, outside a sandbox**, and nothing of it is in place
+until you press **Install**. One that was installed before, or put in the
+folder by hand, keeps its themes and languages and has an **Allow** button
+under **Its code**.
+
+Each extension runs in a Node process of its own, started when what it waits
+for happens (its activation events: the editor is up, a file of a language is
+open, one of its commands is asked for), never before. It gets a `vscode`
+module that is Solder's: what is in it works as in VS Code, and what is not
+yet does nothing and is listed in the tab under **Asked for what Solder does
+not have yet**, so it is plain why a feature is missing. Today the module has
+commands, the extension's own storage and the plumbing (events, disposables,
+URIs); the rest of the API is the next items of the roadmap.
+
+An extension that throws ends nothing but its own start. One that ends its
+process is shown as stopped, with its last words. One that never returns stops
+answering, and after 30 seconds its process is ended: the editor and the other
+extensions never waited for it. What stopped is not started over and over;
+**Start again** in the tab does it once. Node is the machine's, or the one
+Solder downloads the first time something needs it.
 
 A VS Code extension that has a build for each platform is installed in the
 one for this machine. What it does not work without, and what it is a pack

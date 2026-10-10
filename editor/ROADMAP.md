@@ -120,8 +120,10 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 
 Where it stands: extensions install from Zed's catalog and Open VSX. A Zed
 extension brings its languages (highlighting and how they are typed),
-snippets, themes and language servers. A VS Code extension brings its themes
-and snippets only.
+snippets, themes and language servers. A VS Code extension brings its
+languages, themes, icon themes, snippets and the debuggers its manifest
+describes; its code runs in a Node process of its own, with as much of VS
+Code's API as the items below have ticked.
 
 The two kinds are different work. A Zed extension is data plus a small
 sandboxed program with a fixed interface, so it can be supported completely.
@@ -235,10 +237,11 @@ to build them.
       is asked for this platform first; parts of VS Code itself are left out
 
 ### VS Code extensions: their code
-- [ ] An extension host: a Node process next to the editor that loads
+- [x] An extension host: a Node process next to the editor that loads
       extensions when their activation events happen and gives them a
       `vscode` module of Solder's own. One extension that crashes or hangs
-      does not take the editor or the others with it
+      does not take the editor or the others with it (a process for each,
+      and code runs only once the user allowed it)
 - [ ] The API every extension starts from: commands, messages, pickers and
       input boxes, status bar items, output channels, configuration, the
       workspace's folders and files, open documents, their edits and events

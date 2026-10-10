@@ -10618,7 +10618,7 @@ mod tests {
 
     // ----------------------------------------------------------- extensions
 
-    use crate::extension_store::ExtensionStore;
+    use crate::extension_store::{CodeState, ExtensionStore};
     use extension::{
         Origin,
         testing::{Served, serve, tar, write as write_file, zip},
@@ -11234,6 +11234,10 @@ brackets = [
             ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
         ]);
         let (_config, store, ws, cx) = extension_setup(cx, "ext-vsx", &base);
+        // A machine with no Node.js, and no way to one.
+        store.update(cx, |store, _| {
+            store.world = Some(std::sync::Arc::new(ServerOnPath("nothing", String::new())));
+        });
 
         cx.dispatch_action(ShowExtensions);
         wait_for(cx, "the catalogs", &|cx| {
@@ -11241,20 +11245,37 @@ brackets = [
             !store.catalog(Origin::VsCode).entries.is_empty() && store.catalog(Origin::Zed).searched
         });
         cx.run_until_parked();
-        // Enter installs what is selected.
+        // Enter installs what is selected. This one has code, which has
+        // no sandbox: that is said before anything of it is in place.
         cx.simulate_keystrokes("enter");
+        wait_for(cx, "the download", &|cx| {
+            let waiting = (Origin::VsCode, "vue.volar".to_string());
+            store.read(cx).pending.contains_key(&waiting)
+        });
+        assert_eq!(
+            cx.read(|cx| store.read(cx).asks(Origin::VsCode, "vue.volar")),
+            ["Run its code with Node.js, outside a sandbox"]
+        );
+        assert!(cx.read(|cx| store.read(cx).find(Origin::VsCode, "vue.volar").is_none()));
+        cx.run_until_parked();
+        click(cx, "extension-allow");
         wait_for(cx, "the install", &|cx| {
             store.read(cx).find(Origin::VsCode, "vue.volar").is_some()
         });
         let installed = cx.read(|cx| store.read(cx).find(Origin::VsCode, "Vue.volar").cloned());
         let installed = installed.unwrap();
         assert_eq!(installed.themes.len(), 2);
-        assert!(
-            installed
-                .missing
-                .iter()
-                .any(|m| m.contains("needs VS Code"))
-        );
+        // Its code was allowed and waits for the start to be over, so it
+        // is started; with no Node.js it says so, and the rest of the
+        // extension works as before.
+        assert!(installed.node().is_some());
+        wait_for(cx, "its code to give up", &|cx| {
+            let code = store.read(cx).code("Vue.volar");
+            matches!(
+                code.map(|code| &code.state),
+                Some(CodeState::Stopped(why)) if why.contains("Node.js was not found")
+            )
+        });
         // Its language (files ending in .dm) is colored by the TextMate
         // grammar it brings, and typed as its configuration says.
         assert_eq!(installed.languages[0].suffixes, ["dm", "Demofile"]);
@@ -11371,6 +11392,235 @@ brackets = [
                 .iter()
                 .any(|r| r == "/extensions?max_schema_version=1&filter=vue")
         );
+    }
+
+    /// This machine's Node.js and nothing else of the world.
+    struct NodeOnly(String);
+
+    impl extension::host::World for NodeOnly {
+        fn node(&self) -> Result<String, String> {
+            Ok(self.0.clone())
+        }
+        fn npm_latest(&self, _: &str) -> Result<String, String> {
+            Err("no npm here".into())
+        }
+        fn npm_install(&self, _: &Path, _: &str, _: &str) -> Result<(), String> {
+            Err("no npm here".into())
+        }
+        fn release(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: bool,
+        ) -> Result<extension::host::Release, String> {
+            Err("no network here".into())
+        }
+        fn download(&self, _: &str, _: &Path, _: extension::host::FileKind) -> Result<(), String> {
+            Err("no network here".into())
+        }
+        fn fetch(
+            &self,
+            _: extension::host::HttpRequest,
+        ) -> Result<extension::host::HttpResponse, String> {
+            Err("no network here".into())
+        }
+        fn run(&self, _: &extension::host::Command) -> Result<extension::host::Output, String> {
+            Err("no commands here".into())
+        }
+        fn which(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn env(&self) -> Vec<(String, String)> {
+            Vec::new()
+        }
+        fn status(&self, _: &str, _: extension::host::Status) {}
+    }
+
+    #[gpui::test]
+    fn the_code_of_a_vscode_extension_runs_in_a_process_of_its_own(cx: &mut TestAppContext) {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let _languages = extension_languages();
+        let (base, _) = serve(vec![
+            (
+                "/api/-/search",
+                Served::ok(br#"{"extensions":[]}"#.to_vec()),
+            ),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-code", &base);
+        let folder = cx.read(|cx| store.read(cx).root.clone());
+        // Four extensions put in place by hand, so none was allowed: the
+        // fixture, which has a command; one that asks for that command
+        // when a Rust file is open; one that never returns from its
+        // start; and one that ends its own process.
+        extension::testing::vscode_extension(&folder.join("vscode/acme.demo"));
+        let code = |name: &str, wakes: &str, main: &str| {
+            let dir = folder.join(format!("vscode/acme.{name}"));
+            write_file(
+                &dir.join("package.json"),
+                &format!(
+                    r#"{{ "name": "{name}", "publisher": "Acme", "version": "1.0.0", "main": "main.js", "activationEvents": ["{wakes}"] }}"#
+                ),
+            );
+            write_file(&dir.join("main.js"), main);
+        };
+        code(
+            "other",
+            "onLanguage:rust",
+            r#"const vscode = require('vscode');
+exports.activate = async () => {
+  const answer = await vscode.commands.executeCommand('demo.run', 4);
+  console.log('demo.run said ' + JSON.stringify(answer));
+};"#,
+        );
+        code("spin", "*", "exports.activate = () => { for (;;) {} };");
+        code(
+            "quit",
+            "onStartupFinished",
+            r#"exports.activate = async (context) => {
+  const starts = context.globalState.get('starts', 0) + 1;
+  await context.globalState.update('starts', starts);
+  console.log('start ' + starts);
+  setTimeout(() => { process.stderr.write('out of luck\n'); process.exit(3); }, 200);
+};"#,
+        );
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.patience = Duration::from_secs(2);
+            store.scan(cx);
+        });
+        wait_for(cx, "the four", &|cx| store.read(cx).installed.len() == 4);
+        cx.run_until_parked();
+        let state = |cx: &App, id: &str| store.read(cx).code(id).map(|code| code.state.clone());
+        let said = |cx: &App, id: &str, what: &str| {
+            store
+                .read(cx)
+                .code(id)
+                .is_some_and(|code| code.said.iter().any(|(_, text)| text == what))
+        };
+        // Nothing of them runs: code has no sandbox, and nobody agreed.
+        for id in ["Acme.demo", "Acme.other", "Acme.spin", "Acme.quit"] {
+            assert_eq!(cx.read(|cx| state(cx, id)), None);
+            assert_eq!(
+                cx.read(|cx| store.read(cx).asks_installed(Origin::VsCode, id)),
+                ["Run its code with Node.js, outside a sandbox"]
+            );
+        }
+
+        // Allowed, the fixture is started: it waits for no more than the
+        // editor to be up. Its commands are known, and what it asked for
+        // that is not here.
+        store.update(cx, |store, cx| store.allow(Origin::VsCode, "Acme.demo", cx));
+        wait_for(cx, "the fixture's code", &|cx| {
+            state(cx, "Acme.demo") == Some(CodeState::Running)
+                && store.read(cx).code("Acme.demo").unwrap().commands.len() == 3
+        });
+        let demo = |cx: &App| {
+            let code = store.read(cx).code("Acme.demo").unwrap();
+            (code.commands.clone(), code.missing.clone())
+        };
+        assert_eq!(
+            cx.read(|cx| demo(cx)),
+            (
+                vec!["demo.run".into(), "demo.spin".into(), "demo.quit".into()],
+                vec!["notebooks.createNotebookController".to_string()]
+            )
+        );
+        assert!(cx.read(|cx| said(cx, "Acme.demo", "demo started")));
+
+        // The other is allowed in the tab. It waits for a Rust file, so
+        // it is not started yet.
+        cx.dispatch_action(ShowExtensions);
+        cx.run_until_parked();
+        cx.simulate_input("other");
+        bounds_soon(cx, "extension-allow-code");
+        click(cx, "extension-allow-code");
+        assert!(cx.read(|cx| {
+            store
+                .read(cx)
+                .asks_installed(Origin::VsCode, "Acme.other")
+                .is_empty()
+        }));
+        assert_eq!(cx.read(|cx| state(cx, "Acme.other")), None);
+        // A Rust file is opened: it starts, and asks for a command that is
+        // the fixture's, which answers from its own process.
+        let main = cx.read(|cx| ws.read(cx).root(cx)).join("main.rs");
+        std::fs::write(&main, "fn main() {}\n").unwrap();
+        ws.update_in(cx, |w, window, cx| w.open_path(main, None, window, cx));
+        let answered = r#"demo.run said {"ran":[4],"starts":1}"#;
+        wait_for(cx, "the other's code", &|cx| {
+            said(cx, "Acme.other", answered)
+        });
+        assert_eq!(
+            cx.read(|cx| state(cx, "Acme.other")),
+            Some(CodeState::Running)
+        );
+
+        // One that never returns from its start is ended, and one that
+        // ends itself is known to have, with its last words.
+        store.update(cx, |store, cx| {
+            store.allow(Origin::VsCode, "Acme.spin", cx);
+            store.allow(Origin::VsCode, "Acme.quit", cx);
+        });
+        wait_for(cx, "the two to end", &|cx| {
+            matches!(state(cx, "Acme.spin"), Some(CodeState::Stopped(_)))
+                && matches!(state(cx, "Acme.quit"), Some(CodeState::Stopped(_)))
+        });
+        assert_eq!(
+            cx.read(|cx| state(cx, "Acme.spin")),
+            Some(CodeState::Stopped("It did not answer for 2 s".into()))
+        );
+        assert_eq!(
+            cx.read(|cx| state(cx, "Acme.quit")),
+            Some(CodeState::Stopped("out of luck".into()))
+        );
+        // Neither took the others along: the fixture still answers the
+        // other, started again, and from the same process as before.
+        assert_eq!(
+            cx.read(|cx| state(cx, "Acme.demo")),
+            Some(CodeState::Running)
+        );
+        store.update(cx, |store, cx| store.restart_code("Acme.other", cx));
+        wait_for(cx, "the other's code again", &|cx| {
+            said(cx, "Acme.other", answered)
+        });
+        // What ended is not started over and over, only when asked to.
+        assert!(cx.read(|cx| said(cx, "Acme.quit", "start 1")));
+        store.update(cx, |store, cx| {
+            store.wake(cx);
+            store.restart_code("Acme.quit", cx)
+        });
+        wait_for(cx, "the second start", &|cx| {
+            said(cx, "Acme.quit", "start 2")
+                && matches!(state(cx, "Acme.quit"), Some(CodeState::Stopped(_)))
+        });
+
+        // Turned off, its code is ended; removed, what it kept goes too.
+        store.update(cx, |store, cx| {
+            store.set_off(Origin::VsCode, "Acme.demo", true, cx)
+        });
+        assert_eq!(cx.read(|cx| state(cx, "Acme.demo")), None);
+        assert!(folder.join("work/acme.quit/global.json").is_file());
+        store.update(cx, |store, cx| {
+            store.remove(Origin::VsCode, "Acme.quit", cx)
+        });
+        wait_for(cx, "the removal", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.quit").is_none()
+        });
+        assert_eq!(cx.read(|cx| state(cx, "Acme.quit")), None);
+        assert!(!folder.join("work/acme.quit").exists());
+        // The host is Solder's own file, written once next to them.
+        assert!(folder.join("host/host.js").is_file());
     }
 
     /// What extensions reach outside their sandbox through, for the test

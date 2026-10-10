@@ -567,7 +567,20 @@ mod tests {
         assert_eq!(installed.dir, root.join("vscode/acme.demo"));
         assert_eq!(installed.id, "Acme.demo");
         assert_eq!(installed.name, "Acme Demo");
-        assert_eq!(installed.code, Code::Node);
+        // Its code, and what starts it: what the manifest says, then the
+        // commands and languages it brings.
+        assert_eq!(
+            installed.code,
+            Code::Node {
+                main: installed.dir.join("out/main.js"),
+                wakes: vec![
+                    "onStartupFinished".into(),
+                    "onCommand:demo.run".into(),
+                    "onLanguage:demo".into(),
+                ],
+            }
+        );
+        assert_eq!(installed.outside(), [crate::manifest::NODE_CODE]);
         // Its themes, the one in TextMate's old format too.
         let themes: Vec<&str> = installed.themes.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(themes, ["Acme Dark", "Acme Old"]);
@@ -638,7 +651,6 @@ mod tests {
             [
                 "1 of its themes (could not be read)",
                 "An icon theme (drawn with a font, or not readable)",
-                "Its code, which needs VS Code",
                 "Key bindings for its commands",
             ]
         );

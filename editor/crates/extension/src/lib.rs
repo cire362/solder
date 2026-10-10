@@ -5,12 +5,13 @@
 //! and, for a language server, a WebAssembly component that says how to get
 //! and start it. A VS Code extension is a folder with `package.json`: themes,
 //! snippets and language settings are data Solder reads; its code is a Node
-//! program written against VS Code's API and does not run here.
+//! program written against VS Code's API.
 //!
 //! [`manifest`] reads a folder, [`catalog`] searches Zed's catalog and
 //! Open VSX, [`install`] downloads an extension and puts it in place.
 //! [`host`] runs the code of a Zed extension in a sandbox, and [`world`] is
-//! what that code reaches outside it: npm, GitHub, downloads.
+//! what that code reaches outside it: npm, GitHub, downloads. [`vscode`]
+//! runs the code of a VS Code extension in a Node process of its own.
 
 pub mod catalog;
 pub mod gate;
@@ -21,6 +22,7 @@ pub mod manifest;
 pub mod snippet;
 pub mod state;
 pub mod testing;
+pub mod vscode;
 pub mod world;
 
 pub use catalog::Entry;
