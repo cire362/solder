@@ -332,6 +332,14 @@ made while serving a request sit under it, and each row opens the line of your
 code that made it. A small script loaded with `--require` records them; a dev
 server's own assets (`/_next/`) are left out.
 
+Use **Workspace: Set breakpoint condition**, **Set breakpoint hit condition**
+and **Set logpoint** at the cursor's line. Empty input clears that setting;
+F9 removes the whole point. Expressions and hit-count syntax belong to the
+adapter. A log message can interpolate `{expressions}` without pausing.
+Unsupported settings are reported in the debug console and that point is
+not sent as an unconditional breakpoint. Settings last for this app run,
+like ordinary breakpoints; their line numbers do not follow file edits.
+
 ## Databases
 
 Open the Database tab with `ctrl-shift-d`. Solder lists the databases it finds:

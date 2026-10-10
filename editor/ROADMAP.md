@@ -21,6 +21,9 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] Conditional breakpoints and logpoints with a real JavaScript or
+      extension debug adapter and in a real window. Capability filtering,
+      editing the settings and the wire requests are checked with fixtures
 - [ ] The Tests panel in a real window and with published test extensions.
       Real Cargo, Go and unittest processes and headless window input are
       covered by fixtures; large projects and Windows process cancellation
@@ -87,6 +90,9 @@ something of its own unchecked or unmade adds it here.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] Breakpoints and their conditions are not kept across restarts and
+      their line numbers do not follow edits; expression and hit-count
+      syntax belongs to each adapter
 - [ ] Built-in test discovery has no Cargo doctests or custom harness support,
       no nested Go modules and no pytest. Rust/Go source jumps require a
       unique matching function in the package; generated or repeated names
@@ -581,7 +587,7 @@ update. They come after phase 9, in this order unless one is needed sooner.
 ### Tests and running
 - [x] A tree of the project's tests: run one, see what failed, go to its line
       (Cargo, Go and Python unittest, plus permitted extensions' controllers)
-- [ ] Breakpoints with a condition, and ones that only write to the console
+- [x] Breakpoints with a condition, and ones that only write to the console
 - [ ] Python under the debugger (debugpy), now that an adapter is only
       something to start
 

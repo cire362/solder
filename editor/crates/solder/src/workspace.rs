@@ -111,6 +111,9 @@ actions!(
         DebugStart,
         DebugPick,
         DebugStop,
+        SetBreakpointCondition,
+        SetBreakpointHitCondition,
+        SetLogpoint,
         DebugStepOver,
         DebugStepIn,
         DebugStepOut,
@@ -3665,6 +3668,49 @@ impl Workspace {
         self.debug_panel.update(cx, |p, cx| p.toggle_picker(cx));
     }
 
+    fn breakpoint_prompt(
+        &mut self,
+        field: crate::breakpoint::Field,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.active_editor() else {
+            return;
+        };
+        let editor = editor.read(cx);
+        let Some(path) = editor.path(cx).map(Path::to_path_buf) else {
+            return;
+        };
+        let line = editor.cursor_position(cx).0 as u32;
+        let prompt = crate::breakpoint::Prompt::new(self.debug.clone(), path, line, field);
+        let value = prompt.value(cx);
+        self.toggle_modal(window, cx, move |window, cx| {
+            let mut picker = Picker::new(prompt, window, cx);
+            picker.set_query(&value, cx);
+            picker.refresh(window, cx);
+            picker
+        });
+    }
+    fn breakpoint_condition(
+        &mut self,
+        _: &SetBreakpointCondition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.breakpoint_prompt(crate::breakpoint::Field::Condition, window, cx);
+    }
+    fn breakpoint_hits(
+        &mut self,
+        _: &SetBreakpointHitCondition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.breakpoint_prompt(crate::breakpoint::Field::Hits, window, cx);
+    }
+    fn breakpoint_log(&mut self, _: &SetLogpoint, window: &mut Window, cx: &mut Context<Self>) {
+        self.breakpoint_prompt(crate::breakpoint::Field::Log, window, cx);
+    }
+
     fn debug_stop(&mut self, _: &DebugStop, _: &mut Window, cx: &mut Context<Self>) {
         self.debug.update(cx, |s, cx| s.stop(cx));
     }
@@ -6467,6 +6513,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::debug_start))
             .on_action(cx.listener(Self::debug_pick))
             .on_action(cx.listener(Self::debug_stop))
+            .on_action(cx.listener(Self::breakpoint_condition))
+            .on_action(cx.listener(Self::breakpoint_hits))
+            .on_action(cx.listener(Self::breakpoint_log))
             .on_action(cx.listener(Self::debug_over))
             .on_action(cx.listener(Self::debug_in))
             .on_action(cx.listener(Self::debug_out))
@@ -12334,6 +12383,55 @@ mod tests {
 
     fn paused_line(store: &Entity<crate::debug::DebugStore>, cx: &App) -> Option<u32> {
         store.read(cx).paused.as_ref()?.frame().map(|f| f.line)
+    }
+
+    #[gpui::test]
+    fn breakpoint_prompts_keep_conditions_and_log_without_stopping(cx: &mut TestAppContext) {
+        let (root, store, ws, cx) = debug_setup(cx, "debug-conditions");
+        let path = root.join("app.js");
+        cx.dispatch_action(SetBreakpointCondition);
+        bounds_soon(cx, "picker-matches-viewport");
+        cx.simulate_input("false");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read(|cx| store.read(cx).options(&path, 1).condition),
+            "false"
+        );
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        editor.update_in(cx, |e, window, cx| {
+            e.go_to_point(1, 0, cx);
+            window.focus(&e.focus_handle(cx));
+        });
+        cx.dispatch_action(SetLogpoint);
+        bounds_soon(cx, "picker-matches-viewport");
+        cx.simulate_input("value {a}");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read(|cx| store.read(cx).options(&path, 2).log),
+            "value {a}"
+        );
+        store.update(cx, |s, cx| s.toggle(&path, 3, cx));
+        cx.dispatch_action(DebugStart);
+        wait_for(cx, "the unconditional pause", &|cx| {
+            paused_line(&store, cx) == Some(3)
+        });
+        assert!(cx.read(|cx| {
+            store
+                .read(cx)
+                .console
+                .iter()
+                .any(|line| line.text == "value 2")
+        }));
+        // Changing a condition replaces the file's complete set; clearing a
+        // point removes its settings too, including for the next run.
+        store.update(cx, |s, cx| s.toggle(&path, 2, cx));
+        assert_eq!(
+            cx.read(|cx| store.read(cx).options(&path, 2)),
+            crate::debug::BreakpointOptions::default()
+        );
+        store.update(cx, |s, cx| s.stop(cx));
     }
 
     #[gpui::test]
