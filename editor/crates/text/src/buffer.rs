@@ -74,7 +74,12 @@ impl Buffer {
     pub fn new(text: &str) -> Self {
         let bytes = text.as_bytes();
         let ends = bytes.iter().filter(|byte| **byte == b'\n').count();
-        let returns = bytes.windows(2).filter(|pair| pair == b"\r\n").count();
+        // Most files have no carriage return at all, and are not looked
+        // through a second time for one.
+        let returns = match bytes.contains(&b'\r') {
+            true => bytes.windows(2).filter(|pair| pair == b"\r\n").count(),
+            false => 0,
+        };
         let line_ending = if returns > 0 && returns * 2 >= ends {
             LineEnding::CrLf
         } else {

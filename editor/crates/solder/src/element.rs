@@ -1206,24 +1206,46 @@ fn layout(
         let levels = runs
             .iter()
             .flat_map(|run| guide_levels(buffer, run.clone(), unit));
+        // One line for each level down as many rows as are inside it
+        // one under another, not one for every row: a screen of code has
+        // a few dozen such lines, and would have a few hundred.
+        let mut open: Vec<(Pixels, Pixels)> = Vec::new();
+        let mut draw = |level: usize, (top, bottom): (Pixels, Pixels)| {
+            let x = text_x(em * (level * unit) as f32);
+            if x >= text_left {
+                highlights.push(fill(
+                    Bounds::new(point(x, top), size(theme.shape.border, bottom - top)),
+                    theme.line,
+                ));
+            }
+        };
         for (row, levels) in drawn.zip(levels.collect::<Vec<_>>()) {
             // The row of its lenses is inside the same as the line.
             let shown = rows.shown(row);
             let lensed = shown > 0 && rows.line(shown - 1).1;
-            let own = lh * (1 + rows.more(row)) as f32;
-            let (top, tall) = match lensed {
-                true => (row_y(row) - lh, own + lh),
-                false => (row_y(row), own),
+            let bottom = row_end(row);
+            let top = match lensed {
+                true => row_y(row) - lh,
+                false => row_y(row),
             };
-            for level in 0..levels {
-                let x = text_x(em * (level * unit) as f32);
-                if x >= text_left {
-                    highlights.push(fill(
-                        Bounds::new(point(x, top), size(theme.shape.border, tall)),
-                        theme.line,
-                    ));
-                }
+            // What this row is not inside ends above it, and so does
+            // what does not reach it.
+            let goes_on = |known: &(Pixels, Pixels)| (known.1 - top).abs() < px(0.5);
+            let kept = open
+                .iter()
+                .take(levels)
+                .take_while(|known| goes_on(known))
+                .count();
+            for (level, ended) in open.drain(kept..).enumerate() {
+                draw(kept + level, ended);
             }
+            for known in &mut open {
+                known.1 = bottom;
+            }
+            open.resize(levels, (top, bottom));
+        }
+        for (level, ended) in open.into_iter().enumerate() {
+            draw(level, ended);
         }
     }
     for decoration in doc
