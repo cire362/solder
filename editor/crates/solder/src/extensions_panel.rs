@@ -15,7 +15,7 @@ use gpui::{
 
 use crate::{
     editor::{Editor, EditorEvent},
-    extension_store::{ExtensionStore, key},
+    extension_store::{CodeState, ExtensionStore, key},
     theme::{ActiveTheme, Theme, UI_FONT_SIZE},
     ui,
 };
@@ -658,6 +658,147 @@ impl ExtensionsPanel {
                         }
                     }
                 }
+                // The code of a VS Code extension: whether it runs, and
+                // what it asked of VS Code's API that is not here.
+                if installed.node().is_some() {
+                    details = details.child(heading("ITS CODE"));
+                    let asks = store.asks_installed(installed.origin, &installed.id);
+                    let code = store.code(&installed.id);
+                    let (view, id) = (cx.entity(), installed.id.clone());
+                    if !asks.is_empty() {
+                        details = details.child(line(
+                            "Waits for you to allow it. It would:".into(),
+                            theme.fg_muted,
+                        ));
+                        for what in asks {
+                            details = details.child(line(what.into(), theme.fg));
+                        }
+                        details = details.child(
+                            div().flex().child(
+                                ui::button(
+                                    "extension-allow-code",
+                                    "Allow",
+                                    false,
+                                    theme,
+                                    move |_, _, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.store.update(cx, |store, cx| {
+                                                store.allow(Origin::VsCode, &id, cx)
+                                            })
+                                        })
+                                    },
+                                )
+                                .debug_selector(|| "extension-allow-code".into())
+                                .h(px(22.)),
+                            ),
+                        );
+                    } else if !off {
+                        match code.map(|code| &code.state) {
+                            None => {
+                                details = details.child(line(
+                                    "Starts when it is needed.".into(),
+                                    theme.fg_subtle,
+                                ))
+                            }
+                            Some(CodeState::Starting) => {
+                                details = details.child(line("Starting...".into(), theme.fg_muted))
+                            }
+                            Some(CodeState::Running) => {
+                                let commands = code.map_or(0, |code| code.commands.len());
+                                let text = match commands {
+                                    0 => "Running".to_string(),
+                                    1 => "Running, with 1 command".to_string(),
+                                    n => format!("Running, with {n} commands"),
+                                };
+                                details = details.child(line(text.into(), theme.fg_muted));
+                            }
+                            Some(CodeState::Stopped(why)) => {
+                                details = details
+                                    .child(line(format!("Stopped: {why}").into(), theme.error))
+                                    .child(
+                                        div().flex().child(
+                                            ui::button(
+                                                "extension-restart-code",
+                                                "Start again",
+                                                false,
+                                                theme,
+                                                move |_, _, cx| {
+                                                    view.update(cx, |this, cx| {
+                                                        this.store.update(cx, |store, cx| {
+                                                            store.restart_code(&id, cx)
+                                                        })
+                                                    })
+                                                },
+                                            )
+                                            .debug_selector(|| "extension-restart-code".into())
+                                            .h(px(22.)),
+                                        ),
+                                    );
+                            }
+                        }
+                    }
+                    if let Some(code) = code {
+                        // What it answers for as a language server would.
+                        if !code.languages.is_empty() {
+                            let every = code.languages.iter().any(|language| language == "*");
+                            let of = match every {
+                                true => "every language".to_string(),
+                                false => code.languages.join(", "),
+                            };
+                            details = details.child(line(
+                                format!("Gives language features for {of}").into(),
+                                theme.fg_muted,
+                            ));
+                        }
+                        if !code.missing.is_empty() {
+                            let mut names =
+                                code.missing.iter().take(12).cloned().collect::<Vec<_>>();
+                            if code.missing.len() > names.len() {
+                                names.push(format!("{} more", code.missing.len() - names.len()));
+                            }
+                            details = details.child(line(
+                                format!(
+                                    "Asked for what Solder does not have yet: {}",
+                                    names.join(", ")
+                                )
+                                .into(),
+                                theme.fg_subtle,
+                            ));
+                        }
+                        if let Some(last) =
+                            code.said.back().and_then(|(_, text)| text.lines().next())
+                        {
+                            details = details
+                                .child(line(format!("Last said: {last}").into(), theme.fg_subtle));
+                        }
+                    }
+                    // What it wrote to its output channels, to read in a tab.
+                    let channels = store.outputs(&installed.id);
+                    if !channels.is_empty() {
+                        let view = cx.entity();
+                        details = details.child(div().flex().flex_wrap().gap_1().children(
+                            channels.into_iter().enumerate().map(|(i, channel)| {
+                                let (view, id) = (view.clone(), installed.id.clone());
+                                let label = format!("Show output: {channel}");
+                                ui::button(
+                                    ("extension-output", i),
+                                    label,
+                                    false,
+                                    theme,
+                                    move |_, _, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.store.update(cx, |store, cx| {
+                                                store.show_output(&id, &channel, cx)
+                                            })
+                                        })
+                                    },
+                                )
+                                .debug_selector(move || format!("extension-output-{i}"))
+                                .h(px(22.))
+                            }),
+                        ));
+                    }
+                }
                 let missing = not_running(installed);
                 if !missing.is_empty() {
                     details = details.child(heading("DOES NOT RUN HERE"));
@@ -772,7 +913,7 @@ impl ExtensionsPanel {
                 }
                 if row.origin == Origin::VsCode {
                     details = details.child(line(
-                        "From a VS Code extension Solder takes themes and snippets. Its code needs VS Code and does not run here.".into(),
+                        "From a VS Code extension Solder takes themes, snippets and languages. Its code runs with the parts of VS Code's API Solder has.".into(),
                         theme.fg_subtle,
                     ));
                 }

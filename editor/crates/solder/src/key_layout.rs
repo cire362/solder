@@ -145,7 +145,8 @@ fn apply(
     }
 }
 
-fn kept(cx: &App) -> Vec<KeyBinding> {
+/// The bindings of the layout in use, as they were last read.
+pub(crate) fn kept(cx: &App) -> Vec<KeyBinding> {
     cx.try_global::<Loaded>()
         .and_then(|l| checked(&l.name, &l.source, cx).ok())
         .unwrap_or_default()

@@ -1,6 +1,6 @@
 use std::{
     any::TypeId,
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
@@ -24,6 +24,7 @@ use crate::{
     document::Document,
     editor::{self, Editor, EditorEvent},
     editor_lsp::LspLocation,
+    extension_store::ExtensionStore,
     file_diff::{DiffModel, FileDiff, FileDiffEvent},
     file_finder::FileFinder,
     git::DiffScope,
@@ -79,6 +80,7 @@ actions!(
         OpenKeyLayout,
         ResetLayout,
         UseContextPrompt,
+        RunExtensionTask,
         GoToSymbol,
         GoToProjectSymbol,
         SplitRight,
@@ -93,6 +95,7 @@ actions!(
         ShowAi,
         ShowPlugins,
         ShowExtensions,
+        ShowExtensionViews,
         ImportSettings,
         ToggleChat,
         ShowAgent,
@@ -221,6 +224,8 @@ impl Pane {
 }
 
 pub struct Workspace {
+    web_pages: Vec<(Entity<crate::webview::Page>, Subscription)>,
+    web_front: Option<(Entity<crate::webview::Page>, usize)>,
     focus_handle: FocusHandle,
     project: Entity<Project>,
     project_panel: Entity<ProjectPanel>,
@@ -233,6 +238,7 @@ pub struct Workspace {
     api_panel: Entity<crate::api_panel::ApiPanel>,
     ai_panel: Entity<crate::ai_panel::AiPanel>,
     extensions_panel: Entity<crate::extensions_panel::ExtensionsPanel>,
+    extension_views: Entity<crate::extension_views::ExtensionViews>,
     chat: Entity<crate::chat_panel::ChatPanel>,
     agent: Entity<crate::agent_panel::AgentPanel>,
     /// Pushes started, for tests: the terminal running one may be gone.
@@ -282,6 +288,12 @@ pub struct Workspace {
     /// The menu of a dock: where it opened, the dock, and the panel whose
     /// tab was under the pointer, if one was.
     dock_menu: Option<(Point<Pixels>, Place, Option<Panel>)>,
+    /// The terminals extensions made in this window's dock, each by the
+    /// extension and the number it gave the terminal.
+    extension_terminals: Vec<((String, u64), Entity<Terminal>)>,
+    /// What extensions offer for the file in front, where the right
+    /// button was pressed in it.
+    editor_menu: Option<(Point<Pixels>, Vec<crate::extension_api::Offered>)>,
     bar_menu: Option<(Point<Pixels>, BarEnd, Option<Item>)>,
     /// The panel whose tab is being dragged. A closed dock has a place to
     /// drop it on for as long as it is.
@@ -395,7 +407,25 @@ impl Workspace {
         let ai_store = crate::ai_store::AiStore::global(cx);
         ai_store.update(cx, |s, _| s.add_root(root.clone()));
         let ai_panel = cx.new(|cx| crate::ai_panel::AiPanel::new(ai_store.clone(), cx));
-        let extensions = crate::extension_store::ExtensionStore::global(cx);
+        let extensions = ExtensionStore::global(cx);
+        // The code of extensions sees this window's folder, and asks the
+        // user in the window in front.
+        let this = cx.entity().downgrade();
+        extensions.update(cx, |store, cx| store.set_front(this, root.clone(), cx));
+        let extension_asks =
+            cx.subscribe_in(
+                &extensions,
+                window,
+                |this, _, event, window, cx| match event {
+                    crate::extension_api::ExtensionEvent::Asked => this.extension_asks(window, cx),
+                    crate::extension_api::ExtensionEvent::Webviews => this.sync_webviews(cx),
+                    crate::extension_api::ExtensionEvent::Bar
+                    | crate::extension_api::ExtensionEvent::Views
+                    | crate::extension_api::ExtensionEvent::Files => cx.notify(),
+                },
+            );
+        let extension_views =
+            cx.new(|cx| crate::extension_views::ExtensionViews::new(extensions.clone(), cx));
         let extensions_panel =
             cx.new(|cx| crate::extensions_panel::ExtensionsPanel::new(extensions, cx));
         let weak = cx.entity().downgrade();
@@ -415,9 +445,13 @@ impl Workspace {
                 if window.is_window_active() {
                     let (weak, root) = (cx.entity().downgrade(), this.root(cx));
                     this.plugins
-                        .update(cx, |p, cx| p.set_workspace(weak, root, cx));
+                        .update(cx, |p, cx| p.set_workspace(weak.clone(), root.clone(), cx));
+                    if let Some(extensions) = ExtensionStore::try_global(cx) {
+                        extensions.update(cx, |store, cx| store.set_front(weak, root, cx));
+                    }
                 }
             }),
+            extension_asks,
             cx.subscribe_in(&debug, window, |this, _, event, window, cx| match event {
                 crate::debug::DebugEvent::Paused(path, line) => {
                     // The window whose project holds the file shows it.
@@ -708,6 +742,8 @@ impl Workspace {
             })
         });
         let mut this = Self {
+            web_pages: Vec::new(),
+            web_front: None,
             focus_handle: cx.focus_handle(),
             project,
             project_panel,
@@ -724,6 +760,8 @@ impl Workspace {
             layout_selection: layout::selection(cx),
             resizing: None,
             dock_menu: None,
+            extension_terminals: Vec::new(),
+            editor_menu: None,
             bar_menu: None,
             dragging: None,
             modal: None,
@@ -739,6 +777,7 @@ impl Workspace {
             api_panel: api_panel.clone(),
             ai_panel,
             extensions_panel,
+            extension_views,
             chat,
             agent,
             #[cfg(test)]
@@ -771,6 +810,9 @@ impl Workspace {
     }
 
     pub(crate) fn active_editor(&self) -> Option<&Entity<Editor>> {
+        if self.web_front.is_some() {
+            return None;
+        }
         self.panes
             .get(self.active_pane)
             .and_then(Pane::active_editor)
@@ -967,6 +1009,7 @@ impl Workspace {
             return;
         };
         let editor = tab.editor.clone();
+        self.web_front = None;
         if self
             .inline_edit
             .as_ref()
@@ -994,6 +1037,10 @@ impl Workspace {
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((page, _)) = self.web_front.clone() {
+            self.close_webview(&page, window, cx);
+            return;
+        }
         if self.file_diff.is_some() {
             self.close_file_diff(window, cx);
             return;
@@ -1481,8 +1528,12 @@ impl Workspace {
             window,
             |this, terminal, event, window, cx| match event {
                 TerminalEvent::TitleChanged => cx.notify(),
-                // Services keep their tab so a crash's output stays readable.
-                TerminalEvent::Exited if terminal.read(cx).keep_on_exit => cx.notify(),
+                // Services keep their tab so a crash's output stays readable,
+                // and so do the tasks of extensions.
+                TerminalEvent::Exited if terminal.read(cx).keep_on_exit => {
+                    this.extension_terminal_gone(terminal, cx);
+                    cx.notify()
+                }
                 TerminalEvent::Exited => this.remove_terminal(terminal, window, cx),
             },
         );
@@ -1583,6 +1634,7 @@ impl Workspace {
             Panel::Api => self.api_panel.focus_handle(cx),
             Panel::Ai => self.ai_panel.focus_handle(cx),
             Panel::Extensions => self.extensions_panel.focus_handle(cx),
+            Panel::ExtensionViews => self.extension_views.focus_handle(cx),
             Panel::Chat => self.chat.focus_handle(cx),
             Panel::Agent => self.agent.focus_handle(cx),
             Panel::Debug => self.debug_panel.focus_handle(cx),
@@ -1770,6 +1822,7 @@ impl Workspace {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.dock_menu = None;
                 this.bar_menu = None;
+                this.editor_menu = None;
                 run(this, window, cx);
                 cx.notify();
             }))
@@ -1802,11 +1855,95 @@ impl Workspace {
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                         this.dock_menu = None;
                         this.bar_menu = None;
+                        this.editor_menu = None;
                         cx.notify();
                     }))
                     .children(items),
             ),
         )
+    }
+
+    /// What the conditions of extensions are read against in this window:
+    /// the file in front, with what holds everywhere.
+    fn extension_facts(&self, cx: &App) -> HashMap<String, serde_json::Value> {
+        use serde_json::json;
+        let mut facts = ExtensionStore::try_global(cx)
+            .map(|store| store.read(cx).facts())
+            .unwrap_or_default();
+        let Some(editor) = self.active_editor().filter(|_| self.file_diff.is_none()) else {
+            return facts;
+        };
+        let editor = editor.read(cx);
+        let document = editor.doc(cx);
+        let language = json!(crate::extension_api::language_id(document));
+        let has_selection = editor.selections.iter().any(|s| s.anchor != s.head);
+        for (name, value) in [
+            ("editorLangId", language.clone()),
+            ("resourceLangId", language),
+            ("editorTextFocus", json!(true)),
+            ("editorFocus", json!(true)),
+            ("textInputFocus", json!(true)),
+            ("editorIsOpen", json!(true)),
+            ("editorHasSelection", json!(has_selection)),
+            ("editorReadonly", json!(document.is_read_only())),
+            ("resourceScheme", json!("file")),
+        ] {
+            facts.insert(name.into(), value);
+        }
+        if let Some(path) = document.path() {
+            let part =
+                |part: Option<&std::ffi::OsStr>| part.map(|p| p.to_string_lossy().into_owned());
+            if let Some(name) = part(path.file_name()) {
+                facts.insert("resourceFilename".into(), json!(name));
+            }
+            let ending = part(path.extension()).map(|ending| format!(".{ending}"));
+            facts.insert("resourceExtname".into(), json!(ending.unwrap_or_default()));
+        }
+        facts
+    }
+
+    /// The right button in the file in front: what extensions put in the
+    /// editor's menu for it. With nothing of theirs there is no menu.
+    fn open_editor_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let facts = self.extension_facts(cx);
+        let target = self
+            .active_editor()
+            .and_then(|editor| editor.read(cx).path(cx).map(Path::to_path_buf));
+        let offered = ExtensionStore::try_global(cx)
+            .map(|store| {
+                store
+                    .read(cx)
+                    .menu("editor/context", &facts, target.as_deref())
+            })
+            .unwrap_or_default();
+        if !offered.is_empty() {
+            self.editor_menu = Some((position, offered));
+            cx.notify();
+        }
+    }
+
+    fn render_editor_menu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let (position, offered) = self.editor_menu.clone()?;
+        let items = offered
+            .into_iter()
+            .enumerate()
+            .map(|(i, offered)| {
+                let action = offered.action;
+                Self::menu_item(
+                    format!("editor-menu-{i}"),
+                    offered.title,
+                    Box::new(move |_, window, cx| {
+                        window.dispatch_action(Box::new(action.clone()), cx)
+                    }),
+                    cx,
+                )
+            })
+            .collect();
+        Some(Self::menu_surface(position, items, window, cx))
     }
 
     /// The menu of a dock: what can be done with the tab it was opened
@@ -2056,6 +2193,9 @@ impl Workspace {
     /// Tells the panels what the docks show now: the one that came into
     /// view reads what it shows, and services stop watching when unseen.
     fn tell_panels(&mut self, now: Option<Panel>, cx: &mut Context<Self>) {
+        let visible = self.shown(Panel::ExtensionViews);
+        self.extension_views
+            .update(cx, |p, cx| p.set_visible(visible, cx));
         let visible = self.shown(Panel::Services);
         self.services.update(cx, |s, cx| s.set_visible(visible, cx));
         match now {
@@ -2989,6 +3129,16 @@ impl Workspace {
         });
     }
 
+    fn show_extension_views(
+        &mut self,
+        _: &ShowExtensionViews,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_panel(Panel::ExtensionViews, cx);
+        window.focus(&self.extension_views.focus_handle(cx));
+    }
+
     fn show_extensions(&mut self, _: &ShowExtensions, window: &mut Window, cx: &mut Context<Self>) {
         self.set_sidebar(Some(Panel::Extensions), cx);
         window.focus(&self.extensions_panel.focus_handle(cx));
@@ -3142,6 +3292,7 @@ impl Workspace {
         let Some(ix) = self.terminals.iter().position(|(t, _)| t == terminal) else {
             return;
         };
+        self.extension_terminal_gone(terminal, cx);
         let was_focused = terminal.focus_handle(cx).contains_focused(window, cx);
         drop(self.terminals.remove(ix));
         if self.terminals.is_empty() {
@@ -3907,7 +4058,424 @@ impl Workspace {
         if still_focused && let Some(previous) = modal.previous_focus {
             window.focus(&previous);
         }
+        // A question of an extension that waited for the keyboard.
+        cx.defer_in(window, |this, window, cx| this.extension_asks(window, cx));
         cx.notify();
+    }
+
+    /// What extensions asked of the window in front. Files to show and
+    /// edits are done at once; a list to pick from or a line to type
+    /// waits until nothing else has the keyboard, one at a time.
+    fn extension_asks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::extension_api::Ask;
+        let Some(store) = ExtensionStore::try_global(cx) else {
+            return;
+        };
+        if !store.read(cx).is_front(&cx.entity()) {
+            return;
+        }
+        loop {
+            let free = self.modal.is_none();
+            let Some(ask) = store.update(cx, |store, _| store.take_ask(free)) else {
+                break;
+            };
+            match ask {
+                Ask::Webview { key } => self.open_webview(key, window, cx),
+                Ask::Pick { title, rows, reply } => {
+                    self.toggle_modal(window, cx, move |window, cx| {
+                        let pick = crate::extension_ask::AskPick::new(title, rows, reply);
+                        Picker::new(pick, window, cx)
+                    })
+                }
+                Ask::Input {
+                    title,
+                    value,
+                    reply,
+                } => self.toggle_modal(window, cx, move |window, cx| {
+                    let input = crate::extension_ask::AskInput::new(title, reply);
+                    let mut picker = Picker::new(input, window, cx);
+                    if !value.is_empty() {
+                        picker.set_query(&value, cx);
+                    }
+                    picker
+                }),
+                Ask::Show { path, at, reply } => {
+                    let jump = at.map(|range| Jump::Lsp {
+                        range,
+                        encoding: lsp::Encoding::Utf16,
+                    });
+                    self.open_path(path, jump, window, cx);
+                    if let Some(reply) = reply {
+                        reply.send(Ok(true.into()));
+                    }
+                }
+                Ask::Edit { edit, reply } => {
+                    self.apply_workspace_edit(edit, lsp::Encoding::Utf16, cx);
+                    // After the documents said what changed: the extension
+                    // reads the new text as soon as it has its answer.
+                    cx.defer(move |_| reply.send(Ok(true.into())));
+                }
+                Ask::Save { path, reply } => {
+                    let saving = self.save_for_extension(path.as_deref(), cx);
+                    cx.spawn(async move |_, _| {
+                        let saved = futures::future::join_all(saving).await;
+                        reply.send(Ok(saved.into_iter().all(|saved| saved).into()));
+                    })
+                    .detach();
+                }
+                Ask::SaveAll => {
+                    for saving in self.save_for_extension(None, cx) {
+                        saving.detach();
+                    }
+                }
+                Ask::Terminal {
+                    extension,
+                    terminal,
+                    what,
+                } => self.extension_terminal((extension, terminal), what, window, cx),
+                Ask::Output { title, text } => {
+                    let document = cx.new(|cx| {
+                        Document::virtual_file(title, PathBuf::from("output.log"), &text, cx)
+                    });
+                    let editor = cx.new(|cx| Editor::for_document(document, cx));
+                    self.add_tab(editor, window, cx);
+                }
+            }
+        }
+    }
+
+    fn sync_webviews(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = ExtensionStore::try_global(cx) else {
+            return;
+        };
+        let models = store.read(cx).api.webviews.clone();
+        self.web_pages.retain(|(page, _)| {
+            let key = page.read(cx).key.clone();
+            if let Some(model) = models.get(&key) {
+                page.update(cx, |page, cx| page.sync(model.clone(), cx));
+                true
+            } else {
+                page.update(cx, |page, _| page.show(false));
+                false
+            }
+        });
+        if self
+            .web_front
+            .as_ref()
+            .is_some_and(|(page, _)| !models.contains_key(&page.read(cx).key))
+        {
+            self.web_front = None;
+        }
+        for (page, _) in &self.web_pages {
+            let key = page.read(cx).key.clone();
+            let posts = store.update(cx, |store, _| store.api.web_posts.remove(&key));
+            for (message, reply) in posts.into_iter().flatten() {
+                let accepted = page.update(cx, |page, _| page.post(message));
+                reply.send(Ok(accepted.into()));
+            }
+        }
+        cx.notify();
+    }
+
+    fn open_webview(
+        &mut self,
+        key: crate::webview::Key,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = ExtensionStore::try_global(cx) else {
+            return;
+        };
+        let Some(model) = store.read(cx).api.webviews.get(&key).cloned() else {
+            return;
+        };
+        let page = self
+            .web_pages
+            .iter()
+            .find(|(page, _)| page.read(cx).key == key)
+            .map(|(page, _)| page.clone());
+        let page = page.unwrap_or_else(|| {
+            let page = cx.new(|cx| crate::webview::Page::new(key, model, cx));
+            let events = cx.subscribe_in(&page, window, |this, _, event, window, cx| match event {
+                crate::webview::PageEvent::Key(key) => match key.as_str() {
+                    "close" => this.close_tab(&CloseTab, window, cx),
+                    "commands" => {
+                        window.focus(&this.focus_handle);
+                        this.toggle_command_palette(&ToggleCommandPalette, window, cx);
+                    }
+                    "files" => {
+                        window.focus(&this.focus_handle);
+                        this.toggle_file_finder(&ToggleFileFinder, window, cx);
+                    }
+                    _ => {}
+                },
+            });
+            self.web_pages.push((page.clone(), events));
+            page
+        });
+        self.close_file_diff(window, cx);
+        self.web_front = Some((page, self.active_pane));
+        self.sync_webviews(cx);
+    }
+
+    fn close_webview(
+        &mut self,
+        page: &Entity<crate::webview::Page>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = page.read(cx).key.clone();
+        page.update(cx, |page, _| page.show(false));
+        self.web_front = None;
+        self.web_pages.retain(|(known, _)| known != page);
+        if let Some(store) = ExtensionStore::try_global(cx) {
+            store.update(cx, |store, cx| store.close_webview(&key, cx));
+        }
+        if let Some(editor) = self.active_editor() {
+            window.focus(&editor.focus_handle(cx));
+        } else {
+            window.focus(&self.focus_handle);
+        }
+        cx.notify();
+    }
+
+    fn webview_visibility(&mut self, cx: &mut Context<Self>) {
+        let obscured = self.modal.is_some()
+            || self.file_diff.is_some()
+            || self.structure.is_some()
+            || self.erd.is_some()
+            || self.bar_menu.is_some()
+            || self.dock_menu.is_some()
+            || self.editor_menu.is_some()
+            || self.dragging.is_some();
+        for (page, _) in &self.web_pages {
+            let selected = self
+                .web_front
+                .as_ref()
+                .is_some_and(|(active, _)| active == page);
+            page.update(cx, |page, _| page.show(selected && !obscured));
+        }
+    }
+
+    fn webview_tabs(&self, pane: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let theme = cx.theme().clone();
+        self.web_pages
+            .iter()
+            .enumerate()
+            .map(|(ix, (page, _))| {
+                let selected = self
+                    .web_front
+                    .as_ref()
+                    .is_some_and(|(active, _)| active == page);
+                let title = page.read(cx).model.title.clone();
+                let activate = page.clone();
+                let close = page.clone();
+                div()
+                    .id(("web-tab", ix))
+                    .debug_selector(move || format!("web-tab-{ix}"))
+                    .flex_none()
+                    .h(px(26.))
+                    .max_w(px(260.))
+                    .pl_3()
+                    .pr_1p5()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .rounded(theme.shape.control)
+                    .text_size(UI_FONT_SIZE)
+                    .text_color(if selected { theme.fg } else { theme.fg_subtle })
+                    .when(selected, |d| {
+                        d.bg(theme.bg_elev)
+                            .border(theme.shape.border)
+                            .border_color(theme.line)
+                    })
+                    .hover(|d| d.text_color(theme.fg))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.web_front = Some((activate.clone(), pane));
+                        // Keys go to the page that was chosen.
+                        activate.read(cx).focus();
+                        cx.notify();
+                    }))
+                    .child(crate::icons::draw("code"))
+                    .child(div().min_w_0().truncate().child(title))
+                    .child(
+                        div()
+                            .id(("web-close", ix))
+                            .debug_selector(move || format!("web-close-{ix}"))
+                            .flex_none()
+                            .size(px(16.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(theme.shape.token)
+                            .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                            .child(crate::icons::draw("x"))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.close_webview(&close, window, cx);
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// What an extension does with a terminal of its own, in the dock of
+    /// this window.
+    fn extension_terminal(
+        &mut self,
+        key: (String, u64),
+        what: crate::extension_api::TerminalAsk,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::extension_api::TerminalAsk;
+        let known = self
+            .extension_terminals
+            .iter()
+            .find(|(of, _)| *of == key)
+            .map(|(_, terminal)| terminal.clone());
+        match (what, known) {
+            (
+                TerminalAsk::Create {
+                    name,
+                    program,
+                    args,
+                    cwd,
+                    env,
+                    keep,
+                    show,
+                },
+                None,
+            ) => {
+                let command = TerminalCommand {
+                    program,
+                    args,
+                    cwd: cwd.unwrap_or_else(|| self.root(cx)),
+                    env,
+                    title: name,
+                    keep_on_exit: keep,
+                };
+                match self.spawn_terminal_with(command, show, window, cx) {
+                    Some(terminal) => self.extension_terminals.push((key, terminal)),
+                    // It could not be started: to the extension it ended.
+                    None => {
+                        if let Some(store) = ExtensionStore::try_global(cx) {
+                            store.read(cx).terminal_closed(&key.0, key.1, None);
+                        }
+                    }
+                }
+            }
+            (TerminalAsk::Send(text), Some(terminal)) => terminal.read(cx).write(text.into_bytes()),
+            (TerminalAsk::Show, Some(terminal)) => {
+                if let Some(ix) = self.terminals.iter().position(|(t, _)| *t == terminal) {
+                    self.active_terminal = ix;
+                }
+                self.show_panel(Panel::Terminal, cx);
+                cx.notify();
+            }
+            (TerminalAsk::Dispose, Some(terminal)) => self.remove_terminal(&terminal, window, cx),
+            _ => {}
+        }
+    }
+
+    /// A terminal ended or its tab was closed. If an extension made it,
+    /// the extension hears of it, with what its program ended with.
+    fn extension_terminal_gone(&mut self, terminal: &Entity<Terminal>, cx: &mut Context<Self>) {
+        let made = self
+            .extension_terminals
+            .iter()
+            .position(|(_, known)| known == terminal);
+        let Some(ix) = made else {
+            return;
+        };
+        let ((extension, id), terminal) = self.extension_terminals.remove(ix);
+        let code = terminal.read(cx).exit_code;
+        if let Some(store) = ExtensionStore::try_global(cx) {
+            store.read(cx).terminal_closed(&extension, id, code);
+        }
+    }
+
+    /// The tasks extensions have, to run one in a terminal.
+    fn run_extension_task(
+        &mut self,
+        _: &RunExtensionTask,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = ExtensionStore::try_global(cx) else {
+            return;
+        };
+        let listing = store.update(cx, |store, cx| store.tasks(cx));
+        self.toggle_modal(window, cx, move |window, cx| {
+            let picker = Picker::new(crate::extension_ask::TaskPick::default(), window, cx);
+            crate::extension_ask::TaskPick::load(listing, window, cx);
+            picker
+        });
+    }
+
+    /// Saves the open file at `path`, or with none every open file that
+    /// has changes, for an extension that asked.
+    fn save_for_extension(
+        &mut self,
+        path: Option<&Path>,
+        cx: &mut Context<Self>,
+    ) -> Vec<Task<bool>> {
+        let mut seen = HashSet::new();
+        let editors: Vec<Entity<Editor>> = self
+            .all_editors()
+            .filter(|editor| {
+                let document = editor.read(cx).document();
+                let wanted = match (path, document.read(cx).path()) {
+                    (Some(path), Some(own)) => path == own,
+                    (None, Some(_)) => document.read(cx).is_dirty(),
+                    _ => false,
+                };
+                wanted && seen.insert(document.entity_id())
+            })
+            .cloned()
+            .collect();
+        editors
+            .into_iter()
+            .map(|editor| editor.update(cx, |editor, cx| editor.save(cx)))
+            .collect()
+    }
+
+    /// Runs a command of an extension's code. That it failed is said in
+    /// the status bar; what it answers is the extension's own business.
+    fn run_extension_command(
+        &mut self,
+        action: &crate::extension_api::RunExtensionCommand,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = ExtensionStore::try_global(cx) else {
+            return;
+        };
+        // A key bound under a condition that does not hold here is not
+        // this command's: whoever else has the key gets it.
+        if let Some(when) = &action.when {
+            let facts = self.extension_facts(cx);
+            if !extension::when::holds(when, &|name| facts.get(name).cloned()) {
+                cx.propagate();
+                return;
+            }
+        }
+        let command = action.command.clone();
+        let running = store.update(cx, |store, cx| {
+            store.run_command(&command, action.args.clone(), cx)
+        });
+        cx.spawn(async move |_, cx| {
+            if let Err(error) = running.await {
+                store
+                    .update(cx, |store, cx| {
+                        store.report(format!("{command}: {error}"), cx)
+                    })
+                    .ok();
+            }
+        })
+        .detach();
     }
 
     fn toggle_command_palette(
@@ -3917,7 +4485,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let plugins = self.plugins.clone();
-        let palette = CommandPalette::new(plugins, window, cx);
+        let facts = self.extension_facts(cx);
+        let extensions = ExtensionStore::try_global(cx)
+            .map(|store| store.read(cx).palette(&facts))
+            .unwrap_or_default();
+        let palette = CommandPalette::new(plugins, extensions, window, cx);
         self.toggle_modal(window, cx, move |window, cx| {
             Picker::new(palette, window, cx)
         });
@@ -4064,7 +4636,7 @@ impl Workspace {
         let is_active_pane = p == self.active_pane;
         let search_visible =
             is_active_pane && self.search_bar.read(cx).visible && pane.active_editor().is_some();
-        let tabs: Vec<_> = pane
+        let mut tabs: Vec<AnyElement> = pane
             .tabs
             .iter()
             .enumerate()
@@ -4076,7 +4648,7 @@ impl Workspace {
                     .path()
                     .and_then(|path| crate::file_icons::file(path, cx));
                 let dirty = doc.is_dirty();
-                let active = pane.active == Some(ix);
+                let active = pane.active == Some(ix) && self.web_front.is_none();
                 let close_editor = editor.clone();
                 let middle_editor = editor.clone();
                 div()
@@ -4139,8 +4711,12 @@ impl Workspace {
                                 this.close(&close_editor, window, cx)
                             })),
                     )
+                    .into_any_element()
             })
             .collect();
+        if p == self.active_pane {
+            tabs.extend(self.webview_tabs(p, cx));
+        }
         let TabBar {
             height,
             place: tabs_at,
@@ -4187,9 +4763,25 @@ impl Workspace {
                     .debug_selector(move || format!("pane-body-{p}"))
                     .flex_1()
                     .min_h_0()
-                    .map(|d| match pane.active_editor() {
-                        Some(editor) => d.child(editor.clone()),
-                        None => d.child(self.render_empty(window, cx)),
+                    .when(is_active_pane, |d| {
+                        d.on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                this.open_editor_menu(event.position, cx)
+                            }),
+                        )
+                    })
+                    .map(|d| {
+                        if let Some((page, page_pane)) = &self.web_front
+                            && *page_pane == p
+                        {
+                            d.child(page.clone())
+                        } else {
+                            match pane.active_editor() {
+                                Some(editor) => d.child(editor.clone()),
+                                None => d.child(self.render_empty(window, cx)),
+                            }
+                        }
                     }),
             )
             // Below the file, if that is where the layout puts them.
@@ -4257,6 +4849,9 @@ impl Workspace {
                             Panel::Api => this.show_api(&ShowApi, window, cx),
                             Panel::Ai => this.show_ai(&ShowAi, window, cx),
                             Panel::Extensions => this.show_extensions(&ShowExtensions, window, cx),
+                            Panel::ExtensionViews => {
+                                this.show_extension_views(&ShowExtensionViews, window, cx)
+                            }
                             Panel::Chat => this.show_right(false, window, cx),
                             Panel::Agent => this.show_right(true, window, cx),
                             _ => {}
@@ -4337,6 +4932,7 @@ impl Workspace {
                     Panel::Api => d.pt_1().child(self.api_panel.clone()),
                     Panel::Ai => d.pt_1().child(self.ai_panel.clone()),
                     Panel::Extensions => d.pt_1().child(self.extensions_panel.clone()),
+                    Panel::ExtensionViews => d.child(self.extension_views.clone()),
                     Panel::Chat => d.pt_1().child(self.chat.clone()),
                     Panel::Agent => d.pt_1().child(self.agent.clone()),
                     Panel::Debug => d.child(self.debug_panel.clone()),
@@ -4354,6 +4950,9 @@ impl Workspace {
     /// What is in front, as the window's title says it: the file, or the
     /// view that took its place, or with neither the project's folder.
     fn front_title(&self, cx: &App) -> String {
+        if let Some((page, _)) = &self.web_front {
+            return page.read(cx).model.title.clone();
+        }
         self.structure
             .as_ref()
             .map(|(view, _)| format!("Structure of {}", view.read(cx).title(cx)))
@@ -4522,6 +5121,39 @@ impl Workspace {
                         )
                     })
                     .into_iter()
+                    .collect()
+            }
+            // What the code of extensions shows. An item with a command
+            // runs it.
+            Item::Extensions => {
+                let Some(store) = ExtensionStore::try_global(cx) else {
+                    return Vec::new();
+                };
+                let bar = store.read(cx).bar();
+                bar.into_iter()
+                    .enumerate()
+                    .map(|(i, item)| {
+                        use crate::extension_api::{RunExtensionCommand, Tone};
+                        let color = match item.tone {
+                            Tone::Plain => theme.fg_muted,
+                            Tone::Warning => theme.warning,
+                            Tone::Error => theme.error,
+                        };
+                        let action = item.command.map(|(command, args)| {
+                            let when = None;
+                            Box::new(RunExtensionCommand {
+                                command,
+                                args,
+                                when,
+                            }) as Box<dyn gpui::Action>
+                        });
+                        BarPart {
+                            text: item.text,
+                            id: Some(("status-extension", i)),
+                            color: Some(color),
+                            action,
+                        }
+                    })
                     .collect()
             }
             // What plugins show, and a notice when one is slow; both open
@@ -4825,6 +5457,7 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        self.webview_visibility(cx);
         // A tab let go anywhere is no longer dragged.
         if self.dragging.is_some() && !cx.has_active_drag() {
             self.dragging = None;
@@ -4898,6 +5531,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::open_layout))
             .on_action(cx.listener(Self::switch_layout))
+            .on_action(cx.listener(Self::run_extension_command))
+            .on_action(cx.listener(Self::run_extension_task))
             .on_action(cx.listener(Self::save_layout))
             .on_action(cx.listener(Self::switch_key_layout))
             .on_action(cx.listener(Self::save_key_layout))
@@ -4919,6 +5554,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_agent))
             .on_action(cx.listener(Self::show_plugins))
             .on_action(cx.listener(Self::show_extensions))
+            .on_action(cx.listener(Self::show_extension_views))
             .on_action(cx.listener(Self::import_settings))
             .on_action(cx.listener(Self::debug_start))
             .on_action(cx.listener(Self::debug_pick))
@@ -5000,6 +5636,7 @@ impl Render for Workspace {
             )
             .children(self.render_dock_menu(window, cx))
             .children(self.render_bar_menu(window, cx))
+            .children(self.render_editor_menu(window, cx))
             .child(self.render_status(cx))
             .children(self.resize_handles(cx))
             .on_mouse_move(cx.listener(Self::resize_move))
@@ -5531,6 +6168,121 @@ mod tests {
         });
         cx.simulate_keystrokes("escape");
         assert!(cx.read(|cx| editor.read(cx).signature.is_none()));
+    }
+
+    /// What a server draws into the text: hints in the lines, and colors
+    /// over the grammar's. Against `tests/fixtures/mock_lsp.py --hints`.
+    #[gpui::test]
+    fn a_server_draws_hints_and_colors_into_the_text(cx: &mut TestAppContext) {
+        use crate::document::Inlay;
+        use syntax::HighlightKind;
+        let root = fixture("lsp-hints");
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        let file = root.join("src/main.rs");
+        std::fs::write(&file, "fn helper() {}\n// TODO fix\n").unwrap();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let with = |hints: bool, colors: bool| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "rust-analyzer".into(),
+                settings::ServerOverride {
+                    command: Some("python3".into()),
+                    args: Some(vec![script.display().to_string(), "--hints".into()]),
+                    ..Default::default()
+                },
+            );
+            settings.inlay_hints = hints;
+            settings.semantic_highlighting = colors;
+            settings
+        };
+        cx.update(|_, cx| cx.set_global(with(true, true)));
+        ws.update_in(cx, |w, window, cx| {
+            let content = std::fs::read_to_string(&file).unwrap();
+            w.add_editor(Some(file.clone()), &content, None, window, cx)
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let drawn = |cx: &App| {
+            let editor = editor.read(cx);
+            let doc = editor.doc(cx);
+            ((**doc.inlays()).clone(), (**doc.semantic()).clone())
+        };
+        let hint = |offset: usize| Inlay {
+            offset,
+            text: ": fn ".into(),
+        };
+
+        // Asked a moment after the file opened: a hint after the name of
+        // the function, and the two words the server has a color for. The
+        // third kind it names is none the editor knows, and is left out.
+        wait_for(cx, "hints and colors", &|cx| {
+            let (hints, colors) = drawn(cx);
+            !hints.is_empty() && !colors.is_empty()
+        });
+        assert_eq!(
+            cx.read(|cx| drawn(cx)),
+            (
+                vec![hint(9)],
+                vec![
+                    (3..9, HighlightKind::Function),
+                    (18..22, HighlightKind::Function)
+                ]
+            )
+        );
+        // The hint is in the row and is no place in the file: the cursor
+        // after `helper` stands before it, and `(` comes after it.
+        cx.run_until_parked();
+        let (before, after, inside) = cx.read(|cx| {
+            let editor = editor.read(cx);
+            let layout = editor.layout.as_ref().expect("the editor was drawn");
+            let line = &layout.lines[0];
+            let (before, after) = (line.x_for(9), line.x_for(10));
+            let middle = gpui::point(
+                layout.text_left + (before + after) / 2.,
+                layout.bounds.top() + layout.line_height / 2.,
+            );
+            let buffer = editor.doc(cx).text();
+            let inside = layout.offset_for_position(buffer, gpui::Point::default(), middle);
+            (before, after, inside)
+        });
+        let em = cx.read(|cx| editor.read(cx).layout.as_ref().unwrap().em_width);
+        // Five characters of hint and the `(` itself.
+        assert!(
+            (after - before - em * 6.).abs() < px(1.),
+            "{before:?} {after:?} {em:?}"
+        );
+        assert_eq!(inside, 9);
+
+        // Typed before them, they move with the text at once, and the
+        // server's next answer says the same.
+        let focus = cx.read(|cx| editor.focus_handle(cx));
+        cx.update(|window, _| window.focus(&focus));
+        cx.dispatch_action(crate::editor::MoveToStart);
+        cx.simulate_input("x");
+        assert_eq!(cx.read(|cx| drawn(cx).0), [hint(10)]);
+        wait_for(cx, "the server's answer", &|cx| {
+            drawn(cx).1
+                == [
+                    (4..10, HighlightKind::Function),
+                    (19..23, HighlightKind::Function),
+                ]
+        });
+        assert_eq!(cx.read(|cx| drawn(cx).0), [hint(10)]);
+        // A second function gets a hint of its own.
+        cx.dispatch_action(crate::editor::MoveToEnd);
+        cx.simulate_input("fn two() {}");
+        wait_for(cx, "the second hint", &|cx| drawn(cx).0.len() == 2);
+        assert_eq!(cx.read(|cx| drawn(cx).0[1].offset), 34);
+
+        // Each can be turned off, and is gone at the next change.
+        cx.update(|_, cx| cx.set_global(with(false, true)));
+        cx.simulate_input(" ");
+        wait_for(cx, "the hints to go", &|cx| drawn(cx).0.is_empty());
+        assert!(!cx.read(|cx| drawn(cx).1.is_empty()));
+        cx.update(|_, cx| cx.set_global(with(false, false)));
+        cx.simulate_input(" ");
+        wait_for(cx, "the colors to go", &|cx| drawn(cx).1.is_empty());
     }
 
     /// A real PTY: type a command, read its output off the grid, exit.
@@ -10639,7 +11391,7 @@ mod tests {
 
     // ----------------------------------------------------------- extensions
 
-    use crate::extension_store::ExtensionStore;
+    use crate::extension_store::CodeState;
     use extension::{
         Origin,
         testing::{Served, serve, tar, write as write_file, zip},
@@ -11255,6 +12007,10 @@ brackets = [
             ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
         ]);
         let (_config, store, ws, cx) = extension_setup(cx, "ext-vsx", &base);
+        // A machine with no Node.js, and no way to one.
+        store.update(cx, |store, _| {
+            store.world = Some(std::sync::Arc::new(ServerOnPath("nothing", String::new())));
+        });
 
         cx.dispatch_action(ShowExtensions);
         wait_for(cx, "the catalogs", &|cx| {
@@ -11262,20 +12018,37 @@ brackets = [
             !store.catalog(Origin::VsCode).entries.is_empty() && store.catalog(Origin::Zed).searched
         });
         cx.run_until_parked();
-        // Enter installs what is selected.
+        // Enter installs what is selected. This one has code, which has
+        // no sandbox: that is said before anything of it is in place.
         cx.simulate_keystrokes("enter");
+        wait_for(cx, "the download", &|cx| {
+            let waiting = (Origin::VsCode, "vue.volar".to_string());
+            store.read(cx).pending.contains_key(&waiting)
+        });
+        assert_eq!(
+            cx.read(|cx| store.read(cx).asks(Origin::VsCode, "vue.volar")),
+            ["Run its code with Node.js, outside a sandbox"]
+        );
+        assert!(cx.read(|cx| store.read(cx).find(Origin::VsCode, "vue.volar").is_none()));
+        cx.run_until_parked();
+        click(cx, "extension-allow");
         wait_for(cx, "the install", &|cx| {
             store.read(cx).find(Origin::VsCode, "vue.volar").is_some()
         });
         let installed = cx.read(|cx| store.read(cx).find(Origin::VsCode, "Vue.volar").cloned());
         let installed = installed.unwrap();
         assert_eq!(installed.themes.len(), 2);
-        assert!(
-            installed
-                .missing
-                .iter()
-                .any(|m| m.contains("needs VS Code"))
-        );
+        // Its code was allowed and waits for the start to be over, so it
+        // is started; with no Node.js it says so, and the rest of the
+        // extension works as before.
+        assert!(installed.node().is_some());
+        wait_for(cx, "its code to give up", &|cx| {
+            let code = store.read(cx).code("Vue.volar");
+            matches!(
+                code.map(|code| &code.state),
+                Some(CodeState::Stopped(why)) if why.contains("Node.js was not found")
+            )
+        });
         // Its language (files ending in .dm) is colored by the TextMate
         // grammar it brings, and typed as its configuration says.
         assert_eq!(installed.languages[0].suffixes, ["dm", "Demofile"]);
@@ -11392,6 +12165,1500 @@ brackets = [
                 .iter()
                 .any(|r| r == "/extensions?max_schema_version=1&filter=vue")
         );
+    }
+
+    /// This machine's Node.js and nothing else of the world.
+    struct NodeOnly(String);
+
+    impl extension::host::World for NodeOnly {
+        fn node(&self) -> Result<String, String> {
+            Ok(self.0.clone())
+        }
+        fn npm_latest(&self, _: &str) -> Result<String, String> {
+            Err("no npm here".into())
+        }
+        fn npm_install(&self, _: &Path, _: &str, _: &str) -> Result<(), String> {
+            Err("no npm here".into())
+        }
+        fn release(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: bool,
+        ) -> Result<extension::host::Release, String> {
+            Err("no network here".into())
+        }
+        fn download(&self, _: &str, _: &Path, _: extension::host::FileKind) -> Result<(), String> {
+            Err("no network here".into())
+        }
+        fn fetch(
+            &self,
+            _: extension::host::HttpRequest,
+        ) -> Result<extension::host::HttpResponse, String> {
+            Err("no network here".into())
+        }
+        fn run(&self, _: &extension::host::Command) -> Result<extension::host::Output, String> {
+            Err("no commands here".into())
+        }
+        fn which(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn env(&self) -> Vec<(String, String)> {
+            Vec::new()
+        }
+        fn status(&self, _: &str, _: extension::host::Status) {}
+    }
+
+    #[gpui::test]
+    fn the_code_of_a_vscode_extension_runs_in_a_process_of_its_own(cx: &mut TestAppContext) {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let _languages = extension_languages();
+        let (base, _) = serve(vec![
+            (
+                "/api/-/search",
+                Served::ok(br#"{"extensions":[]}"#.to_vec()),
+            ),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-code", &base);
+        let folder = cx.read(|cx| store.read(cx).root.clone());
+        // Four extensions put in place by hand, so none was allowed: the
+        // fixture, which has a command; one that asks for that command
+        // when a Rust file is open; one that never returns from its
+        // start; and one that ends its own process.
+        extension::testing::vscode_extension(&folder.join("vscode/acme.demo"));
+        let code = |name: &str, wakes: &str, main: &str| {
+            let dir = folder.join(format!("vscode/acme.{name}"));
+            write_file(
+                &dir.join("package.json"),
+                &format!(
+                    r#"{{ "name": "{name}", "publisher": "Acme", "version": "1.0.0", "main": "main.js", "activationEvents": ["{wakes}"] }}"#
+                ),
+            );
+            write_file(&dir.join("main.js"), main);
+        };
+        code(
+            "other",
+            "onLanguage:rust",
+            r#"const vscode = require('vscode');
+exports.activate = async () => {
+  const answer = await vscode.commands.executeCommand('demo.run', 4);
+  console.log('demo.run said ' + JSON.stringify(answer));
+};"#,
+        );
+        code("spin", "*", "exports.activate = () => { for (;;) {} };");
+        code(
+            "quit",
+            "onStartupFinished",
+            r#"exports.activate = async (context) => {
+  const starts = context.globalState.get('starts', 0) + 1;
+  await context.globalState.update('starts', starts);
+  console.log('start ' + starts);
+  setTimeout(() => { process.stderr.write('out of luck\n'); process.exit(3); }, 200);
+};"#,
+        );
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.patience = Duration::from_secs(2);
+            store.scan(cx);
+        });
+        wait_for(cx, "the four", &|cx| store.read(cx).installed.len() == 4);
+        cx.run_until_parked();
+        let state = |cx: &App, id: &str| store.read(cx).code(id).map(|code| code.state.clone());
+        let said = |cx: &App, id: &str, what: &str| {
+            store
+                .read(cx)
+                .code(id)
+                .is_some_and(|code| code.said.iter().any(|(_, text)| text == what))
+        };
+        // Nothing of them runs: code has no sandbox, and nobody agreed.
+        for id in ["Acme.demo", "Acme.other", "Acme.spin", "Acme.quit"] {
+            assert_eq!(cx.read(|cx| state(cx, id)), None);
+            assert_eq!(
+                cx.read(|cx| store.read(cx).asks_installed(Origin::VsCode, id)),
+                ["Run its code with Node.js, outside a sandbox"]
+            );
+        }
+
+        // Allowed, the fixture is started: it waits for no more than the
+        // editor to be up. Its commands are known, and what it asked for
+        // that is not here.
+        store.update(cx, |store, cx| store.allow(Origin::VsCode, "Acme.demo", cx));
+        wait_for(cx, "the fixture's code", &|cx| {
+            state(cx, "Acme.demo") == Some(CodeState::Running)
+                && store.read(cx).code("Acme.demo").unwrap().commands.len() == 3
+        });
+        let demo = |cx: &App| {
+            let code = store.read(cx).code("Acme.demo").unwrap();
+            (code.commands.clone(), code.missing.clone())
+        };
+        assert_eq!(
+            cx.read(|cx| demo(cx)),
+            (
+                vec!["demo.run".into(), "demo.spin".into(), "demo.quit".into()],
+                vec!["notebooks.createNotebookController".to_string()]
+            )
+        );
+        assert!(cx.read(|cx| said(cx, "Acme.demo", "demo started")));
+
+        // The other is allowed in the tab. It waits for a Rust file, so
+        // it is not started yet.
+        cx.dispatch_action(ShowExtensions);
+        cx.run_until_parked();
+        cx.simulate_input("other");
+        bounds_soon(cx, "extension-allow-code");
+        click(cx, "extension-allow-code");
+        assert!(cx.read(|cx| {
+            store
+                .read(cx)
+                .asks_installed(Origin::VsCode, "Acme.other")
+                .is_empty()
+        }));
+        assert_eq!(cx.read(|cx| state(cx, "Acme.other")), None);
+        // A Rust file is opened: it starts, and asks for a command that is
+        // the fixture's, which answers from its own process.
+        let main = cx.read(|cx| ws.read(cx).root(cx)).join("main.rs");
+        std::fs::write(&main, "fn main() {}\n").unwrap();
+        ws.update_in(cx, |w, window, cx| w.open_path(main, None, window, cx));
+        let answered = r#"demo.run said {"ran":[4],"starts":1}"#;
+        wait_for(cx, "the other's code", &|cx| {
+            said(cx, "Acme.other", answered)
+        });
+        assert_eq!(
+            cx.read(|cx| state(cx, "Acme.other")),
+            Some(CodeState::Running)
+        );
+
+        // One that never returns from its start is ended, and one that
+        // ends itself is known to have, with its last words.
+        store.update(cx, |store, cx| {
+            store.allow(Origin::VsCode, "Acme.spin", cx);
+            store.allow(Origin::VsCode, "Acme.quit", cx);
+        });
+        wait_for(cx, "the two to end", &|cx| {
+            matches!(state(cx, "Acme.spin"), Some(CodeState::Stopped(_)))
+                && matches!(state(cx, "Acme.quit"), Some(CodeState::Stopped(_)))
+        });
+        assert_eq!(
+            cx.read(|cx| state(cx, "Acme.spin")),
+            Some(CodeState::Stopped("It did not answer for 2 s".into()))
+        );
+        assert_eq!(
+            cx.read(|cx| state(cx, "Acme.quit")),
+            Some(CodeState::Stopped("out of luck".into()))
+        );
+        // Neither took the others along: the fixture still answers the
+        // other, started again, and from the same process as before.
+        assert_eq!(
+            cx.read(|cx| state(cx, "Acme.demo")),
+            Some(CodeState::Running)
+        );
+        store.update(cx, |store, cx| store.restart_code("Acme.other", cx));
+        wait_for(cx, "the other's code again", &|cx| {
+            said(cx, "Acme.other", answered)
+        });
+        // What ended is not started over and over, only when asked to.
+        assert!(cx.read(|cx| said(cx, "Acme.quit", "start 1")));
+        store.update(cx, |store, cx| {
+            store.wake(cx);
+            store.restart_code("Acme.quit", cx)
+        });
+        wait_for(cx, "the second start", &|cx| {
+            said(cx, "Acme.quit", "start 2")
+                && matches!(state(cx, "Acme.quit"), Some(CodeState::Stopped(_)))
+        });
+
+        // Turned off, its code is ended; removed, what it kept goes too.
+        store.update(cx, |store, cx| {
+            store.set_off(Origin::VsCode, "Acme.demo", true, cx)
+        });
+        assert_eq!(cx.read(|cx| state(cx, "Acme.demo")), None);
+        assert!(folder.join("work/acme.quit/global.json").is_file());
+        store.update(cx, |store, cx| {
+            store.remove(Origin::VsCode, "Acme.quit", cx)
+        });
+        wait_for(cx, "the removal", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.quit").is_none()
+        });
+        assert_eq!(cx.read(|cx| state(cx, "Acme.quit")), None);
+        assert!(!folder.join("work/acme.quit").exists());
+        // The host is Solder's own file, written once next to them.
+        assert!(folder.join("host/host.js").is_file());
+    }
+
+    #[gpui::test]
+    fn an_extension_reads_the_editor_and_asks_the_user(cx: &mut TestAppContext) {
+        use crate::extension_api::{BarText, RunExtensionCommand, Tone};
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let (base, _) = serve(vec![
+            (
+                "/api/-/search",
+                Served::ok(br#"{"extensions":[]}"#.to_vec()),
+            ),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (config, store, ws, cx) = extension_setup(cx, "ext-api", &base);
+        let root = cx.read(|cx| ws.read(cx).root(cx));
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("other.rs"), "fn other() {}\n").unwrap();
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(root.join("main.rs"), None, window, cx)
+        });
+        let front = |cx: &App| {
+            let editor = ws.read(cx).active_editor()?.read(cx);
+            Some((editor.doc(cx).title(), editor.text(cx)))
+        };
+        wait_for(cx, "main.rs in front", &|cx| {
+            front(cx).is_some_and(|(title, _)| title == "main.rs")
+        });
+
+        let folder = cx.read(|cx| store.read(cx).root.clone());
+        let dir = folder.join("vscode/acme.api");
+        write_file(
+            &dir.join("package.json"),
+            r#"{ "name": "api", "publisher": "Acme", "version": "1.0.0", "main": "main.js",
+  "activationEvents": ["*"],
+  "contributes": { "configuration": { "properties": { "api.level": { "type": "number", "default": 2 } } } } }"#,
+        );
+        write_file(
+            &dir.join("main.js"),
+            r#"const vscode = require('vscode');
+exports.activate = async (context) => {
+  const out = vscode.window.createOutputChannel('Api');
+  const log = (...all) => out.appendLine(all.map((one) => (typeof one === 'string' ? one : JSON.stringify(one))).join(' '));
+  const name = (uri) => vscode.workspace.asRelativePath(uri);
+  log('folder', vscode.workspace.workspaceFolders[0].name);
+  log('level', vscode.workspace.getConfiguration('api').get('level'), vscode.workspace.getConfiguration('editor').get('tabSize'));
+  log('open', vscode.workspace.textDocuments.map((doc) => name(doc.uri)).sort());
+  log('front', name(vscode.window.activeTextEditor.document.uri), vscode.window.activeTextEditor.document.languageId);
+  vscode.workspace.onDidChangeTextDocument((e) => log('changed', e.contentChanges[0].text, e.document.lineAt(0).text));
+  vscode.workspace.onDidChangeConfiguration((e) => {
+    if (e.affectsConfiguration('api.level')) log('level now', vscode.workspace.getConfiguration('api').get('level'));
+  });
+  vscode.workspace.onDidOpenTextDocument((doc) => log('opened', name(doc.uri), doc.languageId));
+  vscode.workspace.onDidSaveTextDocument((doc) => log('saved', name(doc.uri)));
+  vscode.window.onDidChangeActiveTextEditor((e) => log('now front', e ? name(e.document.uri) : 'none'));
+  vscode.window.onDidChangeTextEditorSelection((e) => log('cursor', e.selections[0].active.line, e.selections[0].active.character));
+  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
+  item.text = '$(rocket) Api ready';
+  item.command = { command: 'api.ask', arguments: ['from the bar'] };
+  item.show();
+  context.subscriptions.push(vscode.commands.registerCommand('api.ask', async (from) => {
+    const answer = await vscode.window.showInformationMessage('Go on?', 'Yes', 'No');
+    const picked = await vscode.window.showQuickPick(['alpha', 'beta'], { placeHolder: 'Which one' });
+    const typed = await vscode.window.showInputBox({ prompt: 'A name', value: 'abc' });
+    log('asked', from, answer, picked, typed);
+    const editor = vscode.window.activeTextEditor;
+    await editor.edit((builder) => builder.insert(new vscode.Position(0, 0), '// hi\n'));
+    log('after edit', editor.document.lineAt(0).text, editor.document.isDirty);
+    await editor.document.save();
+    await vscode.workspace.getConfiguration('api').update('level', 7);
+    const shown = await vscode.window.showTextDocument(vscode.Uri.joinPath(vscode.workspace.workspaceFolders[0].uri, 'other.rs'));
+    log('shown', name(shown.document.uri));
+    vscode.window.showErrorMessage('It broke');
+    out.show();
+  }));
+  log('ready');
+};"#,
+        );
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.scan(cx);
+        });
+        wait_for(cx, "the extension", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.api").is_some()
+        });
+        store.update(cx, |store, cx| store.allow(Origin::VsCode, "Acme.api", cx));
+        let wrote = |cx: &App, line: &str| {
+            let store = store.read(cx);
+            let output = store.output("Acme.api", "Api").unwrap_or_default();
+            output.lines().any(|known| known == line)
+        };
+        let written = |cx: &mut VisualTestContext, line: &'static str| {
+            for _ in 0..500 {
+                cx.executor().advance_clock(Duration::from_millis(50));
+                cx.run_until_parked();
+                if cx.read(|cx| wrote(cx, line)) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = cx.read(|cx| {
+                let output = store.read(cx).output("Acme.api", "Api");
+                output.unwrap_or_default().to_string()
+            });
+            panic!("no line {line:?} in what it wrote:\n{output}");
+        };
+
+        // Loaded, it already has the folder, the settings with what it
+        // declares, the files that are open and the one in front.
+        written(cx, "ready");
+        let name = root.file_name().unwrap().to_string_lossy().into_owned();
+        let output = cx.read(|cx| {
+            store
+                .read(cx)
+                .output("Acme.api", "Api")
+                .unwrap()
+                .to_string()
+        });
+        assert_eq!(
+            output.lines().collect::<Vec<_>>(),
+            [
+                format!("folder {name}").as_str(),
+                "level 2 4",
+                r#"open ["App.vue","main.rs"]"#,
+                "front main.rs rust",
+                "ready",
+            ]
+        );
+        // Its item is in the status bar, without the picture VS Code
+        // would draw, and a click runs its command with what goes with it.
+        let (command, args) = ("api.ask".to_string(), serde_json::json!(["from the bar"]));
+        assert_eq!(
+            cx.read(|cx| store.read(cx).bar()),
+            [BarText {
+                text: "Api ready".into(),
+                tone: Tone::Plain,
+                command: Some((command.clone(), args.clone())),
+            }]
+        );
+        let when = None;
+        cx.dispatch_action(RunExtensionCommand {
+            command,
+            args,
+            when,
+        });
+
+        // It asks three things, one after another, each in the editor's
+        // own list: a message with answers, one of a list, a line to type.
+        let asking = |cx: &App| ws.read(cx).modal.is_some();
+        wait_for(cx, "the message", &asking);
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the list", &asking);
+        cx.simulate_input("bet");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the line to type", &asking);
+        let guidance = bounds_soon(cx, "extension-input-guidance");
+        let list = bounds_soon(cx, "picker-matches-viewport");
+        assert!(guidance.top() >= list.top());
+        assert!(guidance.bottom() <= list.bottom());
+        // What it suggested is selected, so typing replaces it.
+        cx.simulate_input("xyz");
+        cx.simulate_keystrokes("enter");
+        written(cx, "asked from the bar Yes beta xyz");
+
+        // It changes the file in front, reads its own change, saves the
+        // file, sets a setting and hears of it, and brings another file to
+        // the front.
+        written(cx, "changed // hi");
+        written(cx, "after edit // hi true");
+        written(cx, "saved main.rs");
+        assert_eq!(
+            std::fs::read_to_string(root.join("main.rs")).unwrap(),
+            "// hi\nfn main() {}\n"
+        );
+        written(cx, "level now 7");
+        let settings = std::fs::read_to_string(config.join("settings.json")).unwrap();
+        assert!(settings.contains(r#""api.level": 7"#), "{settings}");
+        written(cx, "opened other.rs rust");
+        written(cx, "now front other.rs");
+        written(cx, "shown other.rs");
+        // A message that asks nothing is in the status bar, and what it
+        // wrote opens in a tab when it says so.
+        wait_for(cx, "its output", &|cx| {
+            front(cx).is_some_and(|(title, text)| {
+                title == "Output: Api" && text.contains("shown other.rs")
+            })
+        });
+        let bar = cx.read(|cx| store.read(cx).bar());
+        assert_eq!(
+            bar.last(),
+            Some(&BarText {
+                text: "It broke".into(),
+                tone: Tone::Error,
+                command: None,
+            })
+        );
+        // The message goes after a while; the item stays.
+        cx.executor().advance_clock(Duration::from_secs(9));
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| store.read(cx).bar().len()), 1);
+
+        // What is typed reaches it as it is typed, with where the cursor is.
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(root.join("other.rs"), None, window, cx)
+        });
+        written(cx, "now front other.rs");
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let focus = cx.read(|cx| editor.focus_handle(cx));
+        cx.update(|window, _| window.focus(&focus));
+        cx.simulate_input("x");
+        written(cx, "changed x xfn other() {}");
+        written(cx, "cursor 0 1");
+
+        // Turned off, its code is ended and its item leaves the bar.
+        store.update(cx, |store, cx| {
+            store.set_off(Origin::VsCode, "Acme.api", true, cx)
+        });
+        assert!(cx.read(|cx| store.read(cx).bar().is_empty()));
+    }
+
+    #[gpui::test]
+    fn an_extension_shows_pages_in_tabs(cx: &mut TestAppContext) {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let (base, _) = serve(vec![
+            (
+                "/api/-/search",
+                Served::ok(br#"{"extensions":[]}"#.to_vec()),
+            ),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-pages", &base);
+        let root = cx.read(|cx| ws.read(cx).root(cx));
+        let folder = cx.read(|cx| store.read(cx).root.clone());
+        let dir = folder.join("vscode/acme.pages");
+        write_file(
+            &dir.join("package.json"),
+            r#"{ "name": "pages", "publisher": "Acme", "version": "1.0.0", "main": "main.js",
+  "activationEvents": ["onCommand:pages.open"],
+  "contributes": {
+    "views": { "explorer": [{ "id": "pages.side", "name": "Side page", "type": "webview" }] },
+    "customEditors": [{ "viewType": "pages.cat", "displayName": "Cat viewer", "selector": [{ "filenamePattern": "*.cat" }] }]
+  } }"#,
+        );
+        write_file(
+            &dir.join("main.js"),
+            r#"const vscode = require('vscode');
+exports.activate = (context) => {
+  let page;
+  context.subscriptions.push(
+    vscode.commands.registerCommand('pages.open', () => {
+      page = vscode.window.createWebviewPanel('pages.one', 'Page one', vscode.ViewColumn.One, { enableScripts: true });
+      page.webview.html = '<h1>One</h1>';
+      page.onDidDispose(() => console.log('page one closed'));
+    }),
+    vscode.commands.registerCommand('pages.post', () => page.webview.postMessage({ hello: 1 })),
+    vscode.window.registerWebviewViewProvider('pages.side', {
+      resolveWebviewView: (view) => { view.webview.html = '<b>side</b>'; },
+    }),
+    vscode.window.registerCustomEditorProvider('pages.cat', {
+      resolveCustomTextEditor: (document, panel) => { panel.webview.html = `<pre>${document.getText()}</pre>`; },
+    }),
+  );
+};"#,
+        );
+        std::fs::write(root.join("tom.cat"), "meow").unwrap();
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.scan(cx);
+        });
+        wait_for(cx, "the extension", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.pages").is_some()
+        });
+        store.update(cx, |store, cx| {
+            store.allow(Origin::VsCode, "Acme.pages", cx)
+        });
+        // The pages this window has, by their titles, and the one in front.
+        let pages = |cx: &App| -> (Vec<String>, Option<String>) {
+            let ws = ws.read(cx);
+            let titles = ws
+                .web_pages
+                .iter()
+                .map(|(page, _)| page.read(cx).model.title.clone());
+            let front = ws
+                .web_front
+                .as_ref()
+                .map(|(page, _)| page.read(cx).model.title.clone());
+            (titles.collect(), front)
+        };
+        let html = |cx: &App, title: &str| {
+            let ws = ws.read(cx);
+            let page = ws
+                .web_pages
+                .iter()
+                .find(|(page, _)| page.read(cx).model.title == title);
+            page.map(|(page, _)| page.read(cx).model.html.clone())
+        };
+        assert!(cx.read(|cx| pages(cx)).0.is_empty());
+        assert!(cx.read(|cx| ws.read(cx).active_editor().is_some()));
+
+        // A page an extension opens is a tab of the window, in front of
+        // the file that was there, and names the window.
+        let ran = |cx: &mut VisualTestContext, command: &str| {
+            let task = store.update(cx, |store, cx| {
+                store.run_command(command, serde_json::Value::Null, cx)
+            });
+            let answer = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let got = answer.clone();
+            cx.foreground_executor()
+                .spawn(async move { *got.borrow_mut() = Some(task.await) })
+                .detach();
+            for _ in 0..500 {
+                cx.run_until_parked();
+                if answer.borrow().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let answer = answer.borrow_mut().take();
+            answer.expect("the command did not answer")
+        };
+        ran(cx, "pages.open").unwrap();
+        wait_for(cx, "the page", &|cx| {
+            pages(cx) == (vec!["Page one".to_string()], Some("Page one".to_string()))
+                && html(cx, "Page one").as_deref() == Some("<h1>One</h1>")
+        });
+        assert!(cx.read(|cx| ws.read(cx).active_editor().is_none()));
+        assert_eq!(cx.read(|cx| ws.read(cx).front_title(cx)), "Page one");
+        // What the extension sends it is taken for the page.
+        assert_eq!(ran(cx, "pages.post"), Ok(serde_json::json!(true)));
+
+        // A file's tab chosen, the file is in front again and the page
+        // keeps its tab; closed by its own button, the extension hears.
+        let tab = bounds_soon(cx, "web-tab-0");
+        ws.update_in(cx, |w, window, cx| {
+            let pane = w.active_pane;
+            w.activate(pane, 0, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| pages(cx)).1, None);
+        assert!(cx.read(|cx| ws.read(cx).active_editor().is_some()));
+        cx.simulate_click(tab.center(), gpui::Modifiers::default());
+        assert_eq!(cx.read(|cx| pages(cx)).1.as_deref(), Some("Page one"));
+        let close = bounds_soon(cx, "web-close-0");
+        cx.simulate_click(close.center(), gpui::Modifiers::default());
+        wait_for(cx, "the extension to hear", &|cx| {
+            let store = store.read(cx);
+            let code = store.code("Acme.pages").unwrap();
+            code.said.iter().any(|(_, text)| text == "page one closed")
+        });
+        assert!(cx.read(|cx| pages(cx)).0.is_empty());
+        assert!(cx.read(|cx| ws.read(cx).active_editor().is_some()));
+
+        // An editor of the extension's is offered for a file its pattern
+        // names, in the tree's menu, and opens the file as a page.
+        let offered = |cx: &App, name: &str| {
+            let store = store.read(cx);
+            store.menu("explorer/context", &store.facts(), Some(&root.join(name)))
+        };
+        assert!(cx.read(|cx| offered(cx, "App.vue")).is_empty());
+        let with = cx.read(|cx| offered(cx, "tom.cat"));
+        assert_eq!(with.len(), 1);
+        assert_eq!(with[0].title, "Open with Cat viewer");
+        cx.dispatch_action(with[0].action.clone());
+        wait_for(cx, "the file as a page", &|cx| {
+            html(cx, "tom.cat").as_deref() == Some("<pre>meow</pre>")
+        });
+
+        // A view that is a page is in the list of views, and chosen there
+        // it opens in a tab.
+        cx.dispatch_action(ShowExtensionViews);
+        cx.run_until_parked();
+        let panel = cx.read(|cx| ws.read(cx).extension_views.clone());
+        wait_for(cx, "the view", &|cx| panel.read(cx).has("Side page"));
+        let side = cx.read(|cx| panel.read(cx).index("Side page").unwrap());
+        panel.update(cx, |panel, cx| panel.pick(side, cx));
+        wait_for(cx, "the view as a page", &|cx| {
+            html(cx, "Side page").as_deref() == Some("<b>side</b>")
+        });
+        assert_eq!(cx.read(|cx| pages(cx)).0, ["tom.cat", "Side page"]);
+
+        // Its code ended, its pages go with it.
+        store.update(cx, |store, cx| {
+            store.set_off(Origin::VsCode, "Acme.pages", true, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| pages(cx)), (Vec::new(), None));
+    }
+
+    #[gpui::test]
+    fn an_extension_runs_terminals_and_tasks_in_the_dock(cx: &mut TestAppContext) {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let (base, _) = serve(vec![
+            (
+                "/api/-/search",
+                Served::ok(br#"{"extensions":[]}"#.to_vec()),
+            ),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-shell", &base);
+        let folder = cx.read(|cx| store.read(cx).root.clone());
+        let dir = folder.join("vscode/acme.shell");
+        write_file(
+            &dir.join("package.json"),
+            r#"{ "name": "shell", "publisher": "Acme", "version": "1.0.0", "main": "main.js",
+  "activationEvents": ["*"] }"#,
+        );
+        write_file(
+            &dir.join("main.js"),
+            r#"const vscode = require('vscode');
+exports.activate = (context) => {
+  const terminal = vscode.window.createTerminal({ name: 'Mine', shellPath: '/bin/sh' });
+  vscode.window.onDidCloseTerminal((closed) => console.log(`closed ${closed.name} ${closed.exitStatus.code}`));
+  vscode.tasks.registerTaskProvider('demo', {
+    provideTasks: () => [
+      new vscode.Task({ type: 'demo' }, vscode.TaskScope.Workspace, 'fail', 'demo',
+        new vscode.ShellExecution('echo task-$((1+1)); exit 3', { executable: '/bin/sh' })),
+    ],
+  });
+  vscode.tasks.onDidEndTaskProcess((e) => console.log(`task ${e.execution.task.name} ended with ${e.exitCode}`));
+  context.subscriptions.push(
+    vscode.commands.registerCommand('shell.type', () => {
+      terminal.sendText('echo solder-$((40+2))');
+      terminal.show();
+    }),
+    vscode.commands.registerCommand('shell.close', () => terminal.dispose()),
+  );
+};"#,
+        );
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.scan(cx);
+        });
+        wait_for(cx, "the extension", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.shell").is_some()
+        });
+        store.update(cx, |store, cx| {
+            store.allow(Origin::VsCode, "Acme.shell", cx)
+        });
+        wait_for(cx, "its code", &|cx| {
+            store
+                .read(cx)
+                .code("Acme.shell")
+                .map(|code| code.state.clone())
+                == Some(CodeState::Running)
+        });
+        let said = |cx: &App, what: &str| {
+            let store = store.read(cx);
+            let code = store.code("Acme.shell").unwrap();
+            code.said.iter().any(|(_, text)| text == what)
+        };
+        let shows = |cx: &App, terminal: usize, line: &str| {
+            let terminals = &ws.read(cx).terminals;
+            let Some((terminal, _)) = terminals.get(terminal) else {
+                return false;
+            };
+            terminal.read(cx).visible_text().iter().any(|l| l == line)
+        };
+        // A terminal it only keeps ready takes no room in the dock.
+        assert!(cx.read(|cx| ws.read(cx).terminals.is_empty()));
+
+        // Typed into, it is a terminal of the dock, under its name, and
+        // what was typed ran in it.
+        store.update(cx, |store, cx| {
+            store
+                .run_command("shell.type", serde_json::Value::Null, cx)
+                .detach()
+        });
+        wait_for(cx, "what it typed to run", &|cx| shows(cx, 0, "solder-42"));
+        assert_eq!(
+            cx.read(|cx| ws.read(cx).terminals[0].0.read(cx).title()),
+            "Mine"
+        );
+        assert!(cx.read(|cx| ws.read(cx).bottom == Some(Panel::Terminal)));
+
+        // Its tasks are in the list of tasks, and one chosen runs in a
+        // terminal of its own. The extension hears what it ended with,
+        // and the tab stays, for what it wrote to be read.
+        cx.dispatch_action(RunExtensionTask);
+        wait_for(cx, "the tasks", &|cx| {
+            let Some(modal) = &ws.read(cx).modal else {
+                return false;
+            };
+            let picker = modal
+                .view
+                .clone()
+                .downcast::<Picker<crate::extension_ask::TaskPick>>();
+            picker.is_ok_and(|picker| !picker.read(cx).delegate.is_loading())
+        });
+        cx.simulate_input("fail");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the task to end", &|cx| {
+            said(cx, "task fail ended with 3")
+        });
+        assert!(cx.read(|cx| shows(cx, 1, "task-2")));
+        let ended = cx.read(|cx| {
+            let task = ws.read(cx).terminals[1].0.read(cx);
+            (task.title().to_string(), task.exited, task.exit_code)
+        });
+        assert_eq!(ended, ("fail".to_string(), true, Some(3)));
+
+        // Closed by the extension, its terminal leaves the dock, and it
+        // hears that too.
+        store.update(cx, |store, cx| {
+            store
+                .run_command("shell.close", serde_json::Value::Null, cx)
+                .detach()
+        });
+        wait_for(cx, "its terminal to close", &|cx| {
+            ws.read(cx).terminals.len() == 1 && said(cx, "closed Mine undefined")
+        });
+    }
+
+    #[gpui::test]
+    fn a_debugger_an_extension_sets_up_in_code_debugs_a_file(cx: &mut TestAppContext) {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let root = db::testing::dir("ws-coded-debug").canonicalize().unwrap();
+        let app = root.join("app.demo");
+        std::fs::write(&app, "one\ntwo\nthree\n").unwrap();
+        let data = db::testing::dir("ws-coded-debug-data");
+        let installed = data.join("extensions/vscode/acme.coded");
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_dap_stdio.py"),
+            installed.join("adapter.py"),
+        )
+        .unwrap();
+        // Two debuggers whose manifest names no adapter: the code says
+        // what each is. One is a program the code names; the other is an
+        // object in the extension's own code.
+        write_file(
+            &installed.join("package.json"),
+            r#"{ "name": "coded", "publisher": "Acme", "version": "1.0.0", "main": "main.js",
+  "activationEvents": ["onDebugResolve:coded"],
+  "contributes": {
+    "languages": [{ "id": "demo", "extensions": [".demo"] }],
+    "breakpoints": [{ "language": "demo" }],
+    "debuggers": [{ "type": "coded", "label": "Coded" }, { "type": "inline", "label": "Inline" }]
+  } }"#,
+        );
+        write_file(
+            &installed.join("main.js"),
+            r#"const vscode = require('vscode');
+// An adapter that is an object here: it stops on the first breakpoint of
+// the program it was launched for, and ends when told to go on.
+class Inline {
+  constructor() {
+    this.sent = new vscode.EventEmitter();
+    this.onDidSendMessage = this.sent.event;
+    this.lines = {};
+    this.seq = 0;
+  }
+  say(message) {
+    this.sent.fire({ seq: ++this.seq, ...message });
+  }
+  handleMessage(request) {
+    const args = request.arguments || {};
+    let body = {};
+    if (request.command === 'initialize') body = { supportsConfigurationDoneRequest: true };
+    if (request.command === 'launch') this.program = args.program;
+    if (request.command === 'setBreakpoints') {
+      this.lines[args.source.path] = (args.breakpoints || []).map((one) => one.line);
+      body = { breakpoints: this.lines[args.source.path].map((line) => ({ verified: true, line })) };
+    }
+    if (request.command === 'threads') body = { threads: [{ id: 1, name: 'main' }] };
+    if (request.command === 'stackTrace') {
+      const line = (this.lines[this.program] || [1])[0];
+      body = { stackFrames: [{ id: 1, name: 'inline', line, column: 1, source: { path: this.program, name: 'program' } }], totalFrames: 1 };
+    }
+    if (request.command === 'scopes') body = { scopes: [] };
+    this.say({ type: 'response', request_seq: request.seq, success: true, command: request.command, body });
+    if (request.command === 'initialize') this.say({ type: 'event', event: 'initialized', body: {} });
+    if (request.command === 'configurationDone') this.say({ type: 'event', event: 'stopped', body: { reason: 'breakpoint', threadId: 1, allThreadsStopped: true } });
+    if (request.command === 'continue') this.say({ type: 'event', event: 'terminated', body: {} });
+  }
+  dispose() {
+    console.log('the adapter was let go');
+  }
+}
+exports.activate = (context) => {
+  context.subscriptions.push(
+    vscode.debug.registerDebugConfigurationProvider('coded', {
+      resolveDebugConfiguration(folder, launch) {
+        if (launch.name === 'Not this one') return undefined;
+        return { ...launch, stopOnEntry: true, folder: folder.name };
+      },
+    }),
+    vscode.debug.registerDebugAdapterDescriptorFactory('coded', {
+      createDebugAdapterDescriptor: (session) =>
+        new vscode.DebugAdapterExecutable('python3', [context.asAbsolutePath('adapter.py'), context.asAbsolutePath(session.configuration.name + '.json')]),
+    }),
+    vscode.debug.registerDebugAdapterDescriptorFactory('inline', {
+      createDebugAdapterDescriptor: () => new vscode.DebugAdapterInlineImplementation(new Inline()),
+    }),
+    vscode.debug.onDidStartDebugSession((session) => console.log(`started ${session.type} ${session.name}`)),
+    vscode.debug.onDidTerminateDebugSession((session) => console.log(`ended ${session.type}`)),
+    vscode.commands.registerCommand('coded.debug', (program, name) =>
+      vscode.debug.startDebugging(undefined, { type: 'coded', request: 'launch', name, program })),
+  );
+};"#,
+        );
+        cx.executor().allow_parking();
+        let (extensions, debug) = cx.update(|cx| {
+            let extensions = cx.new(|cx| {
+                let mut store =
+                    ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
+                store.world = Some(std::sync::Arc::new(NodeOnly(
+                    node.to_string_lossy().into_owned(),
+                )));
+                store
+            });
+            ExtensionStore::set_global(extensions.clone(), cx);
+            extensions.update(cx, |s, cx| s.scan(cx));
+            let debug = cx.new(|_| {
+                crate::debug::DebugStore::new(
+                    data.join("debug"),
+                    crate::debug::AdapterSpec::JsDebug,
+                )
+            });
+            crate::debug::DebugStore::set_global(debug.clone(), cx);
+            (extensions, debug)
+        });
+        let (ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "the extensions folder", &|cx| {
+            extensions.read(cx).loaded
+        });
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(app.clone(), None, window, cx)
+        });
+        let offered = |cx: &App| -> Vec<String> {
+            let configs = crate::debug_launch::from_extensions(&root, &app, cx);
+            configs.into_iter().map(|config| config.name).collect()
+        };
+        let said = |cx: &App, what: &str| {
+            let store = extensions.read(cx);
+            let code = store.code("Acme.coded");
+            code.is_some_and(|code| code.said.iter().any(|(_, text)| text == what))
+        };
+        // Its code was not allowed, so it has no debugger to offer: only
+        // the code knows what the adapters are.
+        assert!(cx.read(|cx| offered(cx)).is_empty());
+        extensions.update(cx, |store, cx| {
+            store.allow(Origin::VsCode, "Acme.coded", cx)
+        });
+        assert_eq!(
+            cx.read(|cx| offered(cx)),
+            ["coded app.demo", "inline app.demo"]
+        );
+        // Offering them started nothing: it waits to be asked.
+        assert!(cx.read(|cx| extensions.read(cx).code("Acme.coded").is_none()));
+
+        // The first: its code is started, goes over the launch, and names
+        // a program for the adapter. The run stops on the breakpoint.
+        let configs = cx.read(|cx| crate::debug_launch::from_extensions(&root, &app, cx));
+        debug.update(cx, |s, cx| {
+            s.toggle(&app, 2, cx);
+            s.start(configs[0].clone(), root.clone(), cx)
+        });
+        wait_for(cx, "the pause in app.demo", &|cx| {
+            paused_line(&debug, cx) == Some(2)
+        });
+        let launch: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(installed.join("coded app.demo.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(launch["program"], app.display().to_string());
+        // What its provider added to the launch.
+        assert_eq!(launch["stopOnEntry"], true);
+        assert_eq!(
+            launch["folder"],
+            root.file_name().unwrap().to_string_lossy().as_ref()
+        );
+        wait_for(cx, "the extension to hear of it", &|cx| {
+            said(cx, "started coded coded app.demo")
+        });
+        debug.update(cx, |s, cx| s.stop(cx));
+        cx.run_until_parked();
+        assert!(cx.read(|cx| !debug.read(cx).state.active()));
+
+        // The second: its adapter is an object in the extension's code,
+        // reached at a port of this machine like any adapter.
+        debug.update(cx, |s, cx| s.start(configs[1].clone(), root.clone(), cx));
+        wait_for(cx, "the pause by the adapter in code", &|cx| {
+            paused_line(&debug, cx) == Some(2)
+                && debug
+                    .read(cx)
+                    .paused
+                    .as_ref()
+                    .unwrap()
+                    .frame()
+                    .unwrap()
+                    .name
+                    == "inline"
+        });
+        debug.update(cx, |s, cx| s.resume(cx));
+        wait_for(cx, "the run to end", &|cx| !debug.read(cx).state.active());
+        wait_for(cx, "the extension to hear of the end", &|cx| {
+            said(cx, "ended inline") && said(cx, "the adapter was let go")
+        });
+
+        // The extension starts a run itself, with a launch of its own.
+        let running = extensions.update(cx, |store, cx| {
+            let args = serde_json::json!([app.display().to_string(), "From code"]);
+            store.run_command("coded.debug", args, cx)
+        });
+        wait_for(cx, "the pause in the run it started", &|cx| {
+            paused_line(&debug, cx) == Some(2)
+        });
+        assert_eq!(
+            cx.executor().block_test(running),
+            Ok(serde_json::json!(true))
+        );
+        assert!(installed.join("From code.json").is_file());
+        debug.update(cx, |s, cx| s.stop(cx));
+        cx.run_until_parked();
+        // A launch its provider calls off is not started, and says so.
+        let called_off = extensions.update(cx, |store, cx| {
+            let launch = extension::host::DebugLaunch {
+                adapter: "coded".into(),
+                ..Default::default()
+            };
+            let given = serde_json::json!({ "type": "coded", "name": "Not this one" });
+            store.debug_adapter("Acme.coded", launch, Some(given), &root, cx)
+        });
+        let answer = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let got = answer.clone();
+        cx.foreground_executor()
+            .spawn(async move { *got.borrow_mut() = Some(called_off.await) })
+            .detach();
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if answer.borrow().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let answer = answer.borrow_mut().take();
+        assert_eq!(
+            answer,
+            Some(Err("The extension called the launch off".to_string()))
+        );
+    }
+
+    #[gpui::test]
+    fn what_an_extension_contributes_is_in_the_palette_the_menus_and_the_keys(
+        cx: &mut TestAppContext,
+    ) {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let _languages = extension_languages();
+        let (base, _) = serve(vec![
+            (
+                "/api/-/search",
+                Served::ok(br#"{"extensions":[]}"#.to_vec()),
+            ),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-contributes", &base);
+        let root = cx.read(|cx| ws.read(cx).root(cx));
+        let folder = cx.read(|cx| store.read(cx).root.clone());
+        extension::testing::vscode_extension(&folder.join("vscode/acme.demo"));
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.scan(cx);
+        });
+        wait_for(cx, "the extension", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.demo").is_some()
+        });
+        let titles = |cx: &App| -> Vec<String> {
+            let facts = ws.read(cx).extension_facts(cx);
+            let offered = store.read(cx).palette(&facts);
+            offered.into_iter().map(|offered| offered.title).collect()
+        };
+        // The note its command leaves in the status bar when it ran.
+        let ran = |cx: &App, with: &str| {
+            let said = format!("ran {with}");
+            store.read(cx).bar().iter().any(|item| item.text == said)
+        };
+        let key = if cfg!(target_os = "macos") {
+            "cmd-alt-r"
+        } else {
+            "ctrl-alt-r"
+        };
+
+        // Its code was not allowed: it has nothing in the palette, and its
+        // keys are nobody's.
+        assert!(cx.read(|cx| titles(cx)).is_empty());
+        store.update(cx, |store, cx| store.allow(Origin::VsCode, "Acme.demo", cx));
+        // Allowed, the palette has the command its manifest names, under
+        // the name it gives it. One it keeps out of the palette is not
+        // there, nor one that cannot be run yet.
+        assert_eq!(cx.read(|cx| titles(cx)), ["Demo: Run"]);
+        cx.dispatch_action(ToggleCommandPalette);
+        cx.run_until_parked();
+        cx.simulate_input("demo: run");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the command to run", &|cx| ran(cx, "[]"));
+        // It said that its other command may be run now, and so it is
+        // there.
+        wait_for(cx, "the other command", &|cx| {
+            titles(cx) == ["Demo: Run", "Spin"]
+        });
+
+        // The key it binds is bound where its condition says: in a file
+        // of its language, not in another.
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let focus = cx.read(|cx| editor.focus_handle(cx));
+        cx.update(|window, _| window.focus(&focus));
+        cx.simulate_keystrokes(key);
+        cx.run_until_parked();
+        let notes = root.join("notes.dm");
+        std::fs::write(&notes, "if 1\n").unwrap();
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(notes.clone(), None, window, cx)
+        });
+        wait_for(cx, "notes.dm", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|editor| editor.read(cx).path(cx) == Some(notes.as_path()))
+                && ws.read(cx).extension_facts(cx)["editorLangId"] == "demo"
+        });
+        assert!(
+            cx.read(|cx| ran(cx, "[]")),
+            "the key ran it in a file of another language"
+        );
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let focus = cx.read(|cx| editor.focus_handle(cx));
+        cx.update(|window, _| window.focus(&focus));
+        cx.simulate_keystrokes(key);
+        wait_for(cx, "the key to run it", &|cx| ran(cx, r#"["from a key"]"#));
+
+        // The right button in the file opens what it put in the editor's
+        // menu, and the command is given the file.
+        let body = cx.debug_bounds("pane-body-0").unwrap().center();
+        let none = gpui::Modifiers::default();
+        cx.simulate_mouse_down(body, MouseButton::Right, none);
+        cx.simulate_mouse_up(body, MouseButton::Right, none);
+        cx.run_until_parked();
+        let item = bounds_soon(cx, "editor-menu-0");
+        cx.simulate_click(item.center(), none);
+        wait_for(cx, "the menu's command", &|cx| ran(cx, r#"["notes.dm"]"#));
+        assert!(cx.read(|cx| ws.read(cx).editor_menu.is_none()));
+        // The tree's menu has it for a file with its ending, and for no
+        // other; in a file of another language the editor has no menu.
+        let in_tree = |cx: &App, name: &str| {
+            let store = store.read(cx);
+            let mut facts = store.facts();
+            let ending = name.rsplit_once('.').map_or("", |(_, ending)| ending);
+            facts.insert("resourceExtname".into(), format!(".{ending}").into());
+            let offered = store.menu("explorer/context", &facts, Some(&root.join(name)));
+            offered.into_iter().map(|o| o.title).collect::<Vec<_>>()
+        };
+        assert_eq!(cx.read(|cx| in_tree(cx, "notes.dm")), ["Demo: Run"]);
+        assert!(cx.read(|cx| in_tree(cx, "App.vue")).is_empty());
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(root.join("App.vue"), None, window, cx)
+        });
+        wait_for(cx, "App.vue", &|cx| {
+            ws.read(cx).extension_facts(cx)["editorLangId"] != "demo"
+        });
+        cx.simulate_mouse_down(body, MouseButton::Right, none);
+        cx.simulate_mouse_up(body, MouseButton::Right, none);
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).editor_menu.is_none()));
+
+        // A key of two strokes, bound everywhere: its command ends the
+        // extension's process, which is how the test sees that it ran.
+        cx.simulate_keystrokes("ctrl-k ctrl-q");
+        wait_for(cx, "the second key", &|cx| {
+            matches!(
+                store.read(cx).code("Acme.demo").map(|code| &code.state),
+                Some(CodeState::Stopped(_))
+            )
+        });
+
+        // Turned off, nothing of it is in the palette.
+        store.update(cx, |store, cx| {
+            store.set_off(Origin::VsCode, "Acme.demo", true, cx)
+        });
+        assert!(cx.read(|cx| titles(cx)).is_empty());
+    }
+
+    /// What `language_server_features` asks of a server, asked of the code
+    /// of a VS Code extension: the same file, the same keys.
+    #[gpui::test]
+    fn an_extension_gives_language_features_in_code(cx: &mut TestAppContext) {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let (base, _) = serve(vec![
+            (
+                "/api/-/search",
+                Served::ok(br#"{"extensions":[]}"#.to_vec()),
+            ),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-lang", &base);
+        let root = cx.read(|cx| ws.read(cx).root(cx));
+        let folder = cx.read(|cx| store.read(cx).root.clone());
+        let dir = folder.join("vscode/acme.lang");
+        write_file(
+            &dir.join("package.json"),
+            r#"{ "name": "lang", "publisher": "Acme", "version": "1.0.0", "main": "main.js",
+  "activationEvents": ["onLanguage:plaintext"] }"#,
+        );
+        write_file(
+            &dir.join("main.js"),
+            r#"const vscode = require('vscode');
+exports.activate = (context) => {
+  // A file of no language Solder has a server for, or a grammar.
+  const selector = { scheme: 'file', language: 'plaintext' };
+  const legend = new vscode.SemanticTokensLegend(['keyword']);
+  const problems = vscode.languages.createDiagnosticCollection('lang');
+  const check = (document) => {
+    if (document.languageId !== 'plaintext') return;
+    const found = [];
+    for (let line = 0; line < document.lineCount; line++) {
+      const text = document.lineAt(line).text;
+      for (const [word, severity] of [['TODO', vscode.DiagnosticSeverity.Warning], ['boom', vscode.DiagnosticSeverity.Error]]) {
+        const at = text.indexOf(word);
+        if (at < 0) continue;
+        const one = new vscode.Diagnostic(new vscode.Range(line, at, line, at + word.length), `${word} here`, severity);
+        one.source = 'lang';
+        found.push(one);
+      }
+    }
+    problems.set(document.uri, found);
+  };
+  vscode.workspace.textDocuments.forEach(check);
+  const all = (document, word) => {
+    const ranges = [];
+    const text = document.getText();
+    for (let at = text.indexOf(word); at >= 0; at = text.indexOf(word, at + 1)) {
+      ranges.push(new vscode.Range(document.positionAt(at), document.positionAt(at + word.length)));
+    }
+    return ranges;
+  };
+  context.subscriptions.push(
+    problems,
+    vscode.workspace.onDidOpenTextDocument(check),
+    vscode.workspace.onDidChangeTextDocument((e) => check(e.document)),
+    vscode.languages.registerCompletionItemProvider(selector, {
+      provideCompletionItems() {
+        const item = new vscode.CompletionItem('println', vscode.CompletionItemKind.Function);
+        item.insertText = new vscode.SnippetString('println!("$1")');
+        item.detail = 'macro';
+        return new vscode.CompletionList([item, new vscode.CompletionItem('print', vscode.CompletionItemKind.Function)]);
+      },
+    }),
+    vscode.languages.registerHoverProvider(selector, {
+      provideHover(document, position) {
+        const range = document.getWordRangeAtPosition(position);
+        return range ? new vscode.Hover(new vscode.MarkdownString(`**${document.getText(range)}** is a word`), range) : undefined;
+      },
+    }),
+    vscode.languages.registerDefinitionProvider(selector, {
+      provideDefinition: (document) => new vscode.Location(document.uri, new vscode.Range(0, 3, 0, 9)),
+    }),
+    vscode.languages.registerRenameProvider(selector, {
+      provideRenameEdits(document, position, newName) {
+        const edit = new vscode.WorkspaceEdit();
+        const word = document.getText(document.getWordRangeAtPosition(position));
+        for (const range of all(document, word)) edit.replace(document.uri, range, newName);
+        return edit;
+      },
+    }),
+    vscode.languages.registerDocumentFormattingEditProvider(selector, {
+      provideDocumentFormattingEdits(document) {
+        const edits = [];
+        for (let line = 0; line < document.lineCount; line++) {
+          const text = document.lineAt(line).text;
+          const kept = text.trimEnd().length;
+          if (kept < text.length) edits.push(vscode.TextEdit.delete(new vscode.Range(line, kept, line, text.length)));
+        }
+        return edits;
+      },
+    }),
+    vscode.languages.registerCodeActionsProvider(selector, {
+      provideCodeActions(document) {
+        const header = new vscode.CodeAction('Add header', vscode.CodeActionKind.QuickFix);
+        header.target = document.uri;
+        const touch = new vscode.CodeAction('Touch', vscode.CodeActionKind.Refactor);
+        touch.command = { title: 'Touch', command: 'lang.touch', arguments: [document.uri] };
+        return [header, touch];
+      },
+      // What the first one changes is worked out only once it is chosen.
+      resolveCodeAction(action) {
+        action.edit = new vscode.WorkspaceEdit();
+        action.edit.insert(action.target, new vscode.Position(0, 0), '// header\n');
+        return action;
+      },
+    }),
+    vscode.languages.registerCodeLensProvider(selector, {
+      provideCodeLenses: (document) => [new vscode.CodeLens(new vscode.Range(0, 0, 0, 2), { title: 'Count lines', command: 'lang.count', arguments: [document.uri] })],
+    }),
+    vscode.commands.registerCommand('lang.touch', async (uri) => {
+      const edit = new vscode.WorkspaceEdit();
+      edit.insert(uri, new vscode.Position(0, 0), '// touched\n');
+      await vscode.workspace.applyEdit(edit);
+    }),
+    vscode.commands.registerCommand('lang.count', (uri) => {
+      const document = vscode.workspace.textDocuments.find((one) => one.uri.toString() === uri.toString());
+      vscode.window.showInformationMessage(`${document.lineCount} lines`);
+    }),
+    vscode.languages.registerInlayHintsProvider(selector, {
+      provideInlayHints: () => [new vscode.InlayHint(new vscode.Position(0, 2), ' (a function)')],
+    }),
+    vscode.languages.registerDocumentSemanticTokensProvider(selector, {
+      provideDocumentSemanticTokens(document) {
+        const builder = new vscode.SemanticTokensBuilder(legend);
+        const word = /[A-Za-z_]+/.exec(document.lineAt(0).text);
+        if (word) builder.push(new vscode.Range(0, word.index, 0, word.index + word[0].length), 'keyword');
+        return builder.build();
+      },
+    }, legend),
+    vscode.languages.registerDocumentSymbolProvider(selector, {
+      provideDocumentSymbols: () => [new vscode.DocumentSymbol('helper', 'fn', vscode.SymbolKind.Function, new vscode.Range(0, 0, 0, 14), new vscode.Range(0, 3, 0, 9))],
+    }),
+    vscode.languages.registerSignatureHelpProvider(selector, {
+      provideSignatureHelp(document, position) {
+        const help = new vscode.SignatureHelp();
+        const info = new vscode.SignatureInformation('assist(a: i32, b: i32)');
+        info.parameters = [new vscode.ParameterInformation('a: i32'), new vscode.ParameterInformation('b: i32')];
+        help.signatures = [info];
+        const before = document.lineAt(position.line).text.slice(0, position.character);
+        help.activeParameter = (before.slice(before.lastIndexOf('(')).match(/,/g) || []).length;
+        return help;
+      },
+    }, '(', ','),
+  );
+};"#,
+        );
+        let file = root.join("notes.txt");
+        std::fs::write(&file, "fn helper() {}\n// TODO fix\n").unwrap();
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.scan(cx);
+        });
+        wait_for(cx, "the extension", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.lang").is_some()
+        });
+        store.update(cx, |store, cx| store.allow(Origin::VsCode, "Acme.lang", cx));
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(file.clone(), None, window, cx)
+        });
+        wait_for(cx, "notes.txt", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|editor| editor.read(cx).path(cx) == Some(file.as_path()))
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let focus = cx.read(|cx| editor.focus_handle(cx));
+        cx.update(|window, _| window.focus(&focus));
+        let wait = wait_for;
+
+        // What it reports is in the file as a server's diagnostics are.
+        wait(cx, "diagnostics", &|cx| {
+            !editor.read(cx).doc(cx).diagnostics().is_empty()
+        });
+        assert_eq!(
+            cx.read(|cx| store.read(cx).code("Acme.lang").unwrap().languages.clone()),
+            ["*", "plaintext"]
+        );
+        let diag = cx.read(|cx| editor.read(cx).doc(cx).diagnostics()[0].clone());
+        assert_eq!(diag.range, 18..22);
+        assert_eq!(diag.severity, crate::document::Severity::Warning);
+        assert_eq!(diag.message, "TODO here");
+        // It draws into the text as a server does: a hint in the line, and
+        // a color for a word of a file that has no grammar at all.
+        wait(cx, "its hint and its color", &|cx| {
+            let editor = editor.read(cx);
+            let doc = editor.doc(cx);
+            !doc.inlays().is_empty() && !doc.semantic().is_empty()
+        });
+        let drawn = cx.read(|cx| {
+            let editor = editor.read(cx);
+            let doc = editor.doc(cx);
+            (doc.inlays()[0].clone(), doc.semantic()[0].clone())
+        });
+        assert_eq!(
+            drawn,
+            (
+                crate::document::Inlay {
+                    offset: 2,
+                    text: " (a function)".into()
+                },
+                (0..2, syntax::HighlightKind::Keyword)
+            )
+        );
+        // It reads what is typed as it is typed.
+        cx.dispatch_action(crate::editor::MoveToEnd);
+        cx.simulate_input("boom");
+        wait(cx, "error diagnostic", &|cx| {
+            editor
+                .read(cx)
+                .doc(cx)
+                .diagnostics()
+                .iter()
+                .any(|d| d.severity == crate::document::Severity::Error)
+        });
+
+        // Completion: the menu opens as a word is typed, and Enter puts
+        // in the snippet with the cursor in its place.
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("pri");
+        wait(cx, "completions", &|cx| {
+            editor.read(cx).completion.is_some()
+        });
+        cx.simulate_input("ntl");
+        let top = cx.read(|cx| {
+            let editor = editor.read(cx);
+            let menu = editor.completion.as_ref().unwrap();
+            menu.selected_item().unwrap().label.clone()
+        });
+        assert_eq!(top, "println");
+        cx.simulate_keystrokes("enter");
+        let text = cx.read(|cx| editor.read(cx).text(cx));
+        assert!(text.ends_with("boom\nprintln!(\"\")"), "{text:?}");
+        assert_eq!(
+            cx.read(|cx| editor.read(cx).newest_range()).start,
+            text.len() - 2
+        );
+
+        // Hover, definition, rename and formatting.
+        cx.dispatch_action(crate::editor::MoveToStart);
+        cx.simulate_keystrokes("right right right right");
+        cx.dispatch_action(crate::editor::ShowHover);
+        wait(cx, "hover", &|cx| editor.read(cx).hover.is_some());
+        cx.simulate_keystrokes("escape");
+        cx.dispatch_action(crate::editor::MoveToStart);
+        cx.simulate_keystrokes("f12");
+        wait(cx, "definition", &|cx| {
+            editor.read(cx).newest_range() == (3..9)
+        });
+        cx.simulate_keystrokes("f2");
+        cx.simulate_input("assist");
+        cx.simulate_keystrokes("enter");
+        wait(cx, "rename", &|cx| {
+            editor.read(cx).text(cx).starts_with("fn assist()")
+        });
+        cx.simulate_keystrokes("end");
+        cx.simulate_input("   ");
+        cx.simulate_keystrokes("shift-alt-f");
+        wait(cx, "formatting", &|cx| {
+            editor.read(cx).text(cx).starts_with("fn assist() {}\n")
+        });
+
+        // Code actions: one whose edit is worked out when it is chosen,
+        // one that runs a command of the extension, which edits the file.
+        cx.simulate_keystrokes("secondary-.");
+        wait(cx, "code actions", &|cx| ws.read(cx).modal.is_some());
+        cx.simulate_keystrokes("enter");
+        wait(cx, "the edit worked out late", &|cx| {
+            editor.read(cx).text(cx).starts_with("// header\n")
+        });
+        cx.simulate_keystrokes("secondary-.");
+        wait(cx, "code actions", &|cx| ws.read(cx).modal.is_some());
+        cx.simulate_input("touch");
+        cx.simulate_keystrokes("enter");
+        wait(cx, "the command's edit", &|cx| {
+            editor.read(cx).text(cx).starts_with("// touched\n")
+        });
+        // A code lens of the line is among what can be done with it.
+        cx.dispatch_action(crate::editor::MoveToStart);
+        cx.simulate_keystrokes("secondary-.");
+        wait(cx, "code actions", &|cx| ws.read(cx).modal.is_some());
+        cx.simulate_input("count");
+        cx.simulate_keystrokes("enter");
+        wait(cx, "the lens to run", &|cx| {
+            store
+                .read(cx)
+                .bar()
+                .iter()
+                .any(|item| item.text == "6 lines")
+        });
+
+        // The file's symbols are the extension's.
+        cx.simulate_keystrokes("secondary-shift-o");
+        wait(cx, "symbols", &|cx| ws.read(cx).modal.is_some());
+        cx.simulate_input("help");
+        cx.simulate_keystrokes("enter");
+        wait(cx, "the symbol", &|cx| {
+            ws.read(cx).modal.is_none() && editor.read(cx).newest_range().start == 3
+        });
+
+        // Signature help follows the argument under the cursor.
+        cx.dispatch_action(crate::editor::MoveToEnd);
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("assist(");
+        let active = |cx: &App| {
+            editor
+                .read(cx)
+                .signature
+                .as_ref()
+                .and_then(|s| s.active.clone().map(|r| s.label[r].to_string()))
+        };
+        wait(cx, "signature", &|cx| {
+            active(cx).as_deref() == Some("a: i32")
+        });
+        cx.simulate_input("1,");
+        wait(cx, "second parameter", &|cx| {
+            active(cx).as_deref() == Some("b: i32")
+        });
+        cx.simulate_keystrokes("escape");
+
+        // Its code ended, what it reported goes with it.
+        store.update(cx, |store, cx| {
+            store.set_off(Origin::VsCode, "Acme.lang", true, cx)
+        });
+        wait(cx, "its diagnostics to go", &|cx| {
+            editor.read(cx).doc(cx).diagnostics().is_empty()
+        });
     }
 
     /// What extensions reach outside their sandbox through, for the test
@@ -13399,7 +15666,16 @@ brackets = [
         drag(cx, "panel-files", "panel-database");
         assert_eq!(
             layout(cx).left.panels,
-            [Search, Services, Files, Database, Api, Ai, Extensions]
+            [
+                Search,
+                Services,
+                Files,
+                Database,
+                Api,
+                Ai,
+                Extensions,
+                ExtensionViews
+            ]
         );
         assert_eq!(docks(cx).0, Some(Files));
         // Onto a tab of another dock: before it there, and shown there.
@@ -13979,5 +16255,145 @@ brackets = [
         });
         start(cx);
         assert!(cx.read(|cx| mcp.read(cx).servers.is_empty()));
+    }
+    #[gpui::test]
+    fn native_extension_views_load_expand_run_refresh_and_clear_decorations(
+        cx: &mut TestAppContext,
+    ) {
+        let Some(node) = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        }) else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let _languages = extension_languages();
+        let (_config, store, ws, cx) =
+            extension_setup(cx, "ext-native-views", "http://127.0.0.1:1");
+        let installed = cx.read(|cx| store.read(cx).root.join("vscode/acme.views"));
+        write_file(
+            &installed.join("package.json"),
+            r#"{
+          "name":"views", "publisher":"Acme", "version":"1.0.0", "main":"main.js",
+          "contributes":{"views":{"explorer":[{"id":"demo","name":"Demo tree"}]}}
+        }"#,
+        );
+        write_file(
+            &installed.join("main.js"),
+            r#"
+const v = require('vscode');
+exports.activate = (context) => {
+  const changes = new v.EventEmitter();
+  const root = {label:'Root'}, child = {label:'Child'};
+  const tree = v.window.createTreeView('demo', { treeDataProvider: {
+    onDidChangeTreeData: changes.event,
+    getChildren: (node) => node ? [child] : [root],
+    getTreeItem: (node) => Object.assign(new v.TreeItem(node.label,node === root ? 1 : 0), {
+      id: node === root ? 'root' : 'child', command:{command:'demo.choose',arguments:[node.label]},
+    }),
+  }});
+  v.commands.registerCommand('demo.choose', (label) => { child.label = 'Updated'; changes.fire(); console.log('chosen',label); });
+  const tests = v.tests.createTestController('demo','Tests');
+  const test = tests.createTestItem('one','A long test name that leaves enough room for its complete action'); tests.items.add(test);
+  tests.createRunProfile('Run', v.TestRunProfileKind.Run, (request) => {
+    const run = tests.createTestRun(request); run.passed(test); run.end();
+  }, true);
+  const control = v.scm.createSourceControl('demo','Changes');
+  control.createResourceGroup('modified','Modified').resourceStates = [
+    {resourceUri:v.workspace.textDocuments[0].uri,command:{command:'demo.choose',arguments:['file']}},
+  ];
+  const kind = v.window.createTextEditorDecorationType({backgroundColor:new v.ThemeColor('editor.findMatchHighlightBackground'), after:{contentText:' annotation'}});
+  const editor = v.window.activeTextEditor;
+  editor.setDecorations(kind,[new v.Range(0,0,0,1)]);
+  context.subscriptions.push(tree, tests, control, kind, v.window.registerFileDecorationProvider({provideFileDecoration: () => ({badge:'M',tooltip:'Changed by extension'})}));
+};
+"#,
+        );
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.scan(cx);
+        });
+        wait_for(cx, "the manifest", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.views").is_some()
+        });
+        store.update(cx, |store, cx| {
+            store.allow(Origin::VsCode, "Acme.views", cx)
+        });
+        cx.dispatch_action(ShowExtensionViews);
+        click(cx, "extension-view-0");
+        let panel = cx.read(|cx| ws.read(cx).extension_views.clone());
+        wait_for(cx, "the tree's root", &|cx| panel.read(cx).has("Root"));
+        // The same native list lives in any dock its layout names.
+        assert!(cx.read(|cx| ws.read(cx).shown(Panel::ExtensionViews)));
+        let root = cx.read(|cx| panel.read(cx).index("Root").unwrap());
+        panel.update(cx, |panel, cx| panel.pick(root, cx));
+        wait_for(cx, "the child", &|cx| panel.read(cx).has("Child"));
+        let child = cx.read(|cx| panel.read(cx).index("Child").unwrap());
+        panel.update(cx, |panel, cx| panel.pick(child, cx));
+        wait_for(cx, "the refreshed child", &|cx| {
+            panel.read(cx).has("Updated")
+        });
+        assert!(cx.read(|cx| !panel.read(cx).has("Child")));
+        let tests = cx.read(|cx| panel.read(cx).index("Tests").unwrap());
+        cx.update(|_, cx| {
+            let mut layout = Layout::get(cx).clone();
+            layout.left.width = 280.;
+            cx.set_global(layout);
+        });
+        ws.update(cx, |_, cx| cx.notify());
+        panel.update(cx, |panel, cx| panel.pick(tests, cx));
+        wait_for(cx, "the controller's tests", &|cx| {
+            panel
+                .read(cx)
+                .has("A long test name that leaves enough room for its complete action")
+        });
+        let test = cx.read(|cx| {
+            panel
+                .read(cx)
+                .index("A long test name that leaves enough room for its complete action")
+                .unwrap()
+        });
+        // GPUI keeps debug selectors in a static callback even in a single test.
+        let selector = Box::leak(format!("extension-view-action-{test}-0").into_boxed_str());
+        let action = bounds_soon(cx, selector);
+        let dock = bounds_soon(cx, "dock-left");
+        assert!(action.left() >= dock.left());
+        assert!(
+            action.right() <= dock.right(),
+            "{action:?} outside {dock:?}"
+        );
+        let all = cx.read(|cx| panel.read(cx).index("Run all").unwrap());
+        panel.update(cx, |panel, cx| panel.pick(all, cx));
+        wait_for(cx, "the test to pass", &|cx| {
+            panel.read(cx).has_mark("Passed")
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        wait_for(cx, "the text annotation", &|cx| {
+            !editor.read(cx).doc(cx).decorations().is_empty()
+        });
+        assert!(cx.read(|cx| {
+            editor
+                .read(cx)
+                .doc(cx)
+                .inlays()
+                .iter()
+                .any(|inlay| inlay.text == " annotation")
+        }));
+        let file = cx.read(|cx| editor.read(cx).doc(cx).path().unwrap().to_path_buf());
+        store.update(cx, |store, cx| store.decorate_files(vec![file.clone()], cx));
+        wait_for(cx, "the file badge", &|cx| {
+            !store.read(cx).file_marks(&file).is_empty()
+        });
+        store.update(cx, |store, cx| {
+            store.set_off(Origin::VsCode, "Acme.views", true, cx)
+        });
+        wait_for(cx, "its views and decorations to go", &|cx| {
+            store.read(cx).views().is_empty() && editor.read(cx).doc(cx).decorations().is_empty()
+        });
+        assert!(cx.read(|cx| store.read(cx).file_marks(&file).is_empty()));
+        assert!(cx.read(|cx| editor.read(cx).doc(cx).inlays().is_empty()));
     }
 }

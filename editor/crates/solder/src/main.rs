@@ -25,7 +25,11 @@ mod editor_git;
 mod editor_lsp;
 mod element;
 mod erd_view;
+mod extension_api;
+mod extension_ask;
+mod extension_decorations;
 mod extension_store;
+mod extension_views;
 mod extensions_panel;
 mod file_diff;
 mod file_finder;
@@ -68,6 +72,7 @@ mod symbols;
 mod terminal;
 mod theme;
 mod ui;
+mod webview;
 mod workspace;
 
 use std::{

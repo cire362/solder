@@ -281,6 +281,25 @@ impl Theme {
         }
     }
 
+    /// Extension colors are resolved here too, so theme references follow
+    /// a theme change without the extension repainting its ranges.
+    pub fn decoration(&self, value: &serde_json::Value) -> Option<Hsla> {
+        if let Some(color) = value.as_str().and_then(import::theme::Rgba::parse) {
+            return Some(
+                gpui::rgba(u32::from_be_bytes([color.r, color.g, color.b, color.a])).into(),
+            );
+        }
+        match value["theme"].as_str()? {
+            "editor.findMatchHighlightBackground" => Some(self.search_match),
+            "editor.findMatchBackground" => Some(self.search_active),
+            "editor.selectionBackground" => Some(self.selection),
+            "editor.lineHighlightBackground" => Some(self.bg_elev),
+            "diffEditor.insertedTextBackground" => Some(self.conflict_ours),
+            "diffEditor.removedTextBackground" => Some(self.conflict_theirs),
+            _ => None,
+        }
+    }
+
     pub fn for_appearance(appearance: WindowAppearance) -> Self {
         match appearance {
             WindowAppearance::Dark | WindowAppearance::VibrantDark => Self::dark(),

@@ -441,7 +441,7 @@ fn vscode_key(key: &str) -> Option<String> {
 }
 
 /// `cmd+k cmd+s` as `cmd-k cmd-s`.
-fn vscode_keys(keys: &str) -> Option<String> {
+pub fn vscode_keys(keys: &str) -> Option<String> {
     let strokes: Vec<String> = keys
         .split_whitespace()
         .map(vscode_stroke)

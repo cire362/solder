@@ -47,6 +47,15 @@ pub struct Diagnostic {
     pub server: &'static str,
 }
 
+/// Text a language server puts into a line that is not in the file: the
+/// type of a variable, the name of a parameter. It is drawn before the
+/// character at `offset`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inlay {
+    pub offset: usize,
+    pub text: String,
+}
+
 pub enum DocumentEvent {
     /// Edits in the order they were applied. `origin` is the editor that made
     /// them, so other views know to move their cursors.
@@ -58,6 +67,9 @@ pub enum DocumentEvent {
     PathChanged,
     Saved,
     DiagnosticsChanged,
+    /// What a language server draws into the text changed: its hints, or
+    /// what it says each word is.
+    HintsChanged,
     /// Git hunks or conflict regions were recomputed.
     GitChanged,
 }
@@ -127,6 +139,16 @@ pub struct Document {
     was_dirty: bool,
     /// Sorted by start.
     diagnostics: Arc<Vec<Diagnostic>>,
+    /// Sorted by where they are.
+    server_inlays: Arc<Vec<Inlay>>,
+    inlays: Arc<Vec<Inlay>>,
+    decorations:
+        std::collections::BTreeMap<(String, String), Vec<crate::extension_decorations::Decoration>>,
+    decoration_ranges: Vec<crate::extension_decorations::Decoration>,
+    /// What a language server says each word is, sorted, none over
+    /// another. Counted so that what was drawn from it can be told stale.
+    semantic: Arc<Vec<(Range<usize>, syntax::HighlightKind)>>,
+    semantic_generation: u64,
     /// The staged version of the file; hunks are relative to it.
     diff_base: Option<Arc<str>>,
     hunks: Arc<Vec<Hunk>>,
@@ -155,6 +177,12 @@ impl Document {
             indent_unit,
             was_dirty: false,
             diagnostics: Arc::default(),
+            server_inlays: Arc::default(),
+            inlays: Arc::default(),
+            decorations: Default::default(),
+            decoration_ranges: Vec::new(),
+            semantic: Arc::default(),
+            semantic_generation: 0,
             diff_base: None,
             hunks: Arc::default(),
             conflicts: Arc::default(),
@@ -397,6 +425,109 @@ impl Document {
         &self.diagnostics
     }
 
+    pub fn inlays(&self) -> &Arc<Vec<Inlay>> {
+        &self.inlays
+    }
+
+    pub fn decorations(&self) -> &[crate::extension_decorations::Decoration] {
+        &self.decoration_ranges
+    }
+
+    pub fn set_decorations(
+        &mut self,
+        owner: &str,
+        kind: &str,
+        decorations: Vec<crate::extension_decorations::Decoration>,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (owner.to_string(), kind.to_string());
+        if decorations.is_empty() {
+            self.decorations.remove(&key);
+        } else {
+            self.decorations.insert(key, decorations);
+        }
+        self.rebuild_decorations();
+        cx.emit(DocumentEvent::HintsChanged);
+        cx.notify();
+    }
+
+    pub fn clear_decorations(&mut self, owner: &str, kind: Option<&str>, cx: &mut Context<Self>) {
+        let before = self.decorations.len();
+        self.decorations
+            .retain(|(of, name), _| of != owner || kind.is_some_and(|kind| kind != name));
+        if before != self.decorations.len() {
+            self.rebuild_decorations();
+            cx.emit(DocumentEvent::HintsChanged);
+            cx.notify();
+        }
+    }
+
+    fn rebuild_decorations(&mut self) {
+        self.decoration_ranges = self.decorations.values().flatten().cloned().collect();
+        self.decoration_ranges
+            .sort_by_key(|decoration| decoration.range.start);
+        let mut inlays = (*self.server_inlays).clone();
+        for decoration in &self.decoration_ranges {
+            for (offset, text) in [
+                (decoration.range.start, &decoration.before),
+                (decoration.range.end, &decoration.after),
+            ] {
+                if let Some(text) = text {
+                    inlays.push(Inlay {
+                        offset,
+                        text: text.clone(),
+                    });
+                }
+            }
+        }
+        inlays.sort_by_key(|inlay| inlay.offset);
+        self.inlays = Arc::new(inlays);
+    }
+
+    pub fn set_inlays(&mut self, mut inlays: Vec<Inlay>, cx: &mut Context<Self>) {
+        inlays.retain(|inlay| !inlay.text.is_empty());
+        inlays.sort_by_key(|inlay| inlay.offset);
+        if *self.server_inlays != inlays {
+            self.server_inlays = Arc::new(inlays);
+            self.rebuild_decorations();
+            cx.emit(DocumentEvent::HintsChanged);
+            cx.notify();
+        }
+    }
+
+    pub fn semantic(&self) -> &Arc<Vec<(Range<usize>, syntax::HighlightKind)>> {
+        &self.semantic
+    }
+
+    pub fn semantic_generation(&self) -> u64 {
+        self.semantic_generation
+    }
+
+    /// What a language server says each word is. One that starts inside
+    /// the one before it is left out: they are drawn side by side.
+    pub fn set_semantic(
+        &mut self,
+        mut spans: Vec<(Range<usize>, syntax::HighlightKind)>,
+        cx: &mut Context<Self>,
+    ) {
+        spans.retain(|(range, _)| range.start < range.end);
+        spans.sort_by_key(|(range, _)| (range.start, range.end));
+        let mut end = 0;
+        spans.retain(|(range, _)| {
+            let apart = range.start >= end;
+            if apart {
+                end = range.end;
+            }
+            apart
+        });
+        if *self.semantic != spans {
+            self.semantic = Arc::new(spans);
+            self.semantic_generation += 1;
+            cx.emit(DocumentEvent::HintsChanged);
+            cx.notify();
+        }
+    }
+
     pub fn set_diagnostics(&mut self, mut diagnostics: Vec<Diagnostic>, cx: &mut Context<Self>) {
         diagnostics.sort_by_key(|d| (d.range.start, d.severity));
         self.diagnostics = Arc::new(diagnostics);
@@ -537,6 +668,41 @@ impl Document {
                 })
                 .collect();
             self.diagnostics = Arc::new(moved);
+        }
+        // The same for what a server draws into the text: it stays with
+        // the code it is about until the server answers again.
+        if !self.server_inlays.is_empty() {
+            let moved = self
+                .server_inlays
+                .iter()
+                .map(|inlay| Inlay {
+                    offset: map_offset(inlay.offset, &edits),
+                    text: inlay.text.clone(),
+                })
+                .collect();
+            self.server_inlays = Arc::new(moved);
+        }
+        for decoration in self.decorations.values_mut().flatten() {
+            decoration.range = map_offset(decoration.range.start, &edits)
+                ..map_offset(decoration.range.end, &edits);
+        }
+        if !self.server_inlays.is_empty() || !self.decorations.is_empty() {
+            self.rebuild_decorations();
+        }
+        if !self.semantic.is_empty() {
+            let moved = self
+                .semantic
+                .iter()
+                .map(|(range, kind)| {
+                    (
+                        map_offset(range.start, &edits)..map_offset(range.end, &edits),
+                        *kind,
+                    )
+                })
+                .filter(|(range, _)| range.start < range.end)
+                .collect();
+            self.semantic = Arc::new(moved);
+            self.semantic_generation += 1;
         }
         let marker_added = edits.iter().any(|e| e.new_text.contains("<<<<<<<"));
         cx.emit(DocumentEvent::Edited { edits, origin });

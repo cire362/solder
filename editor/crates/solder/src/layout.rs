@@ -94,6 +94,7 @@ pub enum Panel {
     Api,
     Ai,
     Extensions,
+    ExtensionViews,
     Chat,
     Agent,
     /// The terminals: each has a tab of its own where this panel is.
@@ -126,7 +127,7 @@ impl Place {
 }
 
 impl Panel {
-    pub const ALL: [Panel; 14] = [
+    pub const ALL: [Panel; 15] = [
         Panel::Files,
         Panel::Search,
         Panel::Git,
@@ -135,6 +136,7 @@ impl Panel {
         Panel::Api,
         Panel::Ai,
         Panel::Extensions,
+        Panel::ExtensionViews,
         Panel::Chat,
         Panel::Agent,
         Panel::Terminal,
@@ -154,6 +156,7 @@ impl Panel {
             Panel::Api => "API",
             Panel::Ai => "AI",
             Panel::Extensions => "Extensions",
+            Panel::ExtensionViews => "Views",
             Panel::Chat => "Chat",
             Panel::Agent => "Agent",
             Panel::Terminal => "Terminal",
@@ -174,6 +177,7 @@ impl Panel {
             Panel::Api => "api",
             Panel::Ai => "ai",
             Panel::Extensions => "extensions",
+            Panel::ExtensionViews => "extension_views",
             Panel::Chat => "chat",
             Panel::Agent => "agent",
             Panel::Terminal => "terminal",
@@ -232,6 +236,9 @@ pub enum Item {
     Activity,
     /// The database a query file runs against. Opens the list of them.
     Connection,
+    /// What the code of extensions shows: its status bar items, work in
+    /// progress, and the last message.
+    Extensions,
     /// What plugins show. Opens the Plugins window.
     Plugins,
     /// The numbers of `show_performance_hud`.
@@ -266,7 +273,7 @@ impl<'de> Deserialize<'de> for Item {
 }
 
 impl Item {
-    pub const ALL: [Item; 11] = [
+    pub const ALL: [Item; 12] = [
         Item::Project,
         Item::File,
         Item::Branch,
@@ -276,6 +283,7 @@ impl Item {
         Item::Problems,
         Item::Activity,
         Item::Connection,
+        Item::Extensions,
         Item::Plugins,
         Item::Performance,
     ];
@@ -291,6 +299,7 @@ impl Item {
             Item::Problems => "Problems",
             Item::Activity => "Activity",
             Item::Connection => "Connection",
+            Item::Extensions => "Extensions",
             Item::Plugins => "Plugins",
             Item::Performance => "Performance",
             Item::Button { button } => button,
@@ -309,6 +318,7 @@ impl Item {
             Item::Problems => "problems",
             Item::Activity => "activity",
             Item::Connection => "connection",
+            Item::Extensions => "extensions",
             Item::Plugins => "plugins",
             Item::Performance => "performance",
             Item::Button { button } => button,
@@ -398,7 +408,7 @@ const STATUS_LEFT: &[Item] = &[
     Item::Activity,
     Item::Connection,
 ];
-const STATUS_RIGHT: &[Item] = &[Item::Plugins, Item::Performance];
+const STATUS_RIGHT: &[Item] = &[Item::Extensions, Item::Plugins, Item::Performance];
 
 /// A bar across the window: its height, and its items from each end. An
 /// end the file leaves out has the items it comes with, less those the
@@ -1564,7 +1574,10 @@ mod tests {
             standard.status_bar.left(),
             [Position, Indent, Language, Problems, Activity, Connection]
         );
-        assert_eq!(standard.status_bar.right(), [Plugins, Performance]);
+        assert_eq!(
+            standard.status_bar.right(),
+            [Extensions, Plugins, Performance]
+        );
         assert_eq!(standard.tab_bar.place, TabsAt::Top);
         assert_eq!(parse("{}").unwrap(), standard);
         // A bar's height alone leaves its items as they come.
@@ -1729,7 +1742,10 @@ mod tests {
             .moved_item(Position, StatusLeft, Some(Indent));
         assert_eq!(moved.title_bar.left(), [Language]);
         assert_eq!(moved.title_bar.right(), [File]);
-        assert_eq!(moved.status_bar.right(), [Plugins, Performance, Project]);
+        assert_eq!(
+            moved.status_bar.right(),
+            [Extensions, Plugins, Performance, Project]
+        );
         assert_eq!(
             moved.status_bar.left(),
             [Position, Indent, Problems, Activity, Connection]
@@ -1842,13 +1858,23 @@ mod tests {
     #[test]
     fn every_panel_is_in_one_dock_or_hidden() {
         use Panel::*;
-        // As it comes: eight on the left, the chat and the agent on the
+        // As it comes: nine on the left, the chat and the agent on the
         // right, the terminals, the debugger and the two kinds of answers
         // at the bottom, none hidden.
         let standard = Layout::default();
         assert_eq!(
             standard.left.panels,
-            [Files, Search, Git, Services, Database, Api, Ai, Extensions]
+            [
+                Files,
+                Search,
+                Git,
+                Services,
+                Database,
+                Api,
+                Ai,
+                Extensions,
+                ExtensionViews
+            ]
         );
         assert_eq!(standard.right.panels, [Chat, Agent]);
         assert_eq!(standard.bottom.panels, [Terminal, Debug, Response, Results]);
@@ -1871,7 +1897,15 @@ mod tests {
         .unwrap();
         assert_eq!(
             layout.left.panels,
-            [Chat, Git, Files, Services, Database, Extensions]
+            [
+                Chat,
+                Git,
+                Files,
+                Services,
+                Database,
+                Extensions,
+                ExtensionViews
+            ]
         );
         assert_eq!(layout.right.panels, [Search, Terminal]);
         assert_eq!(layout.bottom.panels, [Agent, Debug, Response, Results]);
@@ -1897,11 +1931,11 @@ mod tests {
         assert_eq!(parse(&file(&layout)).unwrap(), layout);
         // A dock can be emptied: everything it had is elsewhere.
         let empty = parse(
-            r#"{ "right": { "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions", "chat", "agent"] } }"#,
+            r#"{ "right": { "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions", "extension_views", "chat", "agent"] } }"#,
         )
         .unwrap();
         assert!(empty.left.panels.is_empty());
-        assert_eq!(empty.right.panels.len(), 10);
+        assert_eq!(empty.right.panels.len(), 11);
         assert_eq!(empty.bottom.panels.len(), 4);
     }
 }

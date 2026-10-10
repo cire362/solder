@@ -26,6 +26,9 @@ pub struct ExtensionAdapter {
     /// The extension's id.
     pub extension: String,
     pub launch: extension::host::DebugLaunch,
+    /// The launch as it came whole from the extension's own code, which
+    /// then is not put together from its manifest.
+    pub configuration: Option<Value>,
 }
 
 /// The open file with each debug adapter that installed extensions bring
@@ -60,6 +63,7 @@ pub fn from_extensions(root: &Path, file: &Path, cx: &gpui::App) -> Vec<LaunchCo
                         args: Vec::new(),
                         env: Vec::new(),
                     },
+                    configuration: None,
                 }),
                 ..Default::default()
             }

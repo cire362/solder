@@ -81,6 +81,12 @@ pub struct Settings {
     pub languages: BTreeMap<String, LanguageSettings>,
     /// Format with the language server before every save.
     pub format_on_save: bool,
+    /// What a language server puts into lines: the types it worked out,
+    /// the names of parameters.
+    pub inlay_hints: bool,
+    /// Colors from the language server over the grammar's, where it says
+    /// what a word is.
+    pub semantic_highlighting: bool,
     /// The icon theme of an installed extension, by name: pictures next
     /// to file names in the tree and on tabs. None by default.
     pub icon_theme: Option<String>,
@@ -287,6 +293,8 @@ impl Default for Settings {
             language_servers: BTreeMap::new(),
             languages: BTreeMap::new(),
             format_on_save: false,
+            inlay_hints: true,
+            semantic_highlighting: true,
             icon_theme: None,
             context_servers: BTreeMap::new(),
             other: BTreeMap::new(),
@@ -529,6 +537,7 @@ pub fn bind_defaults(cx: &mut App) {
     crate::buffer_search::bind_keys(cx);
     crate::project_search::bind_keys(cx);
     crate::project_panel::bind_keys(cx);
+    crate::extension_views::bind_keys(cx);
     crate::terminal::bind_keys(cx);
     crate::git_panel::bind_keys(cx);
     crate::file_diff::bind_keys(cx);
@@ -556,17 +565,35 @@ struct KeyFiles {
 }
 impl Global for KeyFiles {}
 
+/// The keys installed extensions bind to their commands.
+#[derive(Default)]
+struct ExtensionKeys(Vec<KeyBinding>);
+impl Global for ExtensionKeys {}
+
 /// A named set arrives from the background. Use the newest personal and
-/// imported files, rather than a snapshot from when its read began.
+/// imported files, rather than a snapshot from when its read began. What
+/// extensions bind is over the layout and under the user's own keys, as
+/// in VS Code.
 pub(crate) fn bind_key_files(selected: Vec<KeyBinding>, cx: &mut App) {
     let files = cx.default_global::<KeyFiles>();
     let imported = files.imported.clone();
     let personal = files.personal.clone();
+    let extensions = cx.default_global::<ExtensionKeys>().0.clone();
     cx.clear_key_bindings();
     bind_defaults(cx);
     cx.bind_keys(imported);
     cx.bind_keys(selected);
+    cx.bind_keys(extensions);
     cx.bind_keys(personal);
+}
+
+/// The keys extensions bind changed: `source` is all of them, written as
+/// a keymap file is. Gives what in it could not be bound.
+pub fn set_extension_keys(source: &str, cx: &mut App) -> Vec<String> {
+    let (keys, errors) = parse_keymap("extensions", source, cx);
+    cx.set_global(ExtensionKeys(keys));
+    bind_key_files(crate::key_layout::kept(cx), cx);
+    errors
 }
 
 /// Loads the config files and applies them. Safe to call again on change.

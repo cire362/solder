@@ -101,6 +101,7 @@ pub struct ProjectPanel {
     edit: Option<EditState>,
     _edit_subscription: Option<Subscription>,
     tints: std::collections::HashMap<PathBuf, crate::git_store::Tint>,
+    _decorations: Option<Subscription>,
 }
 
 const ROW: Pixels = px(24.);
@@ -140,6 +141,13 @@ fn read_dir(dir: &Path, depth: usize) -> Vec<Entry> {
 impl ProjectPanel {
     pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
         let entries = read_dir(&root, 0);
+        let decorations = crate::extension_store::ExtensionStore::try_global(cx).map(|store| {
+            cx.subscribe(&store, |_, _, event, cx| {
+                if matches!(event, crate::extension_api::ExtensionEvent::Files) {
+                    cx.notify();
+                }
+            })
+        });
         Self {
             root,
             focus_handle: cx.focus_handle(),
@@ -150,6 +158,7 @@ impl ProjectPanel {
             edit: None,
             _edit_subscription: None,
             tints: Default::default(),
+            _decorations: decorations,
         }
     }
 
@@ -579,6 +588,52 @@ impl ProjectPanel {
                 })
         };
         let separator = || div().my_1().h(px(1.)).bg(theme.line);
+        // What extensions put in this menu for the file it is on.
+        let offered = path.as_deref().map_or_else(Vec::new, |path| {
+            let Some(store) = crate::extension_store::ExtensionStore::try_global(cx) else {
+                return Vec::new();
+            };
+            let store = store.read(cx);
+            let mut facts = store.facts();
+            let part = |part: Option<&std::ffi::OsStr>| {
+                part.map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            };
+            let ending = match part(path.extension()) {
+                ending if ending.is_empty() => ending,
+                ending => format!(".{ending}"),
+            };
+            for (name, value) in [
+                ("resourceFilename", part(path.file_name()).into()),
+                ("resourceExtname", ending.into()),
+                ("resourceScheme", "file".into()),
+                ("explorerResourceIsFolder", path.is_dir().into()),
+            ] {
+                facts.insert(name.into(), value);
+            }
+            store.menu("explorer/context", &facts, Some(path))
+        });
+        let theirs = offered.into_iter().enumerate().map(|(i, offered)| {
+            let (theme, action) = (theme.clone(), offered.action);
+            div()
+                .id(("m-extension", i))
+                .debug_selector(move || format!("m-extension-{i}"))
+                .h(px(26.))
+                .px_2()
+                .flex()
+                .items_center()
+                .rounded(theme.shape.token)
+                .text_size(UI_FONT_SIZE)
+                .text_color(theme.fg)
+                .hover(|d| d.bg(theme.accent_soft))
+                .child(div().truncate().child(offered.title))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.menu = None;
+                    window.dispatch_action(Box::new(action.clone()), cx);
+                    cx.notify();
+                }))
+        });
+        let theirs: Vec<_> = theirs.collect();
         Some(deferred(
             anchored().position(position).child(
                 div()
@@ -618,7 +673,9 @@ impl ProjectPanel {
                         "Reveal in Finder",
                         Box::new(RevealInFinder),
                         true,
-                    )),
+                    ))
+                    .when(!theirs.is_empty(), |d| d.child(separator()))
+                    .children(theirs),
             ),
         ))
     }
@@ -687,6 +744,13 @@ impl Render for ProjectPanel {
                     cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
                         let theme = cx.theme().clone();
                         let rows = this.display_rows();
+                        let paths = range
+                            .clone()
+                            .filter_map(|row_ix| {
+                                rows[row_ix].map(|ix| this.entries[ix].path.clone())
+                            })
+                            .collect();
+                        crate::extension_decorations::ask_visible(paths, cx);
                         range
                             .map(|row_ix| {
                                 let row = rows[row_ix];
@@ -812,6 +876,33 @@ impl Render for ProjectPanel {
                                                 .child(icon),
                                         )
                                     })
+                                    .children(
+                                        path.as_deref()
+                                            .into_iter()
+                                            .flat_map(|path| {
+                                                crate::extension_store::ExtensionStore::try_global(
+                                                    cx,
+                                                )
+                                                .map(|store| store.read(cx).file_marks(path))
+                                                .unwrap_or_default()
+                                            })
+                                            .enumerate()
+                                            .map(|(i, mark)| {
+                                                div()
+                                                    .id(("extension-file-mark", row_ix * 100 + i))
+                                                    .text_size(crate::theme::UI_FONT_SMALL)
+                                                    .text_color(theme.fg_subtle)
+                                                    .child(mark.badge)
+                                                    .when_some(mark.tooltip, |d, tooltip| {
+                                                        d.tooltip(move |_, cx| {
+                                                            cx.new(|_| {
+                                                                crate::ui::Tooltip(tooltip.clone())
+                                                            })
+                                                            .into()
+                                                        })
+                                                    })
+                                            }),
+                                    )
                                     .child(label)
                                     .when_some(row, |d, ix| {
                                         d.on_mouse_down(

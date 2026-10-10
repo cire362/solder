@@ -120,8 +120,10 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 
 Where it stands: extensions install from Zed's catalog and Open VSX. A Zed
 extension brings its languages (highlighting and how they are typed),
-snippets, themes and language servers. A VS Code extension brings its themes
-and snippets only.
+snippets, themes and language servers. A VS Code extension brings its
+languages, themes, icon themes, snippets and the debuggers its manifest
+describes; its code runs in a Node process of its own, with as much of VS
+Code's API as the items below have ticked.
 
 The two kinds are different work. A Zed extension is data plus a small
 sandboxed program with a fixed interface, so it can be supported completely.
@@ -235,30 +237,59 @@ to build them.
       is asked for this platform first; parts of VS Code itself are left out
 
 ### VS Code extensions: their code
-- [ ] An extension host: a Node process next to the editor that loads
+- [x] An extension host: a Node process next to the editor that loads
       extensions when their activation events happen and gives them a
       `vscode` module of Solder's own. One extension that crashes or hangs
-      does not take the editor or the others with it
-- [ ] The API every extension starts from: commands, messages, pickers and
+      does not take the editor or the others with it (a process for each,
+      and code runs only once the user allowed it)
+- [x] The API every extension starts from: commands, messages, pickers and
       input boxes, status bar items, output channels, configuration, the
-      workspace's folders and files, open documents, their edits and events
-- [ ] Language features: the providers for completion, hover, definition,
+      workspace's folders and files, open documents, their edits and events.
+      Lists pick one, and there is one visible editor, the file in front
+- [x] Language features: the providers for completion, hover, definition,
       references, rename, formatting, code actions, symbols, semantic tokens,
       inlay hints and code lenses, and diagnostic collections. This is what
       `vscode-languageclient` is built on, so it carries most language
-      extensions (and Prettier and ESLint)
-- [ ] Commands, menus and key bindings an extension contributes, in the
-      palette and the keymap
-- [ ] Debugging: adapters and configurations that extensions register in
-      code, in the debugger
-- [ ] Tasks, terminals and file watching
-- [ ] Source control providers, views in the sidebar (trees), decorations and
-      test controllers
-- [ ] Webviews, custom editors and notebooks. They need a browser view inside
-      the window, which GPUI does not have; decided when the rest is done
-- [ ] A check that runs with each release: the most installed extensions of
+      extensions (and Prettier and ESLint). The host answers the editor as
+      a language server does. Inlay hints and semantic colors were added
+      to the editor for this, for every server; a code lens is among the
+      code actions of its line. Not tried against a published extension
+      yet: that is the release check below
+- [x] Commands, menus and key bindings an extension contributes, in the
+      palette and the keymap. Menus: the editor's (`editor/context`), which
+      Solder had none of, and the file tree's (`explorer/context`).
+      Conditions (`when`) are read by a small reader of Solder's own
+- [x] Debugging: adapters and configurations that extensions register in
+      code, in the debugger. An adapter that is an object in the code is
+      reached at a local port; a launch by name and adapters on named
+      pipes are not there
+- [x] Tasks, terminals and file watching. Terminals are the dock's own; a
+      task is a command in one, listed by **Run extension task**. Not
+      there: terminals and tasks that are the extension's own code (`pty`,
+      `CustomExecution`), and problem matchers
+- [x] Source control providers, views in the sidebar (trees), decorations and
+      test controllers. **Show extension views** opens native lists in any
+      dock: open branches lazily, run commands, edit source-control input,
+      run test profiles and show their results. Decorations: file badges,
+      text backgrounds and words before/after ranges. Not there yet: tree
+      checkboxes and programmatic reveal, source-control quick diffs, test
+      coverage and cancellation, arbitrary CSS decoration styles
+- [x] Webviews, custom editors and notebooks. They need a browser view inside
+      the window, which GPUI does not have: the system's, through `wry`
+      (and `gtk` on Linux; agreed on 2026-10-10). A page of an extension is
+      a tab, a view that is a page opens as one, and an editor of an
+      extension's for a kind of file is offered as **Open with**. The
+      browser is made when the first page opens. Not there: notebooks
+      (left out, as phase 10 says), pages kept across restarts, pages on
+      Wayland
+- [x] A check that runs with each release: the most installed extensions of
       Open VSX are installed, activated and asked for their main feature, and
-      the result is the list of what works
+      the result is the list of what works. `extension-census`, run by the
+      **Extensions of Open VSX** workflow on a release or by hand; tested
+      against a catalog served locally. It has not been run against Open
+      VSX itself yet: it runs the code of third parties, so its first list
+      is the first run of the workflow, not something made on a
+      developer's machine
 
 ### What will not run
 Not tasks, but said so nobody waits for them: slash commands of Zed

@@ -114,8 +114,12 @@ pub enum Code {
     Zed {
         api: String,
     },
-    /// A Node program written against VS Code's API. It does not run here.
-    Node,
+    /// A Node program written against VS Code's API: the file it starts
+    /// from, and what it waits for to be started (`onLanguage:rust`, `*`).
+    Node {
+        main: PathBuf,
+        wakes: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -154,6 +158,92 @@ pub struct Extension {
     /// Every TextMate grammar it has, by the name it goes by: also the
     /// ones that are no language of their own, which others ask for.
     pub grammars: Vec<(String, PathBuf)>,
+    /// The commands of its code that its manifest names for the palette.
+    pub contributed: Vec<Contributed>,
+    /// Where else it offers them, and where it keeps one out.
+    pub menus: Vec<MenuItem>,
+    /// The keys it binds to them, the ones for this machine.
+    pub keys: Vec<KeyContribution>,
+    /// The views it names for the sidebar, each by its id and its title:
+    /// its code says what is in them.
+    pub views: Vec<(String, String)>,
+    /// Which of those views are drawn as a page, by id.
+    pub page_views: Vec<String>,
+    /// The editors it has for kinds of files, which open them as a page.
+    pub custom_editors: Vec<CustomEditor>,
+}
+
+/// An editor of a VS Code extension's for a kind of file: its name for the
+/// user, and the patterns of file names it is for (`*.png`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CustomEditor {
+    pub view_type: String,
+    pub name: String,
+    pub patterns: Vec<String>,
+}
+
+impl CustomEditor {
+    /// Whether it is for a file of this name. A pattern is read by its
+    /// last part, where `*` is any run of characters.
+    pub fn opens(&self, file: &Path) -> bool {
+        let Some(name) = file
+            .file_name()
+            .map(|name| name.to_string_lossy().to_lowercase())
+        else {
+            return false;
+        };
+        self.patterns.iter().any(|pattern| {
+            let pattern = pattern.rsplit('/').next().unwrap_or(pattern).to_lowercase();
+            let mut parts = pattern.split('*');
+            let first = parts.next().unwrap_or_default();
+            let Some(mut rest) = name.strip_prefix(first) else {
+                return false;
+            };
+            let parts: Vec<&str> = parts.collect();
+            for (i, part) in parts.iter().enumerate() {
+                // The last part ends the name; one before it is found
+                // anywhere after what came before.
+                if i + 1 == parts.len() {
+                    return rest.ends_with(part);
+                }
+                match rest.find(part) {
+                    Some(at) => rest = &rest[at + part.len()..],
+                    None => return false,
+                }
+            }
+            // No `*` at all: the name itself.
+            rest.is_empty()
+        })
+    }
+}
+
+/// A command a VS Code extension's code has, as its manifest names it for
+/// the user: `Git: Pull`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Contributed {
+    pub command: String,
+    pub title: String,
+    /// The condition it can be run under, if it has one.
+    pub enablement: Option<String>,
+}
+
+/// A command in a menu: which menu (`commandPalette`, `editor/context`,
+/// `explorer/context`), and the condition it is there under.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MenuItem {
+    pub menu: String,
+    pub command: String,
+    pub when: Option<String>,
+}
+
+/// A key a VS Code extension binds to a command, as Solder writes keys.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KeyContribution {
+    pub keys: String,
+    pub command: String,
+    pub when: Option<String>,
+    /// What the command is given.
+    pub args: Value,
 }
 
 /// A setting a VS Code extension declares: its whole name with the dots
@@ -175,8 +265,9 @@ pub struct Debugger {
     /// The ids of the languages it debugs, in small letters.
     pub languages: Vec<String>,
     /// The adapter, inside the extension: a program, or with `runtime`
-    /// a script for it.
-    pub program: PathBuf,
+    /// a script for it. `None` for one only the extension's code names:
+    /// asked when a program is to be debugged.
+    pub program: Option<PathBuf>,
     /// What runs the program: `node` mostly.
     pub runtime: Option<String>,
     pub runtime_args: Vec<String>,
@@ -186,17 +277,34 @@ pub struct Debugger {
     pub initial: Option<Value>,
 }
 
+/// What the user is asked before the code of a VS Code extension runs.
+pub const NODE_CODE: &str = "Run its code with Node.js, outside a sandbox";
+
 impl Extension {
     /// Whether its code runs in Solder's host.
     pub fn runs_code(&self) -> bool {
         matches!(&self.code, Code::Zed { api } if crate::host::runs(api))
     }
 
+    /// The file its Node code starts from and the events it waits for, if
+    /// it is a VS Code extension with code.
+    pub fn node(&self) -> Option<(&Path, &[String])> {
+        match &self.code {
+            Code::Node { main, wakes } => Some((main, wakes)),
+            _ => None,
+        }
+    }
+
     /// What it does outside a sandbox once installed, each in a sentence
     /// for the user: the language servers its code downloads and starts,
-    /// and the commands its manifest declares. Empty for an extension that
-    /// is only data, and for code Solder does not run.
+    /// and the commands its manifest declares. The code of a VS Code
+    /// extension has no sandbox at all, which is the one thing it says.
+    /// Empty for an extension that is only data, and for code Solder does
+    /// not run.
     pub fn outside(&self) -> Vec<String> {
+        if self.node().is_some() {
+            return vec![NODE_CODE.to_string()];
+        }
         if !self.runs_code() {
             return Vec::new();
         }
@@ -266,6 +374,8 @@ impl Extension {
                 "context servers",
             ),
             count(self.debuggers.len(), "debugger", "debuggers"),
+            count(self.contributed.len(), "command", "commands"),
+            count(self.keys.len(), "key binding", "key bindings"),
             count(self.themes.len(), "theme", "themes"),
             count(self.icon_themes.len(), "icon theme", "icon themes"),
             count(self.snippets.len(), "snippet file", "snippet files"),
@@ -588,7 +698,47 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         debuggers: Vec::new(),
         settings: Vec::new(),
         grammars: Vec::new(),
+        contributed: Vec::new(),
+        menus: Vec::new(),
+        keys: Vec::new(),
+        views: Vec::new(),
+        page_views: Vec::new(),
+        custom_editors: Vec::new(),
     })
+}
+
+/// What a VS Code extension waits for to be started: what its manifest
+/// says, and what VS Code reads from what it contributes (a command it
+/// declares starts it, and so does a file of a language it brings).
+fn wakes(manifest: &Value) -> Vec<String> {
+    let mut wakes = strings(&manifest["activationEvents"]);
+    let contributes = &manifest["contributes"];
+    for (list, key, event) in [
+        ("commands", "command", "onCommand"),
+        ("languages", "id", "onLanguage"),
+        ("debuggers", "type", "onDebugResolve"),
+        ("customEditors", "viewType", "onCustomEditor"),
+        ("taskDefinitions", "type", "onTaskType"),
+    ] {
+        for entry in contributes[list].as_array().into_iter().flatten() {
+            let name = text(&entry[key]);
+            if !name.is_empty() {
+                wakes.push(format!("{event}:{name}"));
+            }
+        }
+    }
+    // Views are listed by the place each is shown in.
+    for views in contributes["views"].as_object().into_iter().flatten() {
+        for view in views.1.as_array().into_iter().flatten() {
+            let id = text(&view["id"]);
+            if !id.is_empty() {
+                wakes.push(format!("onView:{id}"));
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    wakes.retain(|event| !event.trim().is_empty() && seen.insert(event.clone()));
+    wakes
 }
 
 /// What a VS Code language's configuration says about typing in it, in
@@ -806,11 +956,28 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         configure(&mut language, &config);
         languages.push(language);
     }
-    let code = if manifest["main"].is_string() || manifest["browser"].is_string() {
-        missing.push("Its code, which needs VS Code".into());
-        Code::Node
-    } else {
-        Code::None
+    // Its code starts from `main`, with or without the ending. Code made
+    // for a browser alone has nothing Node can start.
+    let main = manifest["main"].as_str().and_then(|main| {
+        [main.to_string(), format!("{main}.js")]
+            .iter()
+            .filter_map(|main| inside(dir, main))
+            .find(|main| main.is_file())
+    });
+    let code = match main {
+        Some(main) => Code::Node {
+            main,
+            wakes: wakes(&manifest),
+        },
+        None if manifest["main"].is_string() => {
+            missing.push("Its code (the file it starts from is not there)".into());
+            Code::None
+        }
+        None if manifest["browser"].is_string() => {
+            missing.push("Its code, which is made for a browser".into());
+            Code::None
+        }
+        None => Code::None,
     };
     // The settings it declares: one group of them, or several.
     let mut settings: Vec<Setting> = Vec::new();
@@ -865,10 +1032,12 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
             .as_str()
             .and_then(|program| inside(dir, program))
             .filter(|program| program.is_file());
-        let (Some(program), false) = (program, name.is_empty()) else {
+        // With no program named, the adapter is what the extension's
+        // code says it is; an extension with no code cannot say.
+        if name.is_empty() || (program.is_none() && !matches!(code, Code::Node { .. })) {
             started_by_code += 1;
             continue;
-        };
+        }
         let mut languages: Vec<String> = strings(&entry["languages"])
             .iter()
             .map(|language| language.to_lowercase())
@@ -903,13 +1072,97 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
             n => format!("{n} debuggers its code starts"),
         });
     }
-    for (key, what) in [
-        ("productIconThemes", "Product icon themes"),
-        ("keybindings", "Key bindings for its commands"),
-    ] {
-        if !list(key).is_empty() {
-            missing.push(what.to_string());
+    if !list("productIconThemes").is_empty() {
+        missing.push("Product icon themes".to_string());
+    }
+    // What its code can be asked to do: commands, where they are offered,
+    // and the keys for them.
+    let condition = |value: &Value| Some(text(value)).filter(|when| !when.is_empty());
+    let mut contributed: Vec<Contributed> = Vec::new();
+    for entry in list("commands") {
+        let (command, title) = (text(&entry["command"]), label(&text(&entry["title"])));
+        if command.is_empty()
+            || title.is_empty()
+            || contributed.iter().any(|c| c.command == command)
+        {
+            continue;
         }
+        let category = label(&text(&entry["category"]));
+        contributed.push(Contributed {
+            command,
+            title: match category.is_empty() {
+                true => title,
+                false => format!("{category}: {title}"),
+            },
+            enablement: condition(&entry["enablement"]),
+        });
+    }
+    let mut menus: Vec<MenuItem> = Vec::new();
+    for (menu, entries) in contributes["menus"].as_object().into_iter().flatten() {
+        for entry in entries.as_array().into_iter().flatten() {
+            let command = text(&entry["command"]);
+            if !command.is_empty() {
+                menus.push(MenuItem {
+                    menu: menu.clone(),
+                    command,
+                    when: condition(&entry["when"]),
+                });
+            }
+        }
+    }
+    let mut keys: Vec<KeyContribution> = Vec::new();
+    let mut unbound = 0;
+    for entry in list("keybindings") {
+        let command = text(&entry["command"]);
+        // A name with a minus in front takes a binding of VS Code's own
+        // away, which Solder does not have.
+        if command.is_empty() || command.starts_with('-') {
+            continue;
+        }
+        // The key for this platform, or the one for all.
+        let own = match std::env::consts::OS {
+            "macos" => "mac",
+            "windows" => "win",
+            _ => "linux",
+        };
+        let written = match text(&entry[own]) {
+            own if own.is_empty() => text(&entry["key"]),
+            own => own,
+        };
+        match import::keymap::vscode_keys(&written) {
+            Some(keys_written) => keys.push(KeyContribution {
+                keys: keys_written,
+                command,
+                when: condition(&entry["when"]),
+                args: entry["args"].clone(),
+            }),
+            None => unbound += 1,
+        }
+    }
+    // The views it names, wherever VS Code would put them: Solder has one
+    // place for them all.
+    let mut views: Vec<(String, String)> = Vec::new();
+    let mut page_views: Vec<String> = Vec::new();
+    for (_, listed) in contributes["views"].as_object().into_iter().flatten() {
+        for view in listed.as_array().into_iter().flatten() {
+            let id = text(&view["id"]);
+            if id.is_empty() || views.iter().any(|(known, _)| *known == id) {
+                continue;
+            }
+            // One drawn as a page is listed with the trees and opens in
+            // a tab.
+            if view["type"] == "webview" {
+                page_views.push(id.clone());
+            }
+            let name = label(&text(&view["name"]));
+            views.push((id.clone(), if name.is_empty() { id } else { name }));
+        }
+    }
+    if unbound > 0 {
+        missing.push(match unbound {
+            1 => "A key binding (a key Solder cannot bind)".to_string(),
+            n => format!("{n} key bindings (keys Solder cannot bind)"),
+        });
     }
 
     let display = label(&text(&manifest["displayName"]));
@@ -939,6 +1192,34 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         debuggers,
         settings,
         grammars,
+        contributed,
+        menus,
+        keys,
+        views,
+        page_views,
+        custom_editors: list("customEditors")
+            .iter()
+            .filter_map(|entry| {
+                let view_type = text(&entry["viewType"]);
+                let patterns: Vec<String> = entry["selector"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|selector| text(&selector["filenamePattern"]))
+                    .filter(|pattern| !pattern.is_empty())
+                    .collect();
+                let name = label(&text(&entry["displayName"]));
+                (!view_type.is_empty() && !patterns.is_empty()).then(|| CustomEditor {
+                    name: if name.is_empty() {
+                        view_type.clone()
+                    } else {
+                        name
+                    },
+                    view_type,
+                    patterns,
+                })
+            })
+            .collect(),
         servers: Vec::new(),
         debug_adapters: Vec::new(),
         context_servers: Vec::new(),
@@ -1000,3 +1281,30 @@ const EQUIVALENTS: &[(&str, &str)] = &[
     ("mrmlnc.vscode-scss", "scss"),
     ("syler.sass-indented", "scss"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_editor_of_an_extension_is_for_the_files_its_patterns_name() {
+        let opens = |patterns: &[&str], file: &str| {
+            let editor = CustomEditor {
+                patterns: patterns.iter().map(|p| p.to_string()).collect(),
+                ..Default::default()
+            };
+            editor.opens(Path::new(file))
+        };
+        assert!(opens(&["*.png"], "/a/b/Cat.PNG"));
+        assert!(!opens(&["*.png"], "/a/b/cat.jpg"));
+        // A pattern with folders in it is read by its last part.
+        assert!(opens(&["**/*.drawio.svg"], "/a/plan.drawio.svg"));
+        assert!(!opens(&["**/*.drawio.svg"], "/a/plan.svg"));
+        assert!(
+            opens(&["Makefile", "*.mk"], "/a/Makefile") && opens(&["Makefile", "*.mk"], "x.mk")
+        );
+        assert!(opens(&["data-*.v*.json"], "data-1.v22.json"));
+        assert!(!opens(&["data-*.v*.json"], "data-1.json"));
+        assert!(!opens(&["Makefile"], "/a/Makefile.bak") && !opens(&[], "a.png"));
+    }
+}

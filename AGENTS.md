@@ -111,6 +111,13 @@ Never guess a signature.
 - Language-server requests triggered by typing must run after the current
   effect cycle (`cx.defer`), so the `didChange` for what was just typed
   reaches the server first. See `Editor::after_typing`.
+- What a server draws into the text (inlay hints, semantic colors) is the
+  document's (`Document::inlays`, `Document::semantic`), asked for a
+  moment after the last change (`LspStore::schedule_hints`), never per
+  key, and moved with the text until the answer comes. A hint is in the
+  row and not in the file: `DisplayLine` maps columns both ways, as it
+  does for tabs, and nothing else may assume a column is a place on
+  screen.
 - Git goes through `git.rs`, which shells out to `git` with stable
   `--porcelain=v2 -z` formats. Everything in it blocks: call it from
   `cx.background_executor()`.
@@ -180,6 +187,68 @@ Never guess a signature.
   and a new module, never an edit to an old one, since extensions built for
   the old one stay in the catalog. Keep `wasmtime` and `wasmtime-wasi` on
   the version tree-sitter brings.
+  The code of a VS Code extension has no sandbox, so it asks first
+  (`Extension::outside`, `manifest::NODE_CODE`) and runs only once allowed
+  (`ExtensionStore::may_run`). Each extension has a Node process of its own
+  (`crates/extension/src/vscode.rs`), started with `host/host.js`, which is
+  in the binary and gives the extension its `vscode` module; the two talk
+  in JSON, a message a line. Everything in `vscode.rs` blocks: the store
+  starts a host on a thread of its own, hears it through a channel
+  (`ExtensionStore::heard`), and asks with `VsHost::ask`, which does not
+  wait. Nothing of the editor waits for an extension: one that stops
+  answering is ended by its watch. Ending a process waits for it, so it is
+  never done on the UI thread (`stop_code`). A part of VS Code's API that
+  is not in `host/*.js` must not throw: `namespace()` there gives a
+  stand-in and tells the editor what was asked for.
+  The editor's side of that API is `extension_api.rs`. What an extension
+  reads without waiting (folders, settings, documents, the cursor) is a
+  copy in its host: said once in `init`, then change by change, and never
+  while no host runs, so typing costs nothing without extensions. A new
+  thing of that kind is a new message both ways, not a request. What needs
+  a window (a list, a file to show, an edit) is an `Ask` in the store's
+  queue, taken by the workspace in front (`Workspace::extension_asks`);
+  its answer goes through `Reply`, which answers "nothing" when dropped,
+  so no extension waits forever. What extensions say in the status bar is
+  `ExtensionStore::bar`, drawn by the `extensions` item.
+  Language features of extensions add nothing to the editor's own: the
+  host is a language server to it (`lsp::LanguageServer::linked`, a server
+  that is no process), asked in the protocol and answered by
+  `host/languages.js` from the providers the extension registered. A new
+  feature for extensions is first a feature the editor has for language
+  servers, then a handler there. What a server can do is read once, so
+  when an extension registers something more its server is closed and
+  the documents get a new one (`LspStore::hosts_changed`).
+  What a manifest contributes (commands, menus, keys) is offered from the
+  manifest, before any code runs: `ExtensionStore::palette`, `menu` and
+  `sync_keys`, all through one action, `RunExtensionCommand`. Conditions
+  are `extension::when`, read against `Workspace::extension_facts`; a
+  fact it lacks is false, so a new fact is added there, never guessed.
+  The store cannot read the workspace it is asked from, which is in the
+  middle of its own update: the workspace brings the facts.
+  The debugger starts adapters and speaks to them itself, so an
+  extension's code is only asked what the launch and the adapter are
+  (`debug.adapter`, through `ExtensionStore::ask_host`, which starts the
+  code if it does not run). An adapter that is an object in that code is
+  put behind a local port by `host/debug.js`: no second way to talk to
+  an adapter in Rust.
+  A terminal of an extension is a terminal of the dock, kept by the
+  workspace that made it (`extension_terminals`); a task is a command
+  in such a terminal, and what `host/shell.js` knows of its end is what
+  the terminal's process ended with. Watching files is the host's own
+  work with Node: the editor is not asked.
+  A page of an extension (`webview.rs`) is the one browser view there
+  is: the system's, through `wry`, a child of the window placed where
+  GPUI laid out its tab. It is made when a page is first drawn, never
+  at startup and never in tests, whose windows have no handle to give.
+  A page is shut in, and each way out is closed where the browser is
+  built: navigation, new windows, downloads, permissions, and files
+  outside the folders the extension named. A new thing a page may do
+  is a new line there, with a test of what it refuses.
+  Whether published extensions work is found by `extension::census`,
+  which installs and starts them. It runs their code, so it belongs to
+  the workflow that runs it on a runner with no secrets: do not run it
+  against Open VSX on a machine that matters, and test it against a
+  catalog served locally, as its own test does.
 
 ### Performance rules
 

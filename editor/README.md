@@ -1,12 +1,13 @@
 # Solder editor
 
-The native editor behind the website in `../src`. Rust, GPU-rendered UI, no Electron and no webview.
+The native editor behind the website in `../src`. Rust, GPU-rendered UI, no Electron and no webview: the one place a browser view is made is a page a VS Code extension opens, and only when it opens.
 
 ```
 crates/
   text/     rope buffer, edits, undo history, cursor movement (no UI, fully unit-tested)
   extension/ extensions of Zed and VS Code: manifests, the two catalogs, installing,
-            and the sandbox that runs a Zed extension's code to get its language server
+            the sandbox that runs a Zed extension's code to get its language server,
+            and the Node host that runs a VS Code extension's code
   syntax/   tree-sitter parsing and highlighting for Rust, TS/TSX, JS, JSON, CSS, Go, Python,
             C, C++, Markdown, YAML and shell, and for the languages of extensions
             (grammars in WebAssembly)
@@ -737,9 +738,10 @@ Measured on an M4, release build, counting words on every change:
 | A 2 000 character file | 0.2 ms | 0.5 ms | 2.4 ms |
 | A 30 000 character file | 1.7 ms | 4.8 ms | 32 ms |
 
-The registry and extensions of other editors are not there yet: VS Code
-extensions are Node programs with full access to the machine, and Zed's use the
-WebAssembly Component Model, which this interpreter does not run.
+The registry is not there yet. Extensions of other editors do not run in this
+host: VS Code extensions are Node programs with full access to the machine, and
+Zed's use the WebAssembly Component Model, which this interpreter does not run.
+Each kind has a host of its own, described under Extensions below.
 
 ## Extensions
 
@@ -756,7 +758,7 @@ here.
 | From | Solder uses | Does not run here |
 |---|---|---|
 | A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, icon themes, its language servers, its debug adapters, its context servers | |
-| A VS Code extension | Languages (colors from its TextMate grammar; comments, pairs and indentation from its language configuration), themes (JSON and the older `.tmTheme`), icon themes drawn with pictures, snippets, debuggers whose manifest names the adapter's program | Its code, icon themes drawn with a font, debuggers only its code can start, everything the code would add |
+| A VS Code extension | Languages (colors from its TextMate grammar; comments, pairs and indentation from its language configuration), themes (JSON and the older `.tmTheme`), icon themes drawn with pictures, snippets, its debuggers, and its code, once you allow it | Icon themes drawn with a font, and what its code asks of VS Code that Solder does not have yet |
 
 A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
 It is compiled on the first file that needs it and runs in wasmtime inside
@@ -848,14 +850,174 @@ mostly, the machine's or Solder's own). It is offered for the files of the
 languages it names, even ones Solder has no grammar for, and started with the
 launch its manifest suggests: `${file}`, `${workspaceFolder}` and the like are
 filled in, and where VS Code would ask which program, it is the file in
-front. A debugger whose adapter only the extension's code can start is listed
-among what does not run here.
+front.
+
+A debugger may also be set up in the extension's code, and many are: the
+manifest names the kind of program and the code says what the adapter is.
+Once that code is allowed, such a debugger is offered like the others, and
+the code is started when a run is, not before. It is asked two things. Its
+configuration providers go over the launch and may add to it or call it off.
+Its adapter factory says where the adapter is: a program to start, a port
+where one listens already, or an object in the extension's own code, which
+the host puts behind a port of this machine so that the debugger reaches it
+like any adapter. With no factory, the adapter is the program the manifest
+names. An extension can start a run itself (`debug.startDebugging`, with a
+launch given whole) and hears when runs begin and end. A launch by its name
+in a file of launches, an adapter on a named pipe, and requests to the
+adapter of a running session are not here yet. In an extension with no
+code, a debugger whose manifest names no adapter is listed among what does
+not run here.
 
 The settings a VS Code extension declares are set in `settings.json` under
 their own names, as in VS Code: `"prettier.tabWidth": 2`, or as objects inside
 objects. The Extensions tab lists them with what each is now: what you set,
 or what the extension says it is when not set. They are what its code will be
 handed when it asks for its configuration; nothing else reads them yet.
+
+The code of a VS Code extension is a Node program written against VS Code's
+API. Unlike a Zed extension's it has no sandbox: it can do what your account
+can. So an extension with code is downloaded and then waits, the tab says
+**Run its code with Node.js, outside a sandbox**, and nothing of it is in place
+until you press **Install**. One that was installed before, or put in the
+folder by hand, keeps its themes and languages and has an **Allow** button
+under **Its code**.
+
+Each extension runs in a Node process of its own, started when what it waits
+for happens (its activation events: the editor is up, a file of a language is
+open, one of its commands is asked for), never before. It gets a `vscode`
+module that is Solder's: what is in it works as in VS Code, and what is not
+yet does nothing and is listed in the tab under **Asked for what Solder does
+not have yet**, so it is plain why a feature is missing.
+
+What is in the module today is what every extension starts from:
+
+| An extension can | In Solder |
+|---|---|
+| Register commands and run its own or another extension's | As in VS Code. Of VS Code's own commands: `vscode.open`, `setContext`, `workbench.action.files.saveAll` |
+| Show a message | With nothing to choose, it is in the status bar for eight seconds, in its color. With answers, or `modal`, it is a list to pick the answer from |
+| Ask to pick from a list, or to type a line | The editor's own list, with the keys of the command palette. One is picked, also where the extension allows several. What is typed is checked by the extension and asked again with what is wrong. A password is not hidden |
+| Put items in the status bar | In the `extensions` item of the bars, as text: Solder has no font for the pictures VS Code draws there. A click runs the item's command. Work in progress (`withProgress`) is said there too |
+| Write to an output channel | Kept, the last 256 KB of each. **Show output** in the Extensions tab opens it in a tab, and so does the extension when it asks |
+| Read and set settings | What extensions declare, with what `settings.json` says, and `editor.tabSize`. `update` writes the key to `settings.json` |
+| See the workspace | A folder for each open window, the one in front first. Files through `workspace.fs` and `findFiles` |
+| See open documents and the editor in front | Every file open in a tab, with its text, kept up to date as it is typed, saved and closed, and the cursor of the one in front. There is one visible editor: the file in front |
+| Change text | `TextEditor.edit` and `workspace.applyEdit`, in open files and on disk, with files made, renamed and deleted. A snippet is put in as text, its places taken out |
+| Use the clipboard, open a link | Yes; a link only to the web or to mail |
+| Open terminals | A terminal of the dock, under the name the extension gives it, running what it names or your shell. It is made when the extension first shows it or types into it, so one only kept ready takes no room. A terminal the extension draws itself (`pty`) is not here yet |
+| Provide and run tasks | **Workspace: Run extension task** in the palette lists the tasks extensions provide and runs the one chosen in a terminal, whose tab stays when it ends. The extension hears what it ended with. A task that runs in the extension's own code is not here yet, and problem matchers are not read |
+| Watch files | `createFileSystemWatcher`, for the folders of the open windows: files made, changed and deleted, but for `.git` and `node_modules` |
+| Show pages (webviews) and editors of its own for kinds of files | A tab drawn by the system's browser; see below |
+| Give language features in code (`vscode.languages`) | Completions, hovers, definitions, references, rename, formatting, code actions, document and project symbols, signature help, inlay hints, semantic colors, and diagnostics from its collections. A code lens is offered among the code actions of its line (`cmd-.`), not drawn above it |
+
+**Show extension views** opens the **Views** panel. Trees an extension names
+are listed before its code starts; choosing one starts the approved code.
+Source control groups and test controllers appear when registered. The
+panel moves between docks through `layout.json` (`extension_views`) like
+Files or Git. Open branches load on demand; Refresh keeps those branches
+open and replaces their contents. Arrow keys move and expand, Enter opens
+or runs a node, and Cmd+Enter (Ctrl+Enter on Linux) runs its first test
+profile. Profile buttons also run and debug individual tests. Failed test
+messages are in the row and its tooltip; output is in the extension's log.
+
+Source control has an editable message and the command the provider gave
+it, then groups of files and their commands. File-decoration providers are
+asked only for visible file-tree entries. Text decorations support hex and
+known theme background colors, whole-line backgrounds and text before or
+after a range. UTF-16 positions are converted and ranges follow edits.
+
+A **page** of an extension (a webview) is a tab next to the files' tabs: the
+extension writes its HTML, and the page and the extension send each other
+messages. It is drawn by the system's browser (WebKit on macOS, WebView2 on
+Windows, WebKitGTK on Linux under X11), put where the tab's content is; no
+browser exists until the first page opens, and none is made at startup. A
+view an extension draws as a page is listed in **Views** and opens in a tab
+when chosen. An editor an extension has for a kind of file (a picture, a
+diagram) is offered as **Open with** in the file tree's menu and the
+editor's, and opens the file as such a page.
+
+A page is shut in. It can go nowhere but itself: links, new windows,
+downloads and requests for the camera or the like are refused. Scripts run
+only if the extension turned them on. It reads files only through an
+address of its own, and only under the folders the extension named for it
+(its own folder and the project's, when it named none); what it posts
+reaches only the extension that made it. It gets the editor's colors and
+fonts as VS Code's variables (`--vscode-editor-background` and a dozen
+more, not every one VS Code has), and `vscode-dark` or `vscode-light` on
+its body. `cmd-w` closes it, and the keys of the command palette and the
+file finder work in it.
+
+Not there: notebooks, pages brought back after a restart, a page inside
+the sidebar itself, and pages under Wayland, where the tab says so.
+
+Which extensions work is not claimed from the list above: it is found out.
+With each release the fifty most installed extensions of Open VSX are
+installed, their code is started with a made-up project to look at, and
+each is asked for what it said it does, the way the editor asks (a hover,
+a completion, the formatting of a file of its language). The result is a
+page: what Solder takes from each without running anything, whether its
+code started, what it registered, what it answered, and every part of VS
+Code's API it asked for that Solder does not have. The page is the summary
+and the artifact of the **Extensions of Open VSX** workflow, which can also
+be run by hand. It runs the code of third parties with no sandbox, so it
+runs on a CI machine with no secrets, and is not something to run on your
+own:
+
+```sh
+cargo run --release -p extension --bin extension-census -- --count 50 --out extensions.md
+```
+Disposing a decoration type or disabling the extension removes its marks
+without removing a language server's hints. Tree checkboxes, programmatic
+reveal, source-control quick diffs, test coverage and cancellation, and
+other CSS decoration styles are not implemented yet.
+
+None of this costs anything while no extension's code runs: documents and
+cursors are followed only once a host is up.
+
+What an extension's manifest says its code can be asked to do is where
+Solder's own commands are:
+
+- **The palette** lists its commands under the names it gives them
+  (`Git: Pull`). Choosing one starts the extension if it was waiting for
+  that. A command its manifest keeps out of the palette is not there.
+- **Menus.** The right button in a file opens what it put in the editor's
+  menu (`editor/context`), and the menu of the file tree has what it put
+  there (`explorer/context`) under Solder's own entries. Both give the
+  command the file. Other menus of VS Code have no place here yet.
+- **Keys.** The keys it binds are bound, the ones for this machine, with
+  chords. They are over the key layout and under `keymap.json`, so a key
+  of your own always wins. A key bound for when the editor has the
+  keyboard is bound in the editor only.
+
+Entries and keys have conditions (`when`), read against what Solder knows:
+the language and name of the file in front (`editorLangId`,
+`resourceExtname`, `resourceFilename`), whether it has a selection or can be
+changed, the machine (`isMac`), and whatever extensions set with
+`setContext`. A condition that asks for something Solder does not know, or
+compares in a way it does not (`=~`, `in`), does not hold: an entry is left
+out, never shown by mistake. To bind a key of your own to such a command:
+
+```json
+[{ "bindings": { "alt-r": ["workspace::RunExtensionCommand", { "command": "demo.run" }] } }]
+```
+
+Language features need nothing of the editor that a language server does not
+already use. To the editor the host of such an extension is a language
+server: it is asked in the Language Server Protocol, and the host answers
+from what the extension registered. So an extension's completions are in the
+same menu as a server's, its diagnostics under the same squiggles, its rename
+behind the same key, and it works for a file of a language Solder has no
+grammar for. This is also what `vscode-languageclient` is written against,
+the library most language extensions use to talk to their own server. What
+an extension registers for a feature the editor does not have (folding
+ranges, document links, colors, call hierarchies) is taken and listed in the
+tab with the rest of what is not here.
+
+An extension that throws ends nothing but its own start. One that ends its
+process is shown as stopped, with its last words. One that never returns stops
+answering, and after 30 seconds its process is ended: the editor and the other
+extensions never waited for it. What stopped is not started over and over;
+**Start again** in the tab does it once. Node is the machine's, or the one
+Solder downloads the first time something needs it.
 
 A VS Code extension that has a build for each platform is installed in the
 one for this machine. What it does not work without, and what it is a pack
@@ -933,6 +1095,20 @@ Zed starts for it (`solargraph` for Ruby, `phpactor` for PHP, `elixir-ls` for
 Elixir); any other starts all its servers. Open files go to the chosen servers
 as soon as the settings are saved.
 
+Two things a server draws into the text are shown for every server that has
+them, an extension's or Solder's own. **Inlay hints** are the types a server
+worked out and the names of parameters, in the line in a quieter color; they
+are no part of the file, the cursor steps over them, and one longer than 60
+characters is cut. **Semantic colors** are what the server says each word
+is, over what the grammar says: a server knows a constant from a variable
+where a grammar sees a name. Both are asked for a moment after the last key,
+and move with the text until the answer comes. Each has a setting, on unless
+turned off:
+
+```json
+{ "inlay_hints": true, "semantic_highlighting": true }
+```
+
 That is why such an extension **asks first**. It is downloaded and read, and
 then waits: the tab shows what installing it allows (the servers it gets, the
 commands its manifest declares), and nothing is in place until you press
@@ -980,7 +1156,7 @@ applied as soon as it is saved.
   "status_bar": {
     "height": 26,
     "left": ["position", "indent", "language", "problems", "activity", "connection"],
-    "right": ["plugins", "performance"]
+    "right": ["extensions", "plugins", "performance"]
   },
   "hidden": [],
   "open": ["files"]
@@ -1058,11 +1234,14 @@ such as the branch, keep their actions after moving.
 | `problems` | how many errors and warnings the file has |
 | `activity` | a language server starting, files being read |
 | `connection` | the database of a query file; a click picks another |
+| `extensions` | what the code of VS Code extensions shows: its status bar items, work in progress, its last message. A click on an item runs its command |
 | `plugins` | what plugins show; a click opens the Plugins window |
 | `performance` | the numbers of `show_performance_hud` |
 
 An item with nothing to say now is not drawn. `file` and `branch` are on no bar
-until the file puts them on one. A mistake in a config file is always said in
+until the file puts them on one. A layout file written before `extensions`
+existed names its own items for the right end, so add it there to see what
+extensions show. A mistake in a config file is always said in
 the status bar, whatever it holds.
 
 Panel tabs, bar items and common command buttons have Phosphor icons next to

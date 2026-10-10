@@ -32,6 +32,10 @@ syntax.workspace = true
 text.workspace = true
 trash = "5.2.9"
 unicode-segmentation.workspace = true
+wry = "=0.57.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "=0.18.2"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

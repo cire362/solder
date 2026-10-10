@@ -62,7 +62,12 @@ pub fn humanize_action_name(name: &str) -> String {
 impl CommandPalette {
     /// Must be called while the palette's target still has focus, so the
     /// available actions and their key bindings are the target's.
-    pub fn new(plugins: Entity<PluginStore>, window: &mut Window, cx: &mut gpui::App) -> Self {
+    pub fn new(
+        plugins: Entity<PluginStore>,
+        extensions: Vec<crate::extension_api::Offered>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> Self {
         let mut commands: Vec<Command> = window
             .available_actions(cx)
             .into_iter()
@@ -89,6 +94,18 @@ impl CommandPalette {
                     binding: None,
                 }),
         );
+        // The commands extensions name in their manifests, each with its
+        // key if it has one.
+        commands.extend(extensions.into_iter().map(|offered| {
+            Command {
+                name: offered.title,
+                binding: offered
+                    .keyed
+                    .and_then(|keyed| window.highest_precedence_binding_for_action(&keyed))
+                    .map(|b| format_binding(&b)),
+                run: Run::Action(Box::new(offered.action)),
+            }
+        }));
         commands.sort_by(|a, b| a.name.cmp(&b.name));
         commands.dedup_by(|a, b| a.name == b.name);
         Self {

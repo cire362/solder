@@ -425,13 +425,23 @@ impl DebugStore {
         self.adapter_id = from.launch.adapter.clone();
         self.state = State::Starting("Getting the debugger ready...".into());
         let asked = crate::extension_store::ExtensionStore::global(cx).update(cx, |store, cx| {
-            store.debug_adapter(&from.extension, from.launch.clone(), &root, cx)
+            let given = from.configuration.clone();
+            store.debug_adapter(&from.extension, from.launch.clone(), given, &root, cx)
         });
         cx.spawn(async move |this, cx| {
             let started = async {
                 let adapter = asked.await?;
                 cx.background_executor()
                     .spawn(async move {
+                        // One that listens already, somewhere the
+                        // extension said, is only connected to.
+                        if let (None, Some((host, port, _))) =
+                            (&adapter.command, adapter.connection)
+                        {
+                            let link =
+                                Connection::connect_to(host, port).map_err(|e| e.to_string())?;
+                            return Ok((None, Some(link), adapter));
+                        }
                         let program = adapter
                             .command
                             .clone()
@@ -448,7 +458,7 @@ impl DebugStore {
                         };
                         let (process, link) =
                             dap::Adapter::launch(&launch).map_err(|e| e.to_string())?;
-                        Ok::<_, String>((process, link, adapter))
+                        Ok::<_, String>((Some(process), link, adapter))
                     })
                     .await
             }
@@ -459,8 +469,8 @@ impl DebugStore {
                 }
                 match started {
                     Ok((process, link, adapter)) => {
-                        let port = process.port;
-                        this.adapter = Some(process);
+                        let port = process.as_ref().map_or(0, |process| process.port);
+                        this.adapter = process;
                         this.state = State::Running;
                         let kind = if adapter.attach { "attach" } else { "launch" };
                         let arguments =
@@ -562,6 +572,14 @@ impl DebugStore {
         let id = self.next_id;
         self.next_id += 1;
         let run = self.run;
+        // Extensions hear of it: some show or do something while a
+        // program of theirs is debugged.
+        if let Some(extensions) = crate::extension_store::ExtensionStore::try_global(cx) {
+            let session = serde_json::json!({
+                "id": id, "type": self.adapter_id, "name": name, "configuration": arguments,
+            });
+            extensions.read(cx).debug_session(true, session);
+        }
         let conn_events = conn.clone();
         let (launch_sent, ready) = futures::channel::oneshot::channel();
         let task = cx.spawn(async move |this, cx| {
@@ -767,6 +785,10 @@ impl DebugStore {
         match self.sessions.iter_mut().find(|s| s.id == id) {
             Some(s) if !s.ended => s.ended = true,
             _ => return,
+        }
+        if let Some(extensions) = crate::extension_store::ExtensionStore::try_global(cx) {
+            let session = serde_json::json!({ "id": id });
+            extensions.read(cx).debug_session(false, session);
         }
         if self.paused.as_ref().is_some_and(|p| p.session == id) {
             self.paused = None;

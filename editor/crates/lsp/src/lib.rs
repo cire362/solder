@@ -3,6 +3,10 @@
 //! One reader and one writer thread per server; nothing here blocks the UI.
 //! Requests return futures that resolve when the response arrives, and
 //! server notifications come out of a channel the app polls on its own terms.
+//!
+//! A server need not be a process: [`LanguageServer::linked`] is one whose
+//! messages go to the app and come from it, for something that speaks the
+//! protocol from elsewhere (the code of a VS Code extension, in its host).
 
 use std::{
     collections::HashMap,
@@ -81,7 +85,38 @@ pub struct LanguageServer {
     encoding: Mutex<Encoding>,
     /// What `workspace/configuration` is answered from.
     configuration: Arc<Mutex<Value>>,
-    child: Mutex<Child>,
+    /// The process, for a server that is one.
+    child: Mutex<Option<Child>>,
+}
+
+/// The other end of a server that is not a process: what it says comes in
+/// here, a message at a time. Dropped, the server is gone, and whoever
+/// waited for an answer of it learns so.
+pub struct Link {
+    pending: Pending,
+    notifications: mpsc::UnboundedSender<Notification>,
+    outgoing: std_mpsc::Sender<Vec<u8>>,
+    configuration: Arc<Mutex<Value>>,
+}
+
+impl Link {
+    pub fn receive(&self, message: Value) {
+        dispatch(
+            message,
+            &self.pending,
+            &self.notifications,
+            &self.outgoing,
+            &self.configuration,
+        );
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        for (_, tx) in self.pending.lock().drain() {
+            let _ = tx.send(Err(Error::Closed));
+        }
+    }
 }
 
 pub struct ServerCommand {
@@ -136,9 +171,50 @@ impl LanguageServer {
             capabilities: Mutex::new(ServerCapabilities::default()),
             encoding: Mutex::new(Encoding::Utf16),
             configuration,
-            child: Mutex::new(child),
+            child: Mutex::new(Some(child)),
         });
         Ok((server, note_rx))
+    }
+
+    /// A server that is not a process. Every message for it is given to
+    /// `send`, on a thread of the server's own, and what it says comes in
+    /// through the [`Link`]. Call [`LanguageServer::initialize`] before
+    /// anything else, as for any server.
+    pub fn linked(
+        name: impl Into<String>,
+        send: impl Fn(Value) + Send + 'static,
+    ) -> Result<(Arc<Self>, Link, mpsc::UnboundedReceiver<Notification>)> {
+        let (out_tx, out_rx) = std_mpsc::channel::<Vec<u8>>();
+        let (note_tx, note_rx) = mpsc::unbounded();
+        let pending: Pending = Arc::default();
+        let configuration = Arc::new(Mutex::new(Value::Null));
+        std::thread::Builder::new()
+            .name("lsp-link".into())
+            .spawn(move || {
+                for body in out_rx {
+                    if let Ok(message) = serde_json::from_slice(&body) {
+                        send(message);
+                    }
+                }
+            })
+            .map_err(|e| Error::Io(e.to_string()))?;
+        let link = Link {
+            pending: pending.clone(),
+            notifications: note_tx,
+            outgoing: out_tx.clone(),
+            configuration: configuration.clone(),
+        };
+        let server = Arc::new(Self {
+            name: name.into(),
+            next_id: AtomicI32::new(1),
+            outgoing: out_tx,
+            pending,
+            capabilities: Mutex::new(ServerCapabilities::default()),
+            encoding: Mutex::new(Encoding::Utf16),
+            configuration,
+            child: Mutex::new(None),
+        });
+        Ok((server, link, note_rx))
     }
 
     pub fn name(&self) -> &str {
@@ -246,13 +322,15 @@ impl LanguageServer {
     }
 
     pub fn kill(&self) {
-        let _ = self.child.lock().kill();
+        if let Some(child) = self.child.lock().as_mut() {
+            let _ = child.kill();
+        }
     }
 }
 
 impl Drop for LanguageServer {
     fn drop(&mut self) {
-        let _ = self.child.lock().kill();
+        self.kill();
     }
 }
 
@@ -280,82 +358,93 @@ fn read_loop(
         let Ok(value) = serde_json::from_slice::<Value>(&message) else {
             continue;
         };
-        let id = value.get("id").cloned();
-        let method = value
-            .get("method")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        match (id, method) {
-            // A response to one of our requests.
-            (Some(id), None) => {
-                let Some(id) = id.as_i64() else { continue };
-                let Some(tx) = pending.lock().remove(&(id as i32)) else {
-                    continue;
-                };
-                let result = match value.get("error") {
-                    Some(err) => Err(Error::Server {
-                        code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
-                        message: err
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("request failed")
-                            .to_string(),
-                    }),
-                    None => Ok(value.get("result").cloned().unwrap_or(Value::Null)),
-                };
-                let _ = tx.send(result);
-            }
-            // A request from the server. Edits go to the app, which knows the
-            // open documents; the rest get the answers every client gives.
-            (Some(id), Some(method)) if method == "workspace/applyEdit" => {
-                let params = value.get("params").cloned().unwrap_or(Value::Null);
-                let _ = notifications.unbounded_send(Notification {
-                    method,
-                    params,
-                    id: Some(id),
-                });
-            }
-            (Some(id), Some(method)) => {
-                let result = match method.as_str() {
-                    "workspace/configuration" => {
-                        let settings = configuration.lock();
-                        Value::Array(
-                            value
-                                .pointer("/params/items")
-                                .and_then(Value::as_array)
-                                .into_iter()
-                                .flatten()
-                                .map(|item| section(&settings, item["section"].as_str()))
-                                .collect(),
-                        )
-                    }
-                    _ => Value::Null,
-                };
-                let reply = json!({ "jsonrpc": "2.0", "id": id, "result": result });
-                if let Ok(body) = serde_json::to_vec(&reply) {
-                    let _ = outgoing.send(body);
-                }
-            }
-            (None, Some(method)) => {
-                let params = value.get("params").cloned().unwrap_or(Value::Null);
-                if notifications
-                    .unbounded_send(Notification {
-                        method,
-                        params,
-                        id: None,
-                    })
-                    .is_err()
-                {
-                    // Nobody listens any more; keep draining so the server
-                    // does not block on a full pipe.
-                }
-            }
-            (None, None) => {}
-        }
+        dispatch(value, &pending, &notifications, &outgoing, &configuration);
     }
     // The server is gone: fail everything still waiting.
     for (_, tx) in pending.lock().drain() {
         let _ = tx.send(Err(Error::Closed));
+    }
+}
+
+/// One message of a server: an answer goes to whoever waits for it, a
+/// request the app has to see and a notification go to the app, and the
+/// rest get the answers every client gives.
+fn dispatch(
+    value: Value,
+    pending: &Pending,
+    notifications: &mpsc::UnboundedSender<Notification>,
+    outgoing: &std_mpsc::Sender<Vec<u8>>,
+    configuration: &Mutex<Value>,
+) {
+    let id = value.get("id").filter(|id| !id.is_null()).cloned();
+    let method = value
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    match (id, method) {
+        // A response to one of our requests.
+        (Some(id), None) => {
+            let Some(tx) = id
+                .as_i64()
+                .and_then(|id| pending.lock().remove(&(id as i32)))
+            else {
+                return;
+            };
+            let result = match value.get("error").filter(|error| !error.is_null()) {
+                Some(err) => Err(Error::Server {
+                    code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
+                    message: err
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("request failed")
+                        .to_string(),
+                }),
+                None => Ok(value.get("result").cloned().unwrap_or(Value::Null)),
+            };
+            let _ = tx.send(result);
+        }
+        // A request from the server. Edits go to the app, which knows the
+        // open documents; the rest get the answers every client gives.
+        (Some(id), Some(method)) if method == "workspace/applyEdit" => {
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            let _ = notifications.unbounded_send(Notification {
+                method,
+                params,
+                id: Some(id),
+            });
+        }
+        (Some(id), Some(method)) => {
+            let result = match method.as_str() {
+                "workspace/configuration" => {
+                    let settings = configuration.lock();
+                    Value::Array(
+                        value
+                            .pointer("/params/items")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .map(|item| section(&settings, item["section"].as_str()))
+                            .collect(),
+                    )
+                }
+                _ => Value::Null,
+            };
+            let reply = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            if let Ok(body) = serde_json::to_vec(&reply) {
+                let _ = outgoing.send(body);
+            }
+        }
+        // Nobody listening any more is no reason to stop reading: the
+        // server would block on a full pipe.
+        (None, Some(method)) => {
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            let _ = notifications.unbounded_send(Notification {
+                method,
+                params,
+                id: None,
+            });
+        }
+        (None, None) => {}
     }
 }
 
@@ -395,6 +484,34 @@ fn read_message(reader: &mut impl BufRead) -> Option<Vec<u8>> {
     Some(body)
 }
 
+/// The kinds of words the editor has a color for, as the protocol names
+/// them.
+pub const SEMANTIC_TOKEN_TYPES: &[&str] = &[
+    "namespace",
+    "type",
+    "class",
+    "enum",
+    "interface",
+    "struct",
+    "typeParameter",
+    "parameter",
+    "variable",
+    "property",
+    "enumMember",
+    "event",
+    "function",
+    "method",
+    "macro",
+    "keyword",
+    "modifier",
+    "comment",
+    "string",
+    "number",
+    "regexp",
+    "operator",
+    "decorator",
+];
+
 fn client_capabilities() -> ClientCapabilities {
     // Written as JSON: the typed structs are deeply nested and this reads
     // closer to the spec.
@@ -422,6 +539,15 @@ fn client_capabilities() -> ClientCapabilities {
             "publishDiagnostics": { "relatedInformation": false, "versionSupport": true },
             "signatureHelp": {
                 "signatureInformation": { "parameterInformation": { "labelOffsetSupport": true } }
+            },
+            "inlayHint": {},
+            "semanticTokens": {
+                "requests": { "full": true },
+                "tokenTypes": SEMANTIC_TOKEN_TYPES,
+                "tokenModifiers": [],
+                "formats": ["relative"],
+                "overlappingTokenSupport": false,
+                "multilineTokenSupport": false
             },
             "codeAction": {
                 "resolveSupport": { "properties": ["edit"] },
@@ -480,6 +606,73 @@ mod tests {
         );
         assert_eq!(section(&settings, Some("less")), Value::Null);
         assert_eq!(section(&Value::Null, Some("css")), Value::Null);
+    }
+
+    #[test]
+    fn a_server_that_is_not_a_process_speaks_through_its_link() {
+        use futures::{StreamExt, executor::block_on};
+        // What the app says is given to the other end, which answers
+        // through the link: here it is this test.
+        let (said, hears) = std_mpsc::channel::<Value>();
+        let (server, link, mut notes) = LanguageServer::linked("demo", move |message| {
+            let _ = said.send(message);
+        })
+        .unwrap();
+        let next = || {
+            hears
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+        };
+
+        // The handshake sends nothing until it is waited for, so it is
+        // waited for on a thread of its own while this one answers.
+        std::thread::scope(|scope| {
+            let starting =
+                scope.spawn(|| block_on(server.initialize(Path::new("/tmp/project"), None)));
+            let asked = next();
+            assert_eq!(asked["method"], "initialize");
+            assert_eq!(asked["params"]["rootUri"], "file:///tmp/project");
+            link.receive(json!({ "jsonrpc": "2.0", "id": asked["id"], "result": {
+                "capabilities": { "hoverProvider": true },
+            } }));
+            starting.join().unwrap().unwrap();
+        });
+        assert_eq!(next()["method"], "initialized");
+        assert!(server.capabilities().hover_provider.is_some());
+        assert_eq!(server.encoding(), Encoding::Utf16);
+
+        // A request is answered, or refused in the server's words.
+        let asking = server.request::<lsp_types::request::Shutdown>(());
+        let asked = next();
+        link.receive(json!({ "jsonrpc": "2.0", "id": asked["id"], "error": {
+            "code": -32000, "message": "not now",
+        } }));
+        assert!(
+            matches!(block_on(asking), Err(Error::Server { message, .. }) if message == "not now")
+        );
+
+        // What the server says of its own reaches the app, and what it
+        // asks that every client answers is answered.
+        link.receive(
+            json!({ "jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+            "params": { "uri": "file:///a", "diagnostics": [] } }),
+        );
+        let note = block_on(notes.next()).unwrap();
+        assert_eq!(note.method, "textDocument/publishDiagnostics");
+        assert_eq!(note.params["uri"], "file:///a");
+        server.set_configuration(json!({ "demo": { "level": 3 } }));
+        assert_eq!(next()["method"], "workspace/didChangeConfiguration");
+        link.receive(
+            json!({ "jsonrpc": "2.0", "id": 7, "method": "workspace/configuration",
+            "params": { "items": [{ "section": "demo.level" }] } }),
+        );
+        assert_eq!(next(), json!({ "jsonrpc": "2.0", "id": 7, "result": [3] }));
+
+        // The link gone, whoever waits is told there is no server.
+        let asking = server.request::<lsp_types::request::Shutdown>(());
+        next();
+        drop(link);
+        assert!(matches!(block_on(asking), Err(Error::Closed)));
     }
 
     #[test]
