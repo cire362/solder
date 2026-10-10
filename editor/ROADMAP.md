@@ -399,14 +399,22 @@ against what Solder has: these are the parts it lacked. Each block is one
 update. They come after phase 9, in this order unless one is needed sooner.
 
 ### The editor
-- [ ] Folding of blocks, indent guides, lines wrapped at the window's edge
-- [ ] Selection by column (a rectangle of cursors)
-- [ ] Pinned tabs; the tab closed last opened again (`cmd-shift-t`). Tabs,
-      split panes, cursors and scroll positions now return per project,
-      along with notebooks and pages whose extensions provide a serializer
-- [ ] Unsaved text kept aside as it is typed and offered back after a crash
-- [ ] Line endings and encoding of a file kept as they were; files too large
-      to edit opened for reading, with the reason said
+- [x] Folding of blocks, indent guides, lines wrapped at the window's edge.
+      Folding goes by indentation, the same in every language; wrapping
+      goes by cells, so rows of characters wider than a cell run past the
+      edge
+- [x] Selection by column (a rectangle of cursors): `shift-alt` and the
+      mouse, the middle button, or `cmd-alt-shift` and the arrows
+- [x] Pinned tabs; the tab closed last opened again (`cmd-shift-t`). Tabs,
+      split panes, cursors and scroll positions return per project, along
+      with notebooks and pages whose extensions provide a serializer
+- [x] Unsaved text kept aside as it is typed and put back at the next
+      start after a crash, or after `cmd-q`, which asks nothing
+- [x] Line endings and encoding of a file kept as they were; files too large
+      to edit opened for reading, with the reason said. The encodings are
+      UTF-8, UTF-16 and two single-byte ones written here, with no
+      dependency: any other single-byte file is saved byte for byte but
+      shown with the wrong letters
 
 ### Symbols and problems
 - [x] Symbols of the file (`cmd-shift-o`) and of the project (`cmd-t`), from

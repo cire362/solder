@@ -24,6 +24,7 @@ mod editor;
 mod editor_git;
 mod editor_lsp;
 mod element;
+mod encoding_picker;
 mod erd_view;
 mod extension_api;
 mod extension_ask;
@@ -116,10 +117,11 @@ fn main() {
     // an editable file rather than an empty workspace.
     let initial = file.and_then(|path| {
         if path.extension().is_some_and(|ext| ext == "ipynb") {
-            return Some((path, String::new()));
+            let nothing = document::Loaded::of(&[]);
+            return Some((path, nothing));
         }
-        let bytes = std::fs::read(&path).ok()?;
-        Some((path, String::from_utf8_lossy(&bytes).into_owned()))
+        let loaded = document::load(&path).ok()?;
+        Some((path, loaded))
     });
 
     Application::new()
@@ -161,7 +163,7 @@ fn main() {
 /// Opens a window on `root`, optionally with a file already loaded.
 pub fn open_workspace_window(
     root: PathBuf,
-    initial: Option<(PathBuf, String)>,
+    initial: Option<(PathBuf, document::Loaded)>,
     cx: &mut App,
 ) -> WindowHandle<Workspace> {
     let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
@@ -183,12 +185,12 @@ pub fn open_workspace_window(
                 cx.set_global(theme);
             }
             let workspace = cx.new(|cx| Workspace::new(root, window, cx));
-            if let Some((path, content)) = initial {
+            if let Some((path, loaded)) = initial {
                 workspace.update(cx, |w, cx| {
                     if path.extension().is_some_and(|ext| ext == "ipynb") {
                         w.open_path(path, None, window, cx);
                     } else {
-                        w.add_editor(Some(path), &content, None, window, cx);
+                        w.add_loaded(path, &loaded, None, window, cx);
                     }
                 });
             }

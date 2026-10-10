@@ -51,6 +51,103 @@ scripts/bench.sh [file]
 
 The status bar shows live input latency, frame time, memory and startup time. Toggle it with `cmd-alt-p`.
 
+## Editing
+
+Several cursors: `alt`-click adds one, `cmd-alt-up` and `cmd-alt-down` add
+one on the line above or below, `cmd-d` selects the next place the selected
+word is.
+
+**Indent guides** are thin lines down each level of indentation the rows
+on screen are inside, in steps of the file's own indent. A blank row is as
+deep as the deeper of the rows with text around it. `"indent_guides":
+false` in the settings turns them off.
+
+A block is **folded** under its first line: the lines after it that are
+indented deeper than it, up to the last of them with text, are taken off
+the screen, and a mark after the line says they are there. This goes by
+indentation alone, so it is the same in every language, and a closing
+brace on its own line stays in view.
+
+| | |
+|---|---|
+| `cmd-k cmd-[` | Fold the block the cursor is in |
+| `cmd-k cmd-]` | Unfold at the cursor's line |
+| `cmd-k cmd-0`, `cmd-k cmd-j` | Fold every block that is in no other; unfold all |
+| A click between a line's number and its text | Fold or unfold there. Lines that can be folded show a mark while the pointer is over the gutter |
+| A click on the mark after a folded line | Unfold |
+
+The cursor steps over what is folded. A cursor that is put inside it (a
+definition gone to, a match found, an undo) opens it, and so does an edit
+of its lines; an edit elsewhere moves it with its lines. Folds are of one
+view of the file and are not kept when its tab is closed. `cmd-alt-[` and
+`cmd-alt-]`, which fold in other editors, move between changes here.
+
+**Lines too long for the window** go on in the next row when wrapping is
+on: `alt-z` turns it on and off for the view in front, and `"soft_wrap":
+true` in the settings turns it on for every file. A row ends after the
+last space that fits, and inside a word only where the word alone is
+longer than a row. The rows a line goes on in are drawn as far in as the
+line begins, so they are seen to belong to it. Nothing is to the side
+then, and the cursor moves up and down by rows of the screen. A line is
+wrapped by cells, not by what its letters measure: every character is one
+cell. So a row of characters wider than a cell (Chinese, Japanese, Korean)
+runs past the edge, and so does a row with inlay hints in it, which are
+not counted. Home and End go to the ends of the line, not of the row. The
+choice made with `alt-z` is not kept when the tab is closed.
+
+A **selection by column** is a rectangle of cursors, one on each line it
+crosses. With the mouse, hold `shift` and `alt` and click or drag: the
+rectangle goes from the cursor to the pointer. Or drag with the middle
+button, from where it went down. With the keys, `cmd-alt-shift` and an
+arrow moves the free corner a line or a cell at a time (`ctrl-alt-shift`
+on Linux and Windows). Cells are counted as they are on screen, so a tab
+takes as many as it is wide, and a corner may be past the end of its line.
+A line that ends before the left edge gets no cursor, unless the rectangle
+has no width yet.
+
+A file is **saved as it was written**. It is read in the encoding it is
+in and saved in that one: UTF-8 with or without its mark, UTF-16 with its
+mark, Windows-1251 and Windows-1252. The last two give a character for
+every byte, so a file in another single-byte encoding is shown with the
+wrong letters and still saved byte for byte as it was read. What a file
+that is not UTF-8 is in is told by its letters: words of them are Cyrillic,
+single ones among ASCII letters are Western. Where that is wrong,
+**Workspace: Reopen with encoding** reads the file again as another, and
+**Workspace: Save with encoding** saves it as another from then on. A
+letter the encoding has no byte for is never written as another one: the
+file is not saved, and a line above the text says which letter. Lines end
+in the file as they did: a file with both endings keeps the one most of
+its lines have. **Workspace: Use LF line endings** and **Use CRLF line
+endings** change it. The status bar names the encoding and `CRLF` where
+they are not UTF-8 and LF.
+
+A file that is no text (it has a zero byte) is shown and cannot be edited,
+and so is one larger than 64 MB; one larger than 512 MB is not read. The
+line above the text says which and why. Edits a language server or an
+extension makes to a file that is not open are written in that file's own
+encoding too.
+
+**Text that is not saved is kept aside** as it is typed, for whatever ends
+the editor without asking: a crash, the power, or `cmd-q`, which asks
+nothing. Within a second of a change the whole text of the file goes to
+`sessions/recovery/` beside the settings; saving the file, closing its
+tab, or closing the window with an answer about its changes removes it. What is found there at the next start was neither
+saved nor let go, and is put back: into the tab of its file, into a new
+tab where its file is gone or it never had one. It comes back as changes
+that are not saved, with a line above the text that says so, and one undo
+from it is the file as it is on disk. Nothing is written to the file
+itself until you save. A text over 16 MB is not kept.
+
+A tab can be **pinned** (`cmd-k shift-enter`, or **Workspace: Toggle pin
+tab** in the palette): it goes before the tabs that are not, shows a pin
+where they have their cross, and `cmd-w` and the middle button leave it
+open. A click on the pin lets it go. Pinned tabs are remembered with the
+rest of the project's tabs. `cmd-shift-t` opens again the file of the tab
+closed last, with its cursors and where it was scrolled to, then the one
+closed before it, up to 32 back; a file that is open already or gone from
+disk is passed over. Closed tabs are remembered while the window is open,
+not across a restart.
+
 ## Review changes
 
 Open the Git sidebar with `ctrl-shift-g` and click a file to compare both versions.
@@ -1016,8 +1113,8 @@ per project in `sessions/` beside the settings. Pages of extensions return
 through `registerWebviewPanelSerializer`, with the last `setState` value;
 a custom editor is reopened through its provider. Extensions whose code is
 not allowed are not started for restoration. Missing files are skipped.
-Untitled text and terminal sessions are not restored, and this is not a
-backup of unsaved edits. State is written off the UI thread, in order, once
+Terminal sessions are not restored. Text that was not saved is kept apart
+from this (see Editing), and comes back with its tab. State is written off the UI thread, in order, once
 per second when it changed and when the window closes.
 
 Which extensions work is not claimed from the list above: it is found out.
@@ -1236,7 +1333,7 @@ applied as soon as it is saved.
   "tab_bar": { "height": 34, "place": "top" },
   "status_bar": {
     "height": 26,
-    "left": ["position", "indent", "language", "problems", "activity", "connection"],
+    "left": ["position", "indent", "encoding", "language", "problems", "activity", "connection"],
     "right": ["extensions", "plugins", "performance"]
   },
   "hidden": [],
@@ -1311,6 +1408,7 @@ such as the branch, keep their actions after moving.
 | `branch` | the branch; a click opens the list of branches |
 | `position` | the line and column of the cursor, and how many cursors |
 | `indent` | spaces or tabs, and how many |
+| `encoding` | what the file is written in and `CRLF`, each only where it is not the usual (UTF-8, lines ending with LF); a click opens the list of encodings |
 | `language` | the language of the file |
 | `problems` | how many errors and warnings the file has |
 | `activity` | a language server starting, files being read |

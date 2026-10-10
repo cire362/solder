@@ -84,6 +84,12 @@ actions!(
         GoToSymbol,
         GoToProjectSymbol,
         SplitRight,
+        TogglePinTab,
+        ReopenClosedTab,
+        ReopenWithEncoding,
+        SaveWithEncoding,
+        UseLfLineEndings,
+        UseCrlfLineEndings,
         FocusNextPane,
         FocusPrevPane,
         ToggleTerminal,
@@ -126,6 +132,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-p", ToggleFileFinder, None),
         KeyBinding::new("secondary-shift-o", GoToSymbol, None),
         KeyBinding::new("secondary-t", GoToProjectSymbol, None),
+        KeyBinding::new("secondary-shift-t", ReopenClosedTab, None),
+        KeyBinding::new("secondary-k shift-enter", TogglePinTab, None),
         KeyBinding::new("ctrl-g", GoToLine, Some("Editor")),
         KeyBinding::new("secondary-f", Find, None),
         KeyBinding::new("secondary-alt-f", FindReplace, None),
@@ -205,11 +213,20 @@ struct Modal {
 
 struct Tab {
     editor: Entity<Editor>,
+    /// Kept before the tabs that are not, and closed only once let go:
+    /// the key that closes a tab leaves it.
+    pinned: bool,
     _subscriptions: [Subscription; 2],
 }
 
+/// How many closed tabs are remembered to be opened again.
+const CLOSED_TABS: usize = 32;
+
 #[path = "session.rs"]
 mod session;
+
+#[path = "recovery.rs"]
+mod recovery;
 
 /// A column of tabs. The workspace lays panes out left to right.
 #[derive(Default)]
@@ -281,7 +298,13 @@ pub struct Workspace {
     recent: VecDeque<Arc<str>>,
     session_writer: Option<session::Writer>,
     _session_tick: Option<Task<()>>,
+    /// Unsaved text kept aside, for whatever ends the editor unasked.
+    recovery: Option<recovery::Recovery>,
+    _recovery_tick: Option<Task<()>>,
     restoring: bool,
+    /// The files of the tabs closed last, the latest at the end, each
+    /// with the pane it was in.
+    closed_tabs: Vec<(session::File, usize)>,
     /// The panel each dock shows; `None` for a dock that is closed. Which
     /// dock a panel is in is the layout's to say.
     left: Option<Panel>,
@@ -766,7 +789,10 @@ impl Workspace {
             recent: VecDeque::new(),
             session_writer: None,
             _session_tick: None,
+            recovery: None,
+            _recovery_tick: None,
             restoring: false,
+            closed_tabs: Vec::new(),
             left,
             right,
             bottom,
@@ -939,6 +965,7 @@ impl Workspace {
         let pane = &mut self.panes[self.active_pane];
         pane.tabs.push(Tab {
             editor,
+            pinned: false,
             _subscriptions: [events, focus],
         });
         let ix = pane.tabs.len() - 1;
@@ -952,6 +979,23 @@ impl Workspace {
                 .position(|t| t.editor == *editor)
                 .map(|t| (p, t))
         })
+    }
+
+    /// Adds an editor for a file as it was read from disk: in the
+    /// encoding it is in, and only to be read where it cannot be edited.
+    pub fn add_loaded(
+        &mut self,
+        path: PathBuf,
+        loaded: &crate::document::Loaded,
+        jump: Option<Jump>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = cx.new(|cx| Editor::open(path, loaded, cx));
+        self.add_tab(editor.clone(), window, cx);
+        if let Some(jump) = jump {
+            apply_jump(&editor, jump, cx);
+        }
     }
 
     /// Adds an editor for text already in memory. Used at startup so the first
@@ -1007,19 +1051,19 @@ impl Workspace {
         }
         let read_path = path.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let content = cx
+            let loaded = cx
                 .background_executor()
-                .spawn(async move { std::fs::read(&read_path) })
+                .spawn(async move { crate::document::load(&read_path) })
                 .await;
-            let content = match content {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            let loaded = match loaded {
+                Ok(loaded) => loaded,
                 Err(err) => {
                     eprintln!("could not open {}: {err}", path.display());
                     return;
                 }
             };
             this.update_in(cx, |this, window, cx| {
-                this.add_editor(Some(path), &content, jump, window, cx)
+                this.add_loaded(path, &loaded, jump, window, cx)
             })
             .ok();
         })
@@ -1073,7 +1117,13 @@ impl Workspace {
             return;
         }
         if let Some(editor) = self.active_editor().cloned() {
-            self.close(&editor, window, cx);
+            // A pinned tab is let go first, by its pin.
+            let pinned = self
+                .locate(&editor)
+                .map(|(p, t)| self.panes[p].tabs[t].pinned);
+            if pinned != Some(true) {
+                self.close(&editor, window, cx);
+            }
         }
     }
 
@@ -1127,7 +1177,12 @@ impl Workspace {
         {
             self.discard_inline_edit(cx);
         }
-        self.panes[p].tabs.remove(ix);
+        let closed = self.panes[p].tabs.remove(ix);
+        if let Some(file) = session::File::of(&closed, cx) {
+            self.closed_tabs.push((file, p));
+            let over = self.closed_tabs.len().saturating_sub(CLOSED_TABS);
+            self.closed_tabs.drain(..over);
+        }
         if self.panes[p].tabs.is_empty() && self.panes.len() > 1 {
             // An empty split closes; focus moves to its neighbour.
             self.panes.remove(p);
@@ -1152,6 +1207,106 @@ impl Workspace {
             None => 0,
         };
         self.activate(p, next, window, cx);
+    }
+
+    /// The list of encodings, for the file in front: to read it again as
+    /// one of them, or to save it as one.
+    fn choose_encoding(&mut self, reopen: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor() else {
+            return;
+        };
+        let document = editor.read(cx).document().clone();
+        self.toggle_modal(window, cx, move |window, cx| {
+            let picker = crate::encoding_picker::EncodingPicker::new(document, reopen);
+            Picker::new(picker, window, cx)
+        });
+    }
+
+    /// What the lines of the file in front end with when it is saved.
+    fn set_line_ending(&mut self, ending: text::LineEnding, cx: &mut Context<Self>) {
+        if let Some(editor) = self.active_editor() {
+            let document = editor.read(cx).document().clone();
+            document.update(cx, |document, cx| document.set_line_ending(ending, cx));
+            cx.notify();
+        }
+    }
+
+    /// Pins the tab in front, or lets it go. The pinned tabs of a pane
+    /// are its first, in the order they were pinned.
+    fn toggle_pin_tab(&mut self, _: &TogglePinTab, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor().cloned() else {
+            return;
+        };
+        self.toggle_pin(&editor, window, cx);
+    }
+
+    fn toggle_pin(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((p, ix)) = self.locate(editor) else {
+            return;
+        };
+        let pane = &mut self.panes[p];
+        let front = pane
+            .active
+            .and_then(|active| pane.tabs.get(active))
+            .map(|tab| tab.editor.clone());
+        let mut tab = pane.tabs.remove(ix);
+        tab.pinned = !tab.pinned;
+        // After the tabs that stay pinned: the last of them when it is
+        // pinned, the first of the rest when it is let go.
+        let pinned = pane.tabs.iter().take_while(|tab| tab.pinned).count();
+        pane.tabs.insert(pinned, tab);
+        let front = front.and_then(|front| pane.tabs.iter().position(|tab| tab.editor == front));
+        if let Some(front) = front {
+            self.activate(p, front, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Opens again the file of the tab closed last, where its cursors
+    /// were. One that is open already, or gone from disk, is passed over
+    /// for the one closed before it.
+    fn reopen_closed_tab(
+        &mut self,
+        _: &ReopenClosedTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (file, pane) = loop {
+            let Some((file, pane)) = self.closed_tabs.pop() else {
+                return;
+            };
+            let open = self
+                .all_editors()
+                .any(|editor| editor.read(cx).path(cx) == Some(file.path.as_path()));
+            if !open {
+                break (file, pane);
+            }
+        };
+        let path = file.path.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let loaded = cx
+                .background_executor()
+                .spawn(async move { crate::document::load(&path) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                let Ok(loaded) = loaded else {
+                    // Gone: the one closed before it, then.
+                    this.reopen_closed_tab(&ReopenClosedTab, window, cx);
+                    return;
+                };
+                this.close_file_diff(window, cx);
+                this.active_pane = pane.min(this.panes.len() - 1);
+                this.add_loaded(file.path.clone(), &loaded, None, window, cx);
+                if let Some(editor) = this.active_editor().cloned() {
+                    file.put(&editor, cx);
+                    if file.pinned {
+                        this.toggle_pin(&editor, window, cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn confirm_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -1226,6 +1381,11 @@ impl Workspace {
                 let saved = this.update(cx, |this, cx| this.keep_session(cx));
                 if let Ok(saved) = saved {
                     saved.await;
+                }
+                // What was not saved was asked about and let go: it is
+                // not to come back at the next start.
+                if let Ok(forgotten) = this.update(cx, |this, cx| this.forget_unsaved(cx)) {
+                    forgotten.await;
                 }
                 this.update_in(cx, |this, window, cx| {
                     // Nothing left to ask about; close for real.
@@ -3663,16 +3823,28 @@ impl Workspace {
             }
             cx.background_executor()
                 .spawn(async move {
-                    let Ok(bytes) = std::fs::read(&path) else {
+                    // Read and written in what the file is in, as an open
+                    // one is: an edit of a file that is not UTF-8 is not
+                    // to turn the rest of it into something else.
+                    let Ok(loaded) = crate::document::load(&path) else {
                         return;
                     };
-                    let mut buffer = text::Buffer::new(&String::from_utf8_lossy(&bytes));
+                    if loaded.read_only.is_some() {
+                        eprintln!("not edited, it cannot be: {}", path.display());
+                        return;
+                    }
+                    let mut buffer = text::Buffer::new(&loaded.text);
                     let edits: Vec<_> = edits
                         .into_iter()
                         .map(|e| (from_range(&buffer, e.range, encoding), e.new_text))
                         .collect();
                     buffer.edit(edits, &[], std::time::Instant::now());
-                    if let Err(err) = std::fs::write(&path, buffer.text_for_save()) {
+                    let written = text::encoding::encode(&buffer.text_for_save(), loaded.encoding)
+                        .map_err(|c| {
+                            format!("{c:?} cannot be written in {}", loaded.encoding.name())
+                        })
+                        .and_then(|bytes| std::fs::write(&path, bytes).map_err(|e| e.to_string()));
+                    if let Err(err) = written {
                         eprintln!("could not write {}: {err}", path.display());
                     }
                 })
@@ -4024,13 +4196,15 @@ impl Workspace {
             if dirty {
                 continue;
             }
+            // Read as what the file was opened as.
+            let written_in = document.read(cx).encoding();
             cx.spawn(async move |_, cx| {
                 let content = cx
                     .background_executor()
                     .spawn(async move { std::fs::read(&path) })
                     .await;
                 if let Ok(bytes) = content {
-                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    let text = text::encoding::decode_as(&bytes, written_in);
                     document
                         .update(cx, |d, cx| {
                             if !d.is_dirty() {
@@ -4950,6 +5124,8 @@ impl Workspace {
                     .path()
                     .and_then(|path| crate::file_icons::file(path, cx));
                 let dirty = doc.is_dirty();
+                let pinned = tab.pinned;
+                let pin_editor = editor.clone();
                 let active = pane.active == Some(ix)
                     && self.web_front.is_none()
                     && self.notebook_front.is_none();
@@ -4986,7 +5162,9 @@ impl Workspace {
                     .on_mouse_down(
                         MouseButton::Middle,
                         cx.listener(move |this, _, window, cx| {
-                            this.close(&middle_editor, window, cx)
+                            if !pinned {
+                                this.close(&middle_editor, window, cx)
+                            }
                         }),
                     )
                     .when_some(icon, |d, icon| {
@@ -5009,10 +5187,20 @@ impl Workspace {
                             .rounded(theme.shape.token)
                             .text_color(theme.fg_subtle)
                             .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                            .child(if dirty { "●" } else { "×" })
+                            // A pinned tab has its pin where the others
+                            // have what closes them: a click lets it go.
+                            .map(|d| match (pinned, dirty) {
+                                (true, _) => d
+                                    .debug_selector(move || format!("tab-pin-{ix}"))
+                                    .when(dirty, |d| d.text_color(theme.accent))
+                                    .child(crate::icons::draw("push-pin")),
+                                (false, true) => d.child("●"),
+                                (false, false) => d.child("×"),
+                            })
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.close(&close_editor, window, cx)
+                            .on_click(cx.listener(move |this, _, window, cx| match pinned {
+                                true => this.toggle_pin(&pin_editor, window, cx),
+                                false => this.close(&close_editor, window, cx),
                             })),
                     )
                     .into_any_element()
@@ -5087,7 +5275,27 @@ impl Workspace {
                             d.child(notebook.clone())
                         } else {
                             match pane.active_editor() {
-                                Some(editor) => d.child(editor.clone()),
+                                // What is to be said of the file above
+                                // it: why it is only read, or not saved.
+                                Some(editor) => {
+                                    let notice = editor.read(cx).doc(cx).notice().cloned();
+                                    d.flex()
+                                        .flex_col()
+                                        .children(notice.map(|notice| {
+                                            div()
+                                                .debug_selector(move || format!("file-notice-{p}"))
+                                                .flex_none()
+                                                .px_3()
+                                                .py_1()
+                                                .border_b(theme.shape.border)
+                                                .border_color(theme.line)
+                                                .bg(theme.bg_elev)
+                                                .text_size(UI_FONT_SIZE)
+                                                .text_color(theme.warning)
+                                                .child(notice)
+                                        }))
+                                        .child(div().flex_1().min_h_0().child(editor.clone()))
+                                }
                                 None => d.child(self.render_empty(window, cx)),
                             }
                         }
@@ -5374,6 +5582,26 @@ impl Workspace {
                 .map(|e| says(e.read(cx).doc(cx).indent_label().to_string()))
                 .into_iter()
                 .collect(),
+            // Said only where it is not what every file is taken to be.
+            Item::Encoding => {
+                let Some(editor) = editor else {
+                    return Vec::new();
+                };
+                let doc = editor.read(cx).doc(cx);
+                let mut parts = Vec::new();
+                if doc.encoding() != text::encoding::Encoding::Utf8 {
+                    parts.push(does(
+                        ("encoding", 0),
+                        doc.encoding().name().to_string(),
+                        theme.fg_muted,
+                        Box::new(ReopenWithEncoding),
+                    ));
+                }
+                if doc.line_ending() == text::LineEnding::CrLf {
+                    parts.push(says("CRLF".into()));
+                }
+                parts
+            }
             Item::Language => editor
                 .map(|e| {
                     let name = e.read(cx).doc(cx).language_name();
@@ -5821,6 +6049,20 @@ impl Render for Workspace {
             }))
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::toggle_pin_tab))
+            .on_action(cx.listener(|this, _: &ReopenWithEncoding, window, cx| {
+                this.choose_encoding(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SaveWithEncoding, window, cx| {
+                this.choose_encoding(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &UseLfLineEndings, _, cx| {
+                this.set_line_ending(text::LineEnding::Lf, cx)
+            }))
+            .on_action(cx.listener(|this, _: &UseCrlfLineEndings, _, cx| {
+                this.set_line_ending(text::LineEnding::CrLf, cx)
+            }))
+            .on_action(cx.listener(Self::reopen_closed_tab))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
             .on_action(cx.listener(Self::toggle_hud))
@@ -13336,6 +13578,445 @@ exports.activate = (context) => {
         });
         cx.run_until_parked();
         assert_eq!(cx.read(|cx| pages(cx)), (Vec::new(), None));
+    }
+
+    /// A file is saved in the encoding and with the line endings it was
+    /// read in; what cannot be written in that encoding is said, and a
+    /// file that is no text or is too large is only read.
+    #[gpui::test]
+    fn a_file_is_saved_as_it_was_written(cx: &mut TestAppContext) {
+        use text::{
+            LineEnding,
+            encoding::{Encoding, encode},
+        };
+        let root = fixture("encodings");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let open = |cx: &mut VisualTestContext, name: &str| {
+            let path = root.join(name);
+            ws.update_in(cx, |w, window, cx| {
+                w.open_path(path.clone(), None, window, cx)
+            });
+            wait_for(cx, "the file", &|cx| {
+                let front = ws.read(cx).active_editor();
+                front.is_some_and(|e| e.read(cx).path(cx) == Some(path.as_path()))
+            });
+            cx.read(|cx| ws.read(cx).active_editor().unwrap().clone())
+        };
+        let state = |cx: &App| {
+            let editor = ws.read(cx).active_editor().unwrap().read(cx);
+            let doc = editor.doc(cx);
+            let notice = doc.notice().map(|notice| notice.to_string());
+            (doc.encoding(), doc.line_ending(), notice)
+        };
+        let bar = |cx: &mut VisualTestContext| -> Vec<String> {
+            ws.update(cx, |w, cx| {
+                let parts = w.bar_item(&Item::Encoding, cx);
+                parts.into_iter().map(|part| part.text).collect()
+            })
+        };
+        let saved = |cx: &mut VisualTestContext, name: &str, bytes: Vec<u8>| {
+            let path = root.join(name);
+            wait_for(cx, "the save", &|_| std::fs::read(&path).unwrap() == bytes);
+        };
+
+        // Cyrillic in one byte a letter, lines ending as on Windows.
+        let russian = "// Привет, мир\r\nfn main() {}\r\n";
+        std::fs::write(
+            root.join("old.rs"),
+            encode(russian, Encoding::Windows1251).unwrap(),
+        )
+        .unwrap();
+        let editor = open(cx, "old.rs");
+        assert_eq!(active_text(&ws, cx), "// Привет, мир\nfn main() {}\n");
+        assert_eq!(
+            cx.read(|cx| state(cx)),
+            (Encoding::Windows1251, LineEnding::CrLf, None)
+        );
+        // The bar says what is not the usual, and nothing of a usual file.
+        assert_eq!(bar(cx), ["Windows-1251", "CRLF"]);
+        // Edited and saved, it is what it was but for the edit.
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("secondary-s");
+        let edited = "!// Привет, мир\r\nfn main() {}\r\n";
+        saved(cx, "old.rs", encode(edited, Encoding::Windows1251).unwrap());
+        // A letter the encoding has no byte for: the file is not saved,
+        // and the reason is above the text.
+        cx.simulate_input("é");
+        cx.simulate_keystrokes("secondary-s");
+        wait_for(cx, "the reason", &|cx| state(cx).2.is_some());
+        let reason = cx.read(|cx| state(cx)).2.unwrap();
+        assert_eq!(
+            reason,
+            "Not saved: 'é' cannot be written in Windows-1251. Save with another encoding."
+        );
+        bounds_soon(cx, "file-notice-0");
+        assert!(cx.read(|cx| editor.read(cx).doc(cx).is_dirty()));
+        assert_eq!(
+            std::fs::read(root.join("old.rs")).unwrap(),
+            encode(edited, Encoding::Windows1251).unwrap()
+        );
+        // Saved with another encoding, chosen from the list: the reason
+        // goes, and the endings of its lines stay.
+        cx.dispatch_action(SaveWithEncoding);
+        wait_for(cx, "the list", &|cx| ws.read(cx).modal.is_some());
+        cx.simulate_input("utf");
+        cx.simulate_keystrokes("enter");
+        saved(
+            cx,
+            "old.rs",
+            "!é// Привет, мир\r\nfn main() {}\r\n".as_bytes().to_vec(),
+        );
+        assert_eq!(
+            cx.read(|cx| state(cx)),
+            (Encoding::Utf8, LineEnding::CrLf, None)
+        );
+        assert_eq!(bar(cx), ["CRLF"]);
+        // The endings are changed by a command, which leaves the file to
+        // be saved.
+        cx.dispatch_action(UseLfLineEndings);
+        assert!(cx.read(|cx| editor.read(cx).doc(cx).is_dirty()));
+        cx.simulate_keystrokes("secondary-s");
+        saved(
+            cx,
+            "old.rs",
+            "!é// Привет, мир\nfn main() {}\n".as_bytes().to_vec(),
+        );
+        assert!(bar(cx).is_empty());
+
+        // Read again as written in something else, from what is on disk.
+        std::fs::write(
+            root.join("guess.txt"),
+            encode("тест\n", Encoding::Windows1251).unwrap(),
+        )
+        .unwrap();
+        open(cx, "guess.txt");
+        cx.dispatch_action(ReopenWithEncoding);
+        wait_for(cx, "the list", &|cx| ws.read(cx).modal.is_some());
+        cx.simulate_input("1252");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the file read again", &|cx| {
+            state(cx).0 == Encoding::Windows1252
+        });
+        assert_eq!(active_text(&ws, cx), "òåñò\n");
+
+        // Two bytes a letter, with its mark: kept through an edit.
+        std::fs::write(
+            root.join("wide.txt"),
+            encode("wide 行\n", Encoding::Utf16Le).unwrap(),
+        )
+        .unwrap();
+        open(cx, "wide.txt");
+        assert_eq!(active_text(&ws, cx), "wide 行\n");
+        cx.simulate_input("x");
+        cx.simulate_keystrokes("secondary-s");
+        saved(
+            cx,
+            "wide.txt",
+            encode("xwide 行\n", Encoding::Utf16Le).unwrap(),
+        );
+
+        // No text at all: shown, with the reason it is not edited.
+        std::fs::write(root.join("tool.bin"), b"\x7FELF\0\x01\x02\xFF").unwrap();
+        let binary = open(cx, "tool.bin");
+        let reason = cx.read(|cx| state(cx)).2.unwrap();
+        assert!(reason.starts_with("This is not a text file"), "{reason}");
+        cx.simulate_input("x");
+        assert_eq!(cx.read(|cx| binary.read(cx).text(cx)).chars().count(), 8);
+        cx.simulate_keystrokes("secondary-s");
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read(root.join("tool.bin")).unwrap(),
+            b"\x7FELF\0\x01\x02\xFF"
+        );
+
+        // Too large to edit: read, and said. The size that is too large
+        // is given here, so the test needs no file of that size.
+        let large = crate::document::Loaded::within(&[b'a'; 2048], 1024);
+        assert_eq!(
+            large.read_only.as_deref(),
+            Some("This file is 2 KB: too large to edit. It is open for reading.")
+        );
+        ws.update_in(cx, |w, window, cx| {
+            w.add_loaded(root.join("large.txt"), &large, None, window, cx)
+        });
+        cx.simulate_input("x");
+        assert_eq!(active_text(&ws, cx).len(), 2048);
+        assert!(
+            cx.read(|cx| state(cx))
+                .2
+                .unwrap()
+                .contains("too large to edit")
+        );
+    }
+
+    /// Text that is not saved is kept aside as it is typed, let go when
+    /// it is saved or its tab is closed, and put back at the next start
+    /// where it was neither.
+    #[gpui::test]
+    fn unsaved_text_is_kept_aside_and_put_back(cx: &mut TestAppContext) {
+        let root = fixture("recovery");
+        let dir = db::testing::dir("recovery-kept");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let begin = |cx: &mut VisualTestContext| {
+            ws.update(cx, |w, _| {
+                w.recovery = Some(recovery::Recovery::new(dir.clone()));
+            })
+        };
+        // One pass of the keeping, waited for till it is on disk.
+        let keep = |cx: &mut VisualTestContext| {
+            let kept: std::rc::Rc<std::cell::RefCell<bool>> = Default::default();
+            let done = kept.clone();
+            let pass = ws.update(cx, |w, cx| w.keep_unsaved(cx));
+            cx.spawn(async move |_| {
+                pass.await;
+                *done.borrow_mut() = true;
+            })
+            .detach();
+            wait_for(cx, "the text to be kept", &|_| *kept.borrow());
+        };
+        let kept = || -> Vec<(Option<String>, String)> {
+            let mut all: Vec<_> = std::fs::read_dir(&dir)
+                .map(|entries| entries.flatten().collect::<Vec<_>>())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|entry| {
+                    let read: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(entry.path()).ok()?).ok()?;
+                    let name = read["path"].as_str().map(|path| {
+                        let name = Path::new(path).file_name().unwrap();
+                        name.to_string_lossy().into_owned()
+                    });
+                    Some((name, read["text"].as_str()?.to_string()))
+                })
+                .collect();
+            all.sort();
+            all
+        };
+        let open = |cx: &mut VisualTestContext, name: &str| {
+            let path = root.join(name);
+            ws.update_in(cx, |w, window, cx| {
+                w.open_path(path.clone(), None, window, cx)
+            });
+            wait_for(cx, "the file", &|cx| {
+                let front = ws.read(cx).active_editor();
+                front.is_some_and(|e| e.read(cx).path(cx) == Some(path.as_path()))
+            });
+        };
+        let tabs = |cx: &App| -> Vec<(String, String, bool)> {
+            let tabs = ws.read(cx).panes[0].tabs.iter();
+            tabs.map(|tab| {
+                let editor = tab.editor.read(cx);
+                let doc = editor.doc(cx);
+                (doc.title(), editor.text(cx), doc.is_dirty())
+            })
+            .collect()
+        };
+        begin(cx);
+
+        // A file with changes, a text that never was a file, and a file
+        // with none: the first two are kept, a moment after they changed.
+        open(cx, "src/main.rs");
+        open(cx, "README.md");
+        cx.simulate_input("typed ");
+        ws.update_in(cx, |w, window, cx| w.add_editor(None, "", None, window, cx));
+        cx.simulate_input("a note");
+        keep(cx);
+        let readme = "typed A needle in the docs.\n".to_string();
+        assert_eq!(
+            kept(),
+            [
+                (None, "a note".to_string()),
+                (Some("README.md".to_string()), readme.clone())
+            ]
+        );
+        // Typed on, what is kept follows; saved, it is let go.
+        cx.simulate_input("!");
+        ws.update_in(cx, |w, window, cx| w.activate(0, 1, window, cx));
+        cx.simulate_keystrokes("secondary-s");
+        wait_for(cx, "the save", &|cx| !tabs(cx)[1].2);
+        keep(cx);
+        assert_eq!(kept(), [(None, "a note!".to_string())]);
+
+        // The editor ends unasked with changes in two files and the note:
+        // nothing is saved, nothing was let go.
+        cx.simulate_input("again ");
+        open(cx, "src/main.rs");
+        cx.simulate_input("// lost?\n");
+        keep(cx);
+        assert_eq!(kept().len(), 3);
+        // One of the files is gone from disk by the next start.
+        std::fs::remove_file(root.join("src/main.rs")).unwrap();
+        ws.update_in(cx, |w, _, _| w.panes = vec![Pane::default()]);
+        begin(cx);
+        // At the next start one file is open again already (its tab was
+        // remembered), the other is not.
+        open(cx, "README.md");
+        assert_eq!(cx.read(|cx| tabs(cx)).len(), 1);
+        ws.update_in(cx, |w, window, cx| w.recover_unsaved(window, cx));
+        wait_for(cx, "the text put back", &|cx| tabs(cx).len() == 3);
+        let mut back = cx.read(|cx| tabs(cx));
+        back.sort();
+        assert_eq!(
+            back,
+            [
+                (
+                    "README.md".to_string(),
+                    "typed again A needle in the docs.\n".to_string(),
+                    true
+                ),
+                ("Untitled".to_string(), "a note!".to_string(), true),
+                (
+                    "main.rs".to_string(),
+                    "// lost?\nfn main() {\n    helper();\n}\n".to_string(),
+                    true
+                ),
+            ]
+        );
+        // It says what it is; one step back is the file as it is on disk,
+        // and once it is saved there is nothing left to say.
+        let readme_tab = cx.read(|cx| ws.read(cx).panes[0].tabs[0].editor.clone());
+        let notice = |cx: &App| {
+            let notice = readme_tab.read(cx).doc(cx).notice();
+            notice.map(|notice| notice.to_string())
+        };
+        let said = cx.read(|cx| notice(cx)).unwrap();
+        assert!(
+            said.starts_with("This text was not saved when Solder closed"),
+            "{said}"
+        );
+        ws.update_in(cx, |w, window, cx| w.activate(0, 0, window, cx));
+        cx.simulate_keystrokes("secondary-z");
+        assert_eq!(cx.read(|cx| tabs(cx))[0].1, readme);
+        cx.simulate_keystrokes("secondary-s");
+        wait_for(cx, "the save", &|cx| !tabs(cx)[0].2);
+        assert_eq!(cx.read(|cx| notice(cx)), None);
+        // What was read back is kept anew, under what the texts are now:
+        // the one saved is not, and the old files are gone.
+        keep(cx);
+        assert_eq!(
+            kept(),
+            [
+                (None, "a note!".to_string()),
+                (
+                    Some("main.rs".to_string()),
+                    "// lost?\nfn main() {\n    helper();\n}\n".to_string()
+                )
+            ]
+        );
+        // A tab closed with its changes let go takes what was kept of it;
+        // a window closed with an answer takes the rest.
+        let note = cx.read(|cx| {
+            let tabs = ws.read(cx).panes[0].tabs.iter();
+            let untitled = tabs
+                .map(|tab| tab.editor.clone())
+                .find(|e| e.read(cx).path(cx).is_none());
+            untitled.unwrap()
+        });
+        ws.update_in(cx, |w, window, cx| w.remove_tab(&note, window, cx));
+        drop(note);
+        cx.run_until_parked();
+        keep(cx);
+        assert_eq!(kept().len(), 1);
+        let forgotten = ws.update(cx, |w, cx| w.forget_unsaved(cx));
+        cx.spawn(async move |_| forgotten.await).detach();
+        wait_for(cx, "everything let go", &|_| kept().is_empty());
+    }
+
+    /// A pinned tab is kept before the others and is not closed by the
+    /// key; the tab closed last comes back with its cursor.
+    #[gpui::test]
+    fn tabs_are_pinned_and_the_one_closed_last_is_opened_again(cx: &mut TestAppContext) {
+        let root = fixture("pinned-tabs");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let names = |cx: &App| -> Vec<String> {
+            let tabs = ws.read(cx).panes[0].tabs.iter();
+            tabs.map(|tab| {
+                let name = tab.editor.read(cx).doc(cx).title();
+                match tab.pinned {
+                    true => format!("{name} (pinned)"),
+                    false => name,
+                }
+            })
+            .collect()
+        };
+        let front = |cx: &App| {
+            let editor = ws.read(cx).active_editor().unwrap().read(cx);
+            editor.doc(cx).title()
+        };
+        for file in ["src/main.rs", "README.md", "src/util/strings.rs"] {
+            ws.update_in(cx, |w, window, cx| {
+                w.open_path(root.join(file), None, window, cx)
+            });
+            wait_for(cx, "the file", &|cx| {
+                ws.read(cx)
+                    .active_editor()
+                    .is_some_and(|e| e.read(cx).path(cx) == Some(root.join(file).as_path()))
+            });
+        }
+        assert_eq!(
+            cx.read(|cx| names(cx)),
+            ["main.rs", "README.md", "strings.rs"]
+        );
+
+        // Pinned, the tab in front goes before the others and stays in
+        // front. A second one goes after the first.
+        cx.simulate_keystrokes("secondary-k shift-enter");
+        assert_eq!(
+            cx.read(|cx| names(cx)),
+            ["strings.rs (pinned)", "main.rs", "README.md"]
+        );
+        assert_eq!(cx.read(|cx| front(cx)), "strings.rs");
+        ws.update_in(cx, |w, window, cx| w.activate(0, 2, window, cx));
+        cx.dispatch_action(TogglePinTab);
+        assert_eq!(
+            cx.read(|cx| names(cx)),
+            ["strings.rs (pinned)", "README.md (pinned)", "main.rs"]
+        );
+        // The key that closes a tab leaves a pinned one, and a click on
+        // its pin lets it go: it is then the first of the others.
+        cx.simulate_keystrokes("secondary-w");
+        assert_eq!(cx.read(|cx| names(cx)).len(), 3);
+        ws.update_in(cx, |w, window, cx| w.activate(0, 0, window, cx));
+        click(cx, "tab-pin-0");
+        assert_eq!(
+            cx.read(|cx| names(cx)),
+            ["README.md (pinned)", "strings.rs", "main.rs"]
+        );
+        assert_eq!(cx.read(|cx| front(cx)), "strings.rs");
+        // What is pinned is kept with the tabs of the project.
+        let kept = cx.read(|cx| serde_json::to_value(ws.read(cx).snapshot(cx)).unwrap());
+        let pinned: Vec<bool> = kept["panes"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["pinned"] == true)
+            .collect();
+        assert_eq!(pinned, [true, false, false]);
+
+        // Closed with its cursor somewhere, a tab comes back as it was;
+        // asked again, the one closed before it does.
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let word = std::slice::from_ref(&(7..13));
+        editor.update(cx, |editor, cx| editor.select_ranges(word, cx));
+        cx.simulate_keystrokes("secondary-w");
+        ws.update_in(cx, |w, window, cx| w.activate(0, 1, window, cx));
+        cx.simulate_keystrokes("secondary-w");
+        assert_eq!(cx.read(|cx| names(cx)), ["README.md (pinned)"]);
+        cx.simulate_keystrokes("secondary-shift-t");
+        wait_for(cx, "the tab closed last", &|cx| names(cx).len() == 2);
+        assert_eq!(cx.read(|cx| names(cx))[1], "main.rs");
+        cx.simulate_keystrokes("secondary-shift-t");
+        wait_for(cx, "the one closed before it", &|cx| names(cx).len() == 3);
+        assert_eq!(cx.read(|cx| front(cx)), "strings.rs");
+        let cursor = cx.read(|cx| ws.read(cx).active_editor().unwrap().read(cx).newest_range());
+        assert_eq!(cursor, 7..13);
+        // With nothing left to bring back, the key does nothing.
+        cx.simulate_keystrokes("secondary-shift-t");
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| names(cx)).len(), 3);
     }
 
     #[gpui::test]

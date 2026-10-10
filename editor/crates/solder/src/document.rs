@@ -138,6 +138,69 @@ pub fn parse_conflicts(text: &str) -> Vec<Conflict> {
     out
 }
 
+/// A file larger than this is opened to be read and not edited: every
+/// edit of it would be felt.
+pub const EDIT_LIMIT: u64 = 64 * 1024 * 1024;
+/// And one larger than this is not read at all.
+pub const READ_LIMIT: u64 = 512 * 1024 * 1024;
+
+/// A file as it is opened: its text, what it is written in, and why it
+/// is only to be read, where it is.
+pub struct Loaded {
+    pub text: String,
+    pub encoding: text::encoding::Encoding,
+    pub read_only: Option<String>,
+}
+
+impl Loaded {
+    /// The text of bytes, in the encoding they are found to be in.
+    pub fn of(bytes: &[u8]) -> Self {
+        Self::within(bytes, EDIT_LIMIT)
+    }
+
+    /// The same, with what is too large to edit said by the caller.
+    pub fn within(bytes: &[u8], edit_limit: u64) -> Self {
+        let decoded = text::encoding::decode(bytes);
+        let size = bytes.len() as u64;
+        let read_only = if decoded.binary {
+            Some("This is not a text file. It is shown as it is and cannot be edited.".into())
+        } else if size > edit_limit {
+            let size = megabytes(size);
+            Some(format!(
+                "This file is {size}: too large to edit. It is open for reading."
+            ))
+        } else {
+            None
+        };
+        Self {
+            text: decoded.text,
+            encoding: decoded.encoding,
+            read_only,
+        }
+    }
+}
+
+fn megabytes(bytes: u64) -> String {
+    match bytes {
+        0..1_048_576 => format!("{} KB", bytes.div_ceil(1024)),
+        _ => format!("{} MB", bytes / 1_048_576),
+    }
+}
+
+/// Reads a file to be opened in an editor. Blocking.
+pub fn load(path: &Path) -> std::io::Result<Loaded> {
+    let size = std::fs::metadata(path)?.len();
+    if size > READ_LIMIT {
+        let size = megabytes(size);
+        return Ok(Loaded {
+            text: String::new(),
+            encoding: Default::default(),
+            read_only: Some(format!("This file is {size}: too large to open here.")),
+        });
+    }
+    Ok(Loaded::of(&std::fs::read(path)?))
+}
+
 /// How long git state waits after the last edit before recomputing.
 const GIT_DEBOUNCE: Duration = Duration::from_millis(120);
 
@@ -172,6 +235,11 @@ pub struct Document {
     conflicts: Arc<Vec<Conflict>>,
     git_task: Option<Task<()>>,
     read_only: bool,
+    /// What the file is written in, which is what it is saved in.
+    encoding: text::encoding::Encoding,
+    /// Something to say above the text: why it cannot be edited, or why
+    /// it was not saved.
+    notice: Option<gpui::SharedString>,
     /// Title for documents without a path (a conflict side, a diff base).
     title_override: Option<String>,
     /// Picks the grammar when there is no path.
@@ -206,6 +274,8 @@ impl Document {
             conflicts: Arc::default(),
             git_task: None,
             read_only: false,
+            encoding: Default::default(),
+            notice: None,
             title_override: None,
             language_path: None,
         };
@@ -237,6 +307,69 @@ impl Document {
         doc.language_path = Some(language_path);
         doc.initial_parse(cx);
         doc
+    }
+
+    /// A file as it was read from disk.
+    pub fn open(path: PathBuf, loaded: &Loaded, cx: &mut Context<Self>) -> Self {
+        let mut doc = Self::new(Some(path), &loaded.text, cx);
+        doc.take(loaded);
+        doc
+    }
+
+    fn take(&mut self, loaded: &Loaded) {
+        self.encoding = loaded.encoding;
+        self.read_only = loaded.read_only.is_some();
+        self.notice = loaded.read_only.clone().map(Into::into);
+    }
+
+    /// Reads the file again as written in another encoding: what is on
+    /// disk, in place of the text here.
+    pub fn reopen(
+        &mut self,
+        bytes: &[u8],
+        encoding: text::encoding::Encoding,
+        cx: &mut Context<Self>,
+    ) {
+        let text = text::encoding::decode_as(bytes, encoding);
+        self.reload(&text, cx);
+        self.encoding = encoding;
+        // What could not be saved in the old one is no longer true.
+        if !self.read_only {
+            self.notice = None;
+        }
+        cx.notify();
+    }
+
+    pub fn encoding(&self) -> text::encoding::Encoding {
+        self.encoding
+    }
+
+    /// Changes what the file is saved in. The text stays; the file on
+    /// disk is then not what a save would write.
+    pub fn set_encoding(&mut self, encoding: text::encoding::Encoding, cx: &mut Context<Self>) {
+        if self.encoding != encoding && !self.read_only {
+            self.encoding = encoding;
+            self.text.touch();
+            self.update_dirty(cx);
+            cx.notify();
+        }
+    }
+
+    pub fn line_ending(&self) -> text::LineEnding {
+        self.text.line_ending()
+    }
+
+    pub fn set_line_ending(&mut self, ending: text::LineEnding, cx: &mut Context<Self>) {
+        if !self.read_only {
+            self.text.set_line_ending(ending);
+            self.update_dirty(cx);
+            cx.notify();
+        }
+    }
+
+    /// What is to be said above the text, if anything.
+    pub fn notice(&self) -> Option<&gpui::SharedString> {
+        self.notice.as_ref()
     }
 
     pub fn is_read_only(&self) -> bool {
@@ -776,24 +909,38 @@ impl Document {
         let Some(path) = self.path.clone() else {
             return Task::ready(false);
         };
+        if self.read_only {
+            return Task::ready(false);
+        }
         let text = self.text.text_for_save();
         let version = self.text.version();
+        let encoding = self.encoding;
         cx.spawn(async move |this, cx| {
+            // In the encoding it was read in. A character that encoding
+            // has no byte for is said, never written as another.
             let result = cx
                 .background_executor()
-                .spawn(async move { std::fs::write(&path, text) })
+                .spawn(async move {
+                    let bytes = text::encoding::encode(&text, encoding).map_err(|c| {
+                        let name = encoding.name();
+                        format!("Not saved: {c:?} cannot be written in {name}. Save with another encoding.")
+                    })?;
+                    std::fs::write(&path, bytes).map_err(|err| format!("Not saved: {err}"))
+                })
                 .await;
             this.update(cx, |this, cx| match result {
                 Ok(()) => {
                     if this.text.version() == version {
                         this.text.mark_saved();
                     }
+                    this.notice = None;
                     this.update_dirty(cx);
                     cx.emit(DocumentEvent::Saved);
                     true
                 }
-                Err(err) => {
-                    eprintln!("save failed: {err}");
+                Err(why) => {
+                    this.notice = Some(why.into());
+                    cx.emit(DocumentEvent::DirtyChanged);
                     false
                 }
             })
@@ -817,6 +964,26 @@ impl Document {
         self.text.seal_history();
         self.text.mark_saved();
         self.after_change(applied, None, cx);
+    }
+
+    /// Puts back text that was typed and never saved, as changes that are
+    /// not saved: one step back from it is the file as it is on disk.
+    /// False where there was nothing to put back.
+    pub fn recover(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        if self.read_only || *self.text.rope() == text {
+            return false;
+        }
+        let len = self.text.len();
+        self.text.seal_history();
+        let applied: Arc<[text::Edit]> = self
+            .text
+            .edit([(0..len, text.to_string())], &[], Instant::now())
+            .into();
+        self.text.seal_history();
+        let said = "This text was not saved when Solder closed. Undo brings back the file as it is on disk.";
+        self.notice = Some(said.into());
+        self.after_change(applied, None, cx);
+        true
     }
 
     pub fn set_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {

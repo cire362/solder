@@ -87,8 +87,12 @@ pub struct Settings {
     /// Colors from the language server over the grammar's, where it says
     /// what a word is.
     pub semantic_highlighting: bool,
-    /// What a language server offers to do with a line, at its end.
+    /// What a language server offers to do with a line, above it.
     pub code_lens: bool,
+    /// A thin line down each level of indentation.
+    pub indent_guides: bool,
+    /// Lines too long for the window go on in the next row.
+    pub soft_wrap: bool,
     /// The icon theme of an installed extension, by name: pictures next
     /// to file names in the tree and on tabs. None by default.
     pub icon_theme: Option<String>,
@@ -298,6 +302,8 @@ impl Default for Settings {
             inlay_hints: true,
             semantic_highlighting: true,
             code_lens: true,
+            indent_guides: true,
+            soft_wrap: false,
             icon_theme: None,
             context_servers: BTreeMap::new(),
             other: BTreeMap::new(),

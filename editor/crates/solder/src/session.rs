@@ -8,9 +8,46 @@ use std::sync::mpsc;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(super) struct File {
-    path: PathBuf,
-    cursors: Vec<(usize, usize)>,
-    scroll: (f32, f32),
+    pub(super) path: PathBuf,
+    pub(super) cursors: Vec<(usize, usize)>,
+    pub(super) scroll: (f32, f32),
+    /// Kept at the start of its pane, and not closed by the key.
+    #[serde(default)]
+    pub(super) pinned: bool,
+}
+
+impl File {
+    /// A tab as it is now: its file, its cursors and how far it is
+    /// scrolled. Nothing for a tab that is no file.
+    pub(super) fn of(tab: &Tab, cx: &App) -> Option<Self> {
+        let editor = tab.editor.read(cx);
+        Some(Self {
+            path: editor.path(cx)?.to_path_buf(),
+            cursors: editor
+                .selections
+                .iter()
+                .map(|selection| (selection.anchor, selection.head))
+                .collect(),
+            scroll: (editor.scroll.x.into(), editor.scroll.y.into()),
+            pinned: tab.pinned,
+        })
+    }
+
+    /// Puts the cursors and the scroll back into a view of the file.
+    pub(super) fn put(&self, editor: &Entity<Editor>, cx: &mut App) {
+        editor.update(cx, |editor, cx| {
+            let ranges: Vec<_> = self
+                .cursors
+                .iter()
+                .map(|(anchor, head)| *anchor..*head)
+                .collect();
+            editor.select_ranges(&ranges, cx);
+            if self.scroll.0.is_finite() && self.scroll.1.is_finite() {
+                editor.scroll = point(px(self.scroll.0.max(0.)), px(self.scroll.1.max(0.)));
+                editor.autoscroll = false;
+            }
+        });
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -73,16 +110,21 @@ impl Writer {
     }
 }
 
-fn path(root: &Path) -> PathBuf {
-    // A stable name across processes and platforms, with the full root
-    // checked again when reading; no paths become directory names.
+/// A name for a path that is the same across processes and platforms,
+/// and is no path itself: nothing of a path becomes a folder's name.
+pub(super) fn name_of(path: &Path) -> String {
     let mut hash = 0xcbf29ce484222325u64;
-    for byte in root.to_string_lossy().bytes() {
+    for byte in path.to_string_lossy().bytes() {
         hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
     }
+    format!("{hash:016x}")
+}
+
+fn path(root: &Path) -> PathBuf {
+    // The full root is checked again when reading.
     settings::config_dir()
         .join("sessions")
-        .join(format!("{hash:016x}.json"))
+        .join(format!("{}.json", name_of(root)))
 }
 
 fn read(path: &Path, root: &Path) -> Option<Session> {
@@ -107,18 +149,7 @@ impl Workspace {
             .map(|pane| {
                 pane.tabs
                     .iter()
-                    .filter_map(|tab| {
-                        let editor = tab.editor.read(cx);
-                        Some(File {
-                            path: editor.path(cx)?.to_path_buf(),
-                            cursors: editor
-                                .selections
-                                .iter()
-                                .map(|selection| (selection.anchor, selection.head))
-                                .collect(),
-                            scroll: (editor.scroll.x.into(), editor.scroll.y.into()),
-                        })
-                    })
+                    .filter_map(|tab| File::of(tab, cx))
                     .collect()
             })
             .collect();
@@ -204,6 +235,7 @@ impl Workspace {
         let path = path(&self.root(cx));
         self.session_writer = Some(Writer::new(path.clone()));
         self.restore_session(path, window, cx);
+        self.start_recovery(window, cx);
         self._subscriptions.push(cx.on_app_quit(|this, cx| {
             let saved = this.keep_session(cx);
             async move {
@@ -252,7 +284,7 @@ impl Workspace {
             let read = cx.background_executor().spawn(async move {
                 let saved = read(&path, &root)?;
                 let files = saved.panes.iter().map(|pane| pane.iter().map(|file| {
-                    std::fs::read(&file.path).ok().map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    crate::document::load(&file.path).ok()
                 }).collect::<Vec<_>>()).collect::<Vec<_>>();
                 Some((saved, files))
             }).await;
@@ -277,20 +309,16 @@ impl Workspace {
                         let document = this.document_for_path(&file.path, cx);
                         let editor = match document {
                             Some(document) => cx.new(|cx| Editor::for_document(document, cx)),
-                            None => cx.new(|cx| Editor::new(Some(file.path.clone()), &text, cx)),
+                            None => cx.new(|cx| Editor::open(file.path.clone(), &text, cx)),
                         };
                         // Reuse a CLI-opened view instead of duplicating it.
                         let known = this.panes[pane].tabs.iter().position(|tab| tab.editor.read(cx).path(cx) == Some(file.path.as_path()));
                         let editor = if let Some(known) = known { this.panes[pane].tabs[known].editor.clone() }
                             else { this.add_tab(editor.clone(), window, cx); editor };
-                        editor.update(cx, |editor, cx| {
-                            let ranges = file.cursors.iter().map(|(anchor, head)| *anchor..*head).collect::<Vec<_>>();
-                            editor.select_ranges(&ranges, cx);
-                            if file.scroll.0.is_finite() && file.scroll.1.is_finite() {
-                                editor.scroll = point(px(file.scroll.0.max(0.)), px(file.scroll.1.max(0.)));
-                                editor.autoscroll = false;
-                            }
-                        });
+                        file.put(&editor, cx);
+                        if let Some((pane, tab)) = this.locate(&editor) {
+                            this.panes[pane].tabs[tab].pinned = file.pinned;
+                        }
                         if saved.active.get(pane) == Some(&Some(ix)) { active = this.locate(&editor).map(|(_, tab)| tab); }
                     }
                     if let Some(active) = active { this.activate(pane, active, window, cx); }

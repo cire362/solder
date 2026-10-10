@@ -229,6 +229,9 @@ pub enum Item {
     /// The line and the column of the cursor, and how many cursors.
     Position,
     Indent,
+    /// What the file is written in and what its lines end with, where
+    /// either is not the usual (UTF-8, LF). Opens the list of encodings.
+    Encoding,
     Language,
     /// How many errors and warnings the file has.
     Problems,
@@ -273,12 +276,13 @@ impl<'de> Deserialize<'de> for Item {
 }
 
 impl Item {
-    pub const ALL: [Item; 12] = [
+    pub const ALL: [Item; 13] = [
         Item::Project,
         Item::File,
         Item::Branch,
         Item::Position,
         Item::Indent,
+        Item::Encoding,
         Item::Language,
         Item::Problems,
         Item::Activity,
@@ -295,6 +299,7 @@ impl Item {
             Item::Branch => "Branch",
             Item::Position => "Position",
             Item::Indent => "Indent",
+            Item::Encoding => "Encoding",
             Item::Language => "Language",
             Item::Problems => "Problems",
             Item::Activity => "Activity",
@@ -314,6 +319,7 @@ impl Item {
             Item::Branch => "branch",
             Item::Position => "position",
             Item::Indent => "indent",
+            Item::Encoding => "encoding",
             Item::Language => "language",
             Item::Problems => "problems",
             Item::Activity => "activity",
@@ -403,6 +409,7 @@ const TITLE_RIGHT: &[Item] = &[];
 const STATUS_LEFT: &[Item] = &[
     Item::Position,
     Item::Indent,
+    Item::Encoding,
     Item::Language,
     Item::Problems,
     Item::Activity,
@@ -1572,7 +1579,9 @@ mod tests {
         assert!(standard.title_bar.right().is_empty());
         assert_eq!(
             standard.status_bar.left(),
-            [Position, Indent, Language, Problems, Activity, Connection]
+            [
+                Position, Indent, Encoding, Language, Problems, Activity, Connection
+            ]
         );
         assert_eq!(
             standard.status_bar.right(),
@@ -1600,7 +1609,7 @@ mod tests {
         assert_eq!(layout.title_bar.right(), [Position]);
         assert_eq!(
             layout.status_bar.left(),
-            [Indent, Problems, Activity, Connection]
+            [Indent, Encoding, Problems, Activity, Connection]
         );
         assert_eq!(layout.status_bar.right(), [Language, File]);
         assert_eq!(layout.tab_bar.place, TabsAt::Bottom);
@@ -1748,7 +1757,7 @@ mod tests {
         );
         assert_eq!(
             moved.status_bar.left(),
-            [Position, Indent, Problems, Activity, Connection]
+            [Position, Indent, Encoding, Problems, Activity, Connection]
         );
         assert_eq!(moved.title_bar.height, 46.);
         assert_eq!(moved.status_bar.height, 32.);

@@ -139,6 +139,11 @@ const PICTURES: &[(&str, &[u8])] = &[
         "icons/plus.svg",
         include_bytes!("../assets/icons/phosphor/plus.svg"),
     ),
+    // Drawn here: the set has none that says "kept in its place".
+    (
+        "icons/push-pin.svg",
+        include_bytes!("../assets/icons/own/push-pin.svg"),
+    ),
     (
         "icons/puzzle-piece.svg",
         include_bytes!("../assets/icons/phosphor/puzzle-piece.svg"),
@@ -265,6 +270,7 @@ pub fn item(item: &Item) -> &'static str {
         Item::Branch => "git-branch",
         Item::Position => "cursor-text",
         Item::Indent => "text-indent",
+        Item::Encoding => "file",
         Item::Language => "code",
         Item::Problems => "warning-circle",
         Item::Activity => "spinner-gap",

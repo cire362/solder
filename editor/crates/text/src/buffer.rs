@@ -68,16 +68,26 @@ impl Default for Buffer {
 
 impl Buffer {
     /// Builds a buffer, normalizing `\r\n` to `\n`. The original ending is kept
-    /// for saving, so a CRLF file round-trips unchanged.
+    /// for saving, so a CRLF file round-trips unchanged. A file that has
+    /// both is saved with the one most of its lines have: one stray line
+    /// does not turn every other.
     pub fn new(text: &str) -> Self {
-        let line_ending = if text.contains("\r\n") {
+        let bytes = text.as_bytes();
+        let ends = bytes.iter().filter(|byte| **byte == b'\n').count();
+        // Most files have no carriage return at all, and are not looked
+        // through a second time for one.
+        let returns = match bytes.contains(&b'\r') {
+            true => bytes.windows(2).filter(|pair| pair == b"\r\n").count(),
+            false => 0,
+        };
+        let line_ending = if returns > 0 && returns * 2 >= ends {
             LineEnding::CrLf
         } else {
             LineEnding::Lf
         };
-        let text: Cow<str> = match line_ending {
-            LineEnding::Lf => Cow::Borrowed(text),
-            LineEnding::CrLf => Cow::Owned(text.replace("\r\n", "\n")),
+        let text: Cow<str> = match returns {
+            0 => Cow::Borrowed(text),
+            _ => Cow::Owned(text.replace("\r\n", "\n")),
         };
         Self {
             rope: Rope::from_str(&text),
@@ -106,6 +116,21 @@ impl Buffer {
 
     pub fn line_ending(&self) -> LineEnding {
         self.line_ending
+    }
+
+    /// Says the text is no longer what is on disk, though no letter of
+    /// it changed: it is to be saved in another encoding.
+    pub fn touch(&mut self) {
+        self.version += 1;
+    }
+
+    /// Changes what lines end with when the text is saved. The text is
+    /// then not what is on disk, though no letter of it changed.
+    pub fn set_line_ending(&mut self, ending: LineEnding) {
+        if self.line_ending != ending {
+            self.line_ending = ending;
+            self.version += 1;
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -361,6 +386,23 @@ mod tests {
     fn crlf_round_trips() {
         let b = Buffer::new("a\r\nb\r\n");
         assert_eq!(b.rope().to_string(), "a\nb\n");
+        assert_eq!(b.text_for_save(), "a\r\nb\r\n");
+    }
+
+    #[test]
+    fn a_file_with_both_endings_keeps_the_one_most_lines_have() {
+        // One stray CRLF among lines that end with LF does not turn them.
+        let mostly_lf = Buffer::new("a\nb\r\nc\nd\n");
+        assert_eq!(mostly_lf.line_ending(), LineEnding::Lf);
+        assert_eq!(mostly_lf.rope().to_string(), "a\nb\nc\nd\n");
+        assert_eq!(mostly_lf.text_for_save(), "a\nb\nc\nd\n");
+        let mostly_crlf = Buffer::new("a\r\nb\r\nc\nd\r\n");
+        assert_eq!(mostly_crlf.text_for_save(), "a\r\nb\r\nc\r\nd\r\n");
+        // Changed by hand, the text is no longer what is on disk.
+        let mut b = Buffer::new("a\nb\n");
+        assert!(!b.is_dirty());
+        b.set_line_ending(LineEnding::CrLf);
+        assert!(b.is_dirty());
         assert_eq!(b.text_for_save(), "a\r\nb\r\n");
     }
 

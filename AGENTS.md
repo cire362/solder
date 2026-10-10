@@ -75,6 +75,12 @@ Never guess a signature.
 - `Document` (`document.rs`) owns a file: text, syntax tree, undo history,
   diagnostics. `Editor` (`editor.rs`) is a *view* of a document: selections,
   scroll, popovers. Several editors can show one document (split panes).
+- A file an editor shows is read with `document::load`, never with
+  `from_utf8_lossy`: it finds what the file is written in
+  (`text::encoding`), and the document saves in that same encoding. A
+  character the encoding has no byte for stops the save and is said
+  (`Document::notice`); it is not replaced. Code that edits a file on
+  disk without opening it reads and writes the same way.
 - Edits go through `Document::edit`/`apply_edits` with the `EntityId` of the
   **editor** that made them as `origin`. Passing the document's id made the
   editor move its own cursor twice; this bug happened once.
@@ -112,8 +118,11 @@ Never guess a signature.
   settings folder. Its writer serializes disk writes on one thread; reads
   and file loads are off the UI thread too. Extension pages are restored
   through their serializers, never by replaying old HTML, and permission
-  to run an extension is still checked. Missing files are skipped; this is
-  not a backup of unsaved text.
+  to run an extension is still checked. Missing files are skipped. Text
+  that is not saved is `workspace::recovery`'s: kept a second after it
+  changed, by one thread and in order, let go when the file is saved, its
+  tab closed or the window closed with an answer, and put back at the
+  next start only after the tabs are. It never writes to the file itself.
 - Language-server requests triggered by typing must run after the current
   effect cycle (`cx.defer`), so the `didChange` for what was just typed
   reaches the server first. See `Editor::after_typing`.
@@ -124,8 +133,17 @@ Never guess a signature.
   until the answer comes. A hint is in the
   row and not in the file: `DisplayLine` maps columns both ways, as it
   does for tabs, and nothing else may assume a column is a place on
-  screen. A lens has a row above its line (`element::Rows` maps file lines to
-  display rows), and is kept only if a
+  screen. A line is not in the row of its own number either: a lens has
+  a row above its line and folded lines have none, so every height comes
+  from `element::Rows`, and only the lines of its `runs` are shaped
+  (`LayoutSnapshot::line`, never an index into `lines` by row). A line
+  too long for the window takes several rows (`DisplayLine::parts`), by
+  `text::wrap`, which wraps by cells so that how many rows a line takes
+  is known from its text alone, for lines that are not drawn too: what
+  is drawn must agree with it, so a place in a line is a row and a
+  distance along it (`DisplayLine::place_for`), never an x alone. A fold is
+  the editor's (`Editor::folds`, bytes that follow edits), opened where
+  a cursor lands in it. A lens is kept only if a
   click can do it: its command is one its server said it runs, or one
   of the few the editor does itself (`editor_lsp::LENS_COMMANDS`).
 - Git goes through `git.rs`, which shells out to `git` with stable
