@@ -172,11 +172,13 @@ impl<D: PickerDelegate> Focusable for Picker<D> {
 }
 
 impl<D: PickerDelegate> Render for Picker<D> {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let count = self.delegate.match_count();
         let row = crate::theme::row(ROW_HEIGHT, cx);
         let list_height = row * count.clamp(1, MAX_VISIBLE_ROWS) as f32;
+        // Padding is inside the list's height, so leave the last row its full space.
+        let list_padding = window.rem_size() * 0.75;
         div()
             .key_context("Picker")
             .on_action(cx.listener(Self::select_prev))
@@ -224,8 +226,8 @@ impl<D: PickerDelegate> Render for Picker<D> {
                                     this.delegate.render_match(ix, ix == selected, window, cx);
                                 div()
                                     .id(ix)
+                                    .w_full()
                                     .h(row)
-                                    .mx_1p5()
                                     .px_2p5()
                                     .flex()
                                     .items_center()
@@ -243,8 +245,10 @@ impl<D: PickerDelegate> Render for Picker<D> {
                             .collect()
                     }),
                 )
+                .debug_selector(|| "picker-matches-viewport".into())
                 .track_scroll(self.scroll.clone())
-                .h(list_height)
+                .h(list_height + list_padding)
+                .px_1p5()
                 .py_1p5()
                 .into_any_element()
             })

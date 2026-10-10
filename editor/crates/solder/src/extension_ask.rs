@@ -188,6 +188,7 @@ impl PickerDelegate for AskInput {
         cx: &mut Context<Picker<Self>>,
     ) -> AnyElement {
         div()
+            .debug_selector(|| "extension-input-guidance".into())
             .text_size(UI_FONT_SIZE)
             .text_color(cx.theme().fg_muted)
             .child(format!(

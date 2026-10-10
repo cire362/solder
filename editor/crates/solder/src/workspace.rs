@@ -12351,6 +12351,10 @@ exports.activate = async (context) => {
         cx.simulate_input("bet");
         cx.simulate_keystrokes("enter");
         wait_for(cx, "the line to type", &asking);
+        let guidance = bounds_soon(cx, "extension-input-guidance");
+        let list = bounds_soon(cx, "picker-matches-viewport");
+        assert!(guidance.top() >= list.top());
+        assert!(guidance.bottom() <= list.bottom());
         // What it suggested is selected, so typing replaces it.
         cx.simulate_input("xyz");
         cx.simulate_keystrokes("enter");
