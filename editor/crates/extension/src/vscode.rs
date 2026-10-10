@@ -435,6 +435,21 @@ mod tests {
     /// An extension in `dir` whose code is `code`, and a host for it. The
     /// test is skipped where there is no Node.
     fn hosted(name: &str, code: &str) -> Option<(VsHost, mpsc::Receiver<Told>, PathBuf)> {
+        hosted_logged(name, code).map(|(host, told, dir, _)| (host, told, dir))
+    }
+
+    /// What a host said and asked, each as its name and what came with
+    /// it, in the order it was said.
+    type Log = Arc<Mutex<Vec<(String, Value)>>>;
+
+    /// The same, with everything the host says written down as it is
+    /// read: on the thread that reads the host, so that by the time an
+    /// answer of the host's reaches whoever asked, what it said before
+    /// that answer is in the log.
+    fn hosted_logged(
+        name: &str,
+        code: &str,
+    ) -> Option<(VsHost, mpsc::Receiver<Told>, PathBuf, Log)> {
         let node = std::env::var_os("PATH").and_then(|paths| {
             std::env::split_paths(&paths)
                 .map(|dir| dir.join("node"))
@@ -452,6 +467,8 @@ mod tests {
         write_file(&dir.join("ext/main.js"), code);
         let script = host_script(&dir.join("host")).unwrap();
         let (tx, rx) = mpsc::channel();
+        let log = Log::default();
+        let kept = log.clone();
         let host = VsHost::start(
             &node.to_string_lossy(),
             &script,
@@ -459,11 +476,20 @@ mod tests {
             &dir.join("storage"),
             &[],
             move |told| {
+                match &told {
+                    Told::Asked { method, params, .. } | Told::Said { method, params } => {
+                        lock(&kept).push((method.clone(), params.clone()))
+                    }
+                    Told::Missing(name) => {
+                        lock(&kept).push(("missing".into(), json!({ "name": name })))
+                    }
+                    _ => {}
+                }
                 let _ = tx.send(told);
             },
         )
         .unwrap();
-        Some((host, rx, dir))
+        Some((host, rx, dir, log))
     }
 
     const SOON: Duration = Duration::from_secs(20);
@@ -644,28 +670,20 @@ mod tests {
         assert!(host.is_running() && host.answers(SOON));
     }
 
-    /// Plays the editor for a host: answers what it asks with `answer`,
-    /// and keeps what it says, each as its name and what came with it.
+    /// Plays the editor for a host: answers what it asks with `answer`.
+    /// What it says and asks is in `said`, which is given back.
     fn editor(
         host: &Arc<VsHost>,
         told: mpsc::Receiver<Told>,
+        said: Log,
         answer: impl Fn(&str, &Value) -> Answer + Send + 'static,
-    ) -> Arc<Mutex<Vec<(String, Value)>>> {
-        let said = Arc::new(Mutex::new(Vec::new()));
-        let (host, kept) = (Arc::downgrade(host), said.clone());
+    ) -> Log {
+        let host = Arc::downgrade(host);
         std::thread::spawn(move || {
             for told in told {
-                match told {
-                    Told::Asked { id, method, params } => {
-                        let Some(host) = host.upgrade() else { break };
-                        host.answer(id, answer(&method, &params));
-                        lock(&kept).push((method, params));
-                    }
-                    Told::Said { method, params } => lock(&kept).push((method, params)),
-                    Told::Missing(name) => {
-                        lock(&kept).push(("missing".into(), json!({ "name": name })))
-                    }
-                    _ => {}
+                if let Told::Asked { id, method, params } = told {
+                    let Some(host) = host.upgrade() else { break };
+                    host.answer(id, answer(&method, &params));
                 }
             }
         });
@@ -753,7 +771,7 @@ exports.activate = async (context) => {
   log('ready');
 };
 "#;
-        let Some((host, told, dir)) = hosted("vscode-api", code) else {
+        let Some((host, told, dir, log)) = hosted_logged("vscode-api", code) else {
             return;
         };
         let project = dir.join("project").canonicalize().unwrap_or_else(|_| {
@@ -768,7 +786,7 @@ exports.activate = async (context) => {
         let uri = |name: &str| format!("file://{}/{name}", project.display());
         let host = Arc::new(host);
         let typed = Arc::new(Mutex::new(vec!["ab", "abc"]));
-        let said = editor(&host, told, move |method, params| match method {
+        let said = editor(&host, told, log, move |method, params| match method {
             "message" => Ok(json!(0)),
             "pick" if params["placeholder"] == "Which" => Ok(json!(1)),
             "pick" => Ok(Value::Null),
@@ -969,11 +987,13 @@ exports.activate = (context) => {
   vscode.languages.registerFoldingRangeProvider('rust', {});
 };
 "#;
-        let Some((host, told, dir)) = hosted("vscode-lsp", code) else {
+        let Some((host, told, dir, log)) = hosted_logged("vscode-lsp", code) else {
             return;
         };
         let host = Arc::new(host);
-        let said = editor(&host, told, |method, _| Err(format!("no {method} here")));
+        let said = editor(&host, told, log, |method, _| {
+            Err(format!("no {method} here"))
+        });
         let file = format!("file://{}/a.rs", dir.display());
         host.notify(
             "init",
@@ -1161,14 +1181,16 @@ exports.activate = (context) => {
   log('ready');
 };
 "#;
-        let Some((host, told, dir)) = hosted("vscode-shell", code) else {
+        let Some((host, told, dir, log)) = hosted_logged("vscode-shell", code) else {
             return;
         };
         let project = dir.join("project");
         write_file(&project.join("old.txt"), "old");
         let project = project.canonicalize().unwrap();
         let host = Arc::new(host);
-        let said = editor(&host, told, |method, _| Err(format!("no {method} here")));
+        let said = editor(&host, told, log, |method, _| {
+            Err(format!("no {method} here"))
+        });
         host.notify("init", json!({ "folders": [project] }));
         host.request("activate", json!({}), SOON).unwrap();
         written(&said, "ready");
@@ -1310,11 +1332,11 @@ exports.activate = (context) => {
   log('ready');
 };
 "#;
-        let Some((host, told, dir)) = hosted("vscode-pages", code) else {
+        let Some((host, told, dir, log)) = hosted_logged("vscode-pages", code) else {
             return;
         };
         let host = Arc::new(host);
-        let said = editor(&host, told, |method, _| match method {
+        let said = editor(&host, told, log, |method, _| match method {
             "webview.post" => Ok(json!(true)),
             other => Err(format!("no {other} here")),
         });
