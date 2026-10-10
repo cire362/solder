@@ -92,6 +92,16 @@ jobs:
         with:
           go-version: "1.24"
           cache: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The owner approved this exact wheel for a disposable CI runner.
+      - name: Python debugger for the real DAP test
+        run: |
+          python -m venv "$RUNNER_TEMP/solder-debugpy"
+          "$RUNNER_TEMP/solder-debugpy/bin/python" -m pip install --no-deps \
+            'https://files.pythonhosted.org/packages/7e/ec/7389798843643ea5bc6a08480ba1b855377c70e2ed90189c0a03594e401e/debugpy-1.8.22-cp312-cp312-manylinux_2_34_x86_64.whl#sha256=8a697acec45dbc70d17fb5d9f4f61989fc294d273c69de487fd10cb35fdd75eb'
+          echo "SOLDER_TEST_DEBUGPY_PYTHON=$RUNNER_TEMP/solder-debugpy/bin/python" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

@@ -503,6 +503,9 @@ impl DebugStore {
         if let Some(from) = config.adapter.clone() {
             return self.start_from_extension(config.name, from, root, run, cx);
         }
+        if config.request["type"] == "debugpy" {
+            return self.start_python(config, root, run, cx);
+        }
         self.adapter_id = "pwa-node".into();
         let spec = self.adapter_spec.clone();
         let data_dir = self.data_dir.clone();
@@ -539,6 +542,49 @@ impl DebugStore {
                         this.open_session(port, name, None, "launch", request, cx);
                     }
                     Err(e) => this.state = State::Failed(e.into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn start_python(
+        &mut self,
+        config: LaunchConfig,
+        root: PathBuf,
+        run: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.adapter_id = "debugpy".into();
+        let configured = crate::settings::Settings::get(cx).python_path.clone();
+        let request = config.request;
+        cx.spawn(async move |this, cx| {
+            let started = cx
+                .background_executor()
+                .spawn(async move { crate::python_debug::launch(&root, request, configured) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.run != run {
+                    // Killing and reaping a superseded adapter can wait.
+                    cx.background_executor()
+                        .spawn(async move {
+                            drop(started);
+                        })
+                        .detach();
+                    return;
+                }
+                match started {
+                    Ok((adapter, link, request)) => {
+                        this.adapter = Some(adapter);
+                        this.state = State::Running;
+                        if let Some(config) = this.config.as_mut() {
+                            config.request = request.clone();
+                        }
+                        this.run_session(link, config.name, None, "launch", request, cx);
+                    }
+                    Err(error) => this.state = State::Failed(error.into()),
                 }
                 cx.notify();
             })

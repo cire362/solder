@@ -89,6 +89,8 @@ pub struct Settings {
     pub semantic_highlighting: bool,
     /// What a language server offers to do with a line, above it.
     pub code_lens: bool,
+    /// Python interpreter for debugging; otherwise the project virtualenv.
+    pub python_path: Option<PathBuf>,
     /// A thin line down each level of indentation.
     pub indent_guides: bool,
     /// The other places the symbol under the cursor is used, lit up.
@@ -304,6 +306,7 @@ impl Default for Settings {
             inlay_hints: true,
             semantic_highlighting: true,
             code_lens: true,
+            python_path: None,
             indent_guides: true,
             occurrence_highlights: true,
             soft_wrap: false,

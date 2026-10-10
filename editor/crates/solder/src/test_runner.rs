@@ -189,6 +189,7 @@ pub fn python(root: &Path) -> PathBuf {
         root.join(".venv/bin/python"),
         root.join("venv/bin/python"),
         root.join(".venv/Scripts/python.exe"),
+        root.join("venv/Scripts/python.exe"),
     ] {
         if path.is_file() {
             return path;

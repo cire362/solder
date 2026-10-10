@@ -340,6 +340,24 @@ Unsupported settings are reported in the debug console and that point is
 not sent as an unconditional breakpoint. Settings last for this app run,
 like ordinary breakpoints; their line numbers do not follow file edits.
 
+Python files have a built-in `debugpy` launch in the Debug picker and F5.
+It uses `.venv` or `venv` in the project, then `python3` (`python` on
+Windows). Set `python_path` in settings to an executable or a path relative
+to the project to select another interpreter. Install `debugpy` in that
+same environment beforehand; Solder checks for it and explains when it is
+missing, without installing anything. The adapter runs on its standard
+input/output and uses the same stack, variables, evaluation and stepping
+as other languages. Program output goes to the debug console.
+
+This built-in launch runs the file only: it has no module/argument picker,
+attach mode, subprocess debugging or interactive terminal input. Framework
+launches and additional configurations can still come from extensions.
+The CI test installs the approved, hash-pinned debugpy 1.8.22 wheel in a
+Python 3.12 environment on its disposable Linux runner; local checks skip
+that test unless `SOLDER_TEST_DEBUGPY_PYTHON` names an environment with it.
+[debugpy's configuration reference](https://github.com/microsoft/debugpy/wiki/Debug-configuration-settings)
+describes its expressions and launch settings.
+
 ## Databases
 
 Open the Database tab with `ctrl-shift-d`. Solder lists the databases it finds:

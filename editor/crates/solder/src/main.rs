@@ -73,6 +73,7 @@ mod problems_panel;
 mod project;
 mod project_panel;
 mod project_search;
+mod python_debug;
 mod reference_picker;
 mod response;
 mod results;

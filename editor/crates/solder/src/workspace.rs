@@ -12385,6 +12385,198 @@ mod tests {
         store.read(cx).paused.as_ref()?.frame().map(|f| f.line)
     }
 
+    #[cfg(unix)]
+    #[gpui::test]
+    fn python_debugger_uses_project_interpreter_and_reports_missing_debugpy(
+        cx: &mut TestAppContext,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = fixture("debug-python");
+        let file = root.join("app.py");
+        std::fs::write(&file, "value = 1\nvalue += 2\nprint(value)\n").unwrap();
+        let interpreter = root.join(".venv/bin/python");
+        let log = root.join("launch.json");
+        let adapter =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_dap_stdio.py");
+        let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+        std::fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
+        std::fs::write(
+            &interpreter,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = -c ]; then exit 0; fi\nexec python3 {} {}\n",
+                quote(&adapter),
+                quote(&log)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(file.clone(), None, window, cx)
+        });
+        wait_for(cx, "app.py", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|e| e.read(cx).layout.is_some())
+        });
+        let store = cx.read(|cx| ws.read(cx).debug.clone());
+        store.update(cx, |s, cx| s.toggle(&file, 3, cx));
+        cx.dispatch_action(DebugStart);
+        wait_for(cx, "the Python pause", &|cx| {
+            paused_line(&store, cx) == Some(3)
+        });
+        let request: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&log).unwrap()).unwrap();
+        assert_eq!(request["python"], serde_json::json!([interpreter]));
+        assert_eq!(request["program"], serde_json::json!(file));
+        assert_eq!(request["console"], "internalConsole");
+        assert_eq!(request["subProcess"], false);
+        store.update(cx, |s, cx| s.resume(cx));
+        wait_for(cx, "the Python end", &|cx| !store.read(cx).state.active());
+        let missing = root.join("missing-python");
+        std::fs::write(&missing, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&missing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cx.update(|_, cx| {
+            cx.set_global(Settings {
+                python_path: Some(missing.clone()),
+                ..Default::default()
+            })
+        });
+        let config = crate::python_debug::configuration(&root, &file);
+        store.update(cx, |s, cx| s.start(config, root.clone(), cx));
+        wait_for(
+            cx,
+            "the missing Python module",
+            &|cx| matches!(&store.read(cx).state, crate::debug::State::Failed(message) if message.contains("debugpy") && message.contains(missing.to_str().unwrap())),
+        );
+        assert!(cx.read(|cx| store.read(cx).sessions.is_empty()));
+    }
+
+    #[gpui::test]
+    fn real_debugpy_stops_on_a_condition_steps_and_writes_logpoints(cx: &mut TestAppContext) {
+        let Some(python) = std::env::var_os("SOLDER_TEST_DEBUGPY_PYTHON") else {
+            assert!(
+                std::env::var_os("GITHUB_ACTIONS").is_none(),
+                "CI must provide the approved debugpy environment"
+            );
+            eprintln!("real debugpy test skipped: SOLDER_TEST_DEBUGPY_PYTHON is not set");
+            return;
+        };
+        let root = fixture("real-debugpy");
+        let file = root.join("app.py");
+        std::fs::write(&file, "total = 0\nfor i in range(4):\n    total += i\n    print('tick', i)\nprint('done', total)\n").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(file.clone(), None, window, cx)
+        });
+        wait_for(cx, "the Python document", &|cx| {
+            ws.read(cx).active_editor().is_some()
+        });
+        let store = cx.read(|cx| ws.read(cx).debug.clone());
+        let mut config = crate::python_debug::configuration(&root, &file);
+        config.request["python"] = serde_json::json!([PathBuf::from(python)]);
+        store.update(cx, |s, cx| {
+            s.set_options(
+                &file,
+                3,
+                crate::debug::BreakpointOptions {
+                    condition: "i == 2".into(),
+                    ..Default::default()
+                },
+                cx,
+            );
+            s.set_options(
+                &file,
+                4,
+                crate::debug::BreakpointOptions {
+                    log: "iteration {i}".into(),
+                    ..Default::default()
+                },
+                cx,
+            );
+            s.start(config, root.clone(), cx);
+        });
+        wait_for_with_timeout(
+            cx,
+            "real debugpy's conditional pause",
+            Duration::from_secs(20),
+            &|cx| paused_line(&store, cx) == Some(3),
+        );
+        assert_eq!(
+            cx.read(|cx| store
+                .read(cx)
+                .paused
+                .as_ref()
+                .unwrap()
+                .frame()
+                .unwrap()
+                .path
+                .clone()),
+            Some(file)
+        );
+        wait_for(cx, "Python variables", &|cx| {
+            store
+                .read(cx)
+                .children
+                .values()
+                .flatten()
+                .any(|v| v.name == "i" && v.value == "2")
+        });
+        assert!(cx.read(|cx| {
+            store
+                .read(cx)
+                .children
+                .values()
+                .flatten()
+                .any(|v| v.name == "total" && v.value == "1")
+        }));
+        store.update(cx, |s, cx| s.step_over(cx));
+        wait_for(cx, "Python's next line", &|cx| {
+            paused_line(&store, cx) == Some(4)
+        });
+        wait_for(cx, "the updated Python variable", &|cx| {
+            store
+                .read(cx)
+                .children
+                .values()
+                .flatten()
+                .any(|v| v.name == "total" && v.value == "3")
+        });
+        store.update(cx, |s, cx| s.resume(cx));
+        wait_for_with_timeout(cx, "Python's normal exit", Duration::from_secs(15), &|cx| {
+            !store.read(cx).state.active()
+        });
+        let console = cx.read(|cx| {
+            store
+                .read(cx)
+                .console
+                .iter()
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>()
+        });
+        for i in [0, 1, 3] {
+            assert!(
+                console
+                    .iter()
+                    .any(|line| line.contains(&format!("iteration {i}"))),
+                "{console:?}"
+            );
+        }
+        assert!(
+            console.iter().any(|line| line.contains("done")),
+            "{console:?}"
+        );
+        assert!(
+            console
+                .iter()
+                .any(|line| line.contains("Exited with code 0")),
+            "{console:?}"
+        );
+        assert!(cx.read(|cx| store.read(cx).sessions.is_empty()));
+    }
+
     #[gpui::test]
     fn breakpoint_prompts_keep_conditions_and_log_without_stopping(cx: &mut TestAppContext) {
         let (root, store, ws, cx) = debug_setup(cx, "debug-conditions");

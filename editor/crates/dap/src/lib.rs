@@ -370,6 +370,13 @@ impl Adapter {
                 let _ = child.kill();
                 return Err(Error::Io("The debug adapter has no input or output".into()));
             };
+            // Adapter diagnostics are not DAP messages. Drain them so a
+            // full stderr pipe cannot prevent an initialize response.
+            if let Some(mut stderr) = child.stderr.take() {
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+                });
+            }
             let connection = Connection::stdio(input, output)?;
             let adapter = Self {
                 child,
@@ -653,6 +660,8 @@ mod tests {
         // environment, then says it is ready.
         let script = r#"
 import json, os, sys
+sys.stderr.write('diagnostic\n' * 200000)
+sys.stderr.flush()
 def read():
     length = 0
     while True:
@@ -692,8 +701,17 @@ while True:
         let (connection, mut incoming) = link.expect("a connection on its input and output");
         let arguments = initialize_arguments_for("rdbg");
         assert_eq!(arguments["adapterID"], "rdbg");
+        let (timed, timeout) = futures::channel::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            let _ = timed.send(());
+        });
+        let answer = connection.request("initialize", arguments);
         let body =
-            futures::executor::block_on(connection.request("initialize", arguments)).unwrap();
+            match futures::executor::block_on(futures::future::select(Box::pin(answer), timeout)) {
+                futures::future::Either::Left((answer, _)) => answer.unwrap(),
+                _ => panic!("stderr blocked the adapter's initialize response"),
+            };
         assert_eq!(body["asked"]["adapterID"], "rdbg");
         assert_eq!(body["mode"], "test");
         let event = futures::executor::block_on(futures::StreamExt::next(&mut incoming));

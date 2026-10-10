@@ -21,6 +21,12 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] The new real debugpy check has not run yet: CI installs the approved
+      debugpy 1.8.22 wheel in Python 3.12 and checks conditions, logpoints,
+      stepping and variables. Locally, discovery, interpreter selection,
+      missing-module errors and the editor's DAP path use executable fixtures.
+      Python debugging in a real window, other Python versions and Windows
+      interpreter/process behavior have not been checked
 - [ ] Conditional breakpoints and logpoints with a real JavaScript or
       extension debug adapter and in a real window. Capability filtering,
       editing the settings and the wire requests are checked with fixtures
@@ -90,6 +96,9 @@ something of its own unchecked or unmade adds it here.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] Built-in Python debugging runs the current file only. It has no
+      module/argument picker, attach mode, subprocess sessions or interactive
+      terminal input; stdin is not supported by this internal-console launch
 - [ ] Breakpoints and their conditions are not kept across restarts and
       their line numbers do not follow edits; expression and hit-count
       syntax belongs to each adapter
@@ -588,7 +597,7 @@ update. They come after phase 9, in this order unless one is needed sooner.
 - [x] A tree of the project's tests: run one, see what failed, go to its line
       (Cargo, Go and Python unittest, plus permitted extensions' controllers)
 - [x] Breakpoints with a condition, and ones that only write to the console
-- [ ] Python under the debugger (debugpy), now that an adapter is only
+- [x] Python under the debugger (debugpy), now that an adapter is only
       something to start
 
 ### The terminal
