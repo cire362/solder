@@ -21,6 +21,23 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] The Git PR panel against an authenticated GitHub account. Its CLI
+      process, errors, both kinds of check data and manual refresh are
+      tested with an executable fixture; no live PR was changed in a test
+- [ ] Commit-message suggestions from a real local or hosted model. The
+      staged-context policy and editable suggestion are checked with the
+      scripted model used by the chat tests
+- [ ] Fetch with SSH or a credential helper against a hosted remote. The
+      stash and fetch tests use local repositories; Git runs without
+      terminal credential prompts here
+- [ ] Git history and blame in a large repository, and non-UTF-8 file blame.
+      Rename and merge history, commit patches and unsaved blame are tested
+      with local repositories and a headless window. The graph, opening a
+      commit patch and inserting text with blame enabled were checked in a
+      real macOS window; other platforms have not been checked
+- [ ] Mouse and keyboard use of stash, the blocked commit, model
+      suggestions and the PR panel in a real window. Their actions and
+      controls are covered by process and headless tests
 - [ ] Published extensions. One has been run: the reader `vscode.ipynb`
       1.95.3, on a CI runner, and only for reading and saving. The check of
       the most installed extensions of Open VSX has not produced its list,
@@ -58,12 +75,25 @@ something of its own unchecked or unmade adds it here.
 - [ ] Not measured at all: an editor with extensions running, a notebook
       open, a file with lenses, folding, a file of many megabytes with
       wrapping on, a file in another encoding; Structure and Problems
-      with large lists, and symbol highlights while typing with a server
+      with large lists, and symbol highlights while typing with a server;
+      Git history or a large patch open, and typing with blame enabled
+      (`benchmarks/git-history.md` measures these features inactive)
 - [ ] The numbers on the website (`src/components/performance.tsx`) are
       placeholders, marked so. The measurements in `benchmarks/` are local
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] The commit guard recognizes private-key PEM headers and known AWS,
+      GitHub, GitLab, Slack, API-key and connection-password forms, plus long
+      literal credential assignments (UTF-8 and marked UTF-16 included). It
+      is not a universal detector: short or encoded passwords and binary
+      key containers are not recognized; test credentials can also match. A staged
+      file above 5 MB stops the editor commit because it is not scanned
+- [ ] Git history loads 200 more commits at a time by reading the enlarged
+      range again. A commit opens a read-only patch, limited to 500 KB on
+      screen; the full Git output is read before it is truncated. There is
+      no comparison picker between arbitrary commits. Blame shows the
+      short hash and author, with no author tooltip or commit action
 - [ ] Wrapping goes by cells, a character each: rows of characters wider
       than a cell (Chinese, Japanese, Korean) run past the edge, and so do
       rows with inlay hints. Home and End go to the ends of the line, not
@@ -532,11 +562,11 @@ update. They come after phase 9, in this order unless one is needed sooner.
       for extensions' providers too
 
 ### Git history
-- [ ] The history as a graph, the history of one file, blame in the gutter
-- [ ] Stash and fetch
-- [ ] A check before a commit: keys and secrets in what is staged stop it
-- [ ] A commit message proposed by the model from what is staged
-- [ ] The pull request of the branch and the state of its checks, through `gh`
+- [x] The history as a graph, the history of one file, blame in the gutter
+- [x] Stash and fetch
+- [x] A check before a commit: keys and secrets in what is staged stop it
+- [x] A commit message proposed by the model from what is staged
+- [x] The pull request of the branch and the state of its checks, through `gh`
 
 ### Tests and running
 - [ ] A tree of the project's tests: run one, see what failed, go to its line

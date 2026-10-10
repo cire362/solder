@@ -212,6 +212,53 @@ The comparison is read-only. Deleted files remain reviewable without a working
 file; binary and non-UTF-8 files show an explanation rather than corrupted text.
 Conflicted files still open the three-way conflict view.
 
+## Git history
+
+The Git panel's **History** shows the graph across local and remote branches.
+**File history** follows the file in front through renames on the current
+branch. Each reads the latest 200 commits; **Older commits** adds 200 and
+**Refresh** rereads them. Click a commit to open its message and patch as a
+read-only tab (the first 500 KB of a large patch). File history opens the
+whole commit too, so changes made under an earlier filename remain visible.
+For a merge, the patch shows what changed from its first parent.
+
+**Blame** toggles a hash and author beside each line of the file in front, in
+all of its views. It uses the current text, including unsaved changes; new
+lines say **Not committed**. It is refreshed after typing pauses and when
+Git status changes. Turning it off removes its work and its gutter. History
+and blame use the Git CLI on background threads; neither loads at startup.
+
+**Stash** saves tracked changes and untracked files on disk. **Stashes**
+opens the list: **Apply** keeps the stash, **Pop** removes it after a successful
+apply, and **Delete** asks before discarding it. Apply and pop restore the
+index too. A conflict leaves the stash available. Unsaved editor text stays
+in the editor and is not included: save it first to stash it. **Fetch** updates
+all remotes without merging. Git uses existing credentials and reports an
+error if it needs a terminal prompt. Operations run one at a time.
+
+Before **Commit** or **Amend**, the editor scans the contents of changed staged
+files for private keys and known credential formats. A match stops the commit
+and names the file, line and kind; it never shows the credential. Cleaning only
+the working file is not enough: stage the cleaned file too. Read failures and
+staged files over 5 MB also stop the commit. This is a guard for recognizable
+keys, not a promise to find every password. It applies to editor commits;
+commands typed into a terminal use Git's own hooks.
+
+**Suggest message** asks the chat model selected in AI settings for a short
+commit subject. It uses staged changes, honors `.env` and `.solderignore`,
+checks for known keys before sending, and limits the diff to 60 KB (16 KB per
+file). Omitted files are named. The result fills the message field for editing;
+it creates no commit. If you edited the message or staged something else while
+waiting, your text is kept. **Cancel suggestion** stops waiting for the answer.
+
+**PR** reads the current branch's GitHub pull request through an installed,
+authenticated `gh`. It shows the number, title, state, draft flag, target branch
+and individual checks, including pending, failed, skipped and cancelled ones.
+**Refresh** reads again; there is no background polling. Opening another branch
+closes the old snapshot. Links open the PR or a check in the browser. Missing
+`gh`, missing authentication or no PR are shown as errors. **Create PR** opens
+the existing browser form for the branch (GitHub or GitLab), for you to submit.
+
 ## Run the stack
 
 Open the Services tab with `cmd-shift-s` (`ctrl-shift-s` on Linux). Solder lists the

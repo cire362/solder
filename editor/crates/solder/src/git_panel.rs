@@ -20,13 +20,20 @@ actions!(
     git,
     [
         Commit,
+        GenerateMessage,
         StageAll,
         UnstageAll,
         Push,
         ReviewAndPush,
         Pull,
         OpenPullRequest,
+        CreatePullRequest,
         SwitchBranch,
+        History,
+        FileHistory,
+        ToggleBlame,
+        StashChanges,
+        Fetch,
     ]
 );
 
@@ -46,6 +53,10 @@ pub enum GitPanelEvent {
     OpenAt(PathBuf, u32),
     OpenConflict(PathBuf),
     ReviewDiff(PathBuf, DiffScope),
+    OpenCommit {
+        title: String,
+        text: String,
+    },
 }
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
@@ -91,6 +102,16 @@ pub struct GitPanel {
     git: Entity<GitStore>,
     pub(crate) message: Entity<Editor>,
     amend: bool,
+    pub(crate) generating: bool,
+    generation_task: Option<Task<()>>,
+    pub(crate) generation_note: Option<SharedString>,
+    pub(crate) history: Option<Entity<crate::git_history_panel::HistoryPanel>>,
+    history_subscription: Option<Subscription>,
+    pull_request: Option<Entity<crate::git_pr_panel::PullRequestPanel>>,
+    pr_subscription: Option<Subscription>,
+    pub(crate) stashes: Option<Vec<crate::git_stash::Stash>>,
+    stash_task: Option<Task<()>>,
+    stash_busy: bool,
     pub review: Option<PushReview>,
     review_task: Option<Task<()>>,
     focus_handle: FocusHandle,
@@ -100,17 +121,349 @@ pub struct GitPanel {
 impl GitPanel {
     pub fn new(root: PathBuf, git: Entity<GitStore>, cx: &mut Context<Self>) -> Self {
         let message = cx.new(|cx| Editor::single_line("Commit message", cx));
-        let subscription = cx.observe(&git, |_, _, cx| cx.notify());
+        let subscription = cx.observe(&git, |this, git, cx| {
+            if this.pull_request.as_ref().is_some_and(|panel| {
+                git.read(cx).status().branch.as_deref() != Some(panel.read(cx).branch.as_str())
+            }) {
+                this.pull_request = None;
+                this.pr_subscription = None;
+            }
+            cx.notify();
+        });
         Self {
             root,
             git,
             message,
             amend: false,
+            generating: false,
+            generation_task: None,
+            generation_note: None,
+            history: None,
+            history_subscription: None,
+            pull_request: None,
+            pr_subscription: None,
+            stashes: None,
+            stash_task: None,
+            stash_busy: false,
             review: None,
             review_task: None,
             focus_handle: cx.focus_handle(),
             _subscription: subscription,
         }
+    }
+
+    fn load_stashes(&mut self, cx: &mut Context<Self>) {
+        if self.stash_busy {
+            return;
+        }
+        let Some(repo) = self.git.read(cx).repo().cloned() else {
+            return;
+        };
+        self.stashes = Some(Vec::new());
+        self.stash_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { repo.stashes() })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(stashes) => this.stashes = Some(stashes),
+                    Err(e) => this.git.update(cx, |g, cx| {
+                        g.last_error = Some(e.0.into());
+                        cx.notify();
+                    }),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn stash(&mut self, _: &StashChanges, _: &mut Window, cx: &mut Context<Self>) {
+        if self.stash_busy {
+            return;
+        }
+        self.stashes = Some(Vec::new());
+        self.stash_busy = true;
+        let task = self.git.update(cx, |g, cx| g.run(|repo| repo.stash(), cx));
+        self.stash_task = Some(cx.spawn(async move |this, cx| {
+            task.await;
+            this.update(cx, |this, cx| {
+                this.stash_busy = false;
+                if this.stashes.is_some() {
+                    this.load_stashes(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn stash_action(
+        &mut self,
+        id: String,
+        operation: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.stash_busy {
+            return;
+        }
+        let answer = (operation == "drop").then(|| {
+            window.prompt(
+                PromptLevel::Warning,
+                "Delete this stash?",
+                Some("Its saved changes will be lost."),
+                &["Delete", "Cancel"],
+                cx,
+            )
+        });
+        self.stash_busy = true;
+        let git = self.git.clone();
+        self.stash_task = Some(cx.spawn(async move |this, cx| {
+            let allowed = match answer {
+                Some(answer) => answer.await.ok() == Some(0),
+                None => true,
+            };
+            if allowed {
+                let task = git
+                    .update(cx, |g, cx| {
+                        g.run(move |repo| repo.change_stash(&id, operation), cx)
+                    })
+                    .ok();
+                if let Some(task) = task {
+                    task.await;
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.stash_busy = false;
+                if this.stashes.is_some() {
+                    this.load_stashes(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn fetch(&mut self, _: &Fetch, _: &mut Window, cx: &mut Context<Self>) {
+        self.git
+            .update(cx, |g, cx| g.run(|repo| repo.fetch(), cx).detach());
+    }
+
+    fn render_stashes(&self, cx: &mut Context<Self>) -> AnyElement {
+        let count = self.stashes.as_ref().map_or(0, Vec::len);
+        let theme = cx.theme().clone();
+        if count == 0 {
+            return div()
+                .p_3()
+                .text_size(UI_FONT_SIZE)
+                .text_color(theme.fg_subtle)
+                .child(if self.stash_busy {
+                    "Working..."
+                } else {
+                    "No stashes"
+                })
+                .into_any_element();
+        }
+        uniform_list(
+            "git-stashes",
+            count,
+            cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                let theme = cx.theme().clone();
+                range
+                    .filter_map(|ix| {
+                        this.stashes.as_ref()?.get(ix).map(|stash| {
+                            div()
+                                .id(ix)
+                                .h(crate::theme::row(px(60.), cx))
+                                .px_2()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(UI_FONT_SIZE)
+                                        .text_color(theme.fg)
+                                        .child(format!("{} {}", stash.reference, stash.subject)),
+                                )
+                                .child(div().flex().gap_1().children(
+                                    [("Apply", "apply"), ("Pop", "pop"), ("Delete", "drop")].map(
+                                        |(label, operation)| {
+                                            let id = stash.id.clone();
+                                            ui::button(
+                                                (
+                                                    "stash-action",
+                                                    ix * 3
+                                                        + match operation {
+                                                            "apply" => 0,
+                                                            "pop" => 1,
+                                                            _ => 2,
+                                                        },
+                                                ),
+                                                label,
+                                                false,
+                                                &theme,
+                                                cx.listener(move |this, _, window, cx| {
+                                                    this.stash_action(
+                                                        id.clone(),
+                                                        operation,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                }),
+                                            )
+                                        },
+                                    ),
+                                ))
+                        })
+                    })
+                    .collect()
+            }),
+        )
+        .flex_1()
+        .into_any_element()
+    }
+
+    pub fn show_pull_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let git = self.git.read(cx);
+        let (Some(repo), Some(branch)) = (git.repo().cloned(), git.status().branch.clone()) else {
+            return;
+        };
+        self.history = None;
+        self.history_subscription = None;
+        let panel = cx.new(|cx| crate::git_pr_panel::PullRequestPanel::new(repo, branch, cx));
+        self.pr_subscription = Some(cx.subscribe_in(&panel, window, |this, _, _, window, cx| {
+            this.pull_request = None;
+            this.focus_message(window, cx);
+            cx.notify();
+        }));
+        window.focus(&panel.focus_handle(cx));
+        self.pull_request = Some(panel);
+        cx.notify();
+    }
+
+    pub fn show_history(
+        &mut self,
+        file: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.git.read(cx).repo().cloned() else {
+            return;
+        };
+        self.pull_request = None;
+        self.pr_subscription = None;
+        let history = cx.new(|cx| crate::git_history_panel::HistoryPanel::new(repo, file, cx));
+        self.history_subscription =
+            Some(
+                cx.subscribe_in(&history, window, |this, _, event, window, cx| {
+                    match event {
+                        crate::git_history_panel::HistoryEvent::Close => {
+                            this.history = None;
+                            this.focus_message(window, cx);
+                        }
+                        crate::git_history_panel::HistoryEvent::Patch { title, text } => {
+                            cx.emit(GitPanelEvent::OpenCommit {
+                                title: title.clone(),
+                                text: text.clone(),
+                            });
+                        }
+                    }
+                    cx.notify();
+                }),
+            );
+        window.focus(&history.focus_handle(cx));
+        self.history = Some(history);
+        cx.notify();
+    }
+
+    fn generate_message(&mut self, _: &GenerateMessage, _: &mut Window, cx: &mut Context<Self>) {
+        if self.generating {
+            self.generation_task = None;
+            self.generating = false;
+            self.generation_note = None;
+            cx.notify();
+            return;
+        }
+        let store = crate::ai_store::AiStore::try_global(cx);
+        let model = store
+            .as_ref()
+            .and_then(|s| s.read(cx).roles.get(&ai::Role::Chat).cloned());
+        let (Some(store), Some(model)) = (store, model) else {
+            self.generation_note = Some("Choose a chat model first.".into());
+            cx.notify();
+            return;
+        };
+        let Some(repo) = self.git.read(cx).repo().cloned() else {
+            return;
+        };
+        let root = self.root.clone();
+        let message_version = self.message.read(cx).version(cx);
+        self.generating = true;
+        self.generation_note = None;
+        self.generation_task = Some(cx.spawn(async move |this, cx| {
+            let snapshot_repo = repo.clone();
+            let result = async {
+                let staged = cx
+                    .background_executor()
+                    .spawn(async move { crate::ai_commit::staged(&snapshot_repo, &root) })
+                    .await?;
+                let endpoint = store
+                    .update(cx, |s, cx| s.endpoint(&model, cx))
+                    .map_err(|e| e.to_string())?
+                    .await?;
+                let name = if model.provider == crate::ai_providers::LOCAL {
+                    "local".into()
+                } else {
+                    model.model
+                };
+                let step = ai::spawn(ai::tools::step(
+                    endpoint,
+                    crate::ai_commit::request(name, staged.diff),
+                ))
+                .await?;
+                if step.stop == ai::tools::Stop::Length || !step.calls.is_empty() {
+                    return Err("The model gave no complete commit subject.".into());
+                }
+                let subject = crate::ai_commit::subject(&step.text)?;
+                let tree = cx
+                    .background_executor()
+                    .spawn(async move { repo.run(&["write-tree"]) })
+                    .await
+                    .map_err(|e| e.0)?;
+                if String::from_utf8_lossy(&tree).trim() != staged.tree {
+                    return Err("Staged changes moved. Generate the message again.".into());
+                }
+                Ok::<_, String>((subject, staged.skipped))
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                this.generating = false;
+                this.generation_task = None;
+                match result {
+                    Ok((subject, skipped)) => {
+                        if this.message.read(cx).version(cx) == message_version {
+                            this.message
+                                .update(cx, |e, cx| e.set_text(&subject, false, cx));
+                            this.generation_note = (!skipped.is_empty())
+                                .then(|| format!("Left out: {}", skipped.join(", ")).into());
+                        } else {
+                            this.generation_note =
+                                Some(format!("Your message was kept. Suggested: {subject}").into());
+                        }
+                    }
+                    Err(e) => this.generation_note = Some(e.into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     /// Push, after the chat model reviewed what it sends when review is on.
@@ -653,6 +1006,12 @@ impl Focusable for GitPanel {
 
 impl Render for GitPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(panel) = &self.pull_request {
+            return div().size_full().child(panel.clone()).into_any_element();
+        }
+        if let Some(history) = &self.history {
+            return div().size_full().child(history.clone()).into_any_element();
+        }
         let theme = cx.theme().clone();
         let git = self.git.read(cx);
         if git.is_not_a_repo() {
@@ -680,6 +1039,7 @@ impl Render for GitPanel {
         }
         let status = git.status().clone();
         let error = git.last_error.clone();
+        let busy = git.busy;
         let rows = self.rows(cx);
         let count = rows.len();
         let branch: SharedString = status
@@ -699,8 +1059,11 @@ impl Render for GitPanel {
         div()
             .key_context("GitPanel")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::generate_message))
             .on_action(cx.listener(Self::commit))
             .on_action(cx.listener(Self::review_and_push))
+            .on_action(cx.listener(Self::stash))
+            .on_action(cx.listener(Self::fetch))
             .on_action(cx.listener(Self::stage_all))
             .on_action(cx.listener(Self::unstage_all))
             .size_full()
@@ -755,7 +1118,100 @@ impl Render for GitPanel {
                                 },
                             )),
                     )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(ui::button(
+                                "git-history-button",
+                                "History",
+                                false,
+                                &theme,
+                                |_, window, cx| window.dispatch_action(Box::new(History), cx),
+                            ))
+                            .child(ui::button(
+                                "git-file-history",
+                                "File history",
+                                false,
+                                &theme,
+                                |_, window, cx| window.dispatch_action(Box::new(FileHistory), cx),
+                            ))
+                            .child(ui::button(
+                                "git-blame",
+                                "Blame",
+                                false,
+                                &theme,
+                                |_, window, cx| window.dispatch_action(Box::new(ToggleBlame), cx),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(ui::button(
+                                "git-stash",
+                                "Stash",
+                                false,
+                                &theme,
+                                cx.listener(|this, _, window, cx| {
+                                    this.stash(&StashChanges, window, cx)
+                                }),
+                            ))
+                            .child(ui::button(
+                                "git-stashes",
+                                if self.stashes.is_some() {
+                                    "Changes"
+                                } else {
+                                    "Stashes"
+                                },
+                                false,
+                                &theme,
+                                cx.listener(|this, _, _, cx| {
+                                    if this.stashes.is_some() {
+                                        this.stashes = None;
+                                        if !this.stash_busy {
+                                            this.stash_task = None;
+                                        }
+                                        cx.notify();
+                                    } else {
+                                        this.load_stashes(cx);
+                                    }
+                                }),
+                            ))
+                            .child(ui::button(
+                                "git-fetch",
+                                "Fetch",
+                                false,
+                                &theme,
+                                cx.listener(|this, _, window, cx| this.fetch(&Fetch, window, cx)),
+                            )),
+                    )
+                    .children(busy.then(|| {
+                        div()
+                            .text_size(crate::theme::UI_FONT_SMALL)
+                            .text_color(theme.fg_subtle)
+                            .child("Working...")
+                    }))
                     .children(self.render_review(&theme, cx))
+                    .child(ui::button(
+                        "git-generate-message",
+                        if self.generating {
+                            "Cancel suggestion"
+                        } else {
+                            "Suggest message"
+                        },
+                        false,
+                        &theme,
+                        cx.listener(|this, _, window, cx| {
+                            this.generate_message(&GenerateMessage, window, cx)
+                        }),
+                    ))
+                    .children(self.generation_note.clone().map(|note| {
+                        div()
+                            .text_size(crate::theme::UI_FONT_SMALL)
+                            .text_color(theme.fg_muted)
+                            .child(note)
+                    }))
                     .child(
                         ui::text_field(self.message.clone(), message_focused, &theme)
                             .flex_none()
@@ -810,7 +1266,9 @@ impl Render for GitPanel {
                             .child(e)
                     })),
             )
-            .child(if count == 0 {
+            .child(if self.stashes.is_some() {
+                self.render_stashes(cx)
+            } else if count == 0 {
                 div()
                     .px_4()
                     .py_2()

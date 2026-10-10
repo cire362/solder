@@ -757,10 +757,15 @@ fn layout(
     let buffer = doc.text();
     let line_count = buffer.line_count();
     let digits = line_count.to_string().len().max(3);
+    let blame_width = if !single_line && doc.blame_enabled() {
+        em * 22.
+    } else {
+        px(0.)
+    };
     let gutter_width = if single_line {
         px(0.)
     } else {
-        em * digits as f32 + GUTTER_PADDING * 2.
+        em * digits as f32 + GUTTER_PADDING * 2. + blame_width
     };
     let text_left = bounds.left() + gutter_width;
     let text_bounds = Bounds::new(
@@ -1511,6 +1516,21 @@ fn layout(
                 .shape_line(mark.into(), font_size, &[run], None);
             let origin = point(text_left - (GUTTER_PADDING + shaped.width) / 2., row_y(row));
             gutter.push((shaped, origin));
+        }
+        if let Some(blame) = doc.blame().get(row).filter(|_| blame_width > px(0.)) {
+            let label: SharedString = blame.label().into();
+            let run = TextRun {
+                len: label.len(),
+                font: code_font.clone(),
+                color: theme.fg_subtle,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let shaped = window
+                .text_system()
+                .shape_line(label, font_size, &[run], None);
+            gutter.push((shaped, point(bounds.left() + GUTTER_PADDING, row_y(row))));
         }
         let active = cursor_rows.contains(&row);
         let label: SharedString = (row + 1).to_string().into();
