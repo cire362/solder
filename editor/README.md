@@ -283,6 +283,16 @@ Containers are listed below the services when a Docker runtime is running: Docke
 Desktop, OrbStack or Colima. Solder uses the `docker` CLI and its current context,
 and finds OrbStack's CLI in `~/.orbstack/bin` even without the `/usr/local/bin` links.
 
+## Terminal
+
+**Toggle Terminal** opens the dock's terminal; **New Terminal** adds another.
+Ctrl/Cmd-click `file:line:column` in its output to open that position. A column
+can be omitted. Positions are one-based; relative paths use the terminal's
+starting directory. Quote a path containing spaces as `"my file.rs":12:3`.
+Colors and soft wraps do not become part of a path. Ordinary clicks still
+select text. URLs are not opened by this gesture, and changing directory
+inside a shell does not update the base for relative paths.
+
 ## Tests
 
 **Show Tests** in the command palette opens the Tests panel, which can move

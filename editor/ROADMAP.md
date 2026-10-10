@@ -21,13 +21,16 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
-- [ ] The new real debugpy check has not run yet: CI installs the approved
-      debugpy 1.8.22 wheel in Python 3.12 and checks conditions, logpoints,
-      stepping and variables. Locally, discovery, interpreter selection,
+- [ ] A real paused Python session in a window, other Python versions and
+      Windows interpreter/process behavior. CI of PR #51 passed with the
+      approved debugpy 1.8.22 wheel in Python 3.12, checking conditions,
+      logpoints, stepping and variables. Locally, interpreter selection,
       missing-module errors and the editor's DAP path use executable fixtures.
       The missing-module message and selected interpreter were checked in a
-      real macOS window. A real paused Python session in a window, other
-      Python versions and Windows interpreter/process behavior are unchecked
+      real macOS window
+- [ ] Terminal file links in a real window and on Windows. ANSI colors,
+      soft wraps, Unicode, quoted paths, drive letters and source jumps are
+      checked with the emulator and a real PTY in a headless window
 - [ ] Conditional breakpoints and logpoints with a real JavaScript or
       extension debug adapter. Capability filtering, editing the settings
       and the wire requests are checked with fixtures. Entering a condition
@@ -102,6 +105,10 @@ something of its own unchecked or unmade adds it here.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] Terminal relative file links use the starting directory, not later
+      shell `cd` commands. URLs, `file://` URIs and traceback-only positions
+      without colon numbers are not handled. A logical line is inspected
+      up to 129 rows or 32 KB; unquoted paths cannot contain spaces
 - [ ] Built-in Python debugging runs the current file only. It has no
       module/argument picker, attach mode, subprocess sessions or interactive
       terminal input; stdin is not supported by this internal-console launch.
@@ -609,7 +616,8 @@ update. They come after phase 9, in this order unless one is needed sooner.
       something to start
 
 ### The terminal
-- [ ] `file:line:column` in the output opens in the editor
+- [x] `file:line:column` in the output opens in the editor
+      (Ctrl/Cmd-click, relative to the terminal's starting directory)
 - [ ] Search in what scrolled by; the dock split in two
 - [ ] A command that failed offered to the model to fix
 

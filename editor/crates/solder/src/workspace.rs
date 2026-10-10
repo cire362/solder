@@ -1891,6 +1891,15 @@ impl Workspace {
             window,
             |this, terminal, event, window, cx| match event {
                 TerminalEvent::TitleChanged => cx.notify(),
+                TerminalEvent::OpenFile(link) => this.open_path(
+                    link.path.clone(),
+                    Some(Jump::Point {
+                        row: link.row,
+                        column: link.column,
+                    }),
+                    window,
+                    cx,
+                ),
                 // Services keep their tab so a crash's output stays readable,
                 // and so do the tasks of extensions.
                 TerminalEvent::Exited if terminal.read(cx).keep_on_exit => {
@@ -7780,6 +7789,57 @@ mod tests {
     }
 
     /// A real PTY: type a command, read its output off the grid, exit.
+    #[gpui::test]
+    fn terminal_links_open_the_output_file_and_position(cx: &mut TestAppContext) {
+        let root = fixture("terminal-links");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let path = root.join("src/пример.rs");
+        std::fs::write(&path, "first\nabcdef\n").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let terminal = ws
+            .update_in(cx, |w, window, cx| {
+                w.spawn_terminal(
+                    TerminalCommand {
+                        program: Some("/bin/sh".into()),
+                        args: vec![
+                            "-c".into(),
+                            "printf '\\033[31msrc/пример.rs:2:3\\033[0m\\n'".into(),
+                        ],
+                        cwd: root,
+                        keep_on_exit: true,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        wait_for(cx, "the terminal link", &|cx| {
+            terminal.read(cx).text_position("пример").is_some()
+        });
+        let at = cx.read(|cx| terminal.read(cx).text_position("пример").unwrap());
+        // An ordinary click still selects; only the deliberate link gesture
+        // asks the workspace to open a file.
+        cx.simulate_click(at, gpui::Modifiers::default());
+        assert!(cx.read(|cx| ws.read(cx).active_editor().is_none()));
+        cx.simulate_click(
+            at,
+            gpui::Modifiers {
+                platform: true,
+                ..Default::default()
+            },
+        );
+        wait_for(cx, "the linked file", &|cx| {
+            ws.read(cx).active_editor().is_some()
+        });
+        cx.read(|cx| {
+            let editor = ws.read(cx).active_editor().unwrap().read(cx);
+            assert_eq!(editor.path(cx), Some(path.as_path()));
+            assert_eq!(editor.cursor_position(cx), (2, 3, 1));
+        });
+    }
+
     #[gpui::test]
     fn terminal_runs_commands(cx: &mut TestAppContext) {
         let root = fixture("terminal");

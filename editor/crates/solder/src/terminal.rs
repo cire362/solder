@@ -39,6 +39,7 @@ pub fn bind_keys(cx: &mut App) {
 
 pub enum TerminalEvent {
     TitleChanged,
+    OpenFile(crate::terminal_output::FileLink),
     /// The shell exited; the tab can close.
     Exited,
 }
@@ -92,6 +93,7 @@ pub struct Terminal {
     focus_handle: FocusHandle,
     title: SharedString,
     fixed_title: bool,
+    cwd: PathBuf,
     pub keep_on_exit: bool,
     /// The process has exited; `exit_code` is `None` when a signal ended it.
     pub exited: bool,
@@ -111,6 +113,7 @@ pub struct StartedTerminal {
     title: String,
     fixed_title: bool,
     keep_on_exit: bool,
+    cwd: PathBuf,
 }
 
 impl Terminal {
@@ -167,6 +170,7 @@ impl Terminal {
             title,
             fixed_title,
             keep_on_exit: command.keep_on_exit,
+            cwd: command.cwd,
         })
     }
 
@@ -178,6 +182,7 @@ impl Terminal {
             title,
             fixed_title,
             keep_on_exit,
+            cwd,
         } = started;
         let events = cx.spawn(async move |this, cx| {
             while let Some(first) = rx.next().await {
@@ -206,6 +211,7 @@ impl Terminal {
             title: title.into(),
             fixed_title,
             keep_on_exit,
+            cwd,
             exited: false,
             exit_code: None,
             grid: (80, 24),
@@ -244,6 +250,25 @@ impl Terminal {
             }
         }
         rows.into_iter().map(|r| r.trim_end().to_string()).collect()
+    }
+
+    #[cfg(test)]
+    pub fn text_position(&self, wanted: &str) -> Option<Point<Pixels>> {
+        let bounds = self.last_bounds?;
+        let term = self.term.lock();
+        let offset = term.grid().display_offset() as i32;
+        for row in 0..self.grid.1 {
+            let line = crate::terminal_output::read_line(&*term, Line(row as i32 - offset));
+            let Some(byte) = line.text.find(wanted) else {
+                continue;
+            };
+            let (_, cell) = line.cells.iter().find(|(range, _)| range.contains(&byte))?;
+            return Some(point(
+                bounds.left() + self.cell.0 * (cell.column.0 as f32 + 0.5),
+                bounds.top() + self.cell.1 * ((cell.line.0 + offset) as f32 + 0.5),
+            ));
+        }
+        None
     }
 
     fn handle_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
@@ -366,6 +391,19 @@ impl Terminal {
         let Some((point, side)) = self.cell_at(e.position) else {
             return;
         };
+        if e.modifiers.platform || e.modifiers.control {
+            let found =
+                crate::terminal_output::read_line(&*self.term.lock(), point.line).link_at(point);
+            if let Some(mut link) = found {
+                if link.path.is_relative() {
+                    link.path = self.cwd.join(&link.path);
+                }
+                self.selecting = false;
+                cx.emit(TerminalEvent::OpenFile(link));
+                cx.stop_propagation();
+                return;
+            }
+        }
         let kind = match e.click_count {
             1 => SelectionType::Simple,
             2 => SelectionType::Semantic,
