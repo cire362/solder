@@ -32,7 +32,7 @@ pub use gate::{Event, Refusals};
 pub use icons::IconTheme;
 pub use manifest::{
     Code, Contributed, CustomEditor, Debugger, Extension, Grammar, KeyContribution, Language,
-    MenuItem, Origin, Server, Setting, SnippetFile,
+    MenuItem, NotebookRenderer, Origin, Server, Setting, SnippetFile,
 };
 pub use snippet::Snippet;
 pub use state::State;

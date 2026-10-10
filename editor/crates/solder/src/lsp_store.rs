@@ -18,7 +18,7 @@ use lsp::{Encoding, LanguageServer, Notification, ServerCommand, path_to_uri, ty
 use text::{Buffer, Point};
 
 use crate::{
-    document::{Diagnostic, Document, DocumentEvent, Inlay, Severity},
+    document::{Diagnostic, Document, DocumentEvent, Inlay, Lens, Severity},
     extension_store::ExtensionServer,
     settings::Settings,
 };
@@ -186,6 +186,9 @@ struct DocEntry {
 const HINTS_DEBOUNCE: Duration = Duration::from_millis(300);
 /// A hint longer than this is cut: it is a note in a line, not the line.
 const HINT_CHARS: usize = 60;
+/// How many lenses of a file are asked what they do, of the ones that
+/// come without it: each is a question of its own.
+const LENSES_RESOLVED: usize = 50;
 
 /// A document's place in one server.
 struct Attached {
@@ -234,6 +237,7 @@ fn supports(caps: &lt::ServerCapabilities, method: &str) -> bool {
         "textDocument/rename" => yes(&caps.rename_provider),
         "textDocument/formatting" => yes(&caps.document_formatting_provider),
         "textDocument/inlayHint" => yes(&caps.inlay_hint_provider),
+        "textDocument/codeLens" => caps.code_lens_provider.is_some(),
         "textDocument/codeAction" => !matches!(
             caps.code_action_provider,
             None | Some(lt::CodeActionProviderCapability::Simple(false))
@@ -1250,6 +1254,8 @@ impl LspStore {
             .detach();
         }
 
+        self.ask_lenses(id, &document, version, cx);
+
         let Some(entry) = self.docs.get(&id) else {
             return;
         };
@@ -1653,6 +1659,112 @@ fn sync_kind(caps: &lt::ServerCapabilities) -> lt::TextDocumentSyncKind {
 
 fn position(p: Point) -> lt::Position {
     lt::Position::new(p.row as u32, p.column as u32)
+}
+
+impl LspStore {
+    /// Asks the document's servers what they offer to do with its lines.
+    /// A lens is kept only if a click can do it: its command is one the
+    /// server said it runs, or one of the few the editor does itself
+    /// (`editor_lsp::LENS_COMMANDS`). The others are for the client to do,
+    /// and the client they were written for is another editor.
+    fn ask_lenses(
+        &mut self,
+        id: EntityId,
+        document: &Entity<Document>,
+        version: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self.docs.get(&id) else {
+            return;
+        };
+        let asked = match Settings::get(cx).code_lens {
+            true => self.request_all::<lt::request::CodeLensRequest>(document, cx, |id, _, _| {
+                lt::CodeLensParams {
+                    text_document: id,
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                }
+            }),
+            false => Vec::new(),
+        };
+        if asked.is_empty() {
+            if !document.read(cx).lenses().is_empty() {
+                document.update(cx, |document, cx| document.set_lenses(Vec::new(), cx));
+            }
+            return;
+        }
+        // What each server runs itself, and whether it says later what a
+        // lens does.
+        let servers: HashMap<&'static str, (Vec<String>, bool)> = self
+            .opened(entry)
+            .map(|(name, server)| {
+                let caps = server.capabilities();
+                let runs = caps.execute_command_provider.map(|runs| runs.commands);
+                let later = caps
+                    .code_lens_provider
+                    .and_then(|lens| lens.resolve_provider);
+                (name, (runs.unwrap_or_default(), later == Some(true)))
+            })
+            .collect();
+        let document = document.downgrade();
+        cx.spawn(async move |this, cx| {
+            let mut found = Vec::new();
+            for (name, encoding, request) in asked {
+                let Ok(Some(lenses)) = request.await else {
+                    continue;
+                };
+                let later = servers.get(name).is_some_and(|(_, later)| *later);
+                for (nth, lens) in lenses.into_iter().enumerate() {
+                    let unsaid = lens.command.is_none() && later && nth < LENSES_RESOLVED;
+                    let resolving = unsaid
+                        .then(|| {
+                            let document = document.upgrade()?;
+                            let asked = this.update(cx, |this, _| {
+                                this.server_request::<lt::request::CodeLensResolve>(
+                                    &document,
+                                    name,
+                                    lens.clone(),
+                                )
+                            });
+                            asked.ok().flatten()
+                        })
+                        .flatten();
+                    let lens = match resolving {
+                        Some(resolving) => resolving.await.unwrap_or(lens),
+                        None => lens,
+                    };
+                    found.push((name, encoding, lens));
+                }
+            }
+            document
+                .update(cx, |document, cx| {
+                    if document.version() != version {
+                        return;
+                    }
+                    let buffer = document.text();
+                    let lenses = found
+                        .into_iter()
+                        .filter_map(|(server, encoding, lens)| {
+                            let command = lens.command?;
+                            let (runs, _) = servers.get(server)?;
+                            let known = crate::editor_lsp::LENS_COMMANDS;
+                            let ours = known.contains(&command.command.as_str());
+                            (ours || runs.contains(&command.command)).then(|| Lens {
+                                offset: to_offset(buffer, lens.range.start, encoding),
+                                title: command.title,
+                                server,
+                                encoding,
+                                command: command.command,
+                                arguments: command.arguments.unwrap_or_default(),
+                            })
+                        })
+                        .collect();
+                    document.set_lenses(lenses, cx);
+                })
+                .ok();
+        })
+        .detach();
+    }
 }
 
 /// A hint as it is drawn: its words on one line, with the space the

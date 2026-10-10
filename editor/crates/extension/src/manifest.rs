@@ -171,7 +171,22 @@ pub struct Extension {
     pub page_views: Vec<String>,
     /// The editors it has for kinds of files, which open them as a page.
     pub custom_editors: Vec<CustomEditor>,
+    /// The kinds of notebook it reads: files it opens as a list of cells.
+    /// `view_type` is the kind's name.
+    pub notebooks: Vec<CustomEditor>,
+    pub notebook_renderers: Vec<NotebookRenderer>,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NotebookRenderer {
+    pub id: String,
+    pub name: String,
+    pub entrypoint: PathBuf,
+    pub mimes: Vec<String>,
+    pub messaging: bool,
+}
+
+pub const RENDERER_CODE: &str = "Draw notebook outputs with browser code";
 
 /// An editor of a VS Code extension's for a kind of file: its name for the
 /// user, and the patterns of file names it is for (`*.png`).
@@ -303,7 +318,14 @@ impl Extension {
     /// not run.
     pub fn outside(&self) -> Vec<String> {
         if self.node().is_some() {
-            return vec![NODE_CODE.to_string()];
+            let mut outside = vec![NODE_CODE.to_string()];
+            if !self.notebook_renderers.is_empty() {
+                outside.push(RENDERER_CODE.to_string());
+            }
+            return outside;
+        }
+        if !self.notebook_renderers.is_empty() {
+            return vec![RENDERER_CODE.to_string()];
         }
         if !self.runs_code() {
             return Vec::new();
@@ -704,6 +726,8 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         views: Vec::new(),
         page_views: Vec::new(),
         custom_editors: Vec::new(),
+        notebooks: Vec::new(),
+        notebook_renderers: Vec::new(),
     })
 }
 
@@ -718,6 +742,7 @@ fn wakes(manifest: &Value) -> Vec<String> {
         ("languages", "id", "onLanguage"),
         ("debuggers", "type", "onDebugResolve"),
         ("customEditors", "viewType", "onCustomEditor"),
+        ("notebooks", "type", "onNotebook"),
         ("taskDefinitions", "type", "onTaskType"),
     ] {
         for entry in contributes[list].as_array().into_iter().flatten() {
@@ -835,6 +860,36 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
     };
     let contributes = &manifest["contributes"];
     let list = |key: &str| contributes[key].as_array().cloned().unwrap_or_default();
+    // Its editors for kinds of files, and its kinds of notebook: each
+    // with a name, and the patterns of the file names it is for. A
+    // notebook may say a pattern with what it leaves out, which is not
+    // read: the file is only offered one more way to be opened.
+    let editors = |key: &str, named: &str| -> Vec<CustomEditor> {
+        let editor = |entry: &Value| {
+            let view_type = text(&entry[named]);
+            let patterns: Vec<String> = entry["selector"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|selector| match &selector["filenamePattern"] {
+                    Value::Object(pattern) => pattern.get("include").map(text).unwrap_or_default(),
+                    pattern => text(pattern),
+                })
+                .filter(|pattern| !pattern.is_empty())
+                .collect();
+            let name = label(&text(&entry["displayName"]));
+            (!view_type.is_empty() && !patterns.is_empty()).then(|| CustomEditor {
+                name: if name.is_empty() {
+                    view_type.clone()
+                } else {
+                    name
+                },
+                view_type,
+                patterns,
+            })
+        };
+        list(key).iter().filter_map(editor).collect()
+    };
     let mut missing = Vec::new();
 
     let themes = theme::all_vscode(dir, &manifest, label);
@@ -1197,26 +1252,26 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         keys,
         views,
         page_views,
-        custom_editors: list("customEditors")
+        custom_editors: editors("customEditors", "viewType"),
+        notebooks: editors("notebooks", "type"),
+        notebook_renderers: list("notebookRenderer")
             .iter()
             .filter_map(|entry| {
-                let view_type = text(&entry["viewType"]);
-                let patterns: Vec<String> = entry["selector"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|selector| text(&selector["filenamePattern"]))
-                    .filter(|pattern| !pattern.is_empty())
-                    .collect();
-                let name = label(&text(&entry["displayName"]));
-                (!view_type.is_empty() && !patterns.is_empty()).then(|| CustomEditor {
-                    name: if name.is_empty() {
-                        view_type.clone()
-                    } else {
-                        name
-                    },
-                    view_type,
-                    patterns,
+                let script = entry["entrypoint"]
+                    .as_str()
+                    .or(entry["entrypoint"]["path"].as_str())?;
+                let entrypoint = inside(dir, script)?;
+                let id = text(&entry["id"]);
+                let mimes = strings(&entry["mimeTypes"]);
+                if id.is_empty() || mimes.is_empty() {
+                    return None;
+                }
+                Some(NotebookRenderer {
+                    name: label(&text(&entry["displayName"])),
+                    id,
+                    entrypoint,
+                    mimes,
+                    messaging: entry["requiresMessaging"] == "always",
                 })
             })
             .collect(),
@@ -1306,5 +1361,64 @@ mod tests {
         assert!(opens(&["data-*.v*.json"], "data-1.v22.json"));
         assert!(!opens(&["data-*.v*.json"], "data-1.json"));
         assert!(!opens(&["Makefile"], "/a/Makefile.bak") && !opens(&[], "a.png"));
+    }
+
+    #[test]
+    fn notebook_renderers_are_named_and_their_scripts_stay_in_the_extension() {
+        let dir = crate::testing::scratch("renderer-manifest");
+        crate::testing::write(
+            &dir.join("package.json"),
+            r#"{
+            "name":"render","publisher":"Test","version":"1",
+            "contributes":{"notebookRenderer":[
+                {"id":"inside","displayName":"Widget","entrypoint":"./widget.js","mimeTypes":["application/x-widget"]},
+                {"id":"outside","entrypoint":"../private.js","mimeTypes":["text/html"]}
+            ]}}"#,
+        );
+        let extension = read(&dir).unwrap();
+        assert_eq!(extension.notebook_renderers.len(), 1);
+        assert_eq!(
+            extension.notebook_renderers[0].entrypoint,
+            dir.join("widget.js")
+        );
+        assert_eq!(extension.outside(), [RENDERER_CODE]);
+    }
+
+    #[test]
+    fn a_manifest_names_the_notebooks_it_reads() {
+        let dir =
+            std::env::temp_dir().join(format!("solder-manifest-books-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{ "name": "books", "publisher": "Acme", "version": "1.0.0", "main": "./main.js",
+              "contributes": { "notebooks": [
+                { "type": "rest-book", "displayName": "REST Book", "selector": [{ "filenamePattern": "*.restbook" }] },
+                { "type": "sql-book", "selector": [{ "filenamePattern": { "include": "**/*.sqlnb", "exclude": "**/old/**" } }] },
+                { "type": "no-files", "displayName": "For no file" }
+              ] } }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("main.js"), "").unwrap();
+        let extension = read_vscode(&dir).unwrap();
+        let book = |view_type: &str, name: &str, pattern: &str| CustomEditor {
+            view_type: view_type.into(),
+            name: name.into(),
+            patterns: vec![pattern.into()],
+        };
+        assert_eq!(
+            extension.notebooks,
+            [
+                book("rest-book", "REST Book", "*.restbook"),
+                book("sql-book", "sql-book", "**/*.sqlnb"),
+            ]
+        );
+        assert!(extension.notebooks[1].opens(Path::new("/a/queries.sqlnb")));
+        // Opening one of its kind is something its code is started for.
+        let Code::Node { wakes, .. } = &extension.code else {
+            panic!("no code: {:?}", extension.code);
+        };
+        assert!(wakes.contains(&"onNotebook:rest-book".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

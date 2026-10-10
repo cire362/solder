@@ -104,6 +104,8 @@ pub struct RunExtensionCommand {
 /// The command behind "Open with": Solder's own, given the extension, the
 /// kind of editor and the file.
 const OPEN_WITH: &str = "solder.openWith";
+/// The same for a file an extension reads as a notebook.
+const OPEN_NOTEBOOK: &str = "solder.openNotebook";
 
 /// A command of an extension as a list offers it: what it is called, and
 /// what choosing it does.
@@ -164,20 +166,26 @@ pub struct PickRow {
     pub label: String,
     pub description: String,
     pub detail: String,
+    /// Ticked, in a list where several may be.
+    pub picked: bool,
 }
 
 /// What an extension asks that needs a window.
 pub enum Ask {
-    /// A list to pick one of: the answer is its number.
+    /// A list to pick one of: the answer is its number. With `many`,
+    /// several may be ticked, and the answer is their numbers.
     Pick {
         title: String,
         rows: Vec<PickRow>,
+        many: bool,
         reply: Reply,
     },
-    /// A line to type: the answer is the text.
+    /// A line to type: the answer is the text. A `secret` one is not
+    /// shown as it is typed.
     Input {
         title: String,
         value: String,
+        secret: bool,
         reply: Reply,
     },
     /// A file to bring to the front, at a place in it.
@@ -211,6 +219,12 @@ pub enum Ask {
     },
     Webview {
         key: crate::webview::Key,
+    },
+    /// A file to open as a notebook of a kind an extension reads.
+    Notebook {
+        extension: String,
+        kind: String,
+        path: PathBuf,
     },
 }
 
@@ -277,6 +291,9 @@ struct Followed {
 pub struct Api {
     pub(crate) webviews: BTreeMap<crate::webview::Key, crate::webview::Model>,
     pub(crate) web_posts: BTreeMap<crate::webview::Key, VecDeque<(Value, Reply)>>,
+    /// The notebooks that are open: the extension that reads each, where
+    /// its file is, and its tab, which hears what the extension says.
+    notebooks: Vec<(String, String, WeakEntity<crate::notebook::Notebook>)>,
     pub(crate) files: crate::extension_decorations::Files,
     pub(crate) views: BTreeMap<(String, String), crate::extension_views::View>,
     /// The windows' workspaces and their folders, the one in front first.
@@ -303,7 +320,7 @@ pub struct Api {
     keys: String,
 }
 
-fn uri(path: &Path) -> String {
+pub(crate) fn uri(path: &Path) -> String {
     lsp::path_to_uri(path).to_string()
 }
 
@@ -368,6 +385,41 @@ impl ExtensionStore {
     fn tell(&self, method: &str, params: Value) {
         for host in self.hosts() {
             host.notify(method, params.clone());
+        }
+    }
+
+    /// Says something to one extension, if its code runs.
+    pub(crate) fn tell_host(&self, extension: &str, method: &str, params: Value) {
+        if let Some(host) = self.code.get(extension).and_then(|code| code.host.as_ref()) {
+            host.notify(method, params);
+        }
+    }
+
+    pub(crate) fn notebook_opened(
+        &mut self,
+        extension: &str,
+        uri: &str,
+        notebook: WeakEntity<crate::notebook::Notebook>,
+    ) {
+        let open = &mut self.api.notebooks;
+        open.retain(|(_, _, known)| known.upgrade().is_some());
+        open.push((extension.to_string(), uri.to_string(), notebook));
+    }
+
+    pub(crate) fn notebook_closed(&mut self, extension: &str, uri: &str) {
+        let open = &mut self.api.notebooks;
+        open.retain(|(of, at, _)| of != extension || at != uri);
+    }
+
+    /// What an extension said of a notebook goes to its tab: of one
+    /// notebook where it names one, of all its notebooks where it does not.
+    fn notebook_said(&mut self, id: &str, method: &str, params: Value, cx: &mut Context<Self>) {
+        let about = params["uri"].as_str();
+        let open = self.api.notebooks.iter();
+        let mine = open.filter(|(of, uri, _)| of == id && about.is_none_or(|about| about == uri));
+        let heard: Vec<_> = mine.filter_map(|(_, _, tab)| tab.upgrade()).collect();
+        for notebook in heard {
+            notebook.update(cx, |notebook, cx| notebook.heard(method, &params, cx));
         }
     }
 
@@ -473,6 +525,26 @@ impl ExtensionStore {
                     }
                 })
                 .detach();
+                Some(Ok(Value::Null))
+            }
+            // A file opened as a notebook: a tab of cells, which starts
+            // the code that reads it.
+            OPEN_NOTEBOOK => {
+                let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+                let (extension, kind) = (text(&args[0]), text(&args[1]));
+                let file = match &args[2]["$uri"] {
+                    Value::Null => &args[2],
+                    uri => uri,
+                };
+                let Some(path) = path_of(file) else {
+                    return Some(Err("Only files can be opened".into()));
+                };
+                let ask = Ask::Notebook {
+                    extension,
+                    kind,
+                    path,
+                };
+                self.ask(ask, cx);
                 Some(Ok(Value::Null))
             }
             "workbench.action.files.saveAll" => {
@@ -808,6 +880,18 @@ impl ExtensionStore {
         self.clear_extension_decorations(id, cx);
         self.api.views.retain(|(owner, _), _| owner != id);
         cx.emit(ExtensionEvent::Views);
+        // Its notebooks stay open with what is in them, and say that
+        // nothing runs or saves them now.
+        let open = self.api.notebooks.iter();
+        let mine = open.filter(|(owner, _, _)| owner == id);
+        let left: Vec<_> = mine.filter_map(|(_, _, tab)| tab.upgrade()).collect();
+        // Said once this is done with: a notebook may be what asked for
+        // the code that could not be started.
+        cx.defer(move |cx| {
+            for notebook in left {
+                notebook.update(cx, |notebook, cx| notebook.host_gone(cx));
+            }
+        });
         let (status, progress) = (self.api.status.len(), self.api.progress.len());
         self.api.status.retain(|(of, _), _| of != id);
         self.api.progress.retain(|(of, _), _| of != id);
@@ -932,6 +1016,21 @@ impl ExtensionStore {
                     action: RunExtensionCommand {
                         command: OPEN_WITH.into(),
                         args: json!([extension.id, editor.view_type, { "$uri": uri(path) }]),
+                        when: None,
+                    },
+                    keyed: None,
+                });
+            }
+            // And the kinds of notebook it reads a file of this name as.
+            for notebook in &extension.notebooks {
+                let Some(path) = target.filter(|path| notebook.opens(path)) else {
+                    continue;
+                };
+                offered.push(Offered {
+                    title: format!("Open with {}", notebook.name),
+                    action: RunExtensionCommand {
+                        command: OPEN_NOTEBOOK.into(),
+                        args: json!([extension.id, notebook.view_type, { "$uri": uri(path) }]),
                         when: None,
                     },
                     keyed: None,
@@ -1109,6 +1208,9 @@ impl ExtensionStore {
                 self.decoration_said(id, method, params, cx)
             }
             "view" | "view.changed" => self.view_said(id, method, params, cx),
+            "notebook.outputs" | "notebook.run" | "notebook.runners" | "notebook.saved" => {
+                self.notebook_said(id, method, params, cx)
+            }
             // An answer of the language server its host is, or something
             // that server says on its own.
             "lsp" => {
@@ -1331,7 +1433,16 @@ impl ExtensionStore {
                     Some(detail) if !detail.is_empty() => format!("{said} {detail}"),
                     _ => said,
                 };
-                self.ask(Ask::Pick { title, rows, reply }, cx);
+                let many = false;
+                self.ask(
+                    Ask::Pick {
+                        title,
+                        rows,
+                        many,
+                        reply,
+                    },
+                    cx,
+                );
             }
             "pick" => {
                 let rows = params["items"]
@@ -1342,6 +1453,7 @@ impl ExtensionStore {
                         label: text(&item["label"]),
                         description: text(&item["description"]),
                         detail: text(&item["detail"]),
+                        picked: item["picked"] == true,
                     })
                     .collect();
                 let title = [&params["placeholder"], &params["title"]]
@@ -1349,7 +1461,16 @@ impl ExtensionStore {
                     .map(text)
                     .find(|title| !title.is_empty())
                     .unwrap_or_else(|| "Pick one".into());
-                self.ask(Ask::Pick { title, rows, reply }, cx);
+                let many = params["many"] == true;
+                self.ask(
+                    Ask::Pick {
+                        title,
+                        rows,
+                        many,
+                        reply,
+                    },
+                    cx,
+                );
             }
             "input" => {
                 let title = [&params["prompt"], &params["placeholder"], &params["title"]]
@@ -1358,10 +1479,12 @@ impl ExtensionStore {
                     .find(|title| !title.is_empty())
                     .unwrap_or_else(|| "Type a value".into());
                 let value = text(&params["value"]);
+                let secret = params["password"] == true;
                 self.ask(
                     Ask::Input {
                         title,
                         value,
+                        secret,
                         reply,
                     },
                     cx,

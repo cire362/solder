@@ -45,6 +45,7 @@ mod import_view;
 mod indent;
 mod inline_completion;
 mod inline_edit;
+mod ipynb;
 mod key_layout;
 mod key_layout_picker;
 mod key_prompts;
@@ -53,6 +54,7 @@ mod layout_picker;
 mod locations;
 mod lsp_store;
 mod mcp_store;
+mod notebook;
 mod perf;
 mod picker;
 mod plugin_store;
@@ -113,6 +115,9 @@ fn main() {
     // Read the file before the window exists, so the first frame is already
     // an editable file rather than an empty workspace.
     let initial = file.and_then(|path| {
+        if path.extension().is_some_and(|ext| ext == "ipynb") {
+            return Some((path, String::new()));
+        }
         let bytes = std::fs::read(&path).ok()?;
         Some((path, String::from_utf8_lossy(&bytes).into_owned()))
     });
@@ -180,9 +185,14 @@ pub fn open_workspace_window(
             let workspace = cx.new(|cx| Workspace::new(root, window, cx));
             if let Some((path, content)) = initial {
                 workspace.update(cx, |w, cx| {
-                    w.add_editor(Some(path), &content, None, window, cx)
+                    if path.extension().is_some_and(|ext| ext == "ipynb") {
+                        w.open_path(path, None, window, cx);
+                    } else {
+                        w.add_editor(Some(path), &content, None, window, cx);
+                    }
                 });
             }
+            workspace.update(cx, |w, cx| w.start_session(window, cx));
             workspace
         },
     )

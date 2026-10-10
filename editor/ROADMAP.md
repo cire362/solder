@@ -245,16 +245,16 @@ to build them.
 - [x] The API every extension starts from: commands, messages, pickers and
       input boxes, status bar items, output channels, configuration, the
       workspace's folders and files, open documents, their edits and events.
-      Lists pick one, and there is one visible editor, the file in front
+      There is one visible editor, the file in front
 - [x] Language features: the providers for completion, hover, definition,
       references, rename, formatting, code actions, symbols, semantic tokens,
       inlay hints and code lenses, and diagnostic collections. This is what
       `vscode-languageclient` is built on, so it carries most language
       extensions (and Prettier and ESLint). The host answers the editor as
       a language server does. Inlay hints and semantic colors were added
-      to the editor for this, for every server; a code lens is among the
-      code actions of its line. Not tried against a published extension
-      yet: that is the release check below
+      to the editor for this, for every server, and so was the code lens:
+      at the end of its line, run by a click. Not tried against a
+      published extension yet: that is the release check below
 - [x] Commands, menus and key bindings an extension contributes, in the
       palette and the keymap. Menus: the editor's (`editor/context`), which
       Solder had none of, and the file tree's (`explorer/context`).
@@ -264,9 +264,10 @@ to build them.
       reached at a local port; a launch by name and adapters on named
       pipes are not there
 - [x] Tasks, terminals and file watching. Terminals are the dock's own; a
-      task is a command in one, listed by **Run extension task**. Not
-      there: terminals and tasks that are the extension's own code (`pty`,
-      `CustomExecution`), and problem matchers
+      task is a command in one, listed by **Run extension task**. A
+      terminal or a task that is the extension's own code (`pty`,
+      `CustomExecution`) runs a relay in such a terminal. Not there:
+      problem matchers
 - [x] Source control providers, views in the sidebar (trees), decorations and
       test controllers. **Show extension views** opens native lists in any
       dock: open branches lazily, run commands, edit source-control input,
@@ -279,17 +280,23 @@ to build them.
       (and `gtk` on Linux; agreed on 2026-10-10). A page of an extension is
       a tab, a view that is a page opens as one, and an editor of an
       extension's for a kind of file is offered as **Open with**. The
-      browser is made when the first page opens. Not there: notebooks
-      (left out, as phase 10 says), pages kept across restarts, pages on
-      Wayland
+      browser is made when the first page opens. A notebook is not a
+      page: a tab of cells drawn by Solder, each cell an editor, with the
+      words and pictures its run put out under it; the extension reads,
+      runs and writes it. Pages return through their serializer. HTML output
+      and allowed notebook renderer modules open on demand in a separate tab.
+      Not there: pages on Wayland, Jupyter kernels and the ipywidgets protocol.
+      Format 4 `.ipynb` files are read and saved by the editor, with metadata,
+      attachments and outputs preserved
 - [x] A check that runs with each release: the most installed extensions of
       Open VSX are installed, activated and asked for their main feature, and
       the result is the list of what works. `extension-census`, run by the
       **Extensions of Open VSX** workflow on a release or by hand; tested
-      against a catalog served locally. It has not been run against Open
-      VSX itself yet: it runs the code of third parties, so its first list
-      is the first run of the workflow, not something made on a
-      developer's machine
+      against a catalog served locally. An exact extension version can be
+      selected; notebook readers are asked to read, edit and save a sample
+      `.ipynb`. The published `vscode.ipynb@1.95.3` reader has been checked on
+      a disposable CI runner. Its activation, reading and saving passed;
+      this does not check a Jupyter kernel or every notebook feature
 
 ### What will not run
 Not tasks, but said so nobody waits for them: slash commands of Zed
@@ -394,8 +401,9 @@ update. They come after phase 9, in this order unless one is needed sooner.
 ### The editor
 - [ ] Folding of blocks, indent guides, lines wrapped at the window's edge
 - [ ] Selection by column (a rectangle of cursors)
-- [ ] Tabs and cursors restored when a project is opened again; pinned tabs;
-      the tab closed last opened again (`cmd-shift-t`)
+- [ ] Pinned tabs; the tab closed last opened again (`cmd-shift-t`). Tabs,
+      split panes, cursors and scroll positions now return per project,
+      along with notebooks and pages whose extensions provide a serializer
 - [ ] Unsaved text kept aside as it is typed and offered back after a crash
 - [ ] Line endings and encoding of a file kept as they were; files too large
       to edit opened for reading, with the reason said
@@ -442,7 +450,7 @@ update. They come after phase 9, in this order unless one is needed sooner.
 - [ ] Dev containers: `devcontainer.json`, with terminals, services and the
       agent inside
 
-Left out on purpose: notebooks, a list of servers and deploys (far from an
+Left out on purpose: a list of servers and deploys (far from an
 editor for what they cost), settings synced through a folder (they are files
 already), and moving data over from an Electron version (there is none).
 Accessibility through the system's own tree and installers with updates

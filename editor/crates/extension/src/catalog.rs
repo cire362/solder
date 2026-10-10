@@ -255,6 +255,32 @@ async fn json(url: &str) -> Result<Value, String> {
     serde_json::from_slice(&body).map_err(|_| "The catalog's answer is not JSON".to_string())
 }
 
+/// A pinned Open VSX version, so a compatibility check is reproducible.
+pub fn version(
+    base: &str,
+    id: &str,
+    version: &str,
+) -> impl Future<Output = Result<Entry, String>> + Send + 'static {
+    let (base, id, version) = (
+        base.trim_end_matches('/').to_string(),
+        id.to_string(),
+        version.to_string(),
+    );
+    let handle = runtime().spawn(async move {
+        if !valid_id(&id) || !valid_id(&version) {
+            return Err("Invalid extension id or version".into());
+        }
+        let (namespace, name) = id.split_once('.').ok_or("An extension needs a namespace")?;
+        let answer = json(&format!("{base}/api/{namespace}/{name}/{version}")).await?;
+        let entry = open_vsx_entry(&answer).ok_or("This version has no download")?;
+        if entry.version != version || !entry.id.eq_ignore_ascii_case(&id) {
+            return Err("The catalog answered with a different extension version".into());
+        }
+        Ok(entry)
+    });
+    async move { handle.await.map_err(|e| e.to_string())? }
+}
+
 /// The newest version the catalog at `base` has of each of `ids`, to compare
 /// with what is installed. Zed's answers for all in one request; Open VSX
 /// is asked for each, and one it does not have is left out. The future can

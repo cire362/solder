@@ -61,6 +61,8 @@ TAG = os.environ.get("MOCK_LSP_TAG", "")
 ASKS_TSSERVER = bool(os.environ.get("MOCK_LSP_ASKS_TSSERVER"))
 # Started with --hints, the server also draws into the text: a hint after
 # the name of every function, and a color for every `helper` and `TODO`.
+# And it offers two things to do with the line of every function: one it
+# runs itself, said only when asked, and one it leaves to the editor.
 HINTS = "--hints" in sys.argv
 
 
@@ -125,6 +127,7 @@ while True:
             "signatureHelpProvider": {"triggerCharacters": ["("], "retriggerCharacters": [","]},
             **({
                 "inlayHintProvider": True,
+                "codeLensProvider": {"resolveProvider": True},
                 "semanticTokensProvider": {
                     "legend": {"tokenTypes": ["function", "comment", "somethingElse"], "tokenModifiers": []},
                     "full": True,
@@ -177,6 +180,36 @@ while True:
             })
             at = text.find("fn ", end)
         send({"jsonrpc": "2.0", "id": mid, "result": hints})
+    elif method == "textDocument/codeLens":
+        uri = params["textDocument"]["uri"]
+        text = docs[uri]
+        lenses = []
+        at = text.find("fn ")
+        while at >= 0:
+            start = position(text, len(text[:at].encode()))
+            lenses.append({"range": {"start": start, "end": start}, "data": uri})
+            lenses.append({"range": {"start": start, "end": start},
+                           "command": {"title": "Run in the editor", "command": "mock.client"}})
+            at = text.find("fn ", at + 3)
+        # And two the editor does itself, where a line says TODO: places
+        # to show, and something to run in a terminal.
+        todo = text.find("TODO")
+        if todo >= 0:
+            start = position(text, len(text[:todo].encode()))
+            here = {"start": start, "end": start}
+            first = {"line": 0, "character": 0}
+            lenses.append({"range": here, "command": {
+                "title": "2 places", "command": "editor.action.showReferences",
+                "arguments": [uri, start, [{"uri": uri, "range": {"start": first, "end": first}},
+                                           {"uri": uri, "range": here}]]}})
+            lenses.append({"range": here, "command": {
+                "title": "Run", "command": "rust-analyzer.runSingle",
+                "arguments": [{"label": "lens run", "kind": "shell", "args": {
+                    "program": "/bin/sh", "args": ["-c", "echo lens-$((40+2))"]}}]}})
+        send({"jsonrpc": "2.0", "id": mid, "result": lenses})
+    elif method == "codeLens/resolve":
+        params["command"] = {"title": "Touch", "command": "mock.touch", "arguments": [params["data"]]}
+        send({"jsonrpc": "2.0", "id": mid, "result": params})
     elif method == "textDocument/semanticTokens/full":
         text = docs[params["textDocument"]["uri"]]
         data = []

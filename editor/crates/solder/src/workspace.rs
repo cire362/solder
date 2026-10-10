@@ -208,6 +208,9 @@ struct Tab {
     _subscriptions: [Subscription; 2],
 }
 
+#[path = "session.rs"]
+mod session;
+
 /// A column of tabs. The workspace lays panes out left to right.
 #[derive(Default)]
 struct Pane {
@@ -226,6 +229,10 @@ impl Pane {
 pub struct Workspace {
     web_pages: Vec<(Entity<crate::webview::Page>, Subscription)>,
     web_front: Option<(Entity<crate::webview::Page>, usize)>,
+    /// Files open as notebooks, each a tab, and the one in front with the
+    /// pane it is shown in. A page and a notebook are never both in front.
+    notebooks: Vec<(Entity<crate::notebook::Notebook>, Subscription)>,
+    notebook_front: Option<(Entity<crate::notebook::Notebook>, usize)>,
     focus_handle: FocusHandle,
     project: Entity<Project>,
     project_panel: Entity<ProjectPanel>,
@@ -272,6 +279,9 @@ pub struct Workspace {
     panes: Vec<Pane>,
     active_pane: usize,
     recent: VecDeque<Arc<str>>,
+    session_writer: Option<session::Writer>,
+    _session_tick: Option<Task<()>>,
+    restoring: bool,
     /// The panel each dock shows; `None` for a dock that is closed. Which
     /// dock a panel is in is the layout's to say.
     left: Option<Panel>,
@@ -744,6 +754,8 @@ impl Workspace {
         let mut this = Self {
             web_pages: Vec::new(),
             web_front: None,
+            notebooks: Vec::new(),
+            notebook_front: None,
             focus_handle: cx.focus_handle(),
             project,
             project_panel,
@@ -752,6 +764,9 @@ impl Workspace {
             panes: vec![Pane::default()],
             active_pane: 0,
             recent: VecDeque::new(),
+            session_writer: None,
+            _session_tick: None,
+            restoring: false,
             left,
             right,
             bottom,
@@ -810,7 +825,7 @@ impl Workspace {
     }
 
     pub(crate) fn active_editor(&self) -> Option<&Entity<Editor>> {
-        if self.web_front.is_some() {
+        if self.web_front.is_some() || self.notebook_front.is_some() {
             return None;
         }
         self.panes
@@ -869,6 +884,9 @@ impl Workspace {
                     always_list,
                 } => {
                     this.open_locations(title.clone(), locations.clone(), *always_list, window, cx)
+                }
+                EditorEvent::RunInTerminal(command) => {
+                    this.spawn_terminal_with(command.clone(), true, window, cx);
                 }
                 EditorEvent::RenameRequested { current } => {
                     let prompt = RenamePrompt::new(editor.clone(), current.clone());
@@ -960,6 +978,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if path.extension().is_some_and(|ext| ext == "ipynb") {
+            self.open_notebook(path, String::new(), "jupyter-notebook".into(), window, cx);
+            return;
+        }
         self.close_file_diff(window, cx);
         let pane = &self.panes[self.active_pane];
         if let Some(ix) = pane
@@ -1010,6 +1032,7 @@ impl Workspace {
         };
         let editor = tab.editor.clone();
         self.web_front = None;
+        self.leave_notebook(cx);
         if self
             .inline_edit
             .as_ref()
@@ -1039,6 +1062,10 @@ impl Workspace {
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((page, _)) = self.web_front.clone() {
             self.close_webview(&page, window, cx);
+            return;
+        }
+        if let Some((notebook, _)) = self.notebook_front.clone() {
+            self.close_notebook(&notebook, window, cx);
             return;
         }
         if self.file_diff.is_some() {
@@ -1133,13 +1160,28 @@ impl Workspace {
             .into_iter()
             .filter(|d| d.read(cx).is_dirty())
             .collect();
-        if dirty.is_empty() {
+        // Notebooks with changes are asked about with the files.
+        let open = self.notebooks.iter().map(|(notebook, _)| notebook);
+        let books: Vec<Entity<crate::notebook::Notebook>> = open
+            .filter(|notebook| notebook.read(cx).is_dirty())
+            .cloned()
+            .collect();
+        if dirty.is_empty() && books.is_empty() {
+            if self.session_writer.is_some() {
+                let saved = self.keep_session(cx);
+                cx.spawn_in(window, async move |_, cx| {
+                    saved.await;
+                    cx.update(|window, _| window.remove_window()).ok();
+                })
+                .detach();
+                return false;
+            }
             return true;
         }
-        let message = if dirty.len() == 1 {
-            format!("Save changes to {}?", dirty[0].read(cx).title())
-        } else {
-            format!("Save changes to {} files?", dirty.len())
+        let message = match (dirty.as_slice(), books.as_slice()) {
+            ([one], []) => format!("Save changes to {}?", one.read(cx).title()),
+            ([], [one]) => format!("Save changes to {}?", one.read(cx).title()),
+            _ => format!("Save changes to {} files?", dirty.len() + books.len()),
         };
         let answer = window.prompt(
             PromptLevel::Warning,
@@ -1160,10 +1202,14 @@ impl Workspace {
                                     .cloned()
                             })
                             .collect();
-                        editors
+                        let mut saving = editors
                             .iter()
                             .map(|e| this.save_editor(e, window, cx))
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<_>>();
+                        for book in &books {
+                            saving.push(book.update(cx, |book, cx| book.save(cx)));
+                        }
+                        saving
                     }) else {
                         return;
                     };
@@ -1177,6 +1223,10 @@ impl Workspace {
                 _ => false,
             };
             if close {
+                let saved = this.update(cx, |this, cx| this.keep_session(cx));
+                if let Ok(saved) = saved {
+                    saved.await;
+                }
                 this.update_in(cx, |this, window, cx| {
                     // Nothing left to ask about; close for real.
                     this.panes = vec![Pane::default()];
@@ -4081,19 +4131,31 @@ impl Workspace {
             };
             match ask {
                 Ask::Webview { key } => self.open_webview(key, window, cx),
-                Ask::Pick { title, rows, reply } => {
-                    self.toggle_modal(window, cx, move |window, cx| {
-                        let pick = crate::extension_ask::AskPick::new(title, rows, reply);
-                        Picker::new(pick, window, cx)
-                    })
-                }
+                Ask::Notebook {
+                    extension,
+                    kind,
+                    path,
+                } => self.open_notebook(path, extension, kind, window, cx),
+                Ask::Pick {
+                    title,
+                    rows,
+                    many,
+                    reply,
+                } => self.toggle_modal(window, cx, move |window, cx| {
+                    let pick = crate::extension_ask::AskPick::new(title, rows, many, reply);
+                    Picker::new(pick, window, cx)
+                }),
                 Ask::Input {
                     title,
                     value,
+                    secret,
                     reply,
                 } => self.toggle_modal(window, cx, move |window, cx| {
                     let input = crate::extension_ask::AskInput::new(title, reply);
                     let mut picker = Picker::new(input, window, cx);
+                    if secret {
+                        picker.mask(cx);
+                    }
                     if !value.is_empty() {
                         picker.set_query(&value, cx);
                     }
@@ -4214,8 +4276,238 @@ impl Workspace {
             page
         });
         self.close_file_diff(window, cx);
+        self.leave_notebook(cx);
         self.web_front = Some((page, self.active_pane));
+        window.focus(&self.focus_handle);
         self.sync_webviews(cx);
+    }
+
+    /// Opens a file as a notebook of a kind an extension reads: a tab of
+    /// cells, next to the tabs of files.
+    fn open_notebook(
+        &mut self,
+        path: PathBuf,
+        extension: String,
+        kind: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::notebook::{Notebook, NotebookEvent};
+        let mut open = self.notebooks.iter().map(|(notebook, _)| notebook);
+        let known = open
+            .find(|notebook| notebook.read(cx).is(&path, &extension, &kind))
+            .cloned();
+        let notebook = known.unwrap_or_else(|| {
+            let notebook = cx.new(|cx| Notebook::open(path, extension, kind, cx));
+            let events = cx.subscribe_in(
+                &notebook,
+                window,
+                |this, _, event, window, cx| match event {
+                    NotebookEvent::Changed => cx.notify(),
+                    NotebookEvent::Output {
+                        title,
+                        uri,
+                        items,
+                        renderer,
+                    } => {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static NEXT: AtomicU64 = AtomicU64::new(0);
+                        let owner = renderer
+                            .as_ref()
+                            .map(|renderer| renderer.0.as_str())
+                            .unwrap_or("solder.notebook");
+                        let key = (
+                            owner.to_string(),
+                            format!("output{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+                        );
+                        let model = crate::webview::notebook_output(
+                            (title, uri, &key.1),
+                            items,
+                            renderer
+                                .as_ref()
+                                .map(|renderer| (renderer.1.as_path(), &renderer.2)),
+                            cx,
+                        );
+                        if let (Some(model), Some(store)) = (model, ExtensionStore::try_global(cx))
+                        {
+                            let activate = store.update(cx, |store, cx| {
+                                store.api.webviews.insert(key.clone(), model);
+                                (renderer.is_some()
+                                    && store
+                                        .find(extension::Origin::VsCode, owner)
+                                        .is_some_and(|extension| extension.node().is_some()))
+                                .then(|| {
+                                    store.ask_host(
+                                        owner,
+                                        "notebook.renderer.activate",
+                                        serde_json::json!({}),
+                                        cx,
+                                    )
+                                })
+                            });
+                            if let Some(activate) = activate {
+                                // The page can send its first message immediately.
+                                // Its extension must be listening before it is drawn.
+                                cx.spawn_in(window, async move |this, cx| {
+                                    let _ = activate.await;
+                                    let _ = this.update_in(cx, |this, window, cx| {
+                                        this.open_webview(key, window, cx)
+                                    });
+                                })
+                                .detach();
+                            } else {
+                                this.open_webview(key, window, cx);
+                            }
+                        }
+                    }
+                },
+            );
+            self.notebooks.push((notebook.clone(), events));
+            notebook
+        });
+        self.show_notebook(notebook, self.active_pane, window, cx);
+    }
+
+    fn show_notebook(
+        &mut self,
+        notebook: Entity<crate::notebook::Notebook>,
+        pane: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_file_diff(window, cx);
+        self.leave_notebook(cx);
+        self.web_front = None;
+        notebook.read(cx).fronted(true, cx);
+        notebook.read(cx).focus(window, cx);
+        self.notebook_front = Some((notebook, pane));
+        cx.notify();
+    }
+
+    /// Something else takes the place of the notebook in front.
+    fn leave_notebook(&mut self, cx: &App) {
+        if let Some((notebook, _)) = self.notebook_front.take() {
+            notebook.read(cx).fronted(false, cx);
+        }
+    }
+
+    fn close_notebook(
+        &mut self,
+        notebook: &Entity<crate::notebook::Notebook>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !notebook.read(cx).is_dirty() {
+            self.remove_notebook(notebook, window, cx);
+            return;
+        }
+        let name = notebook.read(cx).title();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Save changes to {name}?"),
+            Some("Your changes will be lost if you don't save them."),
+            &["Save", "Don't Save", "Cancel"],
+            cx,
+        );
+        let notebook = notebook.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let close = match answer.await.ok() {
+                Some(0) => match notebook.update(cx, |notebook, cx| notebook.save(cx)) {
+                    Ok(saved) => saved.await,
+                    Err(_) => false,
+                },
+                Some(1) => true,
+                _ => false,
+            };
+            if close {
+                this.update_in(cx, |this, window, cx| {
+                    this.remove_notebook(&notebook, window, cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn remove_notebook(
+        &mut self,
+        notebook: &Entity<crate::notebook::Notebook>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        notebook.update(cx, |notebook, cx| notebook.closed(cx));
+        let front = self.notebook_front.as_ref();
+        if front.is_some_and(|(front, _)| front == notebook) {
+            self.notebook_front = None;
+            if let Some(editor) = self.active_editor() {
+                window.focus(&editor.focus_handle(cx));
+            } else {
+                window.focus(&self.focus_handle);
+            }
+        }
+        self.notebooks.retain(|(known, _)| known != notebook);
+        cx.notify();
+    }
+
+    fn notebook_tabs(&self, pane: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let theme = cx.theme().clone();
+        self.notebooks
+            .iter()
+            .enumerate()
+            .map(|(ix, (notebook, _))| {
+                let front = self.notebook_front.as_ref();
+                let selected = front.is_some_and(|(active, _)| active == notebook);
+                let (title, dirty) = {
+                    let notebook = notebook.read(cx);
+                    (notebook.title(), notebook.is_dirty())
+                };
+                let (activate, close) = (notebook.clone(), notebook.clone());
+                div()
+                    .id(("notebook-tab", ix))
+                    .debug_selector(move || format!("notebook-tab-{ix}"))
+                    .flex_none()
+                    .h(px(26.))
+                    .max_w(px(260.))
+                    .pl_3()
+                    .pr_1p5()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .rounded(theme.shape.control)
+                    .text_size(UI_FONT_SIZE)
+                    .text_color(if selected { theme.fg } else { theme.fg_subtle })
+                    .when(selected, |d| {
+                        d.bg(theme.bg_elev)
+                            .border(theme.shape.border)
+                            .border_color(theme.line)
+                    })
+                    .hover(|d| d.text_color(theme.fg))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.show_notebook(activate.clone(), pane, window, cx);
+                    }))
+                    .child(crate::icons::draw("code"))
+                    .child(div().min_w_0().truncate().child(title))
+                    .child(
+                        div()
+                            .id(("notebook-close", ix))
+                            .debug_selector(move || format!("notebook-close-{ix}"))
+                            .flex_none()
+                            .size(px(16.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(theme.shape.token)
+                            .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                            .child(if dirty { "●" } else { "×" })
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.close_notebook(&close, window, cx);
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect()
     }
 
     fn close_webview(
@@ -4225,13 +4517,22 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let key = page.read(cx).key.clone();
+        let notebook_uri = page.read(cx).model.notebook_uri.clone();
         page.update(cx, |page, _| page.show(false));
         self.web_front = None;
         self.web_pages.retain(|(known, _)| known != page);
         if let Some(store) = ExtensionStore::try_global(cx) {
             store.update(cx, |store, cx| store.close_webview(&key, cx));
         }
-        if let Some(editor) = self.active_editor() {
+        let notebook = notebook_uri.and_then(|uri| {
+            self.notebooks
+                .iter()
+                .find(|(book, _)| crate::extension_api::uri(&book.read(cx).path) == uri)
+                .map(|(book, _)| book.clone())
+        });
+        if let Some(notebook) = notebook {
+            self.show_notebook(notebook, self.active_pane, window, cx);
+        } else if let Some(editor) = self.active_editor() {
             window.focus(&editor.focus_handle(cx));
         } else {
             window.focus(&self.focus_handle);
@@ -4291,6 +4592,7 @@ impl Workspace {
                     })
                     .hover(|d| d.text_color(theme.fg))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.leave_notebook(cx);
                         this.web_front = Some((activate.clone(), pane));
                         // Keys go to the page that was chosen.
                         activate.read(cx).focus();
@@ -4648,7 +4950,9 @@ impl Workspace {
                     .path()
                     .and_then(|path| crate::file_icons::file(path, cx));
                 let dirty = doc.is_dirty();
-                let active = pane.active == Some(ix) && self.web_front.is_none();
+                let active = pane.active == Some(ix)
+                    && self.web_front.is_none()
+                    && self.notebook_front.is_none();
                 let close_editor = editor.clone();
                 let middle_editor = editor.clone();
                 div()
@@ -4716,6 +5020,7 @@ impl Workspace {
             .collect();
         if p == self.active_pane {
             tabs.extend(self.webview_tabs(p, cx));
+            tabs.extend(self.notebook_tabs(p, cx));
         }
         let TabBar {
             height,
@@ -4776,6 +5081,10 @@ impl Workspace {
                             && *page_pane == p
                         {
                             d.child(page.clone())
+                        } else if let Some((notebook, pane)) = &self.notebook_front
+                            && *pane == p
+                        {
+                            d.child(notebook.clone())
                         } else {
                             match pane.active_editor() {
                                 Some(editor) => d.child(editor.clone()),
@@ -4952,6 +5261,9 @@ impl Workspace {
     fn front_title(&self, cx: &App) -> String {
         if let Some((page, _)) = &self.web_front {
             return page.read(cx).model.title.clone();
+        }
+        if let Some((notebook, _)) = &self.notebook_front {
+            return notebook.read(cx).title();
         }
         self.structure
             .as_ref()
@@ -6283,6 +6595,123 @@ mod tests {
         cx.update(|_, cx| cx.set_global(with(false, false)));
         cx.simulate_input(" ");
         wait_for(cx, "the colors to go", &|cx| drawn(cx).1.is_empty());
+    }
+
+    /// What a server offers to do with a line is said above it,
+    /// and a click does it. Against `tests/fixtures/mock_lsp.py --hints`.
+    #[gpui::test]
+    fn a_lens_is_above_its_line_and_a_click_runs_it(cx: &mut TestAppContext) {
+        let root = fixture("lsp-lens");
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        let file = root.join("src/main.rs");
+        std::fs::write(&file, "fn helper() {}\n// TODO fix\n").unwrap();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let with = |lenses: bool| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "rust-analyzer".into(),
+                settings::ServerOverride {
+                    command: Some("python3".into()),
+                    args: Some(vec![script.display().to_string(), "--hints".into()]),
+                    ..Default::default()
+                },
+            );
+            settings.code_lens = lenses;
+            settings
+        };
+        cx.update(|_, cx| cx.set_global(with(true)));
+        ws.update_in(cx, |w, window, cx| {
+            let content = std::fs::read_to_string(&file).unwrap();
+            w.add_editor(Some(file.clone()), &content, None, window, cx)
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let lenses = |cx: &App| (**editor.read(cx).doc(cx).lenses()).clone();
+        let drawn = |row: usize, cx: &App| {
+            let layout = editor.read(cx).layout.as_ref()?;
+            layout.lens_middle(row, 0)
+        };
+
+        // Of the two the server offers for the line, the one it runs
+        // itself, which it named only when asked. The other is for the
+        // editor to run, and a click on it could do nothing.
+        wait_for(cx, "the lens", &|cx| !lenses(cx).is_empty());
+        let found = cx.read(|cx| lenses(cx));
+        assert_eq!(found.len(), 3, "{found:?}");
+        let lens = &found[0];
+        assert_eq!(
+            (lens.offset, lens.title.as_str(), lens.command.as_str()),
+            (0, "Touch", "mock.touch")
+        );
+        assert_eq!((lens.server, lens.arguments.len()), ("rust-analyzer", 1));
+
+        // It is above the code of its line, and no place in the file: a
+        // click runs the command, whose edit comes from the server.
+        wait_for(cx, "the lens in its line", &|cx| drawn(0, cx).is_some());
+        let at = cx.read(|cx| {
+            let editor = editor.read(cx);
+            let layout = editor.layout.as_ref().unwrap();
+            let at = drawn(0, cx).unwrap();
+            let code = layout
+                .bounds_for_offset(editor.buf(cx), editor.scroll, 0)
+                .unwrap();
+            assert!(at.y < code.top());
+            assert!(
+                layout
+                    .text_offset_at(editor.buf(cx), editor.scroll, at)
+                    .is_none()
+            );
+            at
+        });
+        cx.simulate_click(at, gpui::Modifiers::default());
+        wait_for(cx, "the command's edit", &|cx| {
+            editor.read(cx).text(cx).starts_with("// touched\n")
+        });
+        // The lens goes where its line went.
+        wait_for(cx, "the lens to follow its line", &|cx| {
+            lenses(cx).first().map(|lens| lens.offset) == Some(11) && drawn(1, cx).is_some()
+        });
+
+        // Two lenses of the third line are the editor's own to do. One
+        // names places, which are listed as the places of a symbol are.
+        let titles = |cx: &App| -> Vec<String> {
+            let all = lenses(cx);
+            all.iter().map(|lens| lens.title.clone()).collect()
+        };
+        assert_eq!(cx.read(|cx| titles(cx)), ["Touch", "2 places", "Run"]);
+        let click_lens = |cx: &mut VisualTestContext, nth: usize| {
+            let at = cx.read(|cx| {
+                let layout = editor.read(cx).layout.as_ref().unwrap();
+                layout.lens_middle(2, nth).unwrap()
+            });
+            cx.simulate_click(at, gpui::Modifiers::default());
+        };
+        wait_for(cx, "the lenses of the third line", &|cx| {
+            let layout = editor.read(cx).layout.as_ref();
+            layout.is_some_and(|layout| layout.lens_middle(2, 1).is_some())
+        });
+        click_lens(cx, 0);
+        wait_for(cx, "the places", &|cx| ws.read(cx).modal.is_some());
+        cx.simulate_keystrokes("escape");
+        // The other names something to run, which runs in a terminal of
+        // the dock, under the name the server gave it.
+        click_lens(cx, 1);
+        wait_for(cx, "what the lens runs", &|cx| {
+            let terminals = &ws.read(cx).terminals;
+            terminals.iter().any(|(terminal, _)| {
+                let terminal = terminal.read(cx);
+                terminal.title() == "lens run"
+                    && terminal.visible_text().iter().any(|line| line == "lens-42")
+            })
+        });
+
+        // Turned off, they are gone at the next change.
+        cx.update(|_, cx| cx.set_global(with(false)));
+        let focus = cx.read(|cx| editor.focus_handle(cx));
+        cx.update(|window, _| window.focus(&focus));
+        cx.simulate_input(" ");
+        wait_for(cx, "the lens to go", &|cx| lenses(cx).is_empty());
     }
 
     /// A real PTY: type a command, read its output off the grid, exit.
@@ -12306,7 +12735,7 @@ exports.activate = async () => {
             cx.read(|cx| demo(cx)),
             (
                 vec!["demo.run".into(), "demo.spin".into(), "demo.quit".into()],
-                vec!["notebooks.createNotebookController".to_string()]
+                vec!["comments.createCommentController".to_string()]
             )
         );
         assert!(cx.read(|cx| said(cx, "Acme.demo", "demo started")));
@@ -12624,6 +13053,114 @@ exports.activate = async (context) => {
     }
 
     #[gpui::test]
+    fn a_list_of_an_extension_takes_several_and_a_password_is_not_shown(cx: &mut TestAppContext) {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let (base, _) = serve(vec![
+            (
+                "/api/-/search",
+                Served::ok(br#"{"extensions":[]}"#.to_vec()),
+            ),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-many", &base);
+        let folder = cx.read(|cx| store.read(cx).root.clone());
+        let dir = folder.join("vscode/acme.many");
+        write_file(
+            &dir.join("package.json"),
+            r#"{ "name": "many", "publisher": "Acme", "version": "1.0.0", "main": "main.js",
+  "activationEvents": ["onCommand:many.ask"] }"#,
+        );
+        write_file(
+            &dir.join("main.js"),
+            r#"const vscode = require('vscode');
+exports.activate = (context) => {
+  context.subscriptions.push(vscode.commands.registerCommand('many.ask', async () => {
+    const picked = await vscode.window.showQuickPick(
+      [{ label: 'alpha' }, { label: 'beta', picked: true }, { label: 'gamma' }],
+      { canPickMany: true, placeHolder: 'Which ones' });
+    const none = await vscode.window.showQuickPick(['x', 'y'], { canPickMany: true });
+    const secret = await vscode.window.showInputBox({ prompt: 'Password', password: true });
+    console.log(`picked ${picked.map((item) => item.label)}; none ${JSON.stringify(none)}; secret ${secret}`);
+  }));
+};"#,
+        );
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.scan(cx);
+        });
+        wait_for(cx, "the extension", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.many").is_some()
+        });
+        store.update(cx, |store, cx| {
+            store.allow(Origin::VsCode, "Acme.many", cx);
+            store
+                .run_command("many.ask", serde_json::Value::Null, cx)
+                .detach()
+        });
+        let list = |cx: &App| {
+            let modal = ws.read(cx).modal.as_ref()?;
+            let picker = modal.view.clone();
+            picker
+                .downcast::<Picker<crate::extension_ask::AskPick>>()
+                .ok()
+        };
+        let picked = |cx: &App| -> Option<Vec<String>> {
+            let list = list(cx)?;
+            let picked = list.read(cx).delegate.picked();
+            Some(picked.into_iter().map(str::to_string).collect())
+        };
+
+        // The list comes with what the extension had ticked. Enter ticks
+        // the row in hand and the list stays; the first row answers.
+        wait_for(cx, "the list", &|cx| picked(cx).is_some());
+        assert_eq!(cx.read(|cx| picked(cx)).unwrap(), ["beta"]);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(cx.read(|cx| picked(cx)).unwrap(), ["alpha", "beta"]);
+        cx.simulate_keystrokes("down enter");
+        assert_eq!(cx.read(|cx| picked(cx)).unwrap(), ["alpha"]);
+        // What is typed narrows the rows, and the row that answers stays.
+        cx.simulate_input("gam");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(cx.read(|cx| picked(cx)).unwrap(), ["alpha", "gamma"]);
+        cx.simulate_keystrokes("up enter");
+        // The second list is answered with nothing ticked: an empty
+        // answer, which is not the same as none.
+        wait_for(cx, "the second list", &|cx| {
+            picked(cx).is_some_and(|picked| picked.is_empty())
+        });
+        cx.simulate_keystrokes("up enter");
+
+        // A password is typed in stars.
+        let line = |cx: &App| {
+            let modal = ws.read(cx).modal.as_ref()?;
+            let picker = modal.view.clone();
+            picker
+                .downcast::<Picker<crate::extension_ask::AskInput>>()
+                .ok()
+        };
+        wait_for(cx, "the line to type", &|cx| line(cx).is_some());
+        assert!(cx.read(|cx| line(cx).unwrap().read(cx).is_masked(cx)));
+        cx.simulate_input("s3cret");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "its answers", &|cx| {
+            let store = store.read(cx);
+            let code = store.code("Acme.many").unwrap();
+            let said = "picked alpha,gamma; none []; secret s3cret";
+            code.said.iter().any(|(_, text)| text == said)
+        });
+    }
+
+    #[gpui::test]
     fn an_extension_shows_pages_in_tabs(cx: &mut TestAppContext) {
         let node = std::env::var_os("PATH").and_then(|paths| {
             std::env::split_paths(&paths)
@@ -12802,6 +13339,341 @@ exports.activate = (context) => {
     }
 
     #[gpui::test]
+    fn project_tabs_and_cursors_are_restored_with_missing_files_skipped(cx: &mut TestAppContext) {
+        let root = fixture("session-tabs");
+        let saved = db::testing::dir("session-state").join("session.json");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(
+                Some(root.join("src/main.rs")),
+                "fn main() {}",
+                None,
+                window,
+                cx,
+            );
+            w.active_editor()
+                .unwrap()
+                .update(cx, |e, cx| e.select_ranges(&[3..3, 8..10], cx));
+            w.split_right(&SplitRight, window, cx);
+            w.add_editor(Some(root.join("README.md")), "readme", None, window, cx);
+            w.add_editor(Some(root.join("gone.txt")), "gone", None, window, cx);
+            w.activate(1, 1, window, cx);
+        });
+        let snapshot = cx.read(|cx| ws.read(cx).snapshot(cx));
+        std::fs::write(&saved, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        ws.update_in(cx, |w, window, cx| {
+            w.panes = vec![Pane::default()];
+            w.active_pane = 0;
+            w.restore_session(saved.clone(), window, cx);
+        });
+        wait_for(cx, "restored tabs", &|cx| !ws.read(cx).restoring);
+        assert_eq!(
+            cx.read(|cx| ws
+                .read(cx)
+                .panes
+                .iter()
+                .map(|p| p.tabs.len())
+                .collect::<Vec<_>>()),
+            [1, 2]
+        );
+        assert_eq!(
+            cx.read(|cx| ws
+                .read(cx)
+                .active_editor()
+                .unwrap()
+                .read(cx)
+                .doc(cx)
+                .title()),
+            "README.md"
+        );
+        let cursors = cx.read(|cx| {
+            ws.read(cx).panes[0].tabs[0]
+                .editor
+                .read(cx)
+                .selections
+                .clone()
+        });
+        assert_eq!(
+            cursors
+                .iter()
+                .map(|s| (s.anchor, s.head))
+                .collect::<Vec<_>>(),
+            [(3, 3), (8, 10)]
+        );
+        // A project never restores another project's paths, even if a
+        // copied state file has the right file name.
+        ws.update_in(cx, |w, window, cx| {
+            let mut value = serde_json::to_value(&snapshot).unwrap();
+            value["root"] = "another-project".into();
+            std::fs::write(&saved, serde_json::to_vec(&value).unwrap()).unwrap();
+            w.restore_session(saved, window, cx);
+        });
+        wait_for(cx, "the other project to be ignored", &|cx| {
+            !ws.read(cx).restoring
+        });
+        assert_eq!(cx.read(|cx| ws.read(cx).panes[1].tabs.len()), 2);
+    }
+
+    #[gpui::test]
+    fn a_jupyter_file_opens_edits_and_saves_without_an_extension(cx: &mut TestAppContext) {
+        let root = fixture("native-notebook");
+        let file = root.join("notes.ipynb");
+        let original = serde_json::json!({"nbformat":4,"nbformat_minor":5,
+            "metadata":{"custom":42},"cells":[{"cell_type":"code","id":"first",
+            "source":["print(1)"],"metadata":{"tags":["keep"]},"execution_count":1,
+            "outputs":[{"output_type":"stream","name":"stdout","text":["1\n"]},{"output_type":"display_data","data":{"text/html":"<table><tr><td>Result</td></tr></table>"},"metadata":{}}]}]});
+        std::fs::write(&file, serde_json::to_vec(&original).unwrap()).unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(file.clone(), None, window, cx)
+        });
+        let notebook = cx.read(|cx| ws.read(cx).notebooks[0].0.clone());
+        wait_for(cx, "the native cells", &|cx| notebook.read(cx).is_ready());
+        assert_eq!(
+            cx.read(|cx| notebook.read(cx).seen(cx)),
+            ["code python [1]: print(1) => 1 => an interactive output"]
+        );
+        click(cx, "notebook-output-0-1");
+        let page = cx.read(|cx| ws.read(cx).web_front.as_ref().unwrap().0.clone());
+        assert!(cx.read(|cx| page.read(cx).model.html.contains("<td>Result</td>")));
+        assert!(cx.read(|cx| page.read(cx).options()["enableScripts"] == false));
+        cx.dispatch_action(CloseTab);
+        assert!(cx.read(|cx| ws.read(cx).notebook_front.is_some()));
+        notebook.update_in(cx, |notebook, window, cx| notebook.focus(window, cx));
+        cx.simulate_input("# edited\n");
+        assert!(cx.read(|cx| notebook.read(cx).is_dirty()));
+        cx.dispatch_action(crate::notebook::AddText);
+        cx.simulate_input("note");
+        cx.simulate_keystrokes("secondary-s");
+        wait_for(cx, "the native save", &|cx| !notebook.read(cx).is_dirty());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(saved["metadata"], original["metadata"]);
+        assert_eq!(saved["cells"][0]["source"], "# edited\nprint(1)");
+        assert_eq!(
+            saved["cells"][0]["outputs"],
+            original["cells"][0]["outputs"]
+        );
+        assert_eq!(
+            saved["cells"][0]["metadata"],
+            original["cells"][0]["metadata"]
+        );
+        assert_eq!(saved["cells"][1]["source"], "note");
+        cx.dispatch_action(CloseTab);
+        assert!(cx.read(|cx| ws.read(cx).notebooks.is_empty()));
+    }
+
+    /// A file an extension reads as a notebook opens as a tab of cells:
+    /// typed into, run, added to and saved, with the extension doing the
+    /// reading, the running and the writing.
+    #[gpui::test]
+    fn an_extension_opens_runs_and_saves_a_notebook(cx: &mut TestAppContext) {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let (base, _) = serve(vec![
+            (
+                "/api/-/search",
+                Served::ok(br#"{"extensions":[]}"#.to_vec()),
+            ),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-notebook", &base);
+        let root = cx.read(|cx| ws.read(cx).root(cx));
+        let folder = cx.read(|cx| store.read(cx).root.clone());
+        let dir = folder.join("vscode/acme.books");
+        write_file(
+            &dir.join("package.json"),
+            r#"{ "name": "books", "publisher": "Acme", "version": "1.0.0", "main": "main.js",
+  "contributes": { "notebooks": [
+    { "type": "demo-book", "displayName": "Demo book", "selector": [{ "filenamePattern": "*.book" }] }
+  ] } }"#,
+        );
+        write_file(
+            &dir.join("main.js"),
+            r#"const vscode = require('vscode');
+// A file of cells set apart by a line of dashes, each begun by what it is.
+const reader = {
+  deserializeNotebook(bytes) {
+    const cells = Buffer.from(bytes).toString().split('\n---\n').filter(Boolean).map((part) => {
+      const [head, ...rest] = part.split('\n');
+      const code = head.startsWith('code:');
+      return new vscode.NotebookCellData(code ? vscode.NotebookCellKind.Code : vscode.NotebookCellKind.Markup, rest.join('\n'), code ? head.slice(5) : 'markdown');
+    });
+    return new vscode.NotebookData(cells);
+  },
+  serializeNotebook(data) {
+    const parts = data.cells.map((cell) => `${cell.kind === vscode.NotebookCellKind.Code ? 'code:' + cell.languageId : 'text'}\n${cell.value}`);
+    return Buffer.from(parts.join('\n---\n'));
+  },
+};
+exports.activate = (context) => {
+  let runs = 0;
+  const controller = vscode.notebooks.createNotebookController('demo.runner', 'demo-book', 'Demo runner', async (cells, notebook, controller) => {
+    for (const cell of cells) {
+      const run = controller.createNotebookCellExecution(cell);
+      run.executionOrder = ++runs;
+      run.start();
+      const text = cell.document.getText();
+      if (text.includes('boom')) {
+        await run.replaceOutput(new vscode.NotebookCellOutput([vscode.NotebookCellOutputItem.error(new RangeError('boom'))]));
+        run.end(false);
+        continue;
+      }
+      await run.replaceOutput(new vscode.NotebookCellOutput([vscode.NotebookCellOutputItem.text(text.toUpperCase())]));
+      run.end(true);
+    }
+  });
+  context.subscriptions.push(
+    controller,
+    vscode.workspace.registerNotebookSerializer('demo-book', reader),
+    vscode.workspace.onDidCloseNotebookDocument((notebook) => console.log(`closed a notebook of ${notebook.cellCount}`)),
+  );
+};"#,
+        );
+        let file = root.join("first.book");
+        std::fs::write(&file, "text\n# Title\n---\ncode:javascript\nhello").unwrap();
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.scan(cx);
+        });
+        wait_for(cx, "the extension", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.books").is_some()
+        });
+        store.update(cx, |store, cx| {
+            store.allow(Origin::VsCode, "Acme.books", cx)
+        });
+        cx.run_until_parked();
+        // It waits for a notebook of its kind: nothing of it runs yet.
+        assert!(cx.read(|cx| store.read(cx).code("Acme.books").is_none()));
+
+        // A file its pattern names is offered to be opened as a notebook,
+        // which starts its code and puts a tab of cells in front.
+        let offered = cx.read(|cx| {
+            let store = store.read(cx);
+            store.menu("explorer/context", &store.facts(), Some(&file))
+        });
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].title, "Open with Demo book");
+        cx.dispatch_action(offered[0].action.clone());
+        wait_for(cx, "the tab", &|cx| !ws.read(cx).notebooks.is_empty());
+        let notebook = cx.read(|cx| ws.read(cx).notebooks[0].0.clone());
+        wait_for(cx, "the cells", &|cx| notebook.read(cx).is_ready());
+        let seen = |cx: &App| notebook.read(cx).seen(cx);
+        assert_eq!(
+            cx.read(|cx| seen(cx)),
+            ["text markdown: # Title", "code javascript [ ]: hello"]
+        );
+        assert_eq!(
+            cx.read(|cx| notebook.read(cx).runner()).as_deref(),
+            Some("Demo runner")
+        );
+        assert!(cx.read(|cx| ws.read(cx).active_editor().is_none()));
+        assert_eq!(cx.read(|cx| ws.read(cx).front_title(cx)), "first.book");
+        bounds_soon(cx, "notebook-tab-0");
+
+        // Typed into, a cell is an editor, and the notebook has changes.
+        notebook.update_in(cx, |notebook, window, cx| notebook.select(1, window, cx));
+        cx.dispatch_action(crate::editor::MoveToEnd);
+        cx.simulate_input(" there");
+        assert!(cx.read(|cx| notebook.read(cx).is_dirty()));
+        // Run and go on: the extension runs the cell and says what came
+        // out, and since it was the last a new one is made under it, in
+        // the same language, with the cursor in it.
+        cx.simulate_keystrokes("shift-enter");
+        wait_for(cx, "the run", &|cx| {
+            seen(cx).get(1).map(String::as_str)
+                == Some("code javascript [1]: hello there => HELLO THERE")
+        });
+        assert_eq!(cx.read(|cx| seen(cx))[2], "code javascript [ ]: ");
+        // Run and stay: what went wrong is under the cell.
+        cx.simulate_input("boom");
+        cx.simulate_keystrokes("secondary-enter");
+        wait_for(cx, "the run that fails", &|cx| {
+            seen(cx).get(2).map(String::as_str)
+                == Some("code javascript failed [2]: boom => ! RangeError: boom")
+        });
+        cx.simulate_input("!");
+        assert_eq!(
+            cx.read(|cx| seen(cx))[2],
+            "code javascript failed [2]: boom! => ! RangeError: boom"
+        );
+
+        // A cell of text is added under the one the cursor is in, moved up
+        // and removed again; every cell is run from the bar.
+        cx.dispatch_action(crate::notebook::AddText);
+        cx.simulate_input("note");
+        cx.dispatch_action(crate::notebook::MoveCellUp);
+        let kinds = |cx: &App| -> Vec<String> {
+            let all = seen(cx);
+            let head = |line: &String| line.split(':').next().unwrap_or_default().to_string();
+            all.iter().map(head).collect()
+        };
+        assert_eq!(
+            cx.read(|cx| kinds(cx)),
+            [
+                "text markdown",
+                "code javascript [1]",
+                "text markdown",
+                "code javascript failed [2]"
+            ]
+        );
+        cx.dispatch_action(crate::notebook::DeleteCell);
+        assert_eq!(cx.read(|cx| seen(cx)).len(), 3);
+        click(cx, "notebook-run-all");
+        wait_for(cx, "every cell to run", &|cx| {
+            kinds(cx)[1..] == ["code javascript [3]", "code javascript failed [4]"]
+        });
+
+        // Saved with the key that saves a file: the extension writes it.
+        cx.simulate_keystrokes("secondary-s");
+        wait_for(cx, "the save", &|cx| !notebook.read(cx).is_dirty());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "text\n# Title\n---\ncode:javascript\nhello there\n---\ncode:javascript\nboom!"
+        );
+
+        // Closed as a tab is, the file that was in front before is again,
+        // and the extension hears that it is closed.
+        cx.dispatch_action(CloseTab);
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).notebooks.is_empty()));
+        assert!(cx.read(|cx| ws.read(cx).active_editor().is_some()));
+        wait_for(cx, "the extension to hear of it", &|cx| {
+            let store = store.read(cx);
+            let code = store.code("Acme.books").unwrap();
+            code.said
+                .iter()
+                .any(|(_, text)| text == "closed a notebook of 3")
+        });
+
+        // Opened again it is read again, as it was saved. When the code of
+        // its extension stops, it stays and says so.
+        cx.dispatch_action(offered[0].action.clone());
+        wait_for(cx, "the tab", &|cx| !ws.read(cx).notebooks.is_empty());
+        let notebook = cx.read(|cx| ws.read(cx).notebooks[0].0.clone());
+        wait_for(cx, "the cells", &|cx| notebook.read(cx).is_ready());
+        assert_eq!(cx.read(|cx| notebook.read(cx).seen(cx)).len(), 3);
+        store.update(cx, |store, cx| {
+            store.set_off(Origin::VsCode, "Acme.books", true, cx)
+        });
+        cx.run_until_parked();
+        let note = cx.read(|cx| notebook.read(cx).note()).unwrap_or_default();
+        assert!(note.starts_with("Its extension stopped"), "{note}");
+        assert_eq!(cx.read(|cx| notebook.read(cx).runner()), None);
+    }
+
+    #[gpui::test]
     fn an_extension_runs_terminals_and_tasks_in_the_dock(cx: &mut TestAppContext) {
         let node = std::env::var_os("PATH").and_then(|paths| {
             std::env::split_paths(&paths)
@@ -12846,6 +13718,17 @@ exports.activate = (context) => {
       terminal.show();
     }),
     vscode.commands.registerCommand('shell.close', () => terminal.dispose()),
+    // A terminal that is an object here, with no program behind it.
+    vscode.commands.registerCommand('shell.own', () => {
+      const write = new vscode.EventEmitter();
+      const own = vscode.window.createTerminal({ name: 'Own', pty: {
+        onDidWrite: write.event,
+        open: (size) => write.fire(`own-ready ${size.columns > 0}\r\n`),
+        close: () => console.log('own let go'),
+        handleInput: (data) => write.fire(`[${data.toUpperCase()}]`),
+      } });
+      own.show();
+    }),
   );
 };"#,
         );
@@ -12933,6 +13816,35 @@ exports.activate = (context) => {
         wait_for(cx, "its terminal to close", &|cx| {
             ws.read(cx).terminals.len() == 1 && said(cx, "closed Mine undefined")
         });
+
+        // A terminal the extension draws itself is a tab of the dock like
+        // the others: it is told the terminal's size, what it writes is
+        // shown, and what is typed reaches it key by key and is not shown
+        // by anyone but itself.
+        store.update(cx, |store, cx| {
+            store
+                .run_command("shell.own", serde_json::Value::Null, cx)
+                .detach()
+        });
+        wait_for(cx, "the terminal it draws", &|cx| {
+            shows(cx, 1, "own-ready true")
+        });
+        assert_eq!(
+            cx.read(|cx| ws.read(cx).terminals[1].0.read(cx).title()),
+            "Own"
+        );
+        let own = cx.read(|cx| ws.read(cx).terminals[1].0.clone());
+        own.update(cx, |terminal, _| terminal.write(b"ok".to_vec()));
+        wait_for(cx, "what was typed to reach it", &|cx| {
+            let terminal = ws.read(cx).terminals[1].0.read(cx);
+            let shown = terminal.visible_text().join("");
+            shown.contains("[O][K]") || shown.contains("[OK]")
+        });
+        // Its tab closed, the extension's object is let go.
+        ws.update_in(cx, |w, window, cx| w.remove_terminal(&own, window, cx));
+        // The terminal ends when nothing holds it, this test included.
+        drop(own);
+        wait_for(cx, "the object to be let go", &|cx| said(cx, "own let go"));
     }
 
     #[gpui::test]
@@ -13536,6 +14448,22 @@ exports.activate = (context) => {
                 (0..2, syntax::HighlightKind::Keyword)
             )
         );
+        // And what it offers to do with a line is at the end of it, where
+        // a click runs the extension's command.
+        let lens = |cx: &App| {
+            let layout = editor.read(cx).layout.as_ref()?;
+            layout.lens_middle(0, 0)
+        };
+        wait(cx, "its lens", &|cx| lens(cx).is_some());
+        let at = cx.read(|cx| lens(cx).unwrap());
+        cx.simulate_click(at, gpui::Modifiers::default());
+        wait(cx, "the lens to run", &|cx| {
+            store
+                .read(cx)
+                .bar()
+                .iter()
+                .any(|item| item.text == "3 lines")
+        });
         // It reads what is typed as it is typed.
         cx.dispatch_action(crate::editor::MoveToEnd);
         cx.simulate_input("boom");

@@ -38,8 +38,10 @@ const HOST: &[(&str, &str)] = &[
     ("languages.js", include_str!("../host/languages.js")),
     ("debug.js", include_str!("../host/debug.js")),
     ("shell.js", include_str!("../host/shell.js")),
+    ("relay.js", include_str!("../host/relay.js")),
     ("views.js", include_str!("../host/views.js")),
     ("webviews.js", include_str!("../host/webviews.js")),
+    ("notebooks.js", include_str!("../host/notebooks.js")),
 ];
 
 /// Puts the host where Node can read it, under `dir`. A file is written
@@ -977,6 +979,18 @@ exports.activate = (context) => {
         return builder.build();
       },
     }, legend),
+    vscode.languages.registerCodeLensProvider('rust', {
+      provideCodeLenses: () => [
+        new vscode.CodeLens(new vscode.Range(0, 0, 0, 2), { title: 'Mark', command: 'demo.mark' }),
+        new vscode.CodeLens(new vscode.Range(1, 0, 1, 3)),
+      ],
+      // What the second one does is said only when it is asked.
+      resolveCodeLens(lens) {
+        lens.command = { title: 'Late', command: 'demo.late', arguments: [lens.range.start.line] };
+        return lens;
+      },
+    }),
+    vscode.commands.registerCommand('demo.late', (line) => `late ${line}`),
     vscode.commands.registerCommand('demo.mark', (uri) => {
       problems.set(uri, [new vscode.Diagnostic(new vscode.Range(0, 0, 0, 2), 'marked', vscode.DiagnosticSeverity.Hint)]);
       return vscode.languages.getDiagnostics(uri).length;
@@ -1048,7 +1062,12 @@ exports.activate = (context) => {
             can["textDocumentSync"],
             json!({ "openClose": true, "change": 0 })
         );
-        assert!(can["definitionProvider"].is_null() && can["codeActionProvider"].is_null());
+        assert!(can["definitionProvider"].is_null() && can["documentFormattingProvider"].is_null());
+        assert_eq!(can["codeLensProvider"], json!({ "resolveProvider": true }));
+        assert_eq!(
+            can["executeCommandProvider"],
+            json!({ "commands": ["solder.run", "solder.lens"] })
+        );
         assert_eq!(can["inlayHintProvider"], true);
         assert_eq!(
             can["semanticTokensProvider"],
@@ -1101,6 +1120,34 @@ exports.activate = (context) => {
             )["result"],
             json!({ "data": [0, 0, 2, 0, 0, 0, 3, 4, 1, 0, 1, 4, 1, 2, 1] })
         );
+        // What it offers to do with a line: the command is one of the
+        // host's own, which names the lens by its file and its place, so
+        // that a lens left in its line for an hour still runs what it said.
+        let lenses = ask(
+            12,
+            "textDocument/codeLens",
+            json!({ "textDocument": { "uri": file } }),
+        )["result"]
+            .clone();
+        assert_eq!(
+            lenses,
+            json!([
+                { "range": range(0, 0, 0, 2), "data": { "uri": file, "nth": 0 },
+                  "command": { "title": "Mark", "command": "solder.lens", "arguments": [file, 0] } },
+                { "range": range(1, 0, 1, 3), "data": { "uri": file, "nth": 1 } },
+            ])
+        );
+        let late = json!({ "title": "Late", "command": "solder.lens", "arguments": [file, 1] });
+        assert_eq!(
+            ask(13, "codeLens/resolve", lenses[1].clone())["result"]["command"],
+            late
+        );
+        let run = |id: u64, nth: u64| {
+            let params = json!({ "command": "solder.lens", "arguments": [file, nth] });
+            ask(id, "workspace/executeCommand", params)
+        };
+        assert_eq!(run(14, 1)["result"], "late 1");
+        assert_eq!(run(15, 7)["error"]["code"], -32603);
         // What it has no provider for, and a file it was not told of.
         assert!(
             ask(6, "textDocument/definition", at(0, 4))["result"]
@@ -1290,6 +1337,154 @@ exports.activate = (context) => {
     }
 
     #[test]
+    fn a_terminal_and_a_task_an_extension_draws_itself_run_in_a_terminal() {
+        use std::io::{Read, Write};
+        let code = r#"
+const vscode = require('vscode');
+// A terminal that is an object here: it says its size, shouts back what is
+// typed, and on Enter ends with what it was told to end with.
+function shouting(ending, said) {
+  const write = new vscode.EventEmitter();
+  const close = new vscode.EventEmitter();
+  return {
+    onDidWrite: write.event,
+    onDidClose: close.event,
+    open: (size) => write.fire(`open ${size.columns}x${size.rows}\r\n`),
+    close: () => said('let go'),
+    // Keys come one at a time from a keyboard and several at once from
+    // whatever pastes: each is looked at on its own.
+    handleInput(data) {
+      for (const key of data) {
+        if (key === '\r') {
+          write.fire('done\r\n');
+          close.fire(ending);
+        } else {
+          write.fire(key.toUpperCase());
+        }
+      }
+    },
+  };
+}
+exports.activate = (context) => {
+  const out = vscode.window.createOutputChannel('Pty');
+  const log = (...all) => out.appendLine(all.join(' '));
+  vscode.window.onDidCloseTerminal((closed) => log('closed', closed.name, closed.exitStatus.code));
+  vscode.tasks.onDidEndTaskProcess((e) => log('task ended', e.execution.task.name, e.exitCode));
+  vscode.tasks.registerTaskProvider('demo', {
+    provideTasks: () => [new vscode.Task({ type: 'demo' }, vscode.TaskScope.Workspace, 'own', 'demo',
+      new vscode.CustomExecution(async () => shouting(0, log)))],
+  });
+  context.subscriptions.push(vscode.commands.registerCommand('demo.pty', () => {
+    const terminal = vscode.window.createTerminal({ name: 'Mine', pty: shouting(3, log) });
+    terminal.show();
+  }));
+  log('ready');
+};
+"#;
+        let Some((host, told, _dir, log)) = hosted_logged("vscode-pty", code) else {
+            return;
+        };
+        let host = Arc::new(host);
+        let said = editor(&host, told, log, |method, _| {
+            Err(format!("no {method} here"))
+        });
+        host.notify("init", json!({}));
+        host.request("activate", json!({}), SOON).unwrap();
+        written(&said, "ready");
+        // What the dock's terminal is told to run, once it is said.
+        let made = |count: usize| -> Value {
+            let until = std::time::Instant::now() + SOON;
+            loop {
+                let all: Vec<Value> = lock(&said)
+                    .iter()
+                    .filter(|(method, _)| method == "terminal.create")
+                    .map(|(_, params)| params.clone())
+                    .collect();
+                if all.len() >= count {
+                    return all[count - 1].clone();
+                }
+                assert!(std::time::Instant::now() < until, "no terminal was made");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        // Plays the terminal: runs what it was told to, types `typed`, and
+        // gives what was shown and what the program ended with.
+        let terminal = |create: &Value, typed: &str| -> (String, Option<i32>) {
+            let args: Vec<&str> = create["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            let mut child = Command::new(create["program"].as_str().unwrap())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(typed.as_bytes())
+                .unwrap();
+            let mut shown = String::new();
+            child
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_string(&mut shown)
+                .unwrap();
+            (shown, child.wait().unwrap().code())
+        };
+
+        // A terminal the extension draws is a terminal of the dock that
+        // runs the relay. What is typed reaches the extension's object,
+        // what it writes is shown, and what it ends with is what the
+        // program in the terminal ends with.
+        host.request("executeCommand", json!({ "id": "demo.pty" }), SOON)
+            .unwrap();
+        let create = made(1);
+        assert_eq!(
+            (&create["name"], &create["show"]),
+            (&json!("Mine"), &json!(true))
+        );
+        assert!(create["args"][0].as_str().unwrap().ends_with("relay.js"));
+        let (shown, code) = terminal(&create, "hi\r");
+        assert_eq!(shown, "open 80x24\r\nHIdone\r\n");
+        assert_eq!(code, Some(3));
+        // Its terminal gone, the object is let go; and the extension hears
+        // of the end as of any terminal's.
+        written(&said, "let go");
+        host.notify("terminal.closed", json!({ "id": create["id"], "code": 3 }));
+        written(&said, "closed Mine 3");
+
+        // The port takes its own terminal and nobody else: without the
+        // token nothing is shown, and the one with it has gone already.
+        let mut stranger = create.clone();
+        stranger["args"][2] = json!("0000");
+        let (shown, _) = terminal(&stranger, "x");
+        assert_eq!(shown, "");
+
+        // A task that is the extension's own code runs the same way, in a
+        // terminal that keeps its tab, and ends when its terminal does.
+        let tasks = host.request("tasks.fetch", json!({}), SOON).unwrap();
+        assert_eq!(tasks[0]["name"], "own");
+        host.request("tasks.run", json!({ "index": 0 }), SOON)
+            .unwrap();
+        let create = made(2);
+        assert_eq!(
+            (&create["name"], &create["keep"]),
+            (&json!("own"), &json!(true))
+        );
+        let (shown, code) = terminal(&create, "go\r");
+        assert!(shown.ends_with("GOdone\r\n"), "{shown:?}");
+        assert_eq!(code, Some(0));
+        host.notify("terminal.closed", json!({ "id": create["id"], "code": 0 }));
+        written(&said, "task ended own 0");
+    }
+
+    #[test]
     fn an_extension_has_pages_views_that_are_pages_and_editors_of_its_own() {
         let code = r#"
 const vscode = require('vscode');
@@ -1298,6 +1493,12 @@ exports.activate = (context) => {
   const log = (...all) => out.appendLine(all.map((one) => (typeof one === 'string' ? one : JSON.stringify(one))).join(' '));
   let panel;
   context.subscriptions.push(
+    vscode.window.registerWebviewPanelSerializer('demo.saved', {
+      async deserializeWebviewPanel(page, state) {
+        page.webview.html = `<p>restored ${state.count}</p>`;
+        log('restored', state);
+      },
+    }),
     vscode.commands.registerCommand('demo.page', () => {
       panel = vscode.window.createWebviewPanel('demo.page', 'Demo page', vscode.ViewColumn.Two,
         { enableScripts: true, localResourceRoots: [context.extensionUri] });
@@ -1358,17 +1559,34 @@ exports.activate = (context) => {
             .any(|(method, params)| method == "view" && params["kind"] == "webview");
         assert!(listed && pages().is_empty());
 
+        assert!(
+            host.request("webview.restore", json!({"viewType":"unknown"}), SOON)
+                .is_err()
+        );
+        host.request(
+            "webview.restore",
+            json!({"viewType":"demo.saved","title":"Saved","state":{"count":7}}),
+            SOON,
+        )
+        .unwrap();
+        written(&said, r#"restored {"count":7}"#);
+        assert_eq!(pages().last().unwrap()["html"], "<p>restored 7</p>");
+        host.notify("webview.closed", json!({"id":"page1"}));
+        // The next test's page names are relative to the first created.
         // A page: what it is called, where it goes, what it may do, and
         // then its text. What it may read is under a name of its own.
         host.request("executeCommand", json!({ "id": "demo.page" }), SOON)
             .unwrap();
-        written(&said, "uri true page1 solder-resource://page1");
-        let made = pages();
+        written(&said, "uri true page2 solder-resource://page2");
+        let made = pages()
+            .into_iter()
+            .filter(|page| page["id"] == "page2")
+            .collect::<Vec<_>>();
         let folder = dir.join("ext").display().to_string();
         assert_eq!(
             made[0],
             json!({
-                "id": "page1", "viewType": "demo.page", "title": "Demo page", "column": 2, "html": "",
+                "id": "page2", "viewType": "demo.page", "title": "Demo page", "column": 2, "html": "",
                 "options": { "enableScripts": true, "localResourceRoots": [folder] },
             })
         );
@@ -1380,22 +1598,22 @@ exports.activate = (context) => {
             .iter()
             .find(|(method, _)| method == "webview.post")
             .map(|(_, params)| params.clone());
-        assert_eq!(post, Some(json!({ "id": "page1", "message": { "n": 1 } })));
+        assert_eq!(post, Some(json!({ "id": "page2", "message": { "n": 1 } })));
         host.notify(
             "webview.message",
-            json!({ "id": "page1", "message": { "hi": 1 } }),
+            json!({ "id": "page2", "message": { "hi": 1 } }),
         );
         written(&said, r#"got {"hi":1}"#);
         host.notify(
             "webview.state",
-            json!({ "id": "page1", "visible": false, "active": false }),
+            json!({ "id": "page2", "visible": false, "active": false }),
         );
         written(&said, "state false false");
-        host.notify("webview.closed", json!({ "id": "page1" }));
+        host.notify("webview.closed", json!({ "id": "page2" }));
         written(&said, "disposed");
         assert_eq!(
             pages().last(),
-            Some(&json!({ "id": "page1", "gone": true }))
+            Some(&json!({ "id": "page2", "gone": true }))
         );
         // Gone, it takes no more messages.
         let posted = host.request("executeCommand", json!({ "id": "demo.post" }), SOON);
@@ -1436,6 +1654,288 @@ exports.activate = (context) => {
         written(&said, "let go");
         assert!(pages().iter().any(|page| page["html"] == "tom.txt"));
         assert_eq!(open("demo.none"), Err("No editor demo.none".into()));
+    }
+
+    #[test]
+    fn notebook_renderers_send_messages_only_to_their_open_pages() {
+        let code = r#"
+const v = require('vscode');
+exports.activate = () => {
+  const messages = v.notebooks.createRendererMessaging('counter');
+  const received = [];
+  messages.onDidReceiveMessage(event => received.push(event.message));
+  v.commands.registerCommand('counter.send', message => messages.postMessage(message));
+  v.commands.registerCommand('counter.received', () => received);
+};
+"#;
+        let Some((host, told, _, log)) = hosted_logged("renderer-messages", code) else {
+            return;
+        };
+        let host = Arc::new(host);
+        let said = editor(&host, told, log, |method, _| match method {
+            "webview.post" => Ok(json!(true)),
+            _ => Err(format!("no {method}")),
+        });
+        host.request("activate", json!({}), SOON).unwrap();
+        host.notify(
+            "notebook.renderer.open",
+            json!({"id":"one", "renderer":"counter", "uri":"file:///counter.book"}),
+        );
+        host.notify(
+            "notebook.renderer.open",
+            json!({"id":"other", "renderer":"plot", "uri":"file:///counter.book"}),
+        );
+        let run = |command: &str, args: Value| {
+            host.request("executeCommand", json!({"id":command,"args":args}), SOON)
+                .unwrap()
+        };
+        assert_eq!(run("counter.send", json!([{"count":1}])), json!(true));
+        let all = lock(&said);
+        let posts: Vec<_> = all
+            .iter()
+            .filter(|(method, _)| method == "webview.post")
+            .map(|(_, params)| params.clone())
+            .collect();
+        assert_eq!(posts, [json!({"id":"one","message":{"count":1}})]);
+        drop(all);
+        host.notify(
+            "notebook.renderer.message",
+            json!({"renderer":"counter","uri":"file:///counter.book","message":{"count":2}}),
+        );
+        assert_eq!(run("counter.received", json!([])), json!([{"count":2}]));
+        host.notify("notebook.renderer.closed", json!({"id":"one"}));
+        assert_eq!(run("counter.send", json!([{"count":3}])), json!(false));
+    }
+
+    /// A notebook is read and written by its extension, which also runs
+    /// its cells and says what came out.
+    #[test]
+    fn an_extension_reads_runs_and_writes_a_notebook() {
+        let code = r#"
+const vscode = require('vscode');
+// A file of cells set apart by a line of dashes, each begun by what it is.
+const reader = {
+  deserializeNotebook(bytes) {
+    const cells = Buffer.from(bytes).toString().split('\n---\n').filter(Boolean).map((part) => {
+      const [head, ...rest] = part.split('\n');
+      const code = head.startsWith('code:');
+      return new vscode.NotebookCellData(code ? vscode.NotebookCellKind.Code : vscode.NotebookCellKind.Markup, rest.join('\n'), code ? head.slice(5) : 'markdown');
+    });
+    return new vscode.NotebookData(cells);
+  },
+  serializeNotebook(data) {
+    const parts = data.cells.map((cell) => `${cell.kind === vscode.NotebookCellKind.Code ? 'code:' + cell.languageId : 'text'}\n${cell.value}`);
+    return Buffer.from(parts.join('\n---\n'));
+  },
+};
+exports.activate = (context) => {
+  let runs = 0;
+  const changes = [];
+  const controller = vscode.notebooks.createNotebookController('demo.runner', 'demo-book', 'Demo runner', async (cells, notebook, controller) => {
+    for (const cell of cells) {
+      const run = controller.createNotebookCellExecution(cell);
+      run.executionOrder = ++runs;
+      run.start();
+      const text = cell.document.getText();
+      if (text === 'wait') {
+        await new Promise((resolve) => run.token.onCancellationRequested(resolve));
+        run.end(false);
+        continue;
+      }
+      await run.replaceOutput(new vscode.NotebookCellOutput([vscode.NotebookCellOutputItem.stdout('running\n')]));
+      if (text.includes('boom')) {
+        await run.appendOutput(new vscode.NotebookCellOutput([vscode.NotebookCellOutputItem.error(new RangeError('boom'))]));
+        run.end(false);
+        continue;
+      }
+      await run.appendOutput(new vscode.NotebookCellOutput([
+        vscode.NotebookCellOutputItem.text(text.toUpperCase()),
+        new vscode.NotebookCellOutputItem(Uint8Array.from([137, 80, 78, 71]), 'image/png'),
+        new vscode.NotebookCellOutputItem(Uint8Array.from([1, 2, 3]), 'application/x-thing'),
+      ]));
+      run.end(true);
+    }
+  });
+  context.subscriptions.push(
+    controller,
+    vscode.workspace.registerNotebookSerializer('demo-book', reader),
+    vscode.workspace.onDidChangeNotebookDocument((event) => changes.push(event)),
+    vscode.commands.registerCommand('demo.books', () => ({
+      open: vscode.workspace.notebookDocuments.map((notebook) => `${notebook.notebookType} ${notebook.cellCount} ${notebook.isDirty}`),
+      cells: vscode.workspace.textDocuments.filter((document) => document.uri.scheme === 'vscode-notebook-cell').map((document) => `${document.languageId}:${document.getText()}`),
+      front: vscode.window.activeNotebookEditor && vscode.window.activeNotebookEditor.selection.start,
+      changes: changes.length,
+      moved: changes.filter((event) => event.contentChanges.length).map((event) => event.contentChanges.map((change) => [change.range.start, change.range.end, change.removedCells.length, change.addedCells.length])),
+    })),
+  );
+};
+"#;
+        let Some((host, told, dir, log)) = hosted_logged("vscode-notebook", code) else {
+            return;
+        };
+        let host = Arc::new(host);
+        let said = editor(&host, told, log, |method, _| {
+            Err(format!("no {method} here"))
+        });
+        let file = dir.join("first.book");
+        std::fs::write(&file, "text\n# Title\n---\ncode:javascript\nhello").unwrap();
+        let uri = format!("file://{}", file.display());
+        // Nothing reads a kind of notebook before its extension says it does.
+        let early = host.request(
+            "notebook.open",
+            json!({ "type": "demo-book", "uri": uri }),
+            SOON,
+        );
+        assert!(early.unwrap_err().contains("reads no notebooks"));
+        host.request("activate", json!({}), SOON).unwrap();
+        let heard = |method: &str| -> Vec<Value> {
+            let all = lock(&said);
+            let of = all.iter().filter(|(said, _)| said == method);
+            of.map(|(_, params)| params.clone()).collect()
+        };
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let until = std::time::Instant::now() + SOON;
+            while !done() {
+                assert!(std::time::Instant::now() < until, "no {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        until("runner", &|| !heard("notebook.runners").is_empty());
+        assert_eq!(
+            heard("notebook.runners")[0],
+            json!({ "runners": [{ "type": "demo-book", "label": "Demo runner" }] })
+        );
+
+        // Opened: the cells as the extension read them, and what runs them.
+        let opened = host
+            .request(
+                "notebook.open",
+                json!({ "type": "demo-book", "uri": uri }),
+                SOON,
+            )
+            .unwrap();
+        assert_eq!(
+            opened,
+            json!({ "runner": "Demo runner", "cells": [
+                { "handle": 0, "code": false, "language": "markdown", "value": "# Title", "outputs": [] },
+                { "handle": 1, "code": true, "language": "javascript", "value": "hello", "outputs": [] },
+            ] })
+        );
+        // The editor says what is typed into a cell, and which cells there
+        // are after one was added before the others.
+        host.notify(
+            "notebook.cell",
+            json!({ "uri": uri, "handle": 1, "value": "hello there" }),
+        );
+        host.notify(
+            "notebook.cells",
+            json!({ "uri": uri, "cells": [
+                { "handle": 2, "code": true, "language": "javascript", "value": "boom" },
+                { "handle": 0 }, { "handle": 1 },
+            ] }),
+        );
+        host.notify("notebook.front", json!({ "uri": uri, "selected": 2 }));
+        let books = || {
+            host.request("executeCommand", json!({ "id": "demo.books" }), SOON)
+                .unwrap()
+        };
+        assert_eq!(
+            books(),
+            json!({
+                "open": ["demo-book 3 true"],
+                "cells": ["markdown:# Title", "javascript:hello there", "javascript:boom"],
+                "front": 2,
+                "changes": 2,
+                "moved": [[[0, 0, 0, 1]]],
+            })
+        );
+
+        // Run: each cell says it runs, what it puts out as it comes, and
+        // how it ended. A picture goes as it is, and of a form the editor
+        // draws nothing of, what it is and how large.
+        let ran = host.request(
+            "notebook.execute",
+            json!({ "uri": uri, "handles": [1, 2, 0] }),
+            SOON,
+        );
+        assert_eq!(ran, Ok(json!(true)));
+        until("the runs to end", &|| heard("notebook.run").len() == 4);
+        assert_eq!(
+            heard("notebook.run"),
+            [
+                json!({ "uri": uri, "handle": 2, "running": true }),
+                json!({ "uri": uri, "handle": 2, "running": false, "failed": true, "order": 1 }),
+                json!({ "uri": uri, "handle": 1, "running": true }),
+                json!({ "uri": uri, "handle": 1, "running": false, "failed": false, "order": 2 }),
+            ]
+        );
+        let outputs = heard("notebook.outputs");
+        let last = |handle: u64| {
+            let of = outputs.iter().rev().find(|said| said["handle"] == handle);
+            of.unwrap()["outputs"].clone()
+        };
+        let stdout = json!({ "items": [{ "mime": "application/vnd.code.notebook.stdout", "size": 8, "text": "running\n" }] });
+        let failed = last(2);
+        assert_eq!(failed[0], stdout);
+        let error = &failed[1]["items"][0];
+        assert_eq!(error["mime"], "application/vnd.code.notebook.error");
+        assert!(
+            error["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("RangeError: boom"),
+            "{error}"
+        );
+        assert_eq!(
+            last(1),
+            json!([stdout, { "items": [
+                { "mime": "text/plain", "size": 11, "text": "HELLO THERE" },
+                { "mime": "image/png", "size": 4, "picture": "iVBORw==" },
+                { "mime": "application/x-thing", "size": 3, "data": "AQID" },
+            ] }])
+        );
+
+        // Saved by the extension, from the cells as they are now.
+        assert_eq!(
+            host.request("notebook.save", json!({ "uri": uri }), SOON),
+            Ok(json!(true))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "code:javascript\nboom\n---\ntext\n# Title\n---\ncode:javascript\nhello there"
+        );
+        assert_eq!(books()["open"], json!(["demo-book 3 false"]));
+
+        // A run that does not end by itself is told to stop.
+        host.notify(
+            "notebook.cell",
+            json!({ "uri": uri, "handle": 1, "value": "wait" }),
+        );
+        let waiting = {
+            let (host, uri) = (host.clone(), uri.clone());
+            std::thread::spawn(move || {
+                host.request(
+                    "notebook.execute",
+                    json!({ "uri": uri, "handles": [1] }),
+                    SOON,
+                )
+            })
+        };
+        until("the run to start", &|| heard("notebook.run").len() == 5);
+        assert_eq!(
+            host.request("notebook.interrupt", json!({ "uri": uri }), SOON),
+            Ok(json!(true))
+        );
+        assert_eq!(waiting.join().unwrap(), Ok(json!(true)));
+        assert_eq!(heard("notebook.run")[5]["failed"], true);
+
+        // Closed, it and the text of its cells are gone for the extension.
+        host.notify("notebook.close", json!({ "uri": uri }));
+        let after = books();
+        assert_eq!(
+            (&after["open"], &after["cells"], &after["front"]),
+            (&json!([]), &json!([]), &Value::Null)
+        );
     }
 
     #[test]

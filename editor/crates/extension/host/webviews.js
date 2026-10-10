@@ -8,6 +8,7 @@ module.exports = function buildWebviews(core) {
   const providers = new Map();
   // What opens files of a kind as a page in place of their text.
   const editors = new Map();
+  const serializers = new Map();
   const never = { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) };
   let next = 0;
   // What a view is called: its manifest says, the code only knows its id.
@@ -16,7 +17,7 @@ module.exports = function buildWebviews(core) {
   function origin(id, scheme) {
     return process.platform === 'win32' ? `http://${scheme}.${id}` : `${scheme}://${id}`;
   }
-  function make(viewType, title, column, options = {}, id) {
+  function make(viewType, title, column, options = {}, id, documentUri, initialState) {
     id = id || `page${++next}`;
     const received = new EventEmitter();
     const disposed = new EventEmitter();
@@ -39,6 +40,7 @@ module.exports = function buildWebviews(core) {
         : core.request('webview.post', { id, message: core.plain(message) }),
     };
     const panel = {
+      _id: id,
       viewType,
       get title() { return title; },
       set title(value) { title = String(value); publish(); },
@@ -70,7 +72,7 @@ module.exports = function buildWebviews(core) {
         ? [core.extensionDir, ...core.state.folders]
         : pageOptions.localResourceRoots.filter(Uri.isUri).map(u => u.fsPath);
       core.notify('webview', {
-        id, viewType, title, column, html,
+        id, viewType, title, column, html, documentUri, initialState,
         options: { enableScripts: !!pageOptions.enableScripts, localResourceRoots: roots },
       });
     }
@@ -100,12 +102,21 @@ module.exports = function buildWebviews(core) {
         editors.set(viewType, provider);
         return { dispose() { if (editors.get(viewType) === provider) editors.delete(viewType); } };
       },
-      registerWebviewPanelSerializer() {
-        core.missing('window.registerWebviewPanelSerializer');
-        return { dispose() {} };
+      registerWebviewPanelSerializer(viewType, serializer) {
+        serializers.set(viewType, serializer);
+        return { dispose() { if (serializers.get(viewType) === serializer) serializers.delete(viewType); } };
       },
     },
     asked: {
+      'webview.restore': async ({ viewType, title, state, column, options }) => {
+        const serializer = serializers.get(viewType);
+        if (!serializer) throw new Error(`No serializer for the page ${viewType}`);
+        options = { ...options };
+        if (options.localResourceRoots) options.localResourceRoots = options.localResourceRoots.map(root => Uri.file(root));
+        const panel = make(viewType, title, column || 1, options, undefined, undefined, state);
+        await serializer.deserializeWebviewPanel(panel, state);
+        return panel._id;
+      },
       'webview.resolve': async ({ id }) => {
         const provider = providers.get(id);
         if (!provider) throw new Error(`No webview provider ${id}`);
@@ -132,7 +143,7 @@ module.exports = function buildWebviews(core) {
         const provider = editors.get(viewType);
         if (!provider) throw new Error(`No editor ${viewType}`);
         const file = Uri.parse(uri);
-        const panel = make(viewType, file.path.split('/').pop(), 1, {});
+        const panel = make(viewType, file.path.split('/').pop(), 1, {}, undefined, uri);
         if (provider.resolveCustomTextEditor) {
           await provider.resolveCustomTextEditor(core.docs.get(file) || core.docs.read(file), panel, never);
         } else {
@@ -140,7 +151,7 @@ module.exports = function buildWebviews(core) {
           panel.onDidDispose(() => document && document.dispose && document.dispose());
           await provider.resolveCustomEditor(document, panel, never);
         }
-        return true;
+        return panel._id;
       },
     },
     told: {

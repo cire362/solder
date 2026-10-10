@@ -35,6 +35,67 @@ impl EditorElement {
     }
 }
 
+/// What stands between two lenses of one line.
+const LENS_GAP: &str = "  |  ";
+
+/// The lines of the file that have a row of lenses above them, in order
+/// and each once. With any, a line is no longer drawn in the row of its
+/// own number: everything that turns a line into a height asks here.
+#[derive(Clone, Default)]
+pub struct Rows(Arc<Vec<usize>>);
+
+impl Rows {
+    /// The lines of these lenses, in a text.
+    pub(crate) fn of_lenses(lenses: &[crate::document::Lens], buffer: &Buffer) -> Self {
+        let mut rows: Vec<usize> = lenses
+            .iter()
+            .map(|lens| buffer.offset_to_point(lens.offset.min(buffer.len())).row)
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        Self(Arc::new(rows))
+    }
+
+    /// How many rows there are above the lines.
+    fn added(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The row on screen a line of the file is drawn in.
+    fn shown(&self, row: usize) -> usize {
+        row + self.0.partition_point(|lensed| *lensed <= row)
+    }
+
+    /// The line a row on screen belongs to, and whether the row is the
+    /// lenses above that line and not the line itself.
+    fn line(&self, shown: usize) -> (usize, bool) {
+        // The lenses of the nth such line are in row `line + n`.
+        let (mut low, mut high) = (0, self.0.len());
+        while low < high {
+            let middle = (low + high) / 2;
+            if self.0[middle] + middle <= shown {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        match low.checked_sub(1) {
+            Some(last) if self.0[last] + last == shown => (self.0[last], true),
+            _ => (shown - low, false),
+        }
+    }
+}
+
+/// The lenses of one line as they are drawn above it: their words, how
+/// far in they start (the line's own indent), and which bytes of the
+/// words are which of the document's lenses.
+pub struct LensRow {
+    row: usize,
+    shaped: ShapedLine,
+    indent: Pixels,
+    parts: Vec<(Range<usize>, usize)>,
+}
+
 /// A shaped row plus the bookkeeping to map buffer columns to shaped columns.
 pub struct DisplayLine {
     pub shaped: ShapedLine,
@@ -128,12 +189,60 @@ pub struct LayoutSnapshot {
     pub em_width: Pixels,
     pub first_row: usize,
     pub lines: Vec<DisplayLine>,
+    /// Which lines have a row of lenses above them, and those rows.
+    pub rows: Rows,
+    pub lens_rows: Vec<LensRow>,
 }
 
 impl LayoutSnapshot {
-    pub(crate) fn row_at(&self, buffer: &Buffer, scroll: Point<Pixels>, y: Pixels) -> usize {
+    /// The row on screen under a height, counted from the first.
+    fn shown_at(&self, scroll: Point<Pixels>, y: Pixels) -> usize {
         let row = ((y - self.bounds.top() + scroll.y) / self.line_height).floor();
-        (row.max(0.) as usize).min(buffer.line_count() - 1)
+        row.max(0.) as usize
+    }
+
+    /// Where the top of a line of the file is, were nothing scrolled.
+    pub(crate) fn top_of(&self, row: usize) -> Pixels {
+        self.bounds.top() + self.line_height * self.rows.shown(row) as f32
+    }
+
+    pub(crate) fn is_lens_row(&self, scroll: Point<Pixels>, y: Pixels) -> bool {
+        self.rows.line(self.shown_at(scroll, y)).1
+    }
+
+    pub(crate) fn row_at(&self, buffer: &Buffer, scroll: Point<Pixels>, y: Pixels) -> usize {
+        let (row, _) = self.rows.line(self.shown_at(scroll, y));
+        row.min(buffer.line_count() - 1)
+    }
+
+    /// The lens whose words are under the pointer, as its place among the
+    /// document's.
+    pub fn lens_at(&self, scroll: Point<Pixels>, position: Point<Pixels>) -> Option<usize> {
+        if !self.bounds.contains(&position) || position.x < self.text_left {
+            return None;
+        }
+        let (row, lenses) = self.rows.line(self.shown_at(scroll, position.y));
+        let above = self.lens_rows.iter().find(|above| above.row == row)?;
+        let x = position.x - self.text_left + scroll.x - above.indent;
+        let at = above.shaped.index_for_x(x).filter(|_| lenses)?;
+        let found = above.parts.iter().find(|(words, _)| words.contains(&at));
+        found.map(|(_, lens)| *lens)
+    }
+
+    /// The middle of the words of a lens above a line, for a test to
+    /// click: the `nth` of that line's.
+    #[cfg(test)]
+    pub(crate) fn lens_middle(&self, row: usize, nth: usize) -> Option<Point<Pixels>> {
+        let above = self.lens_rows.iter().find(|above| above.row == row)?;
+        let (words, _) = above.parts.get(nth)?;
+        let (start, end) = (
+            above.shaped.x_for_index(words.start),
+            above.shaped.x_for_index(words.end),
+        );
+        Some(gpui::point(
+            self.text_left + above.indent + (start + end) / 2.,
+            self.top_of(row) - self.line_height / 2.,
+        ))
     }
 
     pub fn offset_for_position(
@@ -168,9 +277,9 @@ impl LayoutSnapshot {
         if !self.bounds.contains(&position) || position.x < self.text_left {
             return None;
         }
-        let row_f = (position.y - self.bounds.top() + scroll.y) / self.line_height;
-        let row = row_f.floor() as usize;
-        if row >= buffer.line_count() {
+        // The row of a line's lenses is no text of the file.
+        let (row, lenses) = self.rows.line(self.shown_at(scroll, position.y));
+        if row >= buffer.line_count() || lenses {
             return None;
         }
         let line = self.lines.get(row.checked_sub(self.first_row)?)?;
@@ -191,7 +300,7 @@ impl LayoutSnapshot {
         let p = buffer.offset_to_point(offset);
         let line = self.lines.get(p.row.checked_sub(self.first_row)?)?;
         let x = self.text_left + line.x_for(p.column) - scroll.x;
-        let y = self.bounds.top() + self.line_height * p.row as f32 - scroll.y;
+        let y = self.top_of(p.row) - scroll.y;
         Some(Bounds::new(
             point(x, y),
             size(self.em_width, self.line_height),
@@ -215,6 +324,9 @@ pub struct PrepaintState {
     ghost: Vec<(ShapedLine, Point<Pixels>)>,
     ghost_background: Vec<PaintQuad>,
     gutter: Vec<(ShapedLine, Point<Pixels>)>,
+    /// Where the row of the cursor is, when an editor as tall as its text
+    /// wants it in view.
+    reveal: Option<(Pixels, Pixels)>,
 }
 
 impl IntoElement for EditorElement {
@@ -247,8 +359,13 @@ impl Element for EditorElement {
         let single_line = self.editor.read(cx).mode == EditorMode::SingleLine;
         let mut style = Style::default();
         style.size.width = relative(1.).into();
+        let editor = self.editor.read(cx);
         style.size.height = if single_line {
             Settings::get(cx).line_height().into()
+        } else if editor.fit.is_some() {
+            // As tall as its text.
+            let lines = editor.doc(cx).text().line_count();
+            (Settings::get(cx).line_height() * lines as f32).into()
         } else {
             relative(1.).into()
         };
@@ -272,6 +389,13 @@ impl Element for EditorElement {
             layout(editor, bounds, focused, &theme, &settings, window, cx)
         });
         state.started = started;
+        // What the editor is in is asked to show the cursor once this
+        // frame is done with: it may be in the middle of its own.
+        if let Some((top, bottom)) = state.reveal.take()
+            && let Some(reveal) = self.editor.read(cx).fit.clone()
+        {
+            cx.defer(move |cx| reveal(top, bottom, cx));
+        }
         state
     }
 
@@ -324,11 +448,18 @@ impl Element for EditorElement {
                 }
                 for (i, line) in layout.lines.iter().enumerate() {
                     let row = layout.first_row + i;
-                    let origin = point(
-                        layout.text_left - scroll.x,
-                        bounds.top() + layout.line_height * row as f32 - scroll.y,
-                    );
+                    let origin = point(layout.text_left - scroll.x, layout.top_of(row) - scroll.y);
                     line.shaped
+                        .paint(origin, layout.line_height, window, cx)
+                        .ok();
+                }
+                for above in &layout.lens_rows {
+                    let origin = point(
+                        layout.text_left + above.indent - scroll.x,
+                        layout.top_of(above.row) - layout.line_height - scroll.y,
+                    );
+                    above
+                        .shaped
                         .paint(origin, layout.line_height, window, cx)
                         .ok();
                 }
@@ -395,24 +526,46 @@ fn layout(
     let mut scroll = editor.scroll;
     let newest_head = editor.selections[editor.newest].head;
     let cursor_row = buffer.offset_to_point(newest_head).row;
+    // The lines that have their lenses above them. An editor as tall as
+    // its text has no server, and a field has one line.
+    let rows = match single_line || editor.fit.is_some() || doc.lenses().is_empty() {
+        true => Rows::default(),
+        false => Rows::of_lenses(doc.lenses(), buffer),
+    };
     if editor.autoscroll {
         let margin = if single_line {
             px(0.)
         } else {
             (lh * 3.).min(height / 3.)
         };
-        let top = lh * cursor_row as f32;
+        let top = lh * rows.shown(cursor_row) as f32;
         if top - margin < scroll.y {
             scroll.y = top - margin;
         } else if top + lh + margin > scroll.y + height {
             scroll.y = top + lh + margin - height;
         }
     }
-    let max_y = lh * line_count.saturating_sub(1) as f32;
+    let max_y = lh * (line_count + rows.added()).saturating_sub(1) as f32;
     scroll.y = clamp(scroll.y, px(0.), max_y);
 
-    let first_row = ((scroll.y / lh).floor() as usize).min(line_count - 1);
-    let end_row = (((scroll.y + height) / lh).ceil() as usize + 1).min(line_count);
+    let line_at = |y: Pixels| rows.line((y / lh).floor().max(0.) as usize).0;
+    let mut first_row = line_at(scroll.y).min(line_count - 1);
+    let mut end_row = (line_at(scroll.y + height) + 2).min(line_count);
+    let mut reveal = None;
+    if editor.fit.is_some() {
+        // As tall as its text, it does not scroll: the rows to draw are
+        // the ones its place in the window leaves to be seen.
+        scroll.y = px(0.);
+        let seen = window.content_mask().bounds;
+        let from = (seen.top() - bounds.top()).max(px(0.));
+        let to = (seen.bottom() - bounds.top()).max(px(0.));
+        first_row = ((from / lh).floor() as usize).min(line_count - 1);
+        end_row = ((to / lh).ceil() as usize + 1).clamp(first_row + 1, line_count);
+        if editor.autoscroll {
+            let top = bounds.top() + lh * cursor_row as f32;
+            reveal = Some((top, top + lh));
+        }
+    }
     let visible = buffer.line_start(first_row)..if end_row < line_count {
         buffer.line_start(end_row)
     } else {
@@ -462,7 +615,6 @@ fn layout(
     // What a language server puts into the rows on screen.
     let inlays = doc.inlays();
     let mut inlay_ix = inlays.partition_point(|inlay| inlay.offset < visible.start);
-    let mut hints: Vec<(usize, &str)> = Vec::new();
     for row in first_row..end_row {
         let line_start = buffer.line_start(row);
         let full = buffer.line_str(row);
@@ -481,7 +633,7 @@ fn layout(
         };
         let (segments, next_ix) = color_segments(text, line_start, &spans, span_ix, theme);
         span_ix = next_ix;
-        hints.clear();
+        let mut hints: Vec<(usize, &str)> = Vec::new();
         while let Some(inlay) = inlays
             .get(inlay_ix)
             .filter(|i| i.offset <= line_start + full.len())
@@ -503,6 +655,53 @@ fn layout(
         ));
     }
 
+    // What a server offers to do with a line, above it: the words of its
+    // lenses one after another, starting where the line's own text does.
+    let mut lens_rows = Vec::new();
+    let lenses = doc.lenses();
+    let mut lens_ix = lenses.partition_point(|lens| lens.offset < visible.start);
+    while let Some(lens) = lenses.get(lens_ix).filter(|_| rows.added() > 0) {
+        let row = buffer.offset_to_point(lens.offset.min(buffer.len())).row;
+        if row >= end_row {
+            break;
+        }
+        let mut words = String::new();
+        let mut parts = Vec::new();
+        while let Some(lens) = lenses
+            .get(lens_ix)
+            .filter(|lens| buffer.offset_to_point(lens.offset.min(buffer.len())).row == row)
+        {
+            if !words.is_empty() {
+                words.push_str(LENS_GAP);
+            }
+            let title = lens.title.trim();
+            parts.push((words.len()..words.len() + title.len(), lens_ix));
+            words.push_str(title);
+            lens_ix += 1;
+        }
+        let Some(line) = row.checked_sub(first_row).and_then(|at| lines.get(at)) else {
+            continue;
+        };
+        let full = buffer.line_str(row);
+        let indent = full.len() - full.trim_start().len();
+        let run = TextRun {
+            len: words.len(),
+            font: code_font.clone(),
+            color: theme.fg_subtle,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        lens_rows.push(LensRow {
+            row,
+            shaped: window
+                .text_system()
+                .shape_line(words.into(), font_size, &[run], None),
+            indent: line.x_for(indent),
+            parts,
+        });
+    }
+
     // Horizontal: keep the newest cursor in view, then clamp to content width.
     let text_width = text_bounds.size.width;
     if editor.autoscroll
@@ -520,6 +719,11 @@ fn layout(
     let widest = lines
         .iter()
         .map(|l| l.shaped.width)
+        .chain(
+            lens_rows
+                .iter()
+                .map(|above| above.indent + above.shaped.width),
+        )
         .fold(px(0.), |a, b| if b > a { b } else { a });
     let max_x = widest + em * 2. - text_width;
     scroll.x = clamp(
@@ -530,7 +734,7 @@ fn layout(
     editor.scroll = scroll;
     editor.autoscroll = false;
 
-    let row_y = |row: usize| bounds.top() + lh * row as f32 - scroll.y;
+    let row_y = |row: usize| bounds.top() + lh * rows.shown(row) as f32 - scroll.y;
     let text_x = |x: Pixels| text_left + x - scroll.x;
 
     // Rectangles covering a byte range on the visible rows. A range that runs
@@ -587,7 +791,9 @@ fn layout(
                     theme.accent,
                 ));
             }
-            if s.is_empty() && !single_line {
+            // One of many on a page (a cell of a notebook) marks the row
+            // of its cursor only while the keys are its own.
+            if s.is_empty() && !single_line && (focused || editor.fit.is_none()) {
                 background.push(fill(
                     Bounds::new(
                         point(bounds.left(), row_y(head.row)),
@@ -852,7 +1058,7 @@ fn layout(
             background.push(fill(
                 Bounds::new(
                     point(bounds.left() + px(1.), row_y(start)),
-                    size(px(3.), lh * (end - start) as f32),
+                    size(px(3.), row_y(end - 1) + lh - row_y(start)),
                 ),
                 color,
             ));
@@ -870,7 +1076,7 @@ fn layout(
                     background.push(fill(
                         Bounds::new(
                             point(bounds.left(), row_y(start)),
-                            size(bounds.size.width, lh * (end - start) as f32),
+                            size(bounds.size.width, row_y(end - 1) + lh - row_y(start)),
                         ),
                         color,
                     ));
@@ -908,6 +1114,8 @@ fn layout(
             em_width: em,
             first_row,
             lines,
+            rows,
+            lens_rows,
         }),
         started: Instant::now(),
         scroll,
@@ -920,6 +1128,7 @@ fn layout(
         ghost,
         ghost_background,
         gutter,
+        reveal,
     }
 }
 
@@ -1175,6 +1384,28 @@ mod tests {
             inlays: inlays.to_vec(),
             len,
         }
+    }
+
+    #[test]
+    fn lens_rows_map_both_ways_without_changing_file_lines() {
+        let rows = Rows(Arc::new(vec![0, 2, 3, 90]));
+        let expected = [
+            (0, true),
+            (0, false),
+            (1, false),
+            (2, true),
+            (2, false),
+            (3, true),
+            (3, false),
+            (4, false),
+        ];
+        for (shown, expected) in expected.into_iter().enumerate() {
+            assert_eq!(rows.line(shown), expected);
+        }
+        for line in 0..100 {
+            assert_eq!(rows.line(rows.shown(line)), (line, false));
+        }
+        assert_eq!(Rows::default().line(42), (42, false));
     }
 
     #[test]

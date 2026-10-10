@@ -87,6 +87,8 @@ pub struct Settings {
     /// Colors from the language server over the grammar's, where it says
     /// what a word is.
     pub semantic_highlighting: bool,
+    /// What a language server offers to do with a line, at its end.
+    pub code_lens: bool,
     /// The icon theme of an installed extension, by name: pictures next
     /// to file names in the tree and on tabs. None by default.
     pub icon_theme: Option<String>,
@@ -295,6 +297,7 @@ impl Default for Settings {
             format_on_save: false,
             inlay_hints: true,
             semantic_highlighting: true,
+            code_lens: true,
             icon_theme: None,
             context_servers: BTreeMap::new(),
             other: BTreeMap::new(),
@@ -552,6 +555,8 @@ pub fn bind_defaults(cx: &mut App) {
     crate::agent_panel::bind_keys(cx);
     crate::debug_panel::bind_keys(cx);
     crate::inline_edit::bind_keys(cx);
+    // After the editor's: in a cell, two of its keys run the cell.
+    crate::notebook::bind_keys(cx);
 }
 
 fn read(path: &Path) -> String {

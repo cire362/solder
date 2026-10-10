@@ -17,6 +17,7 @@ echo "== editor: clippy"
 echo "== editor: test build"
 (cd editor && cargo test --workspace --profile ci --locked --no-run --quiet)
 echo "== editor: tests"
-(cd editor && cargo test --workspace --profile ci --locked --quiet)
+bash scripts/test-test-temp.sh
+(cd editor && bash ../scripts/with-test-temp.sh cargo test --workspace --profile ci --locked --quiet)
 
 echo "All checks passed."

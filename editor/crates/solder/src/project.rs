@@ -102,6 +102,7 @@ impl Project {
             return;
         }
         self._watcher = Some(watcher);
+        let sessions = crate::settings::config_dir().join("sessions");
         self._watch_task = Some(cx.spawn(async move |this, cx| {
             while let Some(first) = rx.next().await {
                 // Coalesce bursts (a branch switch, a formatter run) into one update.
@@ -115,8 +116,14 @@ impl Project {
                 let mut changed = HashSet::new();
                 let mut structural = false;
                 let mut git_changed = false;
-                for e in events {
+                for mut e in events {
                     if matches!(e.kind, EventKind::Access(_)) {
+                        continue;
+                    }
+                    // Opening HOME can put our state inside the project.
+                    // Atomic cursor saves must not trigger another full scan.
+                    without_session_paths(&mut e, &sessions);
+                    if e.paths.is_empty() {
                         continue;
                     }
                     structural |= matches!(e.kind, EventKind::Create(_) | EventKind::Remove(_))
@@ -175,14 +182,23 @@ fn is_git_state(path: &Path) -> bool {
 /// Walks the tree in parallel, honoring `.gitignore`, `.ignore` and global
 /// git excludes.
 pub fn scan(root: &Path) -> Vec<Arc<str>> {
+    scan_with_sessions(root, crate::settings::config_dir().join("sessions"))
+}
+
+fn without_session_paths(event: &mut notify::Event, sessions: &Path) {
+    event.paths.retain(|path| !path.starts_with(sessions));
+}
+
+fn scan_with_sessions(root: &Path, sessions: PathBuf) -> Vec<Arc<str>> {
     let files = Mutex::new(Vec::new());
     ignore::WalkBuilder::new(root)
         .hidden(false)
         .require_git(false)
-        .filter_entry(|e| {
+        .filter_entry(move |e| {
             let name = e.file_name().to_str().unwrap_or("");
-            !(e.file_type().is_some_and(|t| t.is_dir()) && is_excluded_dir(name))
-                && name != ".DS_Store"
+            !(e.path().starts_with(&sessions)
+                || e.file_type().is_some_and(|t| t.is_dir()) && is_excluded_dir(name)
+                || name == ".DS_Store")
         })
         .build_parallel()
         .run(|| {
@@ -206,6 +222,29 @@ pub fn scan(root: &Path) -> Vec<Arc<str>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_saves_inside_a_project_do_not_rescan_or_enter_the_finder() {
+        let dir = db::testing::dir("session-scan");
+        let sessions = dir.join(".config/solder/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        std::fs::write(sessions.join("project.json"), "{}").unwrap();
+        std::fs::write(dir.join("sessions/user.json"), "{}").unwrap();
+        let files = scan_with_sessions(&dir, sessions.clone());
+        assert_eq!(
+            files.iter().map(|file| &**file).collect::<Vec<_>>(),
+            ["sessions/user.json"]
+        );
+        let mut event = notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
+            .add_path(sessions.join(".solder-save-1"))
+            .add_path(sessions.join("project.json"));
+        without_session_paths(&mut event, &sessions);
+        assert!(event.paths.is_empty());
+        event.paths.push(dir.join("sessions/user.json"));
+        without_session_paths(&mut event, &sessions);
+        assert_eq!(event.paths, [dir.join("sessions/user.json")]);
+    }
 
     #[test]
     fn recognizes_git_state_files() {

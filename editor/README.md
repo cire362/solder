@@ -895,7 +895,7 @@ What is in the module today is what every extension starts from:
 |---|---|
 | Register commands and run its own or another extension's | As in VS Code. Of VS Code's own commands: `vscode.open`, `setContext`, `workbench.action.files.saveAll` |
 | Show a message | With nothing to choose, it is in the status bar for eight seconds, in its color. With answers, or `modal`, it is a list to pick the answer from |
-| Ask to pick from a list, or to type a line | The editor's own list, with the keys of the command palette. One is picked, also where the extension allows several. What is typed is checked by the extension and asked again with what is wrong. A password is not hidden |
+| Ask to pick from a list, or to type a line | The editor's own list, with the keys of the command palette. Where the extension allows several, Enter ticks a row and the first row answers with the ones ticked. What is typed is checked by the extension and asked again with what is wrong. A password is typed in stars |
 | Put items in the status bar | In the `extensions` item of the bars, as text: Solder has no font for the pictures VS Code draws there. A click runs the item's command. Work in progress (`withProgress`) is said there too |
 | Write to an output channel | Kept, the last 256 KB of each. **Show output** in the Extensions tab opens it in a tab, and so does the extension when it asks |
 | Read and set settings | What extensions declare, with what `settings.json` says, and `editor.tabSize`. `update` writes the key to `settings.json` |
@@ -903,11 +903,12 @@ What is in the module today is what every extension starts from:
 | See open documents and the editor in front | Every file open in a tab, with its text, kept up to date as it is typed, saved and closed, and the cursor of the one in front. There is one visible editor: the file in front |
 | Change text | `TextEditor.edit` and `workspace.applyEdit`, in open files and on disk, with files made, renamed and deleted. A snippet is put in as text, its places taken out |
 | Use the clipboard, open a link | Yes; a link only to the web or to mail |
-| Open terminals | A terminal of the dock, under the name the extension gives it, running what it names or your shell. It is made when the extension first shows it or types into it, so one only kept ready takes no room. A terminal the extension draws itself (`pty`) is not here yet |
-| Provide and run tasks | **Workspace: Run extension task** in the palette lists the tasks extensions provide and runs the one chosen in a terminal, whose tab stays when it ends. The extension hears what it ended with. A task that runs in the extension's own code is not here yet, and problem matchers are not read |
+| Open terminals | A terminal of the dock, under the name the extension gives it, running what it names or your shell. It is made when the extension first shows it or types into it, so one only kept ready takes no room. A terminal the extension draws itself (`pty`) is a terminal of the dock too: what is typed goes to the extension key by key, and what it writes is shown |
+| Provide and run tasks | **Workspace: Run extension task** in the palette lists the tasks extensions provide and runs the one chosen in a terminal, whose tab stays when it ends. The extension hears what it ended with. A task that is the extension's own code (`CustomExecution`) runs in a terminal it draws. Problem matchers are not read |
 | Watch files | `createFileSystemWatcher`, for the folders of the open windows: files made, changed and deleted, but for `.git` and `node_modules` |
 | Show pages (webviews) and editors of its own for kinds of files | A tab drawn by the system's browser; see below |
-| Give language features in code (`vscode.languages`) | Completions, hovers, definitions, references, rename, formatting, code actions, document and project symbols, signature help, inlay hints, semantic colors, and diagnostics from its collections. A code lens is offered among the code actions of its line (`cmd-.`), not drawn above it |
+| Read, run and write notebooks | A tab of cells, drawn by Solder: the extension reads the file, runs the cells and writes it back; see below |
+| Give language features in code (`vscode.languages`) | Completions, hovers, definitions, references, rename, formatting, code actions, document and project symbols, signature help, inlay hints, semantic colors, and diagnostics from its collections. A code lens is above its line, where a click runs it, and among the code actions of the line (`cmd-.`) |
 
 **Show extension views** opens the **Views** panel. Trees an extension names
 are listed before its code starts; choosing one starts the approved code.
@@ -946,8 +947,78 @@ more, not every one VS Code has), and `vscode-dark` or `vscode-light` on
 its body. `cmd-w` closes it, and the keys of the command palette and the
 file finder work in it.
 
-Not there: notebooks, pages brought back after a restart, a page inside
-the sidebar itself, and pages under Wayland, where the tab says so.
+Not there: a page inside the sidebar itself, and pages under Wayland,
+where the tab says so. Pages return through their serializer after a restart.
+
+A **notebook** is a file an extension reads as a list of cells: text, and
+code it can run. A file whose name an extension's kind of notebook is for
+is offered as **Open with** in the file tree's menu and the editor's, and
+opens as a tab of cells next to the files' tabs. Nothing of it is a browser
+view: each cell is an editor of Solder's, as tall as its text and colored
+for its language, and under a code cell is what its last run put out.
+
+| | |
+|---|---|
+| `cmd-enter` | Run the cell the cursor is in |
+| `shift-enter` | Run it and go to the next cell; after the last, a new one is made |
+| `cmd-s` | Save: the extension writes the file from the cells as they are |
+| **Run all**, **Stop** | Every code cell, in order; stop what runs |
+| **Add code**, **Add text** | A cell under the one the cursor is in; code in the language of the code above it |
+| The arrows and the bin in a cell's head | Move the cell up or down, remove it |
+
+The extension does three things: it reads the file into cells and writes
+them back (`registerNotebookSerializer`), and it runs the code
+(`createNotebookController`), saying what each run put out as it comes.
+Of what a run puts out, Solder draws words (plain text, what was written to
+standard output and to standard error, an error with its trace, Markdown
+and JSON as their source) and pictures (PNG, JPEG, GIF, WebP, up to 8 MB).
+An output of more than 200 lines or 64 KB is cut, and says so. HTML output has a **View HTML output** button, which opens it in a separate
+tab with scripts disabled. A matching `contributes.notebookRenderer` module
+can draw an interactive output in that tab after the extension is allowed.
+It receives the output's MIME data and can exchange messages through
+`createRendererMessaging`. Only files inside that extension are served;
+remote requests, navigation and downloads are blocked. Text and pictures
+stay inline; browser views are created only when a result is opened.
+Closing the result returns to its notebook. Closing a notebook with
+changes asks, as closing a file does.
+
+Not there for notebooks: language features inside a cell (completions and
+the like), text cells shown as formatted text and not as their Markdown, a
+choice between several things that can run a kind of notebook (the first
+the extension made is used), dependencies between renderer modules
+(`getRenderer`, `extends`), cell status bar items, edits an extension
+makes to the cells itself (`NotebookEdit`), and a notebook opened by an
+extension's code (`openNotebookDocument`, `showNotebookDocument`). Jupyter `.ipynb` files (format 4) open directly, without an extension. The
+built-in reader preserves cell ids, metadata, attachments, outputs and
+unknown fields when editing and saving. It does not start a kernel: reading
+and saving a Jupyter file is independent of running its cells. A file over
+64 MB is refused with a reason. Jupyter kernels and the ipywidgets protocol
+are not built in: a generic renderer module does not make every Jupyter
+widget or the Jupyter extension compatible. Outputs opened in a separate
+tab are transient and are reopened from the notebook, not restored as pages.
+
+The published `vscode.ipynb@1.95.3` reader from Open VSX has been checked on
+a disposable CI runner: its code activated, read a sample `.ipynb` and saved
+the edited cell. The census accepts an exact version and changes the sample
+cell before saving, so losing edits is reported as a failure. This checks
+a serializer, not a kernel or every notebook feature. Locally the same path is tested
+against a catalog served by the test itself, including a serializer that
+ignores edits. Published extension code is not run locally. The exact run
+and its limits are in [the reader check](extension-checks/vscode-ipynb-1.95.3.md).
+
+Live macOS check on 2026-10-10: typed into a Jupyter cell, saved and checked
+the file; opened its HTML table and a renderer counter; clicked the counter
+and received its extension's reply; restarted the project and saw the saved
+notebook again. The renderer in that check was written here, not downloaded.
+
+Files, split panes, cursors, scroll positions and notebook tabs are remembered
+per project in `sessions/` beside the settings. Pages of extensions return
+through `registerWebviewPanelSerializer`, with the last `setState` value;
+a custom editor is reopened through its provider. Extensions whose code is
+not allowed are not started for restoration. Missing files are skipped.
+Untitled text and terminal sessions are not restored, and this is not a
+backup of unsaved edits. State is written off the UI thread, in order, once
+per second when it changed and when the window closes.
 
 Which extensions work is not claimed from the list above: it is found out.
 With each release the fifty most installed extensions of Open VSX are
@@ -1095,18 +1166,28 @@ Zed starts for it (`solargraph` for Ruby, `phpactor` for PHP, `elixir-ls` for
 Elixir); any other starts all its servers. Open files go to the chosen servers
 as soon as the settings are saved.
 
-Two things a server draws into the text are shown for every server that has
+Three things a server draws into the text are shown for every server that has
 them, an extension's or Solder's own. **Inlay hints** are the types a server
 worked out and the names of parameters, in the line in a quieter color; they
 are no part of the file, the cursor steps over them, and one longer than 60
 characters is cut. **Semantic colors** are what the server says each word
 is, over what the grammar says: a server knows a constant from a variable
-where a grammar sees a name. Both are asked for a moment after the last key,
-and move with the text until the answer comes. Each has a setting, on unless
-turned off:
+where a grammar sees a name. A **code lens** is something the server offers
+to do with a line (run this test, show what refers to this): its words are
+above the line, in a quieter color, and a click does it. Its row has no
+line number and is no part of the file: cursor movement, selections,
+breakpoints and hover still refer to the lines of the file. A lens is shown if a click
+can do it: its command is one the server runs itself, or one of three the
+editor does for it. Places to show (`editor.action.showReferences`, and
+rust-analyzer's name for the same) are listed as the references of a symbol
+are. rust-analyzer's "Run" over a test or a `main` runs in a terminal of
+the dock, whose tab stays to be read. A lens of any other command of the
+editor it was written for (rust-analyzer's "Debug") is left out. All three are asked for a moment after
+the last key, and move with the text until the answer comes. Each has a
+setting, on unless turned off:
 
 ```json
-{ "inlay_hints": true, "semantic_highlighting": true }
+{ "inlay_hints": true, "semantic_highlighting": true, "code_lens": true }
 ```
 
 That is why such an extension **asks first**. It is downloaded and read, and

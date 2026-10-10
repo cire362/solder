@@ -108,7 +108,9 @@ jobs:
         run: cargo test --workspace --profile ci --locked --no-run
       - name: Run Rust tests
         timeout-minutes: 5
-        run: cargo test --workspace --profile ci --locked
+        run: |
+          bash ../scripts/test-test-temp.sh
+          bash ../scripts/with-test-temp.sh cargo test --workspace --profile ci --locked
       - name: Verify database TLS
         timeout-minutes: 5
         run: bash scripts/test-db-tls.sh

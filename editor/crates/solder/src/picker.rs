@@ -105,6 +105,19 @@ impl<D: PickerDelegate> Picker<D> {
         self.query.read(cx).text(cx)
     }
 
+    /// Draws what is typed as stars: for a password an extension asks for.
+    pub fn mask(&mut self, cx: &mut Context<Self>) {
+        self.query.update(cx, |editor, cx| {
+            editor.masked = true;
+            cx.notify();
+        });
+    }
+
+    #[cfg(test)]
+    pub fn is_masked(&self, cx: &App) -> bool {
+        self.query.read(cx).masked
+    }
+
     /// Prefills the query, selected so typing replaces it.
     pub fn set_query(&mut self, text: &str, cx: &mut Context<Self>) {
         self.query.update(cx, |e, cx| e.set_text(text, true, cx));

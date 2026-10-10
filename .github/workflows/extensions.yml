@@ -13,6 +13,9 @@ on:
       count:
         description: How many of the most installed to try
         default: "50"
+      extension:
+        description: Optional exact extension, such as vscode.ipynb@1.95.3
+        default: ""
 
 permissions:
   contents: read
@@ -44,9 +47,12 @@ jobs:
       - name: Install, start and ask
         env:
           COUNT: ${{ inputs.count || '50' }}
+          EXTENSION: ${{ inputs.extension }}
         run: |
+          args=()
+          if [ -n "$EXTENSION" ]; then args+=(--extension "$EXTENSION"); fi
           cargo run --locked --release -p extension --bin extension-census -- \
-            --count "$COUNT" --out "$RUNNER_TEMP/extensions.md"
+            --count "$COUNT" --out "$RUNNER_TEMP/extensions.md" "${args[@]}"
       - name: The list
         run: cat "$RUNNER_TEMP/extensions.md" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4

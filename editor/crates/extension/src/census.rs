@@ -83,6 +83,8 @@ pub struct Plan {
     pub catalog: String,
     /// How many of the most installed to try.
     pub count: usize,
+    /// Exact ids and versions; empty selects the most installed instead.
+    pub extensions: Vec<(String, String)>,
     /// Where they are installed: a folder that is thrown away.
     pub root: PathBuf,
     pub node: String,
@@ -92,7 +94,15 @@ pub struct Plan {
 
 /// Runs the check; blocking, for as long as `count` starts take.
 pub fn run(plan: &Plan, mut said: impl FnMut(&str)) -> Result<Vec<Row>, String> {
-    let entries = block(catalog::search(Origin::VsCode, &plan.catalog, ""))??;
+    let entries = if plan.extensions.is_empty() {
+        block(catalog::search(Origin::VsCode, &plan.catalog, ""))??
+    } else {
+        let mut entries = Vec::new();
+        for (id, version) in &plan.extensions {
+            entries.push(block(catalog::version(&plan.catalog, id, version))??);
+        }
+        entries
+    };
     let script = vscode::host_script(&plan.root.join("host"))?;
     let mut rows = Vec::new();
     for entry in entries.into_iter().take(plan.count) {
@@ -363,6 +373,73 @@ fn start(plan: &Plan, script: &Path, extension: &Extension) -> Code {
         }
         read(&mut started);
     }
+    // Opening and saving exercise a serializer without claiming a kernel
+    // works, or running code from a notebook we downloaded.
+    let file = project.join("sample.ipynb");
+    for book in extension.notebooks.iter().filter(|book| book.opens(&file)) {
+        let sample = json!({"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[
+            {"cell_type":"code","id":"sample","source":"1 + 1","metadata":{},"execution_count":null,"outputs":[]}
+        ]});
+        let opened = std::fs::write(&file, sample.to_string())
+            .map_err(|e| e.to_string())
+            .and_then(|_| {
+                host.request(
+                    "notebook.open",
+                    json!({"type":book.view_type,"uri":uri(&file)}),
+                    plan.patience,
+                )
+            })
+            .and_then(|answer| match answer["cells"].as_array() {
+                Some(cells) if cells.len() == 1 && cells[0]["value"] == "1 + 1" => Ok(()),
+                _ => Err("The sample cell was not read back".into()),
+            });
+        let read_ok = opened.is_ok();
+        started.asked.push((
+            format!("read .ipynb ({})", book.view_type),
+            opened.map_err(|e| line(&e)),
+        ));
+        if read_ok {
+            // Saving an unchanged cell would also pass if the serializer
+            // ignored edits and merely returned the original file.
+            let edited = "2 + 2\n";
+            host.notify(
+                "notebook.cell",
+                json!({"uri":uri(&file),"handle":0,"value":edited}),
+            );
+            let saved = host
+                .request("notebook.save", json!({"uri":uri(&file)}), plan.patience)
+                .and_then(|answer| {
+                    if answer == true {
+                        Ok(())
+                    } else {
+                        Err("No save confirmation".into())
+                    }
+                })
+                .and_then(|_| std::fs::read(&file).map_err(|e| e.to_string()))
+                .and_then(|bytes| {
+                    serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())
+                })
+                .and_then(|value| {
+                    let source = &value["cells"][0]["source"];
+                    let text = source.as_str().map(str::to_string).or_else(|| {
+                        source
+                            .as_array()
+                            .map(|lines| lines.iter().filter_map(Value::as_str).collect::<String>())
+                    });
+                    if value["nbformat"] == 4 && text.as_deref() == Some(edited) {
+                        Ok(())
+                    } else {
+                        Err("The saved file lost the edited sample cell".into())
+                    }
+                });
+            started.asked.push((
+                format!("save .ipynb ({})", book.view_type),
+                saved.map_err(|e| line(&e)),
+            ));
+        }
+        host.notify("notebook.close", json!({"uri":uri(&file)}));
+    }
+    read(&mut started);
     host.stop();
     Code::Started(started)
 }
@@ -384,7 +461,7 @@ pub fn report(rows: &[Row]) -> String {
     let with_code = rows.iter().filter(|row| row.code != Code::None).count();
     let mut out = String::from("# Extensions of Open VSX in Solder\n\n");
     out.push_str(&format!(
-        "The {} most installed, each installed and started. {} are data alone; of the {} with code, {} started.\n\n",
+        "The {} selected extensions, each installed and started. {} are data alone; of the {} with code, {} started.\n\n",
         rows.len(),
         rows.len() - with_code,
         with_code,
@@ -444,6 +521,104 @@ pub fn report(rows: &[Row]) -> String {
 mod tests {
     use super::*;
     use crate::testing::{Served, scratch, serve, vscode_extension, write, zip};
+
+    #[test]
+    fn a_pinned_notebook_extension_reads_and_saves_the_sample() {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else { return };
+        let dir = scratch("census-notebook");
+        let extension = dir.join("book/extension");
+        write(
+            &extension.join("package.json"),
+            r#"{
+            "name":"book","publisher":"Test","version":"1.0.0","main":"main.js",
+            "contributes":{"notebooks":[
+              {"type":"test-book","selector":[{"filenamePattern":"*.ipynb"}]},
+              {"type":"stale-book","selector":[{"filenamePattern":"*.ipynb"}]}
+            ]}
+        }"#,
+        );
+        write(
+            &extension.join("main.js"),
+            r#"
+const v = require('vscode');
+exports.activate = () => ['test-book', 'stale-book'].forEach(type => v.workspace.registerNotebookSerializer(type, {
+  deserializeNotebook(bytes) {
+    const file = JSON.parse(Buffer.from(bytes).toString());
+    return new v.NotebookData(file.cells.map(cell => new v.NotebookCellData(v.NotebookCellKind.Code, cell.source, 'python')));
+  },
+  serializeNotebook(data) {
+    return Buffer.from(JSON.stringify({nbformat:4,cells:data.cells.map(cell => ({source:type === 'stale-book' ? '1 + 1' : cell.value}))}));
+  }
+}));
+"#,
+        );
+        let Some(vsix) = zip(&dir.join("book"), "extension") else {
+            return;
+        };
+        let (files, _) = serve(vec![("/book.vsix", Served::ok(vsix))]);
+        let metadata = json!({"namespace":"Test","name":"book","version":"1.0.0","files":{"download":format!("{files}/book.vsix")}});
+        let wrong = json!({"namespace":"Test","name":"book","version":"2.0.0","files":{"download":format!("{files}/book.vsix")}});
+        let (catalog, requests) = serve(vec![
+            (
+                "/api/Test/book/1.0.0",
+                Served::ok(metadata.to_string().into_bytes()),
+            ),
+            (
+                "/api/Test/book/0.0.0",
+                Served::ok(wrong.to_string().into_bytes()),
+            ),
+        ]);
+        assert!(
+            block(catalog::version(&catalog, "Test.book", "0.0.0"))
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            block(catalog::version(&catalog, "Test.book", "../1.0.0"))
+                .unwrap()
+                .is_err()
+        );
+        let rows = run(
+            &Plan {
+                catalog,
+                count: 1,
+                extensions: vec![("Test.book".into(), "1.0.0".into())],
+                root: dir.join("root"),
+                node: node.to_string_lossy().into_owned(),
+                patience: Duration::from_secs(10),
+            },
+            |_| {},
+        )
+        .unwrap();
+        let Code::Started(started) = &rows[0].code else {
+            panic!("{:?}", rows[0].code)
+        };
+        assert_eq!(
+            started.asked,
+            [
+                ("read .ipynb (test-book)".into(), Ok(())),
+                ("save .ipynb (test-book)".into(), Ok(())),
+                ("read .ipynb (stale-book)".into(), Ok(())),
+                (
+                    "save .ipynb (stale-book)".into(),
+                    Err("The saved file lost the edited sample cell".into()),
+                ),
+            ]
+        );
+        assert_eq!(rows[0].version, "1.0.0");
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.contains("search"))
+        );
+    }
 
     #[test]
     fn the_most_installed_are_installed_started_and_asked_what_they_do() {
@@ -514,6 +689,7 @@ exports.activate = () => {
         let plan = Plan {
             catalog,
             count: 3,
+            extensions: Vec::new(),
             root: dir.join("root"),
             node: node.to_string_lossy().into_owned(),
             patience: Duration::from_secs(20),
@@ -538,7 +714,7 @@ exports.activate = () => {
             panic!("{:?}", rows[0].code);
         };
         assert_eq!(demo.commands, 3);
-        assert_eq!(demo.missing, ["notebooks.createNotebookController"]);
+        assert_eq!(demo.missing, ["comments.createCommentController"]);
         assert!(demo.languages.is_empty() && demo.asked.is_empty());
 
         // The one with language features: what it can do, and what it
@@ -561,14 +737,14 @@ exports.activate = () => {
 
         // The list, as it is read.
         let page = report(&rows);
-        assert!(page.contains("The 3 most installed, each installed and started."));
+        assert!(page.contains("The 3 selected extensions, each installed and started."));
         assert!(page.contains("of the 3 with code, 2 started"));
         assert!(page.contains("| Acme.lang 1.0.0 | 500 |"));
         assert!(
             page.contains("hovers, formatting for python; hovers answered; formatting answered")
         );
         assert!(page.contains("its start failed: no license"));
-        assert!(page.contains("| notebooks.createNotebookController |"));
+        assert!(page.contains("| comments.createCommentController |"));
         // One the catalog lists and does not have is said, and the rest go on.
         let gone = Row {
             id: "Acme.gone".into(),

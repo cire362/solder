@@ -108,16 +108,26 @@ Never guess a signature.
   of a server Solder knows; options are read once, at the start, so such a
   server is started again (`LspStore::restart`) when they change, and a
   start that finishes after a later one began is dropped.
+- Project tabs and view positions are kept by `workspace::session` in the
+  settings folder. Its writer serializes disk writes on one thread; reads
+  and file loads are off the UI thread too. Extension pages are restored
+  through their serializers, never by replaying old HTML, and permission
+  to run an extension is still checked. Missing files are skipped; this is
+  not a backup of unsaved text.
 - Language-server requests triggered by typing must run after the current
   effect cycle (`cx.defer`), so the `didChange` for what was just typed
   reaches the server first. See `Editor::after_typing`.
-- What a server draws into the text (inlay hints, semantic colors) is the
-  document's (`Document::inlays`, `Document::semantic`), asked for a
-  moment after the last change (`LspStore::schedule_hints`), never per
-  key, and moved with the text until the answer comes. A hint is in the
+- What a server draws into the text (inlay hints, semantic colors, code
+  lenses) is the document's (`Document::inlays`, `Document::semantic`,
+  `Document::lenses`), asked for a moment after the last change
+  (`LspStore::schedule_hints`), never per key, and moved with the text
+  until the answer comes. A hint is in the
   row and not in the file: `DisplayLine` maps columns both ways, as it
   does for tabs, and nothing else may assume a column is a place on
-  screen.
+  screen. A lens has a row above its line (`element::Rows` maps file lines to
+  display rows), and is kept only if a
+  click can do it: its command is one its server said it runs, or one
+  of the few the editor does itself (`editor_lsp::LENS_COMMANDS`).
 - Git goes through `git.rs`, which shells out to `git` with stable
   `--porcelain=v2 -z` formats. Everything in it blocks: call it from
   `cx.background_executor()`.
@@ -234,8 +244,11 @@ Never guess a signature.
   A terminal of an extension is a terminal of the dock, kept by the
   workspace that made it (`extension_terminals`); a task is a command
   in such a terminal, and what `host/shell.js` knows of its end is what
-  the terminal's process ended with. Watching files is the host's own
-  work with Node: the editor is not asked.
+  the terminal's process ended with. A terminal the extension draws
+  itself has no program, so its terminal runs `host/relay.js`, which
+  carries between the terminal and the extension's object on a local
+  port, under a token: again nothing new in Rust. Watching files is the
+  host's own work with Node: the editor is not asked.
   A page of an extension (`webview.rs`) is the one browser view there
   is: the system's, through `wry`, a child of the window placed where
   GPUI laid out its tab. It is made when a page is first drawn, never
@@ -244,6 +257,21 @@ Never guess a signature.
   built: navigation, new windows, downloads, permissions, and files
   outside the folders the extension named. A new thing a page may do
   is a new line there, with a test of what it refuses.
+  A notebook (`notebook.rs`) is no page: a tab of cells the editor draws
+  itself, kept by the workspace next to the pages' tabs. Jupyter format 4 files are read and atomically written by `ipynb.rs`,
+  preserving metadata, attachments and output bundles. Other notebooks
+  use their extension, which reads the file, runs the cells and writes it back (`host/notebooks.js`,
+  which also reads and writes the file: no bytes of it cross to the
+  editor); the editor says what is typed and which cells there are, a
+  cell by a number that stays its own. A cell is an `Editor` as tall as
+  its text (`Editor::fitted`): it never scrolls up or down itself, draws
+  only the rows its place in the window leaves to be seen, and asks the
+  list it is in to show the cursor. Cells are a `list`, so only the ones
+  on screen are laid out. What a run puts out is words or a picture
+  (`notebook::outputs`). HTML and a permitted extension's renderer module
+  open on demand in a separate page tab (`webview::notebook_output`), with
+  remote requests blocked and only the extension's files available. Raw
+  HTML has scripts disabled. These result tabs are transient.
   Whether published extensions work is found by `extension::census`,
   which installs and starts them. It runs their code, so it belongs to
   the workflow that runs it on a runner with no secrets: do not run it

@@ -1558,9 +1558,8 @@ mod tests {
         assert!(wasm::THREADS.load(std::sync::atomic::Ordering::Relaxed) > 0);
         assert!(!vue.is_hung() && !hung_grammars().contains(&"Vue.js"));
 
-        // The same grammar under a language with no patience at all, in
-        // place of one whose scanner never returns: its first parse is
-        // not waited for, and that is the last one it is asked for.
+        // A scanner that cannot finish: a zero timeout alone is not
+        // enough, since recv_timeout can take an already queued answer.
         let Source::Wasm(spec) = &vue.source else {
             unreachable!()
         };
@@ -1575,7 +1574,17 @@ mod tests {
             watch: wasm::Watch::patient(Duration::ZERO),
             lines: OnceLock::new(),
         });
-        assert!(SyntaxTree::parse(impatient.clone(), &rope).is_none());
+        let mut parser = new_parser(&impatient).unwrap();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        assert!(matches!(
+            impatient.watch.run(None, move || {
+                let _ = held.recv();
+            }),
+            wasm::Outcome::Hung
+        ));
+        // The parse path records the failure for the editor to report,
+        // then public parses refuse the grammar without waiting again.
+        assert!(parse_rope(&impatient, &mut parser, &rope, None, None).is_none());
         assert!(impatient.is_hung());
         assert_eq!(hung_grammars(), ["Impatient"]);
         // Its files are plain text from then on, at no cost.
@@ -1585,6 +1594,7 @@ mod tests {
         assert!(asked.elapsed() < Duration::from_millis(200));
         // The others go on as before.
         assert!(SyntaxTree::parse(vue, &rope).is_some());
+        drop(release);
     }
 
     #[test]
