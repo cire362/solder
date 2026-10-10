@@ -876,6 +876,9 @@ impl Workspace {
                 } => {
                     this.open_locations(title.clone(), locations.clone(), *always_list, window, cx)
                 }
+                EditorEvent::RunInTerminal(command) => {
+                    this.spawn_terminal_with(command.clone(), true, window, cx);
+                }
                 EditorEvent::RenameRequested { current } => {
                     let prompt = RenamePrompt::new(editor.clone(), current.clone());
                     let current = current.clone();
@@ -6537,7 +6540,7 @@ mod tests {
         // editor to run, and a click on it could do nothing.
         wait_for(cx, "the lens", &|cx| !lenses(cx).is_empty());
         let found = cx.read(|cx| lenses(cx));
-        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found.len(), 3, "{found:?}");
         let lens = &found[0];
         assert_eq!(
             (lens.offset, lens.title.as_str(), lens.command.as_str()),
@@ -6561,6 +6564,40 @@ mod tests {
         // The lens goes where its line went.
         wait_for(cx, "the lens to follow its line", &|cx| {
             lenses(cx).first().map(|lens| lens.offset) == Some(11) && drawn(1, cx).is_some()
+        });
+
+        // Two lenses of the third line are the editor's own to do. One
+        // names places, which are listed as the places of a symbol are.
+        let titles = |cx: &App| -> Vec<String> {
+            let all = lenses(cx);
+            all.iter().map(|lens| lens.title.clone()).collect()
+        };
+        assert_eq!(cx.read(|cx| titles(cx)), ["Touch", "2 places", "Run"]);
+        let click_lens = |cx: &mut VisualTestContext, nth: usize| {
+            let at = cx.read(|cx| {
+                let layout = editor.read(cx).layout.as_ref().unwrap();
+                layout.lens_middle(2, nth).unwrap()
+            });
+            cx.simulate_click(at, gpui::Modifiers::default());
+        };
+        wait_for(cx, "the lenses of the third line", &|cx| {
+            let layout = editor.read(cx).layout.as_ref();
+            layout.is_some_and(|layout| layout.lens_middle(2, 1).is_some())
+        });
+        // The last drawn is the first found from the end of the row.
+        click_lens(cx, 1);
+        wait_for(cx, "the places", &|cx| ws.read(cx).modal.is_some());
+        cx.simulate_keystrokes("escape");
+        // The other names something to run, which runs in a terminal of
+        // the dock, under the name the server gave it.
+        click_lens(cx, 0);
+        wait_for(cx, "what the lens runs", &|cx| {
+            let terminals = &ws.read(cx).terminals;
+            terminals.iter().any(|(terminal, _)| {
+                let terminal = terminal.read(cx);
+                terminal.title() == "lens run"
+                    && terminal.visible_text().iter().any(|line| line == "lens-42")
+            })
         });
 
         // Turned off, they are gone at the next change.

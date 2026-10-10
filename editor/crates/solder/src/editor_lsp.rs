@@ -89,6 +89,59 @@ fn locations(response: Option<lt::GotoDefinitionResponse>, encoding: Encoding) -
     }
 }
 
+/// The commands of a lens that are the editor's to do, not the server's:
+/// VS Code's name for showing places, and rust-analyzer's names for that
+/// and for running what it found (a test, a `main`).
+pub(crate) const LENS_COMMANDS: &[&str] = &[
+    "editor.action.showReferences",
+    "rust-analyzer.showReferences",
+    "rust-analyzer.runSingle",
+];
+
+/// What rust-analyzer says can be run, as a command for a terminal: Cargo
+/// with its arguments and then the program's, or a program as it is.
+/// `beside` is where it runs when it names no folder.
+fn runnable(
+    what: &serde_json::Value,
+    beside: Option<&std::path::Path>,
+) -> Option<crate::terminal::TerminalCommand> {
+    let args = &what["args"];
+    let list = |value: &serde_json::Value| -> Vec<String> {
+        let all = value.as_array().into_iter().flatten();
+        all.filter_map(|one| one.as_str().map(str::to_string))
+            .collect()
+    };
+    let (program, argv) = match what["kind"].as_str()? {
+        "cargo" => {
+            let mut argv = list(&args["cargoArgs"]);
+            argv.extend(list(&args["cargoExtraArgs"]));
+            let own = list(&args["executableArgs"]);
+            if !own.is_empty() {
+                argv.push("--".into());
+                argv.extend(own);
+            }
+            let cargo = args["overrideCargo"].as_str().unwrap_or("cargo");
+            (cargo.to_string(), argv)
+        }
+        "shell" => (args["program"].as_str()?.to_string(), list(&args["args"])),
+        _ => return None,
+    };
+    let folder = args["cwd"].as_str().or(args["workspaceRoot"].as_str());
+    let cwd = folder.map(PathBuf::from).or(beside.map(PathBuf::from))?;
+    let env = args["environment"].as_object().into_iter().flatten();
+    Some(crate::terminal::TerminalCommand {
+        program: Some(program),
+        args: argv,
+        cwd,
+        env: env
+            .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
+            .collect(),
+        title: what["label"].as_str().map(str::to_string),
+        // What it wrote stays to be read once it ended.
+        keep_on_exit: true,
+    })
+}
+
 /// Splits markdown into prose and fenced code blocks.
 fn markdown_blocks(markdown: &str) -> Vec<HoverBlock> {
     let mut blocks = Vec::new();
@@ -1089,6 +1142,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn what_rust_analyzer_says_can_be_run_is_a_command() {
+        let test = serde_json::json!({
+            "label": "test tests::adds", "kind": "cargo",
+            "args": {
+                "workspaceRoot": "/work/app", "cwd": "/work/app/crates/core",
+                "cargoArgs": ["test", "--package", "core", "--lib"],
+                "executableArgs": ["tests::adds", "--exact", "--nocapture"],
+                "environment": { "RUSTC_BOOTSTRAP": "1" },
+            },
+        });
+        let command = runnable(&test, None).unwrap();
+        assert_eq!(command.program.as_deref(), Some("cargo"));
+        assert_eq!(
+            command.args.join(" "),
+            "test --package core --lib -- tests::adds --exact --nocapture"
+        );
+        assert_eq!(command.cwd, PathBuf::from("/work/app/crates/core"));
+        assert_eq!(
+            command.env.get("RUSTC_BOOTSTRAP").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(command.title.as_deref(), Some("test tests::adds"));
+        // Its own Cargo where the project names one, the file's folder
+        // where it names none, and nothing it has no kind for.
+        let main = serde_json::json!({ "label": "run app", "kind": "cargo",
+            "args": { "overrideCargo": "cross", "cargoArgs": ["run"], "executableArgs": [] } });
+        let command = runnable(&main, Some(std::path::Path::new("/work/app/src"))).unwrap();
+        assert_eq!(
+            (command.program.as_deref(), command.args.join(" ").as_str()),
+            (Some("cross"), "run")
+        );
+        assert_eq!(command.cwd, PathBuf::from("/work/app/src"));
+        assert!(runnable(&serde_json::json!({ "kind": "wasm", "args": {} }), None).is_none());
+        assert!(runnable(&main, None).is_none());
+    }
+
+    #[test]
     fn markdown_splits_code_fences() {
         let blocks = markdown_blocks("```rust\nfn a()\n```\n---\nDoes a thing.");
         assert!(matches!(&blocks[0], HoverBlock::Code(c) if c == "fn a()"));
@@ -1363,6 +1453,33 @@ impl Editor {
         let Some(lens) = self.doc(cx).lenses().get(lens).cloned() else {
             return;
         };
+        // What the server leaves to the editor: places to show, and
+        // something to run.
+        match lens.command.as_str() {
+            "editor.action.showReferences" | "rust-analyzer.showReferences" => {
+                let places = lens.arguments.get(2).cloned().unwrap_or_default();
+                let places: Vec<lt::Location> = serde_json::from_value(places).unwrap_or_default();
+                let found = locations(
+                    Some(lt::GotoDefinitionResponse::Array(places)),
+                    lens.encoding,
+                );
+                cx.emit(EditorEvent::OpenLocations {
+                    title: lens.title.trim().to_string().into(),
+                    locations: found,
+                    always_list: true,
+                });
+                return;
+            }
+            "rust-analyzer.runSingle" => {
+                let root = self.path(cx).and_then(|path| path.parent());
+                let command = lens.arguments.first().and_then(|what| runnable(what, root));
+                if let Some(command) = command {
+                    cx.emit(EditorEvent::RunInTerminal(command));
+                }
+                return;
+            }
+            _ => {}
+        }
         let Some(store) = LspStore::global(cx) else {
             return;
         };

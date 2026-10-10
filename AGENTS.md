@@ -119,7 +119,8 @@ Never guess a signature.
   row and not in the file: `DisplayLine` maps columns both ways, as it
   does for tabs, and nothing else may assume a column is a place on
   screen. A lens is the last thing in its row, and is kept only if a
-  click can do it: its command is one its server said it runs.
+  click can do it: its command is one its server said it runs, or one
+  of the few the editor does itself (`editor_lsp::LENS_COMMANDS`).
 - Git goes through `git.rs`, which shells out to `git` with stable
   `--porcelain=v2 -z` formats. Everything in it blocks: call it from
   `cx.background_executor()`.

@@ -63,8 +63,10 @@ pub struct Inlay {
 pub struct Lens {
     pub offset: usize,
     pub title: String,
-    /// The server that offered it, which is the one to run it.
+    /// The server that offered it, which is the one to run it, and how
+    /// that server counts the places it names.
     pub server: &'static str,
+    pub encoding: lsp::Encoding,
     pub command: String,
     pub arguments: Vec<serde_json::Value>,
 }

@@ -226,6 +226,8 @@ pub enum EditorEvent {
         locations: Vec<crate::editor_lsp::LspLocation>,
         always_list: bool,
     },
+    /// Something to run in a terminal of the dock: what a lens offered.
+    RunInTerminal(crate::terminal::TerminalCommand),
     /// F2: the workspace asks for the new name.
     RenameRequested { current: String },
     /// Code actions for the cursor came back; the workspace shows a picker.

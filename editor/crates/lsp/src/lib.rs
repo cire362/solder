@@ -565,7 +565,12 @@ fn client_capabilities() -> ClientCapabilities {
             "applyEdit": true,
             "workspaceEdit": { "documentChanges": true }
         },
-        "window": { "workDoneProgress": true }
+        "window": { "workDoneProgress": true },
+        // The commands of rust-analyzer's lenses that the editor does
+        // itself: without them named here it offers no such lens.
+        "experimental": { "commands": { "commands": [
+            "rust-analyzer.runSingle", "rust-analyzer.showReferences"
+        ] } }
     });
     serde_json::from_value(value).unwrap_or_default()
 }

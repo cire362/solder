@@ -1664,8 +1664,9 @@ fn position(p: Point) -> lt::Position {
 impl LspStore {
     /// Asks the document's servers what they offer to do with its lines.
     /// A lens is kept only if a click can do it: its command is one the
-    /// server said it runs. The others are for the client to do, and the
-    /// client they were written for is another editor.
+    /// server said it runs, or one of the few the editor does itself
+    /// (`editor_lsp::LENS_COMMANDS`). The others are for the client to do,
+    /// and the client they were written for is another editor.
     fn ask_lenses(
         &mut self,
         id: EntityId,
@@ -1746,10 +1747,13 @@ impl LspStore {
                         .filter_map(|(server, encoding, lens)| {
                             let command = lens.command?;
                             let (runs, _) = servers.get(server)?;
-                            runs.contains(&command.command).then(|| Lens {
+                            let known = crate::editor_lsp::LENS_COMMANDS;
+                            let ours = known.contains(&command.command.as_str());
+                            (ours || runs.contains(&command.command)).then(|| Lens {
                                 offset: to_offset(buffer, lens.range.start, encoding),
                                 title: command.title,
                                 server,
+                                encoding,
                                 command: command.command,
                                 arguments: command.arguments.unwrap_or_default(),
                             })

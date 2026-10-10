@@ -1146,10 +1146,13 @@ where a grammar sees a name. A **code lens** is something the server offers
 to do with a line (run this test, show what refers to this): its words are
 at the end of the line, in the accent color, and a click does it. Other
 editors put a lens on a row of its own above the line; here every row is a
-line of the file, so it stands after the code. Only a lens the server runs
-itself is shown. One that names a command of the editor it was written for
-(rust-analyzer's "Run", which VS Code's extension carries out) could do
-nothing on a click, and is left out. All three are asked for a moment after
+line of the file, so it stands after the code. A lens is shown if a click
+can do it: its command is one the server runs itself, or one of three the
+editor does for it. Places to show (`editor.action.showReferences`, and
+rust-analyzer's name for the same) are listed as the references of a symbol
+are. rust-analyzer's "Run" over a test or a `main` runs in a terminal of
+the dock, whose tab stays to be read. A lens of any other command of the
+editor it was written for (rust-analyzer's "Debug") is left out. All three are asked for a moment after
 the last key, and move with the text until the answer comes. Each has a
 setting, on unless turned off:
 
