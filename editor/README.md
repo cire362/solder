@@ -57,6 +57,11 @@ Several cursors: `alt`-click adds one, `cmd-alt-up` and `cmd-alt-down` add
 one on the line above or below, `cmd-d` selects the next place the selected
 word is.
 
+**Indent guides** are thin lines down each level of indentation the rows
+on screen are inside, in steps of the file's own indent. A blank row is as
+deep as the deeper of the rows with text around it. `"indent_guides":
+false` in the settings turns them off.
+
 A **selection by column** is a rectangle of cursors, one on each line it
 crosses. With the mouse, hold `shift` and `alt` and click or drag: the
 rectangle goes from the cursor to the pointer. Or drag with the middle

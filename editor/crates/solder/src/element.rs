@@ -860,6 +860,33 @@ fn layout(
     }
 
     let mut highlights = Vec::new();
+    // A thin line down each level of indentation the rows on screen are
+    // inside. A blank row is inside what the rows around it are.
+    if settings.indent_guides && !single_line && !editor.masked {
+        let unit = match doc.indent_unit() {
+            "\t" => text::TAB_SIZE,
+            spaces => spaces.len().max(1),
+        };
+        let levels = guide_levels(buffer, first_row..end_row, unit);
+        for (row, levels) in (first_row..end_row).zip(levels) {
+            // The row of its lenses is inside the same as the line.
+            let shown = rows.shown(row);
+            let lensed = shown > 0 && rows.line(shown - 1).1;
+            let (top, tall) = match lensed {
+                true => (row_y(row) - lh, lh * 2.),
+                false => (row_y(row), lh),
+            };
+            for level in 0..levels {
+                let x = text_x(em * (level * unit) as f32);
+                if x >= text_left {
+                    highlights.push(fill(
+                        Bounds::new(point(x, top), size(theme.shape.border, tall)),
+                        theme.line,
+                    ));
+                }
+            }
+        }
+    }
     for decoration in doc
         .decorations()
         .iter()
@@ -1132,6 +1159,50 @@ fn layout(
     }
 }
 
+/// How far from a blank row the rows that say how deep it is are looked for.
+const GUIDE_REACH: usize = 200;
+
+/// How many levels of indentation each row of a range is inside, where a
+/// level is `unit` cells. A blank row is as deep as the deeper of the
+/// rows with text around it: it is inside what goes on past it.
+fn guide_levels(buffer: &Buffer, rows: Range<usize>, unit: usize) -> Vec<usize> {
+    // Blank rows at the edge of the screen look past it, not far.
+    let around = |row: usize, step: isize| -> usize {
+        let mut at = row as isize + step;
+        for _ in 0..GUIDE_REACH {
+            if at < 0 || at as usize >= buffer.line_count() {
+                break;
+            }
+            if let Some(cells) = indent_cells(&buffer.line_str(at as usize)) {
+                return cells;
+            }
+            at += step;
+        }
+        0
+    };
+    rows.map(|row| {
+        let cells = match indent_cells(&buffer.line_str(row)) {
+            Some(cells) => cells,
+            None => around(row, -1).max(around(row, 1)),
+        };
+        cells / unit.max(1)
+    })
+    .collect()
+}
+
+/// How far in a row's text begins, in cells; nothing for a blank row.
+fn indent_cells(line: &str) -> Option<usize> {
+    let mut cells = 0;
+    for c in line.chars() {
+        match c {
+            ' ' => cells += 1,
+            '\t' => cells += text::TAB_SIZE - cells % text::TAB_SIZE,
+            _ => return Some(cells),
+        }
+    }
+    None
+}
+
 fn severity_color(severity: Severity, theme: &Theme) -> gpui::Hsla {
     match severity {
         Severity::Error => theme.error,
@@ -1384,6 +1455,23 @@ mod tests {
             inlays: inlays.to_vec(),
             len,
         }
+    }
+
+    #[test]
+    fn rows_are_inside_the_levels_they_are_indented_to() {
+        let text = "fn a() {\n    if b {\n\n        c();\n    }\n\n}\n\tx\n  \n";
+        let buffer = Buffer::new(text);
+        // The blank row inside the `if` is as deep as what follows it;
+        // the one after its `}` is as deep as that; a tab is one level
+        // of four cells, and a row of spaces only is blank, as deep as
+        // the row with text nearest to it.
+        assert_eq!(
+            guide_levels(&buffer, 0..buffer.line_count(), 4),
+            [0, 1, 2, 2, 1, 1, 0, 1, 1, 1]
+        );
+        // Asked for some rows only, it still looks at the ones around.
+        assert_eq!(guide_levels(&buffer, 2..3, 4), [2]);
+        assert_eq!(guide_levels(&buffer, 3..4, 2), [4]);
     }
 
     #[test]
