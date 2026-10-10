@@ -242,9 +242,10 @@ to build them.
       `vscode` module of Solder's own. One extension that crashes or hangs
       does not take the editor or the others with it (a process for each,
       and code runs only once the user allowed it)
-- [ ] The API every extension starts from: commands, messages, pickers and
+- [x] The API every extension starts from: commands, messages, pickers and
       input boxes, status bar items, output channels, configuration, the
-      workspace's folders and files, open documents, their edits and events
+      workspace's folders and files, open documents, their edits and events.
+      Lists pick one, and there is one visible editor, the file in front
 - [ ] Language features: the providers for completion, hover, definition,
       references, rename, formatting, code actions, symbols, semantic tokens,
       inlay hints and code lenses, and diagnostic collections. This is what

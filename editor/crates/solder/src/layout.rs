@@ -232,6 +232,9 @@ pub enum Item {
     Activity,
     /// The database a query file runs against. Opens the list of them.
     Connection,
+    /// What the code of extensions shows: its status bar items, work in
+    /// progress, and the last message.
+    Extensions,
     /// What plugins show. Opens the Plugins window.
     Plugins,
     /// The numbers of `show_performance_hud`.
@@ -266,7 +269,7 @@ impl<'de> Deserialize<'de> for Item {
 }
 
 impl Item {
-    pub const ALL: [Item; 11] = [
+    pub const ALL: [Item; 12] = [
         Item::Project,
         Item::File,
         Item::Branch,
@@ -276,6 +279,7 @@ impl Item {
         Item::Problems,
         Item::Activity,
         Item::Connection,
+        Item::Extensions,
         Item::Plugins,
         Item::Performance,
     ];
@@ -291,6 +295,7 @@ impl Item {
             Item::Problems => "Problems",
             Item::Activity => "Activity",
             Item::Connection => "Connection",
+            Item::Extensions => "Extensions",
             Item::Plugins => "Plugins",
             Item::Performance => "Performance",
             Item::Button { button } => button,
@@ -309,6 +314,7 @@ impl Item {
             Item::Problems => "problems",
             Item::Activity => "activity",
             Item::Connection => "connection",
+            Item::Extensions => "extensions",
             Item::Plugins => "plugins",
             Item::Performance => "performance",
             Item::Button { button } => button,
@@ -398,7 +404,7 @@ const STATUS_LEFT: &[Item] = &[
     Item::Activity,
     Item::Connection,
 ];
-const STATUS_RIGHT: &[Item] = &[Item::Plugins, Item::Performance];
+const STATUS_RIGHT: &[Item] = &[Item::Extensions, Item::Plugins, Item::Performance];
 
 /// A bar across the window: its height, and its items from each end. An
 /// end the file leaves out has the items it comes with, less those the
@@ -1564,7 +1570,10 @@ mod tests {
             standard.status_bar.left(),
             [Position, Indent, Language, Problems, Activity, Connection]
         );
-        assert_eq!(standard.status_bar.right(), [Plugins, Performance]);
+        assert_eq!(
+            standard.status_bar.right(),
+            [Extensions, Plugins, Performance]
+        );
         assert_eq!(standard.tab_bar.place, TabsAt::Top);
         assert_eq!(parse("{}").unwrap(), standard);
         // A bar's height alone leaves its items as they come.
@@ -1729,7 +1738,10 @@ mod tests {
             .moved_item(Position, StatusLeft, Some(Indent));
         assert_eq!(moved.title_bar.left(), [Language]);
         assert_eq!(moved.title_bar.right(), [File]);
-        assert_eq!(moved.status_bar.right(), [Plugins, Performance, Project]);
+        assert_eq!(
+            moved.status_bar.right(),
+            [Extensions, Plugins, Performance, Project]
+        );
         assert_eq!(
             moved.status_bar.left(),
             [Position, Indent, Problems, Activity, Connection]

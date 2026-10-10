@@ -12,6 +12,11 @@ const fs = require('fs');
 const path = require('path');
 const util = require('util');
 const Module = require('module');
+const types = require('./types');
+const { Documents } = require('./documents');
+const buildApi = require('./api');
+
+const { Disposable, EventEmitter, Uri } = types.classes;
 
 const [extensionDir, storageDir] = process.argv.slice(2);
 const manifest = JSON.parse(fs.readFileSync(path.join(extensionDir, 'package.json'), 'utf8'));
@@ -53,6 +58,7 @@ for (const level of ['log', 'info', 'debug', 'warn', 'error']) {
 // VS Code's does.
 process.on('uncaughtException', (error) => say('error', [error && error.stack || error]));
 process.on('unhandledRejection', (error) => say('error', [error && error.stack || error]));
+types.report.error = (error) => say('error', [error && error.stack || error]);
 
 // What can go over the wire of what an extension hands back.
 function plain(value) {
@@ -65,96 +71,6 @@ function plain(value) {
 }
 
 // ------------------------------------------------------- the `vscode` module
-
-class Disposable {
-  constructor(dispose) {
-    this._dispose = dispose;
-  }
-  static from(...disposables) {
-    return new Disposable(() => disposables.forEach((d) => d && d.dispose && d.dispose()));
-  }
-  dispose() {
-    const dispose = this._dispose;
-    this._dispose = undefined;
-    if (dispose) dispose();
-  }
-}
-
-class EventEmitter {
-  constructor() {
-    this._listeners = new Set();
-    this.event = (listener, thisArg, disposables) => {
-      const entry = { listener, thisArg };
-      this._listeners.add(entry);
-      const disposable = new Disposable(() => this._listeners.delete(entry));
-      if (Array.isArray(disposables)) disposables.push(disposable);
-      return disposable;
-    };
-  }
-  fire(value) {
-    for (const { listener, thisArg } of [...this._listeners]) {
-      try {
-        listener.call(thisArg, value);
-      } catch (error) {
-        say('error', [error && error.stack || error]);
-      }
-    }
-  }
-  dispose() {
-    this._listeners.clear();
-  }
-}
-
-class Uri {
-  constructor(scheme, authority, uriPath, query, fragment) {
-    this.scheme = scheme || 'file';
-    this.authority = authority || '';
-    this.path = uriPath || '';
-    this.query = query || '';
-    this.fragment = fragment || '';
-  }
-  static file(filePath) {
-    let normal = filePath.replace(/\\/g, '/');
-    if (!normal.startsWith('/')) normal = '/' + normal;
-    return new Uri('file', '', normal);
-  }
-  static parse(value) {
-    const match = /^([a-zA-Z][\w+.-]*):(?:\/\/([^/?#]*))?([^?#]*)(?:\?([^#]*))?(?:#(.*))?$/.exec(value);
-    if (!match) return Uri.file(value);
-    return new Uri(match[1], match[2], decodeURIComponent(match[3] || ''), match[4], match[5]);
-  }
-  static from(parts) {
-    return new Uri(parts.scheme, parts.authority, parts.path, parts.query, parts.fragment);
-  }
-  static joinPath(base, ...segments) {
-    return base.with({ path: path.posix.join(base.path || '/', ...segments) });
-  }
-  static isUri(value) {
-    return value instanceof Uri;
-  }
-  get fsPath() {
-    return this.path;
-  }
-  with(change) {
-    return new Uri(
-      change.scheme !== undefined ? change.scheme : this.scheme,
-      change.authority !== undefined ? change.authority : this.authority,
-      change.path !== undefined ? change.path : this.path,
-      change.query !== undefined ? change.query : this.query,
-      change.fragment !== undefined ? change.fragment : this.fragment,
-    );
-  }
-  toString() {
-    const encoded = this.path.split('/').map(encodeURIComponent).join('/');
-    const authority = this.authority || this.scheme === 'file' ? `//${this.authority}` : '';
-    const query = this.query ? `?${this.query}` : '';
-    const fragment = this.fragment ? `#${this.fragment}` : '';
-    return `${this.scheme}:${authority}${encoded}${query}${fragment}`;
-  }
-  toJSON() {
-    return { $uri: this.toString(), scheme: this.scheme, path: this.path, fsPath: this.fsPath };
-  }
-}
 
 // The commands this extension registered, by name.
 const commands = new Map();
@@ -169,21 +85,58 @@ function missing(name) {
     notify('missing', { name });
   }
 }
+// What stands in for it: something that can be called, built, read from
+// and disposed of, and gives the same again. It is not a promise, so
+// waiting for it does not wait forever.
+function soft() {
+  return new Proxy(function () {}, {
+    get(target, key) {
+      if (key === 'then' || key === 'toJSON') return undefined;
+      if (key === Symbol.toPrimitive) return () => '';
+      if (typeof key === 'symbol' || key in target) return target[key];
+      return soft();
+    },
+    apply: () => soft(),
+    construct: () => soft(),
+  });
+}
 function namespace(name, members) {
   return new Proxy(members, {
     get(target, key) {
       if (key in target || typeof key === 'symbol') return target[key];
       missing(`${name}.${String(key)}`);
-      return () => new Disposable(() => {});
+      return soft();
     },
   });
 }
 
+// What the rest of the API is built on.
+const core = {
+  request,
+  notify,
+  say,
+  plain,
+  missing,
+  namespace,
+  extensionId,
+  extensionDir,
+  state: { folders: [], configuration: {}, defaults: {}, dark: true },
+  tabSize: () => {
+    const size = core.state.configuration.editor && core.state.configuration.editor.tabSize;
+    return typeof size === 'number' ? size : 4;
+  },
+};
+core.docs = new Documents(core);
+const built = buildApi(core);
+
 const vscode = {
   version: '1.90.0',
-  Disposable,
-  EventEmitter,
-  Uri,
+  ...types.classes,
+  ...types.enums,
+  window: built.window,
+  workspace: built.workspace,
+  env: built.env,
+  l10n: built.l10n,
   commands: namespace('commands', {
     registerCommand(id, handler, thisArg) {
       commands.set(id, { handler, thisArg });
@@ -203,16 +156,6 @@ const vscode = {
       return [...commands.keys()];
     },
   }),
-  env: namespace('env', {
-    appName: 'Solder',
-    appHost: 'desktop',
-    language: 'en',
-    machineId: 'solder',
-    sessionId: 'solder',
-    uiKind: 1,
-    isTelemetryEnabled: false,
-    onDidChangeTelemetryEnabled: new EventEmitter().event,
-  }),
   extensions: namespace('extensions', {
     all: [],
     getExtension(id) {
@@ -221,11 +164,18 @@ const vscode = {
     onDidChange: new EventEmitter().event,
   }),
 };
-// What is not a namespace above is one that is not here yet at all.
+// What is not above is not here yet at all: a namespace whose every
+// member is a stand-in, or a class that builds one.
 const api = new Proxy(vscode, {
   get(target, key) {
     if (key in target || typeof key === 'symbol') return target[key];
-    target[key] = namespace(String(key), {});
+    const name = String(key);
+    if (/^[A-Z]/.test(name)) {
+      missing(name);
+      target[key] = soft();
+    } else {
+      target[key] = namespace(name, {});
+    }
     return target[key];
   },
 });
@@ -352,7 +302,10 @@ async function handle(message) {
   }
   const handler = handlers[message.method];
   if (message.id === undefined) {
-    if (handler) await handler(message.params || {});
+    // What the editor says of its own state, or asks without waiting.
+    const told = built.told[message.method];
+    if (told) told(message.params || {});
+    else if (handler) await handler(message.params || {});
     return;
   }
   try {

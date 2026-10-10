@@ -99,7 +99,7 @@ pub enum CodeState {
 
 /// The host of an extension once its code was started, for whoever waits
 /// for that; or why it did not start.
-type Started = Shared<Task<Result<Arc<VsHost>, String>>>;
+type Started = Shared<oneshot::Receiver<Result<Arc<VsHost>, String>>>;
 
 /// The code of one VS Code extension that was started: a Node process of
 /// its own.
@@ -112,16 +112,22 @@ pub struct NodeCode {
     /// The last things it said, each with how loud.
     pub said: VecDeque<(String, String)>,
     /// There from when the process is up, which is before its code is.
-    host: Option<Arc<VsHost>>,
+    pub(crate) host: Option<Arc<VsHost>>,
     started: Started,
+    /// Tells whoever waits that its code is up, or why it is not.
+    resolve: Option<oneshot::Sender<Result<Arc<VsHost>, String>>>,
     /// Which start this is: what an older one still says is not about it.
     run: usize,
 }
 
-/// What reaches the store from the thread of an extension's host.
+/// What reaches the store from the threads of an extension's host.
 enum Heard {
-    Up(Arc<VsHost>),
+    /// Its process is up, with nothing of the extension loaded yet; or
+    /// why there is none.
+    Up(Result<Arc<VsHost>, String>),
     Said(Told),
+    /// The extension's own start returned, or threw.
+    Active(Result<(), String>),
 }
 
 /// How many of the last things an extension said are kept.
@@ -140,7 +146,7 @@ pub struct ExtensionStore {
     /// Where extensions are kept: `zed/<id>` and `vscode/<publisher.name>`.
     pub root: PathBuf,
     /// Where settings and themes are kept.
-    config: PathBuf,
+    pub(crate) config: PathBuf,
     pub installed: Vec<Extension>,
     /// False until the first scan has finished.
     pub loaded: bool,
@@ -171,7 +177,7 @@ pub struct ExtensionStore {
     pub theme_status: Option<Result<String, String>>,
     /// The same for the last icon theme chosen.
     pub icon_status: Option<Result<String, String>>,
-    documents: Vec<WeakEntity<Document>>,
+    pub(crate) documents: Vec<WeakEntity<Document>>,
     scans: usize,
     /// The loaded code of extensions, by extension id.
     hosts: HashMap<String, Slot>,
@@ -186,7 +192,9 @@ pub struct ExtensionStore {
     /// real thing; tests script it.
     pub world: Option<Arc<dyn World>>,
     /// The code of VS Code extensions that was started, by extension id.
-    code: HashMap<String, NodeCode>,
+    pub(crate) code: HashMap<String, NodeCode>,
+    /// What that code is told of the editor, and what it shows in it.
+    pub(crate) api: crate::extension_api::Api,
     /// Where their hosts speak from their threads: the extension, which
     /// start of it, and what.
     heard: mpsc::UnboundedSender<(String, usize, Heard)>,
@@ -417,6 +425,7 @@ impl ExtensionStore {
         let watching = cx.observe_global::<Settings>(move |this, cx| {
             copy(&watched, cx);
             this.sync_icons(cx);
+            this.settings_changed(cx);
         });
         Self {
             root,
@@ -445,6 +454,7 @@ impl ExtensionStore {
             resolved: Arc::default(),
             world: None,
             code: HashMap::new(),
+            api: Default::default(),
             heard,
             runs: 0,
             patience: Duration::from_secs(30),
@@ -477,6 +487,23 @@ impl ExtensionStore {
         );
         let store = cx.new(|cx| ExtensionStore::new(root, config, cx));
         cx.set_global(GlobalExtensionStore(store.clone()));
+        // The code of extensions runs in processes of its own: one that
+        // does not answer would not notice the editor is gone.
+        cx.on_app_quit({
+            let store = store.clone();
+            move |cx| {
+                let hosts: Vec<Arc<VsHost>> = store.update(cx, |store, _| {
+                    let code = store.code.drain();
+                    code.filter_map(|(_, code)| code.host).collect()
+                });
+                async move {
+                    for host in hosts {
+                        host.stop();
+                    }
+                }
+            }
+        })
+        .detach();
         store.update(cx, |s, cx| s.scan(cx));
         store
     }
@@ -527,6 +554,7 @@ impl ExtensionStore {
         store.update(cx, |store, cx| {
             store.documents.retain(|d| d.upgrade().is_some());
             store.documents.push(document.downgrade());
+            store.follow(document, cx);
             // A file of a language may be what an extension waits for.
             store.wake(cx);
         });
@@ -643,6 +671,8 @@ impl ExtensionStore {
                         })
                 });
                 this.sync_languages(cx);
+                // What is installed says which settings there are.
+                this.settings_changed(cx);
                 this.wake(cx);
                 cx.notify();
             })
@@ -1769,6 +1799,7 @@ impl ExtensionStore {
     /// process, so it is done off the UI thread.
     fn stop_code(&mut self, id: &str, cx: &mut Context<Self>) {
         if let Some(code) = self.code.remove(id) {
+            self.clear_shown(id, cx);
             cx.background_executor()
                 .spawn(async move {
                     if let Some(host) = &code.host {
@@ -1805,11 +1836,11 @@ impl ExtensionStore {
         let heard = self.heard.clone();
         let patience = self.patience;
         let name = extension.id.clone();
-        let (tx, rx) = oneshot::channel();
+        let id = extension.id.clone();
         let spawned = std::thread::Builder::new()
             .name("solder-vscode".into())
             .spawn(move || {
-                let started = (|| {
+                let up = (|| {
                     let world = world_in(&work_dir, world, statuses, settings, gated);
                     let node = world.node()?;
                     let script = vscode::host_script(&script_dir)?;
@@ -1824,62 +1855,38 @@ impl ExtensionStore {
                             let _ = says.unbounded_send((from.clone(), run, Heard::Said(said)));
                         },
                     )?);
-                    let _ = heard.unbounded_send((name.clone(), run, Heard::Up(host.clone())));
                     let why = format!("It did not answer for {} s", patience.as_secs().max(1));
+                    let (says, from) = (heard.clone(), name.clone());
                     host.watch(patience / 4, patience, move || {
-                        let _ = heard.unbounded_send((name, run, Heard::Said(Told::Gone(why))));
+                        let _ = says.unbounded_send((from, run, Heard::Said(Told::Gone(why))));
                     });
-                    // For as long as it takes: an extension may get what it
-                    // needs first. One that never returns is the watch's.
-                    host.request("activate", serde_json::json!({}), Duration::MAX)?;
                     Ok(host)
                 })();
-                let _ = tx.send(started);
+                let _ = heard.unbounded_send((name, run, Heard::Up(up)));
             });
-        let started: Started = match spawned {
-            Ok(_) => cx
-                .background_executor()
-                .spawn(async move { rx.await.unwrap_or_else(|_| Err(STOPPED.into())) })
-                .shared(),
-            Err(error) => Task::ready(Err(error.to_string())).shared(),
-        };
+        let (resolve, started) = oneshot::channel();
         self.code.insert(
-            extension.id.clone(),
+            id.clone(),
             NodeCode {
                 state: CodeState::Starting,
                 commands: Vec::new(),
                 missing: Vec::new(),
                 said: VecDeque::new(),
                 host: None,
-                started: started.clone(),
+                started: started.shared(),
+                resolve: Some(resolve),
                 run,
             },
         );
-        let id = extension.id;
-        cx.spawn(async move |this, cx| {
-            let started = started.await;
-            this.update(cx, |this, cx| {
-                match started {
-                    Ok(_) => {
-                        if let Some(code) = this.code.get_mut(&id).filter(|code| code.run == run)
-                            && code.state == CodeState::Starting
-                        {
-                            code.state = CodeState::Running;
-                        }
-                    }
-                    Err(error) => this.stopped(&id, run, error),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        if let Err(error) = spawned {
+            self.stopped(&id, run, error.to_string(), cx);
+        }
         cx.notify();
     }
 
     /// The code of an extension ended. The first reason that says more
     /// than that it ended is the one kept.
-    fn stopped(&mut self, id: &str, run: usize, why: String) {
+    fn stopped(&mut self, id: &str, run: usize, why: String, cx: &mut Context<Self>) {
         let Some(code) = self.code.get_mut(id).filter(|code| code.run == run) else {
             return;
         };
@@ -1889,10 +1896,14 @@ impl ExtensionStore {
             code.state = CodeState::Stopped(why.unwrap_or_else(|| STOPPED.into()));
         }
         code.commands.clear();
+        if let (Some(resolve), CodeState::Stopped(why)) = (code.resolve.take(), &code.state) {
+            let _ = resolve.send(Err(why.clone()));
+        }
         // The process is ended where that may wait, if it is not already.
         if let Some(host) = code.host.take() {
             std::thread::spawn(move || host.stop());
         }
+        self.clear_shown(id, cx);
     }
 
     /// What the host of an extension said from its thread.
@@ -1905,17 +1916,36 @@ impl ExtensionStore {
         };
         let Some(code) = self.code.get_mut(id).filter(|code| code.run == run) else {
             // Turned off or removed while its process was coming up.
-            if let Heard::Up(host) = heard {
+            if let Heard::Up(Ok(host)) = heard {
                 end(host, cx);
             }
             return;
         };
         match heard {
-            Heard::Up(host) => {
+            Heard::Up(Ok(host)) => {
                 if matches!(code.state, CodeState::Stopped(_)) {
                     end(host, cx);
-                } else {
-                    code.host = Some(host);
+                    return;
+                }
+                code.host = Some(host.clone());
+                // What the editor has is said before anything of the
+                // extension runs, and then its own start is asked for. That
+                // takes as long as it takes: an extension may get what it
+                // needs first, and one that never returns is the watch's.
+                let all = self.snapshot(cx);
+                host.notify("init", all);
+                let (says, from) = (self.heard.clone(), id.to_string());
+                host.ask("activate", serde_json::json!({}), move |answer| {
+                    let _ = says.unbounded_send((from, run, Heard::Active(answer.map(|_| ()))));
+                });
+            }
+            Heard::Up(Err(error)) | Heard::Active(Err(error)) => self.stopped(id, run, error, cx),
+            Heard::Active(Ok(())) => {
+                if code.state == CodeState::Starting {
+                    code.state = CodeState::Running;
+                }
+                if let (Some(resolve), Some(host)) = (code.resolve.take(), &code.host) {
+                    let _ = resolve.send(Ok(host.clone()));
                 }
             }
             Heard::Said(Told::Log { level, text }) => {
@@ -1938,45 +1968,36 @@ impl ExtensionStore {
                     code.missing.push(name);
                 }
             }
-            Heard::Said(Told::Gone(words)) => self.stopped(id, run, words),
+            Heard::Said(Told::Gone(words)) => self.stopped(id, run, words, cx),
+            Heard::Said(Told::Said { method, params }) => self.said(id, &method, params, cx),
             Heard::Said(Told::Asked {
                 id: asked,
                 method,
                 params,
             }) => {
-                let Some(host) = code.host.clone() else {
-                    return;
-                };
-                let answer = match method.as_str() {
-                    "executeCommand" => self.command_from(
-                        id,
-                        params["id"].as_str().unwrap_or_default(),
-                        params["args"].clone(),
-                        cx,
-                    ),
-                    _ => Task::ready(Err(format!("Solder does not do {method}"))),
-                };
-                // Written where a full pipe may wait.
-                cx.background_executor()
-                    .spawn(async move { host.answer(asked, answer.await) })
-                    .detach();
+                if let Some(host) = code.host.clone() {
+                    self.asked(id, host, asked, &method, params, cx);
+                }
             }
         }
         cx.notify();
     }
 
-    /// Runs a command the code of another VS Code extension has, with
-    /// what it is given, and gives what it answers. An extension that
-    /// waits for the command is started for it. `asker` is the extension
-    /// whose code asks, which has no such command itself: its host looked
-    /// there first.
-    fn command_from(
+    /// Runs a command the code of a VS Code extension has, with what it is
+    /// given, and gives what it answers. An extension that waits for the
+    /// command is started for it. `asker` is the extension whose code
+    /// asks, which has no such command itself: its host looked there
+    /// first.
+    pub(crate) fn command_from(
         &mut self,
-        asker: &str,
+        asker: Option<&str>,
         command: &str,
         args: serde_json::Value,
         cx: &mut Context<Self>,
     ) -> Task<Result<serde_json::Value, String>> {
+        if let Some(done) = self.own_command(command, &args, cx) {
+            return Task::ready(done);
+        }
         let registered = self
             .code
             .iter()
@@ -1995,7 +2016,9 @@ impl ExtensionStore {
                 })
                 .map(|extension| extension.id.clone())
         };
-        let owner = registered.or_else(declared).filter(|owner| owner != asker);
+        let owner = registered
+            .or_else(declared)
+            .filter(|owner| Some(owner.as_str()) != asker);
         let Some(owner) = owner else {
             return Task::ready(Err(format!("No command {command}")));
         };
@@ -2012,7 +2035,7 @@ impl ExtensionStore {
         };
         let params = serde_json::json!({ "id": command, "args": args });
         cx.background_executor().spawn(async move {
-            let host = started.await?;
+            let host = started.await.unwrap_or_else(|_| Err(STOPPED.into()))?;
             let (tx, rx) = oneshot::channel();
             host.ask("executeCommand", params, move |answer| {
                 let _ = tx.send(answer);

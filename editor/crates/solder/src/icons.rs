@@ -268,6 +268,7 @@ pub fn item(item: &Item) -> &'static str {
         Item::Problems => "warning-circle",
         Item::Activity => "spinner-gap",
         Item::Connection => "database",
+        Item::Extensions => "plugs",
         Item::Plugins => "puzzle-piece",
         Item::Performance => "gauge",
         Item::Button { .. } => "gear",

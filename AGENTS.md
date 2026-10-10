@@ -191,8 +191,18 @@ Never guess a signature.
   wait. Nothing of the editor waits for an extension: one that stops
   answering is ended by its watch. Ending a process waits for it, so it is
   never done on the UI thread (`stop_code`). A part of VS Code's API that
-  is not in `host.js` must not throw: `namespace()` there gives a stand-in
-  and tells the editor what was asked for.
+  is not in `host/*.js` must not throw: `namespace()` there gives a
+  stand-in and tells the editor what was asked for.
+  The editor's side of that API is `extension_api.rs`. What an extension
+  reads without waiting (folders, settings, documents, the cursor) is a
+  copy in its host: said once in `init`, then change by change, and never
+  while no host runs, so typing costs nothing without extensions. A new
+  thing of that kind is a new message both ways, not a request. What needs
+  a window (a list, a file to show, an edit) is an `Ask` in the store's
+  queue, taken by the workspace in front (`Workspace::extension_asks`);
+  its answer goes through `Reply`, which answers "nothing" when dropped,
+  so no extension waits forever. What extensions say in the status bar is
+  `ExtensionStore::bar`, drawn by the `extensions` item.
 
 ### Performance rules
 

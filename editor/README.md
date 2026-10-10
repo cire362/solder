@@ -872,9 +872,25 @@ for happens (its activation events: the editor is up, a file of a language is
 open, one of its commands is asked for), never before. It gets a `vscode`
 module that is Solder's: what is in it works as in VS Code, and what is not
 yet does nothing and is listed in the tab under **Asked for what Solder does
-not have yet**, so it is plain why a feature is missing. Today the module has
-commands, the extension's own storage and the plumbing (events, disposables,
-URIs); the rest of the API is the next items of the roadmap.
+not have yet**, so it is plain why a feature is missing.
+
+What is in the module today is what every extension starts from:
+
+| An extension can | In Solder |
+|---|---|
+| Register commands and run its own or another extension's | As in VS Code. Of VS Code's own commands: `vscode.open`, `setContext`, `workbench.action.files.saveAll` |
+| Show a message | With nothing to choose, it is in the status bar for eight seconds, in its color. With answers, or `modal`, it is a list to pick the answer from |
+| Ask to pick from a list, or to type a line | The editor's own list, with the keys of the command palette. One is picked, also where the extension allows several. What is typed is checked by the extension and asked again with what is wrong. A password is not hidden |
+| Put items in the status bar | In the `extensions` item of the bars, as text: Solder has no font for the pictures VS Code draws there. A click runs the item's command. Work in progress (`withProgress`) is said there too |
+| Write to an output channel | Kept, the last 256 KB of each. **Show output** in the Extensions tab opens it in a tab, and so does the extension when it asks |
+| Read and set settings | What extensions declare, with what `settings.json` says, and `editor.tabSize`. `update` writes the key to `settings.json` |
+| See the workspace | A folder for each open window, the one in front first. Files through `workspace.fs` and `findFiles` |
+| See open documents and the editor in front | Every file open in a tab, with its text, kept up to date as it is typed, saved and closed, and the cursor of the one in front. There is one visible editor: the file in front |
+| Change text | `TextEditor.edit` and `workspace.applyEdit`, in open files and on disk, with files made, renamed and deleted. A snippet is put in as text, its places taken out |
+| Use the clipboard, open a link | Yes; a link only to the web or to mail |
+
+None of this costs anything while no extension's code runs: documents and
+cursors are followed only once a host is up.
 
 An extension that throws ends nothing but its own start. One that ends its
 process is shown as stopped, with its last words. One that never returns stops
@@ -1006,7 +1022,7 @@ applied as soon as it is saved.
   "status_bar": {
     "height": 26,
     "left": ["position", "indent", "language", "problems", "activity", "connection"],
-    "right": ["plugins", "performance"]
+    "right": ["extensions", "plugins", "performance"]
   },
   "hidden": [],
   "open": ["files"]
@@ -1084,11 +1100,14 @@ such as the branch, keep their actions after moving.
 | `problems` | how many errors and warnings the file has |
 | `activity` | a language server starting, files being read |
 | `connection` | the database of a query file; a click picks another |
+| `extensions` | what the code of VS Code extensions shows: its status bar items, work in progress, its last message. A click on an item runs its command |
 | `plugins` | what plugins show; a click opens the Plugins window |
 | `performance` | the numbers of `show_performance_hud` |
 
 An item with nothing to say now is not drawn. `file` and `branch` are on no bar
-until the file puts them on one. A mistake in a config file is always said in
+until the file puts them on one. A layout file written before `extensions`
+existed names its own items for the right end, so add it there to see what
+extensions show. A mistake in a config file is always said in
 the status bar, whatever it holds.
 
 Panel tabs, bar items and common command buttons have Phosphor icons next to

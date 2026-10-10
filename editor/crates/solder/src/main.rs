@@ -25,6 +25,8 @@ mod editor_git;
 mod editor_lsp;
 mod element;
 mod erd_view;
+mod extension_api;
+mod extension_ask;
 mod extension_store;
 mod extensions_panel;
 mod file_diff;

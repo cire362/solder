@@ -29,18 +29,26 @@ use std::{
 use serde_json::{Value, json};
 
 /// The host, kept in the binary: nothing is downloaded to run extensions.
-const HOST: &str = include_str!("../host/host.js");
+/// The first file is the one Node is started with.
+const HOST: &[(&str, &str)] = &[
+    ("host.js", include_str!("../host/host.js")),
+    ("types.js", include_str!("../host/types.js")),
+    ("documents.js", include_str!("../host/documents.js")),
+    ("api.js", include_str!("../host/api.js")),
+];
 
-/// Puts the host where Node can read it, under `dir`. Written again only
-/// when it changed, which is when the editor did.
+/// Puts the host where Node can read it, under `dir`. A file is written
+/// again only when it changed, which is when the editor did.
 pub fn host_script(dir: &Path) -> Result<PathBuf, String> {
-    let path = dir.join("host.js");
-    if std::fs::read_to_string(&path).is_ok_and(|there| there == HOST) {
-        return Ok(path);
+    for (name, source) in HOST {
+        let path = dir.join(name);
+        if std::fs::read_to_string(&path).is_ok_and(|there| there == *source) {
+            continue;
+        }
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        std::fs::write(&path, source).map_err(|e| e.to_string())?;
     }
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    std::fs::write(&path, HOST).map_err(|e| e.to_string())?;
-    Ok(path)
+    Ok(dir.join(HOST[0].0))
 }
 
 /// What a host tells the editor without being asked.
@@ -59,6 +67,9 @@ pub enum Told {
         method: String,
         params: Value,
     },
+    /// Anything else it says and waits for no answer to: what its status
+    /// bar item reads now, a line for an output channel.
+    Said { method: String, params: Value },
     /// The process ended, with its last words if it had any.
     Gone(String),
 }
@@ -71,7 +82,9 @@ const STOPPED: &str = "The extension's code stopped";
 
 pub struct VsHost {
     child: Mutex<Child>,
-    input: Arc<Mutex<Option<ChildStdin>>>,
+    /// Lines on their way to the host. Nothing that sends waits for the
+    /// host to read: a thread of its own writes them.
+    input: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     waiting: Waiting,
     next: AtomicU64,
 }
@@ -80,17 +93,22 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn write(input: &Mutex<Option<ChildStdin>>, message: &Value) -> Result<(), String> {
-    let guard = lock(input);
-    let Some(mut input) = guard.as_ref() else {
-        return Err("The extension's code was stopped".into());
-    };
+fn write(input: &Mutex<Option<mpsc::Sender<Vec<u8>>>>, message: &Value) -> Result<(), String> {
     let mut line = serde_json::to_vec(message).map_err(|e| e.to_string())?;
     line.push(b'\n');
-    input
-        .write_all(&line)
-        .and_then(|()| input.flush())
-        .map_err(|_| "The extension's code is not running".to_string())
+    lock(input)
+        .as_ref()
+        .and_then(|input| input.send(line).ok())
+        .ok_or_else(|| STOPPED.to_string())
+}
+
+/// Writes what is sent to the host, for as long as it reads.
+fn feed(mut input: ChildStdin, lines: mpsc::Receiver<Vec<u8>>) {
+    for line in lines {
+        if input.write_all(&line).and_then(|()| input.flush()).is_err() {
+            break;
+        }
+    }
 }
 
 impl VsHost {
@@ -126,7 +144,12 @@ impl VsHost {
         let mut child = command
             .spawn()
             .map_err(|e| format!("Could not start Node ({node}): {e}"))?;
-        let input = Arc::new(Mutex::new(child.stdin.take()));
+        let stdin = child.stdin.take().ok_or("The host has no input")?;
+        let (input, lines) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("vscode-host-input".into())
+            .spawn(move || feed(stdin, lines))
+            .map_err(|e| e.to_string())?;
         let output = child.stdout.take().ok_or("The host has no output")?;
         let errors = child.stderr.take();
         let waiting: Waiting = Arc::default();
@@ -159,7 +182,7 @@ impl VsHost {
         }
         let host = Self {
             child: Mutex::new(child),
-            input,
+            input: Mutex::new(Some(input)),
             waiting,
             next: AtomicU64::new(1),
         };
@@ -375,6 +398,10 @@ fn read(output: impl Read, waiting: &Waiting, ready: &mpsc::Sender<()>, told: &i
                 registered: message["params"]["registered"] == true,
             }),
             (None, Some("missing")) => told(Told::Missing(text(&message["params"]["name"]))),
+            (None, Some(method)) => told(Told::Said {
+                method: method.to_string(),
+                params: message["params"].clone(),
+            }),
             _ => {}
         }
     }
@@ -603,6 +630,274 @@ mod tests {
         host.watch(Duration::from_millis(20), SOON, || panic!("it answered"));
         std::thread::sleep(Duration::from_millis(300));
         assert!(host.is_running() && host.answers(SOON));
+    }
+
+    /// Plays the editor for a host: answers what it asks with `answer`,
+    /// and keeps what it says, each as its name and what came with it.
+    fn editor(
+        host: &Arc<VsHost>,
+        told: mpsc::Receiver<Told>,
+        answer: impl Fn(&str, &Value) -> Answer + Send + 'static,
+    ) -> Arc<Mutex<Vec<(String, Value)>>> {
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let (host, kept) = (Arc::downgrade(host), said.clone());
+        std::thread::spawn(move || {
+            for told in told {
+                match told {
+                    Told::Asked { id, method, params } => {
+                        let Some(host) = host.upgrade() else { break };
+                        host.answer(id, answer(&method, &params));
+                        lock(&kept).push((method, params));
+                    }
+                    Told::Said { method, params } => lock(&kept).push((method, params)),
+                    _ => {}
+                }
+            }
+        });
+        said
+    }
+
+    /// The lines written to the output channel so far.
+    fn output(said: &Mutex<Vec<(String, Value)>>) -> Vec<String> {
+        lock(said)
+            .iter()
+            .filter(|(method, _)| method == "output")
+            .filter_map(|(_, params)| params["text"].as_str())
+            .map(|line| line.trim_end().to_string())
+            .collect()
+    }
+
+    fn written(said: &Mutex<Vec<(String, Value)>>, line: &str) {
+        let until = std::time::Instant::now() + SOON;
+        while !output(said).iter().any(|known| known == line) {
+            assert!(
+                std::time::Instant::now() < until,
+                "no line {line:?} among {:#?}",
+                output(said)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn an_extension_has_the_window_the_workspace_and_the_documents() {
+        let code = r#"
+const vscode = require('vscode');
+exports.activate = async (context) => {
+  const out = vscode.window.createOutputChannel('Demo');
+  const log = (...all) => out.appendLine(all.map((one) => (typeof one === 'string' ? one : JSON.stringify(one))).join(' '));
+  const folder = vscode.workspace.workspaceFolders[0];
+  log('folder', folder.name, vscode.workspace.name, vscode.workspace.workspaceFolders.length);
+  const config = vscode.workspace.getConfiguration('demo');
+  log('config', config.get('level'), config.get('none', 'fallback'), config.nested.deep, config.has('level'), vscode.workspace.getConfiguration().get('demo.level'));
+  const doc = vscode.workspace.textDocuments[0];
+  log('doc', doc.languageId, doc.lineCount, doc.lineAt(1).text, doc.getText(new vscode.Range(0, 3, 0, 7)), doc.offsetAt(new vscode.Position(1, 2)), doc.positionAt(14));
+  log('word', doc.getText(doc.getWordRangeAtPosition(new vscode.Position(0, 4))));
+  const editor = vscode.window.activeTextEditor;
+  log('active', editor.document === doc, editor.selection.active, editor.selection.isReversed);
+  vscode.workspace.onDidChangeTextDocument((e) => log('changed', e.document.version, e.contentChanges[0].text, e.contentChanges[0].rangeOffset, e.contentChanges[0].rangeLength, e.document.getText(), e.document.isDirty));
+  vscode.workspace.onDidChangeConfiguration((e) => log('configured', e.affectsConfiguration('demo.level'), e.affectsConfiguration('other'), vscode.workspace.getConfiguration('demo').get('level')));
+  vscode.workspace.onDidOpenTextDocument((d) => log('opened', vscode.workspace.asRelativePath(d.uri), d.languageId));
+  vscode.workspace.onDidCloseTextDocument((d) => log('closed', d.isClosed, vscode.workspace.textDocuments.length));
+  vscode.workspace.onDidSaveTextDocument((d) => log('saved', d.isDirty));
+  vscode.workspace.onDidChangeWorkspaceFolders((e) => log('folders', e.added.length, e.removed.length));
+  vscode.window.onDidChangeTextEditorSelection((e) => log('selected', e.selections[0].active.line));
+  vscode.window.onDidChangeActiveTextEditor((e) => log('front', e ? vscode.workspace.asRelativePath(e.document.uri) : 'none'));
+  vscode.window.onDidChangeActiveColorTheme((theme) => log('theme', theme.kind));
+  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 5);
+  item.text = '$(check) Demo';
+  item.command = 'demo.ask';
+  item.show();
+  context.subscriptions.push(vscode.commands.registerCommand('demo.ask', async () => {
+    const answer = await vscode.window.showInformationMessage('Go on?', { modal: true }, 'Yes', 'No');
+    const picked = await vscode.window.showQuickPick([{ label: 'one', description: 'first' }, { label: 'two' }], { placeHolder: 'Which' });
+    const name = await vscode.window.showInputBox({ prompt: 'Name', validateInput: (value) => (value.length < 3 ? 'Too short' : undefined) });
+    const applied = await vscode.window.activeTextEditor.edit((builder) => builder.insert(new vscode.Position(0, 0), '// '));
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(doc.uri, new vscode.Range(1, 0, 1, 1), 'X');
+    const also = await vscode.workspace.applyEdit(edit);
+    await vscode.workspace.getConfiguration('demo').update('level', 9);
+    await vscode.env.clipboard.writeText('copied');
+    const none = await vscode.window.showQuickPick(['a']);
+    return { answer, picked: picked && picked.label, name, applied, also, none: none === undefined };
+  }));
+  const found = await vscode.workspace.findFiles('**/*.{rs,md}', '**/skip/**');
+  log('found', found.map((uri) => vscode.workspace.asRelativePath(uri)).sort());
+  const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(folder.uri, 'a.rs'));
+  log('read', Buffer.from(bytes).toString().trim());
+  const disk = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(folder.uri, 'docs/b.md'));
+  log('disk', disk.languageId, disk.lineCount, (await vscode.workspace.openTextDocument(doc.uri)) === doc);
+  await vscode.window.withProgress({ title: 'Working' }, async (progress) => progress.report({ message: 'half' }));
+  vscode.window.showWarningMessage('Careful');
+  log(vscode.l10n.t('Hello {0}', 'you'), new vscode.Range(2, 0, 1, 0).start.line, vscode.ViewColumn.Two);
+  // What is not here yet does not break it.
+  const watcher = vscode.workspace.createFileSystemWatcher('**/*');
+  watcher.onDidChange(() => {});
+  class Item extends vscode.TreeItem {}
+  new Item('x');
+  log('ready');
+};
+"#;
+        let Some((host, told, dir)) = hosted("vscode-api", code) else {
+            return;
+        };
+        let project = dir.join("project").canonicalize().unwrap_or_else(|_| {
+            std::fs::create_dir_all(dir.join("project")).unwrap();
+            dir.join("project").canonicalize().unwrap()
+        });
+        write_file(&project.join("a.rs"), "fn main() {}\n");
+        write_file(&project.join("docs/b.md"), "# B\n\ntext\n");
+        write_file(&project.join("skip/c.rs"), "");
+        write_file(&project.join("node_modules/d/e.rs"), "");
+        write_file(&project.join("f.txt"), "");
+        let uri = |name: &str| format!("file://{}/{name}", project.display());
+        let host = Arc::new(host);
+        let typed = Arc::new(Mutex::new(vec!["ab", "abc"]));
+        let said = editor(&host, told, move |method, params| match method {
+            "message" => Ok(json!(0)),
+            "pick" if params["placeholder"] == "Which" => Ok(json!(1)),
+            "pick" => Ok(Value::Null),
+            "input" => Ok(json!(lock(&typed).remove(0))),
+            "applyEdit" | "updateConfiguration" | "clipboardWrite" => Ok(json!(true)),
+            other => Err(format!("no {other} here")),
+        });
+        // Everything the editor has is said before the extension is loaded.
+        host.notify(
+            "init",
+            json!({
+                "folders": [project],
+                "configuration": { "demo": { "level": 2, "nested": { "deep": "yes" } } },
+                "dark": true,
+                "documents": [
+                    { "uri": uri("a.rs"), "languageId": "rust", "version": 1, "text": "fn main() {}\nlet a = 1;\n" },
+                ],
+                "active": { "uri": uri("a.rs"), "selections": [
+                    { "anchor": { "line": 1, "character": 4 }, "active": { "line": 0, "character": 2 } },
+                ] },
+            }),
+        );
+        host.request("activate", json!({}), SOON).unwrap();
+        written(&said, "ready");
+        let lines = output(&said);
+        assert_eq!(
+            lines[..10],
+            [
+                "folder project project 1",
+                "config 2 fallback yes true 2",
+                r#"doc rust 3 let a = 1; main 15 {"line":1,"character":1}"#,
+                "word main",
+                r#"active true {"line":0,"character":2} true"#,
+                r#"found ["a.rs","docs/b.md"]"#,
+                "read fn main() {}",
+                "disk markdown 4 true",
+                "Hello you 1 2",
+                "ready",
+            ]
+        );
+        // What it showed: an item of the status bar, a message that waits
+        // for nothing, and work in progress that began and ended.
+        let sent = |method: &str| -> Vec<Value> {
+            lock(&said)
+                .iter()
+                .filter(|(known, _)| known == method)
+                .map(|(_, params)| params.clone())
+                .collect()
+        };
+        assert_eq!(
+            sent("status"),
+            [json!({
+                "id": 1, "text": "$(check) Demo", "command": "demo.ask", "visible": true,
+                "right": true, "priority": 5,
+            })]
+        );
+        assert_eq!(sent("message")[0]["text"], "Careful");
+        assert_eq!(sent("message")[0]["level"], "warning");
+        assert_eq!(
+            sent("progress"),
+            [
+                json!({ "id": 1, "text": "Working" }),
+                json!({ "id": 1, "text": "Working: half" }),
+                json!({ "id": 1, "done": true }),
+            ]
+        );
+        // The editor says what changes, and the extension's copy follows.
+        let change = |version: u64, line: u64, from: u64, to: u64, text: &str| {
+            json!({ "uri": uri("a.rs"), "version": version, "changes": [{
+                "range": { "start": { "line": line, "character": from }, "end": { "line": line, "character": to } },
+                "text": text,
+            }] })
+        };
+        host.notify("changed", change(2, 1, 4, 5, "bc"));
+        written(&said, "changed 2 bc 17 1 fn main() {}\nlet bc = 1;\n true");
+        host.notify("saved", json!({ "uri": uri("a.rs") }));
+        written(&said, "saved false");
+        host.notify(
+            "active",
+            json!({ "uri": uri("a.rs"), "selections": [
+                { "anchor": { "line": 1, "character": 0 }, "active": { "line": 1, "character": 0 } },
+            ] }),
+        );
+        written(&said, "selected 1");
+        host.notify(
+            "opened",
+            json!({ "uri": uri("docs/b.md"), "languageId": "markdown", "version": 1, "text": "# B\n" }),
+        );
+        written(&said, "opened docs/b.md markdown");
+        host.notify("active", json!({ "uri": uri("docs/b.md") }));
+        written(&said, "front docs/b.md");
+        host.notify("closed", json!({ "uri": uri("docs/b.md") }));
+        written(&said, "front none");
+        written(&said, "closed true 1");
+        host.notify(
+            "configuration",
+            json!({ "configuration": { "demo": { "level": 3 } } }),
+        );
+        written(&said, "configured true false 3");
+        host.notify("folders", json!({ "folders": [project, dir] }));
+        written(&said, "folders 1 0");
+        host.notify("theme", json!({ "dark": false }));
+        written(&said, "theme 1");
+
+        // Its command asks the user three things and changes the text two
+        // ways; what is typed is checked by the extension and asked again.
+        host.notify("active", json!({ "uri": uri("a.rs") }));
+        written(&said, "front a.rs");
+        let ran = host.request("executeCommand", json!({ "id": "demo.ask" }), SOON);
+        assert_eq!(
+            ran,
+            Ok(json!({
+                "answer": "Yes", "picked": "two", "name": "abc", "applied": true, "also": true,
+                "none": true,
+            }))
+        );
+        let asked = sent("message");
+        assert_eq!(
+            asked[1],
+            json!({ "level": "info", "text": "Go on?", "modal": true, "items": ["Yes", "No"] })
+        );
+        assert_eq!(
+            sent("pick")[0],
+            json!({ "placeholder": "Which", "items": [
+                { "label": "one", "description": "first" }, { "label": "two" },
+            ] })
+        );
+        let inputs = sent("input");
+        assert_eq!(inputs[0]["prompt"], "Name");
+        assert_eq!(
+            (&inputs[1]["prompt"], &inputs[1]["value"]),
+            (&json!("Too short"), &json!("ab"))
+        );
+        let edits = sent("applyEdit");
+        assert_eq!(
+            edits[0]["changes"][uri("a.rs")],
+            json!([{ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }, "newText": "// " }])
+        );
+        assert_eq!(edits[1]["changes"][uri("a.rs")][0]["newText"], "X");
+        assert_eq!(
+            sent("updateConfiguration"),
+            [json!({ "key": "demo.level", "value": 9 })]
+        );
+        assert_eq!(sent("clipboardWrite"), [json!({ "text": "copied" })]);
     }
 
     #[test]

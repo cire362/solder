@@ -760,6 +760,32 @@ impl ExtensionsPanel {
                                 .child(line(format!("Last said: {last}").into(), theme.fg_subtle));
                         }
                     }
+                    // What it wrote to its output channels, to read in a tab.
+                    let channels = store.outputs(&installed.id);
+                    if !channels.is_empty() {
+                        let view = cx.entity();
+                        details = details.child(div().flex().flex_wrap().gap_1().children(
+                            channels.into_iter().enumerate().map(|(i, channel)| {
+                                let (view, id) = (view.clone(), installed.id.clone());
+                                let label = format!("Show output: {channel}");
+                                ui::button(
+                                    ("extension-output", i),
+                                    label,
+                                    false,
+                                    theme,
+                                    move |_, _, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.store.update(cx, |store, cx| {
+                                                store.show_output(&id, &channel, cx)
+                                            })
+                                        })
+                                    },
+                                )
+                                .debug_selector(move || format!("extension-output-{i}"))
+                                .h(px(22.))
+                            }),
+                        ));
+                    }
                 }
                 let missing = not_running(installed);
                 if !missing.is_empty() {

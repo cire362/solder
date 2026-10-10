@@ -24,6 +24,7 @@ use crate::{
     document::Document,
     editor::{self, Editor, EditorEvent},
     editor_lsp::LspLocation,
+    extension_store::ExtensionStore,
     file_diff::{DiffModel, FileDiff, FileDiffEvent},
     file_finder::FileFinder,
     git::DiffScope,
@@ -395,7 +396,20 @@ impl Workspace {
         let ai_store = crate::ai_store::AiStore::global(cx);
         ai_store.update(cx, |s, _| s.add_root(root.clone()));
         let ai_panel = cx.new(|cx| crate::ai_panel::AiPanel::new(ai_store.clone(), cx));
-        let extensions = crate::extension_store::ExtensionStore::global(cx);
+        let extensions = ExtensionStore::global(cx);
+        // The code of extensions sees this window's folder, and asks the
+        // user in the window in front.
+        let this = cx.entity().downgrade();
+        extensions.update(cx, |store, cx| store.set_front(this, root.clone(), cx));
+        let extension_asks =
+            cx.subscribe_in(
+                &extensions,
+                window,
+                |this, _, event, window, cx| match event {
+                    crate::extension_api::ExtensionEvent::Asked => this.extension_asks(window, cx),
+                    crate::extension_api::ExtensionEvent::Bar => cx.notify(),
+                },
+            );
         let extensions_panel =
             cx.new(|cx| crate::extensions_panel::ExtensionsPanel::new(extensions, cx));
         let weak = cx.entity().downgrade();
@@ -415,9 +429,13 @@ impl Workspace {
                 if window.is_window_active() {
                     let (weak, root) = (cx.entity().downgrade(), this.root(cx));
                     this.plugins
-                        .update(cx, |p, cx| p.set_workspace(weak, root, cx));
+                        .update(cx, |p, cx| p.set_workspace(weak.clone(), root.clone(), cx));
+                    if let Some(extensions) = ExtensionStore::try_global(cx) {
+                        extensions.update(cx, |store, cx| store.set_front(weak, root, cx));
+                    }
                 }
             }),
+            extension_asks,
             cx.subscribe_in(&debug, window, |this, _, event, window, cx| match event {
                 crate::debug::DebugEvent::Paused(path, line) => {
                     // The window whose project holds the file shows it.
@@ -3907,7 +3925,138 @@ impl Workspace {
         if still_focused && let Some(previous) = modal.previous_focus {
             window.focus(&previous);
         }
+        // A question of an extension that waited for the keyboard.
+        cx.defer_in(window, |this, window, cx| this.extension_asks(window, cx));
         cx.notify();
+    }
+
+    /// What extensions asked of the window in front. Files to show and
+    /// edits are done at once; a list to pick from or a line to type
+    /// waits until nothing else has the keyboard, one at a time.
+    fn extension_asks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::extension_api::Ask;
+        let Some(store) = ExtensionStore::try_global(cx) else {
+            return;
+        };
+        if !store.read(cx).is_front(&cx.entity()) {
+            return;
+        }
+        loop {
+            let free = self.modal.is_none();
+            let Some(ask) = store.update(cx, |store, _| store.take_ask(free)) else {
+                break;
+            };
+            match ask {
+                Ask::Pick { title, rows, reply } => {
+                    self.toggle_modal(window, cx, move |window, cx| {
+                        let pick = crate::extension_ask::AskPick::new(title, rows, reply);
+                        Picker::new(pick, window, cx)
+                    })
+                }
+                Ask::Input {
+                    title,
+                    value,
+                    reply,
+                } => self.toggle_modal(window, cx, move |window, cx| {
+                    let input = crate::extension_ask::AskInput::new(title, reply);
+                    let mut picker = Picker::new(input, window, cx);
+                    if !value.is_empty() {
+                        picker.set_query(&value, cx);
+                    }
+                    picker
+                }),
+                Ask::Show { path, at, reply } => {
+                    let jump = at.map(|range| Jump::Lsp {
+                        range,
+                        encoding: lsp::Encoding::Utf16,
+                    });
+                    self.open_path(path, jump, window, cx);
+                    if let Some(reply) = reply {
+                        reply.send(Ok(true.into()));
+                    }
+                }
+                Ask::Edit { edit, reply } => {
+                    self.apply_workspace_edit(edit, lsp::Encoding::Utf16, cx);
+                    // After the documents said what changed: the extension
+                    // reads the new text as soon as it has its answer.
+                    cx.defer(move |_| reply.send(Ok(true.into())));
+                }
+                Ask::Save { path, reply } => {
+                    let saving = self.save_for_extension(path.as_deref(), cx);
+                    cx.spawn(async move |_, _| {
+                        let saved = futures::future::join_all(saving).await;
+                        reply.send(Ok(saved.into_iter().all(|saved| saved).into()));
+                    })
+                    .detach();
+                }
+                Ask::SaveAll => {
+                    for saving in self.save_for_extension(None, cx) {
+                        saving.detach();
+                    }
+                }
+                Ask::Output { title, text } => {
+                    let document = cx.new(|cx| {
+                        Document::virtual_file(title, PathBuf::from("output.log"), &text, cx)
+                    });
+                    let editor = cx.new(|cx| Editor::for_document(document, cx));
+                    self.add_tab(editor, window, cx);
+                }
+            }
+        }
+    }
+
+    /// Saves the open file at `path`, or with none every open file that
+    /// has changes, for an extension that asked.
+    fn save_for_extension(
+        &mut self,
+        path: Option<&Path>,
+        cx: &mut Context<Self>,
+    ) -> Vec<Task<bool>> {
+        let mut seen = HashSet::new();
+        let editors: Vec<Entity<Editor>> = self
+            .all_editors()
+            .filter(|editor| {
+                let document = editor.read(cx).document();
+                let wanted = match (path, document.read(cx).path()) {
+                    (Some(path), Some(own)) => path == own,
+                    (None, Some(_)) => document.read(cx).is_dirty(),
+                    _ => false,
+                };
+                wanted && seen.insert(document.entity_id())
+            })
+            .cloned()
+            .collect();
+        editors
+            .into_iter()
+            .map(|editor| editor.update(cx, |editor, cx| editor.save(cx)))
+            .collect()
+    }
+
+    /// Runs a command of an extension's code. That it failed is said in
+    /// the status bar; what it answers is the extension's own business.
+    fn run_extension_command(
+        &mut self,
+        action: &crate::extension_api::RunExtensionCommand,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = ExtensionStore::try_global(cx) else {
+            return;
+        };
+        let command = action.command.clone();
+        let running = store.update(cx, |store, cx| {
+            store.run_command(&command, action.args.clone(), cx)
+        });
+        cx.spawn(async move |_, cx| {
+            if let Err(error) = running.await {
+                store
+                    .update(cx, |store, cx| {
+                        store.report(format!("{command}: {error}"), cx)
+                    })
+                    .ok();
+            }
+        })
+        .detach();
     }
 
     fn toggle_command_palette(
@@ -4524,6 +4673,34 @@ impl Workspace {
                     .into_iter()
                     .collect()
             }
+            // What the code of extensions shows. An item with a command
+            // runs it.
+            Item::Extensions => {
+                let Some(store) = ExtensionStore::try_global(cx) else {
+                    return Vec::new();
+                };
+                let bar = store.read(cx).bar();
+                bar.into_iter()
+                    .enumerate()
+                    .map(|(i, item)| {
+                        use crate::extension_api::{RunExtensionCommand, Tone};
+                        let color = match item.tone {
+                            Tone::Plain => theme.fg_muted,
+                            Tone::Warning => theme.warning,
+                            Tone::Error => theme.error,
+                        };
+                        let action = item.command.map(|(command, args)| {
+                            Box::new(RunExtensionCommand { command, args }) as Box<dyn gpui::Action>
+                        });
+                        BarPart {
+                            text: item.text,
+                            id: Some(("status-extension", i)),
+                            color: Some(color),
+                            action,
+                        }
+                    })
+                    .collect()
+            }
             // What plugins show, and a notice when one is slow; both open
             // the Plugins window.
             Item::Plugins => {
@@ -4898,6 +5075,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::open_layout))
             .on_action(cx.listener(Self::switch_layout))
+            .on_action(cx.listener(Self::run_extension_command))
             .on_action(cx.listener(Self::save_layout))
             .on_action(cx.listener(Self::switch_key_layout))
             .on_action(cx.listener(Self::save_key_layout))
@@ -10618,7 +10796,7 @@ mod tests {
 
     // ----------------------------------------------------------- extensions
 
-    use crate::extension_store::{CodeState, ExtensionStore};
+    use crate::extension_store::CodeState;
     use extension::{
         Origin,
         testing::{Served, serve, tar, write as write_file, zip},
@@ -11621,6 +11799,224 @@ exports.activate = async () => {
         assert!(!folder.join("work/acme.quit").exists());
         // The host is Solder's own file, written once next to them.
         assert!(folder.join("host/host.js").is_file());
+    }
+
+    #[gpui::test]
+    fn an_extension_reads_the_editor_and_asks_the_user(cx: &mut TestAppContext) {
+        use crate::extension_api::{BarText, RunExtensionCommand, Tone};
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let (base, _) = serve(vec![
+            (
+                "/api/-/search",
+                Served::ok(br#"{"extensions":[]}"#.to_vec()),
+            ),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (config, store, ws, cx) = extension_setup(cx, "ext-api", &base);
+        let root = cx.read(|cx| ws.read(cx).root(cx));
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("other.rs"), "fn other() {}\n").unwrap();
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(root.join("main.rs"), None, window, cx)
+        });
+        let front = |cx: &App| {
+            let editor = ws.read(cx).active_editor()?.read(cx);
+            Some((editor.doc(cx).title(), editor.text(cx)))
+        };
+        wait_for(cx, "main.rs in front", &|cx| {
+            front(cx).is_some_and(|(title, _)| title == "main.rs")
+        });
+
+        let folder = cx.read(|cx| store.read(cx).root.clone());
+        let dir = folder.join("vscode/acme.api");
+        write_file(
+            &dir.join("package.json"),
+            r#"{ "name": "api", "publisher": "Acme", "version": "1.0.0", "main": "main.js",
+  "activationEvents": ["*"],
+  "contributes": { "configuration": { "properties": { "api.level": { "type": "number", "default": 2 } } } } }"#,
+        );
+        write_file(
+            &dir.join("main.js"),
+            r#"const vscode = require('vscode');
+exports.activate = async (context) => {
+  const out = vscode.window.createOutputChannel('Api');
+  const log = (...all) => out.appendLine(all.map((one) => (typeof one === 'string' ? one : JSON.stringify(one))).join(' '));
+  const name = (uri) => vscode.workspace.asRelativePath(uri);
+  log('folder', vscode.workspace.workspaceFolders[0].name);
+  log('level', vscode.workspace.getConfiguration('api').get('level'), vscode.workspace.getConfiguration('editor').get('tabSize'));
+  log('open', vscode.workspace.textDocuments.map((doc) => name(doc.uri)).sort());
+  log('front', name(vscode.window.activeTextEditor.document.uri), vscode.window.activeTextEditor.document.languageId);
+  vscode.workspace.onDidChangeTextDocument((e) => log('changed', e.contentChanges[0].text, e.document.lineAt(0).text));
+  vscode.workspace.onDidChangeConfiguration((e) => {
+    if (e.affectsConfiguration('api.level')) log('level now', vscode.workspace.getConfiguration('api').get('level'));
+  });
+  vscode.workspace.onDidOpenTextDocument((doc) => log('opened', name(doc.uri), doc.languageId));
+  vscode.workspace.onDidSaveTextDocument((doc) => log('saved', name(doc.uri)));
+  vscode.window.onDidChangeActiveTextEditor((e) => log('now front', e ? name(e.document.uri) : 'none'));
+  vscode.window.onDidChangeTextEditorSelection((e) => log('cursor', e.selections[0].active.line, e.selections[0].active.character));
+  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
+  item.text = '$(rocket) Api ready';
+  item.command = { command: 'api.ask', arguments: ['from the bar'] };
+  item.show();
+  context.subscriptions.push(vscode.commands.registerCommand('api.ask', async (from) => {
+    const answer = await vscode.window.showInformationMessage('Go on?', 'Yes', 'No');
+    const picked = await vscode.window.showQuickPick(['alpha', 'beta'], { placeHolder: 'Which one' });
+    const typed = await vscode.window.showInputBox({ prompt: 'A name', value: 'abc' });
+    log('asked', from, answer, picked, typed);
+    const editor = vscode.window.activeTextEditor;
+    await editor.edit((builder) => builder.insert(new vscode.Position(0, 0), '// hi\n'));
+    log('after edit', editor.document.lineAt(0).text, editor.document.isDirty);
+    await editor.document.save();
+    await vscode.workspace.getConfiguration('api').update('level', 7);
+    const shown = await vscode.window.showTextDocument(vscode.Uri.joinPath(vscode.workspace.workspaceFolders[0].uri, 'other.rs'));
+    log('shown', name(shown.document.uri));
+    vscode.window.showErrorMessage('It broke');
+    out.show();
+  }));
+  log('ready');
+};"#,
+        );
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.scan(cx);
+        });
+        wait_for(cx, "the extension", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.api").is_some()
+        });
+        store.update(cx, |store, cx| store.allow(Origin::VsCode, "Acme.api", cx));
+        let wrote = |cx: &App, line: &str| {
+            let store = store.read(cx);
+            let output = store.output("Acme.api", "Api").unwrap_or_default();
+            output.lines().any(|known| known == line)
+        };
+        let written = |cx: &mut VisualTestContext, line: &'static str| {
+            for _ in 0..500 {
+                cx.executor().advance_clock(Duration::from_millis(50));
+                cx.run_until_parked();
+                if cx.read(|cx| wrote(cx, line)) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = cx.read(|cx| {
+                let output = store.read(cx).output("Acme.api", "Api");
+                output.unwrap_or_default().to_string()
+            });
+            panic!("no line {line:?} in what it wrote:\n{output}");
+        };
+
+        // Loaded, it already has the folder, the settings with what it
+        // declares, the files that are open and the one in front.
+        written(cx, "ready");
+        let name = root.file_name().unwrap().to_string_lossy().into_owned();
+        let output = cx.read(|cx| {
+            store
+                .read(cx)
+                .output("Acme.api", "Api")
+                .unwrap()
+                .to_string()
+        });
+        assert_eq!(
+            output.lines().collect::<Vec<_>>(),
+            [
+                format!("folder {name}").as_str(),
+                "level 2 4",
+                r#"open ["App.vue","main.rs"]"#,
+                "front main.rs rust",
+                "ready",
+            ]
+        );
+        // Its item is in the status bar, without the picture VS Code
+        // would draw, and a click runs its command with what goes with it.
+        let (command, args) = ("api.ask".to_string(), serde_json::json!(["from the bar"]));
+        assert_eq!(
+            cx.read(|cx| store.read(cx).bar()),
+            [BarText {
+                text: "Api ready".into(),
+                tone: Tone::Plain,
+                command: Some((command.clone(), args.clone())),
+            }]
+        );
+        cx.dispatch_action(RunExtensionCommand { command, args });
+
+        // It asks three things, one after another, each in the editor's
+        // own list: a message with answers, one of a list, a line to type.
+        let asking = |cx: &App| ws.read(cx).modal.is_some();
+        wait_for(cx, "the message", &asking);
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the list", &asking);
+        cx.simulate_input("bet");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the line to type", &asking);
+        // What it suggested is selected, so typing replaces it.
+        cx.simulate_input("xyz");
+        cx.simulate_keystrokes("enter");
+        written(cx, "asked from the bar Yes beta xyz");
+
+        // It changes the file in front, reads its own change, saves the
+        // file, sets a setting and hears of it, and brings another file to
+        // the front.
+        written(cx, "changed // hi");
+        written(cx, "after edit // hi true");
+        written(cx, "saved main.rs");
+        assert_eq!(
+            std::fs::read_to_string(root.join("main.rs")).unwrap(),
+            "// hi\nfn main() {}\n"
+        );
+        written(cx, "level now 7");
+        let settings = std::fs::read_to_string(config.join("settings.json")).unwrap();
+        assert!(settings.contains(r#""api.level": 7"#), "{settings}");
+        written(cx, "opened other.rs rust");
+        written(cx, "now front other.rs");
+        written(cx, "shown other.rs");
+        // A message that asks nothing is in the status bar, and what it
+        // wrote opens in a tab when it says so.
+        wait_for(cx, "its output", &|cx| {
+            front(cx).is_some_and(|(title, text)| {
+                title == "Output: Api" && text.contains("shown other.rs")
+            })
+        });
+        let bar = cx.read(|cx| store.read(cx).bar());
+        assert_eq!(
+            bar.last(),
+            Some(&BarText {
+                text: "It broke".into(),
+                tone: Tone::Error,
+                command: None,
+            })
+        );
+        // The message goes after a while; the item stays.
+        cx.executor().advance_clock(Duration::from_secs(9));
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| store.read(cx).bar().len()), 1);
+
+        // What is typed reaches it as it is typed, with where the cursor is.
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(root.join("other.rs"), None, window, cx)
+        });
+        written(cx, "now front other.rs");
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let focus = cx.read(|cx| editor.focus_handle(cx));
+        cx.update(|window, _| window.focus(&focus));
+        cx.simulate_input("x");
+        written(cx, "changed x xfn other() {}");
+        written(cx, "cursor 0 1");
+
+        // Turned off, its code is ended and its item leaves the bar.
+        store.update(cx, |store, cx| {
+            store.set_off(Origin::VsCode, "Acme.api", true, cx)
+        });
+        assert!(cx.read(|cx| store.read(cx).bar().is_empty()));
     }
 
     /// What extensions reach outside their sandbox through, for the test
