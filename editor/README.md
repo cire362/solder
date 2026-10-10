@@ -908,7 +908,7 @@ What is in the module today is what every extension starts from:
 | Watch files | `createFileSystemWatcher`, for the folders of the open windows: files made, changed and deleted, but for `.git` and `node_modules` |
 | Show pages (webviews) and editors of its own for kinds of files | A tab drawn by the system's browser; see below |
 | Read, run and write notebooks | A tab of cells, drawn by Solder: the extension reads the file, runs the cells and writes it back; see below |
-| Give language features in code (`vscode.languages`) | Completions, hovers, definitions, references, rename, formatting, code actions, document and project symbols, signature help, inlay hints, semantic colors, and diagnostics from its collections. A code lens is at the end of its line, where a click runs it, and among the code actions of the line (`cmd-.`) |
+| Give language features in code (`vscode.languages`) | Completions, hovers, definitions, references, rename, formatting, code actions, document and project symbols, signature help, inlay hints, semantic colors, and diagnostics from its collections. A code lens is above its line, where a click runs it, and among the code actions of the line (`cmd-.`) |
 
 **Show extension views** opens the **Views** panel. Trees an extension names
 are listed before its code starts; choosing one starts the approved code.
@@ -1144,9 +1144,9 @@ characters is cut. **Semantic colors** are what the server says each word
 is, over what the grammar says: a server knows a constant from a variable
 where a grammar sees a name. A **code lens** is something the server offers
 to do with a line (run this test, show what refers to this): its words are
-at the end of the line, in the accent color, and a click does it. Other
-editors put a lens on a row of its own above the line; here every row is a
-line of the file, so it stands after the code. A lens is shown if a click
+above the line, in a quieter color, and a click does it. Its row has no
+line number and is no part of the file: cursor movement, selections,
+breakpoints and hover still refer to the lines of the file. A lens is shown if a click
 can do it: its command is one the server runs itself, or one of three the
 editor does for it. Places to show (`editor.action.showReferences`, and
 rust-analyzer's name for the same) are listed as the references of a symbol

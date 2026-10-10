@@ -6499,10 +6499,10 @@ mod tests {
         wait_for(cx, "the colors to go", &|cx| drawn(cx).1.is_empty());
     }
 
-    /// What a server offers to do with a line is said at the end of it,
+    /// What a server offers to do with a line is said above it,
     /// and a click does it. Against `tests/fixtures/mock_lsp.py --hints`.
     #[gpui::test]
-    fn a_lens_is_at_the_end_of_its_line_and_a_click_runs_it(cx: &mut TestAppContext) {
+    fn a_lens_is_above_its_line_and_a_click_runs_it(cx: &mut TestAppContext) {
         let root = fixture("lsp-lens");
         std::fs::write(root.join("Cargo.toml"), "").unwrap();
         let file = root.join("src/main.rs");
@@ -6548,15 +6548,24 @@ mod tests {
         );
         assert_eq!((lens.server, lens.arguments.len()), ("rust-analyzer", 1));
 
-        // It is after the code of its line, and no place in the file: a
-        // click on it runs the command, whose edit comes from the server.
+        // It is above the code of its line, and no place in the file: a
+        // click runs the command, whose edit comes from the server.
         wait_for(cx, "the lens in its line", &|cx| drawn(0, cx).is_some());
-        let (at, end) = cx.read(|cx| {
-            let layout = editor.read(cx).layout.as_ref().unwrap();
-            let end = layout.text_left + layout.lines[0].x_for(14);
-            (drawn(0, cx).unwrap(), end)
+        let at = cx.read(|cx| {
+            let editor = editor.read(cx);
+            let layout = editor.layout.as_ref().unwrap();
+            let at = drawn(0, cx).unwrap();
+            let code = layout
+                .bounds_for_offset(editor.buf(cx), editor.scroll, 0)
+                .unwrap();
+            assert!(at.y < code.top());
+            assert!(
+                layout
+                    .text_offset_at(editor.buf(cx), editor.scroll, at)
+                    .is_none()
+            );
+            at
         });
-        assert!(at.x > end, "{at:?} {end:?}");
         cx.simulate_click(at, gpui::Modifiers::default());
         wait_for(cx, "the command's edit", &|cx| {
             editor.read(cx).text(cx).starts_with("// touched\n")
@@ -6584,13 +6593,12 @@ mod tests {
             let layout = editor.read(cx).layout.as_ref();
             layout.is_some_and(|layout| layout.lens_middle(2, 1).is_some())
         });
-        // The last drawn is the first found from the end of the row.
-        click_lens(cx, 1);
+        click_lens(cx, 0);
         wait_for(cx, "the places", &|cx| ws.read(cx).modal.is_some());
         cx.simulate_keystrokes("escape");
         // The other names something to run, which runs in a terminal of
         // the dock, under the name the server gave it.
-        click_lens(cx, 0);
+        click_lens(cx, 1);
         wait_for(cx, "what the lens runs", &|cx| {
             let terminals = &ws.read(cx).terminals;
             terminals.iter().any(|(terminal, _)| {

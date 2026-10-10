@@ -1794,6 +1794,9 @@ impl Editor {
             && event.position.x < layout.text_left
             && event.position.x >= layout.bounds.left()
         {
+            if layout.is_lens_row(self.scroll, event.position.y) {
+                return;
+            }
             let row = layout.row_at(self.buf(cx), self.scroll, event.position.y);
             self.toggle_breakpoint_at(row, cx);
             return;

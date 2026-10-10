@@ -118,7 +118,8 @@ Never guess a signature.
   until the answer comes. A hint is in the
   row and not in the file: `DisplayLine` maps columns both ways, as it
   does for tabs, and nothing else may assume a column is a place on
-  screen. A lens is the last thing in its row, and is kept only if a
+  screen. A lens has a row above its line (`element::Rows` maps file lines to
+  display rows), and is kept only if a
   click can do it: its command is one its server said it runs, or one
   of the few the editor does itself (`editor_lsp::LENS_COMMANDS`).
 - Git goes through `git.rs`, which shells out to `git` with stable
