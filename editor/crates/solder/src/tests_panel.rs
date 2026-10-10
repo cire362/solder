@@ -493,6 +493,15 @@ impl Render for TestsPanel {
                                 range
                                     .map(|i| {
                                         div()
+                                            .id(("test-output-line", i))
+                                            .w_full()
+                                            .truncate()
+                                            .tooltip({
+                                                let line = this.details[i].clone();
+                                                move |_, cx| {
+                                                    cx.new(|_| ui::Tooltip(line.clone())).into()
+                                                }
+                                            })
                                             .h(crate::theme::row(gpui::px(24.), cx))
                                             .px_2()
                                             .text_size(UI_FONT_SMALL)

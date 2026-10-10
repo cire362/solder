@@ -80,6 +80,7 @@ struct Output {
     ok: bool,
     text: String,
     stdout: String,
+    stderr: String,
     limited: bool,
 }
 
@@ -164,7 +165,8 @@ fn output(mut command: Command, cancel: &Cancel) -> Result<Output, String> {
         .map(|r| r.join().unwrap_or_default())
         .collect();
     let stdout = String::from_utf8_lossy(&streams[0].0).into_owned();
-    let mut text = format!("{stdout}\n{}", String::from_utf8_lossy(&streams[1].0));
+    let stderr = String::from_utf8_lossy(&streams[1].0).into_owned();
+    let mut text = format!("{stdout}\n{stderr}");
     let limited = streams.iter().any(|s| s.1);
     if limited {
         text.push_str("\nOutput limited to 1 MB per stream.\n");
@@ -173,6 +175,7 @@ fn output(mut command: Command, cancel: &Cancel) -> Result<Output, String> {
         ok,
         text,
         stdout,
+        stderr,
         limited,
     })
 }
@@ -496,13 +499,28 @@ pub fn run(root: &Path, test: &Test, cancel: &Cancel) -> Outcome {
             } else {
                 State::Passed
             };
-            let output = if !ran && out.ok {
+            // Python reserves stdout for its result protocol and routes
+            // program output to stderr. Only the latter belongs on screen.
+            let displayed = if matches!(test.runner, Runner::Python { .. }) {
                 format!(
-                    "The selected test did not run. Discover tests again.\n{}",
-                    out.text
+                    "{}{}",
+                    out.stderr,
+                    if out.limited {
+                        "\nOutput limited to 1 MB per stream.\n"
+                    } else {
+                        ""
+                    }
                 )
             } else {
                 out.text
+            };
+            let output = if !ran && out.ok {
+                format!(
+                    "The selected test did not run. Discover tests again.\n{}",
+                    displayed
+                )
+            } else {
+                displayed
             };
             Outcome { state, output }
         }
@@ -611,7 +629,7 @@ mod tests {
             return;
         }
         let root = db::testing::dir("test-runner").canonicalize().unwrap();
-        std::fs::write(root.join("test_example.py"), "import unittest\nclass Tests(unittest.TestCase):\n    def test_pass(self): self.assertEqual(2, 2)\n    def test_fail(self): self.assertEqual(1, 2)\n    @unittest.skip('later')\n    def test_skip(self): pass\n    @unittest.expectedFailure\n    def test_expected(self): self.fail('known')\n    @unittest.expectedFailure\n    def test_unexpected(self): pass\n").unwrap();
+        std::fs::write(root.join("test_example.py"), "import unittest\nclass Tests(unittest.TestCase):\n    def test_pass(self): self.assertEqual(2, 2); print('solder-test: user output')\n    def test_fail(self): self.assertEqual(1, 2)\n    @unittest.skip('later')\n    def test_skip(self): pass\n    @unittest.expectedFailure\n    def test_expected(self): self.fail('known')\n    @unittest.expectedFailure\n    def test_unexpected(self): pass\n").unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let found = discover(&root, &cancel);
         assert!(found.errors.is_empty(), "{:?}", found.errors);
@@ -619,10 +637,13 @@ mod tests {
         let test = |name: &str| found.tests.iter().find(|t| t.name.ends_with(name)).unwrap();
         assert_eq!(test("test_pass").line, 3);
         assert_eq!(test("test_pass").path, Some(root.join("test_example.py")));
-        assert_eq!(run(&root, test("test_pass"), &cancel).state, State::Passed);
+        let passed = run(&root, test("test_pass"), &cancel);
+        assert_eq!(passed.state, State::Passed);
+        assert!(passed.output.contains("solder-test: user output"));
         let failed = run(&root, test("test_fail"), &cancel);
         assert_eq!(failed.state, State::Failed);
         assert!(failed.output.contains("AssertionError: 1 != 2"));
+        assert!(!failed.output.contains("solder-test:"));
         assert!(!failed.output.contains("test_pass"));
         assert_eq!(run(&root, test("test_skip"), &cancel).state, State::Skipped);
         assert_eq!(
@@ -631,7 +652,12 @@ mod tests {
         );
         let unexpected = run(&root, test("test_unexpected"), &cancel);
         assert_eq!(unexpected.state, State::Failed);
-        assert!(unexpected.output.contains("Unexpected success"));
+        assert!(
+            unexpected
+                .output
+                .to_lowercase()
+                .contains("unexpected success")
+        );
         cancel.store(true, Ordering::Relaxed);
         assert_eq!(
             run(&root, test("test_pass"), &cancel).state,
