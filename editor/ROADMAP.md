@@ -21,6 +21,23 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] The new real debugpy check has not run yet: CI installs the approved
+      debugpy 1.8.22 wheel in Python 3.12 and checks conditions, logpoints,
+      stepping and variables. Locally, discovery, interpreter selection,
+      missing-module errors and the editor's DAP path use executable fixtures.
+      The missing-module message and selected interpreter were checked in a
+      real macOS window. A real paused Python session in a window, other
+      Python versions and Windows interpreter/process behavior are unchecked
+- [ ] Conditional breakpoints and logpoints with a real JavaScript or
+      extension debug adapter. Capability filtering, editing the settings
+      and the wire requests are checked with fixtures. Entering a condition
+      through the palette and its gutter marker were checked in a real
+      macOS window; hit-count and logpoint input there remain unchecked
+- [ ] The Tests panel with published test extensions, large projects and
+      Windows process cancellation. Real Cargo, Go and unittest processes
+      and headless window input are covered by fixtures. Discovery, running
+      passing and failed unittest tests, reading their output and clicking
+      through to the failing source were checked in a real macOS window
 - [ ] The Git PR panel against an authenticated GitHub account. Its CLI
       process, errors, both kinds of check data and manual refresh are
       tested with an executable fixture; no live PR was changed in a test
@@ -77,12 +94,28 @@ something of its own unchecked or unmade adds it here.
       wrapping on, a file in another encoding; Structure and Problems
       with large lists, and symbol highlights while typing with a server;
       Git history or a large patch open, and typing with blame enabled
-      (`benchmarks/git-history.md` measures these features inactive)
+      (`benchmarks/git-history.md` measures these features inactive);
+      test discovery, large test output and a real Python debug session
+      (`benchmarks/tests-running.md` measures these features inactive)
 - [ ] The numbers on the website (`src/components/performance.tsx`) are
       placeholders, marked so. The measurements in `benchmarks/` are local
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] Built-in Python debugging runs the current file only. It has no
+      module/argument picker, attach mode, subprocess sessions or interactive
+      terminal input; stdin is not supported by this internal-console launch.
+      Adapter stderr is drained to avoid blocking, but is not shown in the
+      console; program output reported through DAP is shown
+- [ ] Breakpoints and their conditions are not kept across restarts and
+      their line numbers do not follow edits; expression and hit-count
+      syntax belongs to each adapter
+- [ ] Built-in test discovery has no Cargo doctests or custom harness support,
+      no nested Go modules and no pytest. Rust/Go source jumps require a
+      unique matching function in the package; generated or repeated names
+      can have no source jump. Output is limited to 1 MB per stream and its
+      first 2,000 lines are shown. Runs are sequential and results are not
+      kept across a restart; extension controllers keep their own limits
 - [ ] The commit guard recognizes private-key PEM headers and known AWS,
       GitHub, GitLab, Slack, API-key and connection-password forms, plus long
       literal credential assignments (UTF-8 and marked UTF-16 included). It
@@ -569,9 +602,10 @@ update. They come after phase 9, in this order unless one is needed sooner.
 - [x] The pull request of the branch and the state of its checks, through `gh`
 
 ### Tests and running
-- [ ] A tree of the project's tests: run one, see what failed, go to its line
-- [ ] Breakpoints with a condition, and ones that only write to the console
-- [ ] Python under the debugger (debugpy), now that an adapter is only
+- [x] A tree of the project's tests: run one, see what failed, go to its line
+      (Cargo, Go and Python unittest, plus permitted extensions' controllers)
+- [x] Breakpoints with a condition, and ones that only write to the console
+- [x] Python under the debugger (debugpy), now that an adapter is only
       something to start
 
 ### The terminal

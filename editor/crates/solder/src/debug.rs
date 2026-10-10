@@ -24,6 +24,46 @@ pub const JS_DEBUG: &str = "v1.140.0";
 const JS_DEBUG_SHA256: &str = "27dab92937ec1ab35821ae955aac867544fe06a1b6307229049f2d789af10968";
 const JS_DEBUG_SIZE: u64 = 1_249_709;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BreakpointOptions {
+    pub condition: String,
+    pub hits: String,
+    pub log: String,
+}
+
+impl BreakpointOptions {
+    fn is_empty(&self) -> bool {
+        self.condition.is_empty() && self.hits.is_empty() && self.log.is_empty()
+    }
+    fn argument(&self, line: u32, capabilities: &Value) -> Result<Value, &'static str> {
+        let mut point = json!({ "line": line });
+        for (text, capability, key, reason) in [
+            (
+                &self.condition,
+                "supportsConditionalBreakpoints",
+                "condition",
+                "conditions",
+            ),
+            (
+                &self.hits,
+                "supportsHitConditionalBreakpoints",
+                "hitCondition",
+                "hit conditions",
+            ),
+            (&self.log, "supportsLogPoints", "logMessage", "logpoints"),
+        ] {
+            if text.is_empty() {
+                continue;
+            }
+            if capabilities[capability] != true {
+                return Err(reason);
+            }
+            point[key] = text.clone().into();
+        }
+        Ok(point)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum State {
     Idle,
@@ -52,6 +92,7 @@ pub struct Session {
     pub parent: Option<usize>,
     pub conn: Arc<Connection>,
     pub ended: bool,
+    capabilities: Option<Value>,
     _task: Task<()>,
 }
 
@@ -116,6 +157,8 @@ pub struct DebugStore {
     /// Which line each breakpoint the adapter numbered stands for, so a
     /// later `breakpoint` event can mark it verified.
     breakpoint_ids: HashMap<(usize, i64), (PathBuf, u32)>,
+    breakpoint_options: BTreeMap<PathBuf, BTreeMap<u32, BreakpointOptions>>,
+    breakpoint_revisions: HashMap<(usize, PathBuf), u64>,
     pub timeline: Vec<crate::debug_timeline::Entry>,
     timeline_task: Option<Task<()>>,
 }
@@ -163,6 +206,8 @@ impl DebugStore {
             run: 0,
             pending_browser: None,
             breakpoint_ids: HashMap::new(),
+            breakpoint_options: BTreeMap::new(),
+            breakpoint_revisions: HashMap::new(),
             timeline: Vec::new(),
             timeline_task: None,
         }
@@ -203,12 +248,55 @@ impl DebugStore {
         self.breakpoints.get(path)
     }
 
+    pub fn options(&self, path: &Path, line: u32) -> BreakpointOptions {
+        self.breakpoint_options
+            .get(path)
+            .and_then(|points| points.get(&line))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn set_options(
+        &mut self,
+        path: &Path,
+        line: u32,
+        options: BreakpointOptions,
+        cx: &mut Context<Self>,
+    ) {
+        if options.is_empty() {
+            if let Some(points) = self.breakpoint_options.get_mut(path) {
+                points.remove(&line);
+            }
+        } else {
+            self.breakpoint_options
+                .entry(path.to_path_buf())
+                .or_default()
+                .insert(line, options);
+            self.breakpoints
+                .entry(path.to_path_buf())
+                .or_default()
+                .insert(line, false);
+        }
+        let ids: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|s| !s.ended)
+            .map(|s| s.id)
+            .collect();
+        for id in ids {
+            self.send_breakpoints(id, path, cx);
+        }
+        cx.notify();
+    }
+
     /// Adds or removes the breakpoint on `line` (1-based) and tells every
     /// running session.
     pub fn toggle(&mut self, path: &Path, line: u32, cx: &mut Context<Self>) {
         let lines = self.breakpoints.entry(path.to_path_buf()).or_default();
         if lines.remove(&line).is_none() {
             lines.insert(line, false);
+        } else if let Some(points) = self.breakpoint_options.get_mut(path) {
+            points.remove(&line);
         }
         if lines.is_empty() {
             self.breakpoints.remove(path);
@@ -226,32 +314,81 @@ impl DebugStore {
     }
 
     fn send_breakpoints(&mut self, session: usize, path: &Path, cx: &mut Context<Self>) {
-        let Some(conn) = self.session(session).map(|s| s.conn.clone()) else {
+        let Some((conn, capabilities)) = self
+            .session(session)
+            .filter(|s| !s.ended)
+            .and_then(|s| s.capabilities.clone().map(|caps| (s.conn.clone(), caps)))
+        else {
             return;
         };
+        let mut asked = Vec::new();
+        let mut points = Vec::new();
         let lines: Vec<u32> = self
             .breakpoints
             .get(path)
             .map(|l| l.keys().copied().collect())
             .unwrap_or_default();
-        let answer = conn.request("setBreakpoints", dap::breakpoints_arguments(path, &lines));
+        for line in lines {
+            match self.options(path, line).argument(line, &capabilities) {
+                Ok(point) => {
+                    asked.push(line);
+                    points.push(point);
+                }
+                Err(reason) => self.log(
+                    "stderr",
+                    format!(
+                        "The debugger does not support {reason}; {}:{line} was not set",
+                        path.display()
+                    ),
+                ),
+            }
+            if let Some(slot) = self
+                .breakpoints
+                .get_mut(path)
+                .and_then(|l| l.get_mut(&line))
+            {
+                *slot = false;
+            }
+        }
         let path = path.to_path_buf();
+        let key = (session, path.clone());
+        let revision = self.breakpoint_revisions.entry(key).or_default();
+        *revision += 1;
+        let revision = *revision;
+        let run = self.run;
+        self.breakpoint_ids
+            .retain(|(id, _), (file, _)| *id != session || file != &path);
+        let mut arguments = dap::breakpoints_arguments(&path, &asked);
+        arguments["breakpoints"] = points.into();
+        let answer = conn.request("setBreakpoints", arguments);
         cx.spawn(async move |this, cx| {
-            let Ok(body) = answer.await else { return };
+            let result = answer.await;
             this.update(cx, |this, cx| {
+                // A later edit replaces this entire file's set. Its earlier
+                // reply must not verify or number the new breakpoints.
+                if this.run != run
+                    || this.breakpoint_revisions.get(&(session, path.clone())) != Some(&revision)
+                {
+                    return;
+                }
+                let body = match result {
+                    Ok(body) => body,
+                    Err(error) => {
+                        this.log("stderr", format!("Could not set breakpoints: {error}"));
+                        cx.notify();
+                        return;
+                    }
+                };
                 let Some(lines) = this.breakpoints.get_mut(&path) else {
                     return;
                 };
-                for (asked, got) in lines
-                    .clone()
-                    .keys()
+                for (asked, got) in asked
+                    .iter()
                     .zip(body["breakpoints"].as_array().into_iter().flatten())
                 {
-                    if got["verified"].as_bool().unwrap_or(false) {
-                        lines.insert(*asked, true);
+                    if let Some(slot) = lines.get_mut(asked) {
+                        *slot = got["verified"].as_bool().unwrap_or(false);
                     }
-                    // js-debug answers unverified and confirms once the
-                    // script loads.
                     if let Some(bp) = got["id"].as_i64() {
                         this.breakpoint_ids
                             .insert((session, bp), (path.clone(), *asked));
@@ -366,6 +503,9 @@ impl DebugStore {
         if let Some(from) = config.adapter.clone() {
             return self.start_from_extension(config.name, from, root, run, cx);
         }
+        if config.request["type"] == "debugpy" {
+            return self.start_python(config, root, run, cx);
+        }
         self.adapter_id = "pwa-node".into();
         let spec = self.adapter_spec.clone();
         let data_dir = self.data_dir.clone();
@@ -402,6 +542,49 @@ impl DebugStore {
                         this.open_session(port, name, None, "launch", request, cx);
                     }
                     Err(e) => this.state = State::Failed(e.into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn start_python(
+        &mut self,
+        config: LaunchConfig,
+        root: PathBuf,
+        run: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.adapter_id = "debugpy".into();
+        let configured = crate::settings::Settings::get(cx).python_path.clone();
+        let request = config.request;
+        cx.spawn(async move |this, cx| {
+            let started = cx
+                .background_executor()
+                .spawn(async move { crate::python_debug::launch(&root, request, configured) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.run != run {
+                    // Killing and reaping a superseded adapter can wait.
+                    cx.background_executor()
+                        .spawn(async move {
+                            drop(started);
+                        })
+                        .detach();
+                    return;
+                }
+                match started {
+                    Ok((adapter, link, request)) => {
+                        this.adapter = Some(adapter);
+                        this.state = State::Running;
+                        if let Some(config) = this.config.as_mut() {
+                            config.request = request.clone();
+                        }
+                        this.run_session(link, config.name, None, "launch", request, cx);
+                    }
+                    Err(error) => this.state = State::Failed(error.into()),
                 }
                 cx.notify();
             })
@@ -617,6 +800,7 @@ impl DebugStore {
             parent,
             conn: conn.clone(),
             ended: false,
+            capabilities: None,
             _task: task,
         });
         let init = conn.request(
@@ -625,12 +809,36 @@ impl DebugStore {
         );
         let kind = kind.to_string();
         cx.spawn(async move |this, cx| {
-            if let Err(e) = init.await {
-                this.update(cx, |this, cx| {
-                    this.log("stderr", format!("The debugger did not start: {e}"));
-                    cx.notify();
+            let capabilities = match init.await {
+                Ok(value) => value,
+                Err(e) => {
+                    this.update(cx, |this, cx| {
+                        if this.run != run {
+                            return;
+                        }
+                        this.log("stderr", format!("The debugger did not start: {e}"));
+                        if parent.is_none() {
+                            this.state = State::Failed(e.to_string().into());
+                            this.stop(cx);
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            let alive = this
+                .update(cx, |this, _| {
+                    if this.run != run {
+                        return false;
+                    }
+                    if let Some(session) = this.sessions.iter_mut().find(|s| s.id == id) {
+                        session.capabilities = Some(capabilities);
+                    }
+                    true
                 })
-                .ok();
+                .unwrap_or(false);
+            if !alive {
                 return;
             }
             // The answer to launch comes only after configurationDone, which
@@ -1012,6 +1220,7 @@ impl DebugStore {
         self.children.clear();
         self.pending_browser = None;
         self.breakpoint_ids.clear();
+        self.breakpoint_revisions.clear();
         // The next run's adapter verifies them again.
         for line in self.breakpoints.values_mut().flat_map(|l| l.values_mut()) {
             *line = false;
@@ -1084,5 +1293,32 @@ impl DebugStore {
         })
         .detach();
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod breakpoint_tests {
+    use super::*;
+    #[test]
+    fn an_unsupported_setting_never_becomes_an_unconditional_breakpoint() {
+        let point = BreakpointOptions {
+            condition: "value > 2".into(),
+            hits: "3".into(),
+            log: "value {value}".into(),
+        };
+        assert!(point.argument(7, &json!({})).is_err());
+        assert!(
+            point
+                .argument(7, &json!({"supportsConditionalBreakpoints":true}))
+                .is_err()
+        );
+        assert!(point.argument(7, &json!({"supportsConditionalBreakpoints":true,"supportsHitConditionalBreakpoints":true})).is_err());
+        assert_eq!(point.argument(7, &json!({"supportsConditionalBreakpoints":true,"supportsHitConditionalBreakpoints":true,"supportsLogPoints":true})).unwrap(), json!({"line":7,"condition":"value > 2","hitCondition":"3","logMessage":"value {value}"}));
+        assert_eq!(
+            BreakpointOptions::default()
+                .argument(7, &Value::Null)
+                .unwrap(),
+            json!({"line":7})
+        );
     }
 }

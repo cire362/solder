@@ -1404,7 +1404,20 @@ fn layout(
                 continue;
             }
             let size_px = (lh * 0.55).min(px(11.));
-            let mut color = theme.error;
+            let options = doc
+                .path()
+                .and_then(|path| {
+                    crate::debug::DebugStore::try_global(cx)
+                        .map(|debug| debug.read(cx).options(path, *row as u32 + 1))
+                })
+                .unwrap_or_default();
+            let mut color = if !options.log.is_empty() {
+                theme.accent
+            } else if !options.condition.is_empty() || !options.hits.is_empty() {
+                theme.warning
+            } else {
+                theme.error
+            };
             // While a program runs, a breakpoint no session confirmed is faint.
             if checked && !verified {
                 color.a = 0.45;

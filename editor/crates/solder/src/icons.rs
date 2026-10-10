@@ -247,6 +247,7 @@ pub fn panel(panel: Panel) -> &'static str {
         Panel::Ai => "sparkle",
         Panel::Extensions => "puzzle-piece",
         Panel::ExtensionViews => "puzzle-piece",
+        Panel::Tests => "check",
         Panel::Structure => "list",
         Panel::Problems => "warning-circle",
         Panel::Chat => "chat-circle",

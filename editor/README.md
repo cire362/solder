@@ -283,6 +283,35 @@ Containers are listed below the services when a Docker runtime is running: Docke
 Desktop, OrbStack or Colima. Solder uses the `docker` CLI and its current context,
 and finds OrbStack's CLI in `~/.orbstack/bin` even without the `/usr/local/bin` links.
 
+## Tests
+
+**Show Tests** in the command palette opens the Tests panel, which can move
+between docks through `layout.json` like any other panel. **Project** lists
+built-in runners; **Extensions** shows only the test controllers registered by
+allowed extensions. Nothing discovers or runs tests at startup.
+
+Choose **Discover** to compile and list Cargo tests, list Go tests in the root
+module, or collect Python `unittest` tests. Python uses `.venv` or `venv` when
+present, otherwise Python on PATH. Discovery runs the project's tools and code.
+A group folds its tests; select a test and **Run** (`cmd-enter`) to run only that
+one, select a group to run it, or choose **Run all**. Enter or a click opens its
+source. Results distinguish passing, failed and skipped tests, and the selected
+test's output stays under the tree. **Stop** or Escape cancels the command and
+its process group. Commands have a ten-minute deadline.
+
+Source lookup for Rust and Go accepts only an unambiguous function in its
+package; generated tests and repeated names may have no source jump. Cargo
+doctests, custom harnesses, nested Go modules and Python pytest are not built-in
+runners here. Output keeps at most 1 MB per stream and displays its first 2,000
+lines. Extension test runners keep their own discovery and run profiles.
+Long output lines are clipped to the panel width; hover to read the full line.
+Python's internal result messages are kept out of the displayed output.
+
+A discovery whose output exceeds the limit is reported as incomplete rather
+than silently offering only part of the test list. In `unittest`, expected
+failures are marked skipped; unexpected successes are failed as the runner
+requires. Rust target groups include their package folder.
+
 ## Debugging
 
 Click a line number (or press `F9`) to set a breakpoint, then `F5`. The Debug
@@ -309,6 +338,32 @@ served and sent (`http`, `https`, `fetch`) and the SQL it ran through `pg` and
 made while serving a request sit under it, and each row opens the line of your
 code that made it. A small script loaded with `--require` records them; a dev
 server's own assets (`/_next/`) are left out.
+
+Use **Workspace: Set breakpoint condition**, **Set breakpoint hit condition**
+and **Set logpoint** at the cursor's line. Empty input clears that setting;
+F9 removes the whole point. Expressions and hit-count syntax belong to the
+adapter. A log message can interpolate `{expressions}` without pausing.
+Unsupported settings are reported in the debug console and that point is
+not sent as an unconditional breakpoint. Settings last for this app run,
+like ordinary breakpoints; their line numbers do not follow file edits.
+
+Python files have a built-in `debugpy` launch in the Debug picker and F5.
+It uses `.venv` or `venv` in the project, then `python3` (`python` on
+Windows). Set `python_path` in settings to an executable or a path relative
+to the project to select another interpreter. Install `debugpy` in that
+same environment beforehand; Solder checks for it and explains when it is
+missing, without installing anything. The adapter runs on its standard
+input/output and uses the same stack, variables, evaluation and stepping
+as other languages. Program output goes to the debug console.
+
+This built-in launch runs the file only: it has no module/argument picker,
+attach mode, subprocess debugging or interactive terminal input. Framework
+launches and additional configurations can still come from extensions.
+The CI test installs the approved, hash-pinned debugpy 1.8.22 wheel in a
+Python 3.12 environment on its disposable Linux runner; local checks skip
+that test unless `SOLDER_TEST_DEBUGPY_PYTHON` names an environment with it.
+[debugpy's configuration reference](https://github.com/microsoft/debugpy/wiki/Debug-configuration-settings)
+describes its expressions and launch settings.
 
 ## Databases
 

@@ -27,6 +27,7 @@ class Session:
         self.child = False
         self.program = None
         self.lines = []
+        self.points = []
         self.line = 0
         self.launch = None
         self.parent = None
@@ -82,7 +83,7 @@ class Session:
         command = request["command"]
         args = request.get("arguments") or {}
         if command == "initialize":
-            self.reply(request, {"supportsConfigurationDoneRequest": True})
+            self.reply(request, {"supportsConfigurationDoneRequest": True, "supportsConditionalBreakpoints": True, "supportsHitConditionalBreakpoints": True, "supportsLogPoints": True})
         elif command == "launch":
             self.config = args
             pending = args.get("__pendingTargetId")
@@ -99,7 +100,10 @@ class Session:
             path = args["source"].get("path")
             lines = [b["line"] for b in args.get("breakpoints", [])]
             if path == self.program:
-                self.lines = sorted(lines)
+                self.points = args.get("breakpoints", [])
+                self.lines = sorted(b["line"] for b in self.points
+                                    if b.get("condition") not in ("false", "False")
+                                    and not b.get("logMessage"))
             ids = [hash((path, line)) % 100000 for line in lines]
             self.reply(request, {"breakpoints": [
                 {"id": i, "verified": False, "line": line} for i, line in zip(ids, lines)
@@ -116,6 +120,9 @@ class Session:
                 self.start_child()
             elif self.config.get("type") == "pwa-node":
                 self.event("output", {"category": "stdout", "output": "ready on http://localhost:4123\n"})
+                for point in self.points:
+                    if point.get("logMessage") and point.get("condition") not in ("false", "False"):
+                        self.event("output", {"category": "console", "output": point["logMessage"].replace("{a}", "2") + "\n"})
                 if self.lines:
                     self.stop_at(self.lines[0], "breakpoint")
                 else:

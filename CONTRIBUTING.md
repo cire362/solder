@@ -50,6 +50,13 @@ GitHub Actions reports test compilation separately from test execution. Rust
 dependency artifacts are cached even when tests fail, so failures do not force
 another full dependency build on the next run.
 
+The built-in Python debugger has one real-adapter check in CI: the approved
+`debugpy` 1.8.22 wheel, pinned by SHA-256, runs in an isolated Python 3.12
+virtualenv. Locally this check skips unless `SOLDER_TEST_DEBUGPY_PYTHON`
+names an interpreter where debugpy is already installed. No test installs
+it on a developer's machine. The fixture tests cover the same DAP startup,
+interpreter selection and missing-module errors without this dependency.
+
 New editor behavior comes with a test. UI behavior is tested headlessly
 through GPUI's test context (see `workspace.rs` tests); features that talk
 to external processes (language servers, the terminal) are tested against

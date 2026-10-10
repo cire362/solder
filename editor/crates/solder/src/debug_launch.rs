@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LaunchConfig {
     pub name: String,
-    /// The launch request's arguments for js-debug.
+    /// The launch request's arguments for the chosen adapter.
     pub request: Value,
     /// A page to open in a browser session once the server answers there.
     pub browser: Option<String>,
@@ -118,6 +118,9 @@ pub fn detect(root: &Path, file: Option<&Path>) -> Vec<LaunchConfig> {
         dev_dependencies: BTreeMap<String, Value>,
     }
     let mut out = Vec::new();
+    if let Some(file) = file.filter(|f| f.extension().is_some_and(|e| e == "py")) {
+        out.push(crate::python_debug::configuration(root, file));
+    }
     if let Some(file) = file.filter(|f| {
         f.extension()
             .is_some_and(|e| matches!(e.to_str(), Some("js" | "mjs" | "cjs" | "ts" | "mts")))

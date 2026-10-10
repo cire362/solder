@@ -95,6 +95,7 @@ pub enum Panel {
     Ai,
     Extensions,
     ExtensionViews,
+    Tests,
     /// The outline of the file in front.
     Structure,
     /// What the language servers report of the project's files.
@@ -131,7 +132,7 @@ impl Place {
 }
 
 impl Panel {
-    pub const ALL: [Panel; 17] = [
+    pub const ALL: [Panel; 18] = [
         Panel::Files,
         Panel::Search,
         Panel::Git,
@@ -141,6 +142,7 @@ impl Panel {
         Panel::Ai,
         Panel::Extensions,
         Panel::ExtensionViews,
+        Panel::Tests,
         Panel::Structure,
         Panel::Chat,
         Panel::Agent,
@@ -163,6 +165,7 @@ impl Panel {
             Panel::Ai => "AI",
             Panel::Extensions => "Extensions",
             Panel::ExtensionViews => "Views",
+            Panel::Tests => "Tests",
             Panel::Structure => "Structure",
             Panel::Problems => "Problems",
             Panel::Chat => "Chat",
@@ -186,6 +189,7 @@ impl Panel {
             Panel::Ai => "ai",
             Panel::Extensions => "extensions",
             Panel::ExtensionViews => "extension_views",
+            Panel::Tests => "tests",
             Panel::Structure => "structure",
             Panel::Problems => "problems",
             Panel::Chat => "chat",
@@ -1903,6 +1907,7 @@ mod tests {
                 Ai,
                 Extensions,
                 ExtensionViews,
+                Tests,
                 Structure
             ]
         );
@@ -1938,6 +1943,7 @@ mod tests {
                 Database,
                 Extensions,
                 ExtensionViews,
+                Tests,
                 Structure
             ]
         );
@@ -1968,11 +1974,11 @@ mod tests {
         assert_eq!(parse(&file(&layout)).unwrap(), layout);
         // A dock can be emptied: everything it had is elsewhere.
         let empty = parse(
-            r#"{ "right": { "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions", "extension_views", "structure", "chat", "agent"] } }"#,
+            r#"{ "right": { "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions", "extension_views", "tests", "structure", "chat", "agent"] } }"#,
         )
         .unwrap();
         assert!(empty.left.panels.is_empty());
-        assert_eq!(empty.right.panels.len(), 12);
+        assert_eq!(empty.right.panels.len(), 13);
         assert_eq!(empty.bottom.panels.len(), 5);
     }
 }

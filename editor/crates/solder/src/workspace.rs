@@ -104,12 +104,16 @@ actions!(
         ShowExtensionViews,
         ShowStructure,
         ShowProblems,
+        ShowTests,
         ImportSettings,
         ToggleChat,
         ShowAgent,
         DebugStart,
         DebugPick,
         DebugStop,
+        SetBreakpointCondition,
+        SetBreakpointHitCondition,
+        SetLogpoint,
         DebugStepOver,
         DebugStepIn,
         DebugStepOut,
@@ -270,6 +274,7 @@ pub struct Workspace {
     extension_views: Entity<crate::extension_views::ExtensionViews>,
     structure_panel: Entity<crate::outline::StructurePanel>,
     problems_panel: Entity<crate::problems_panel::ProblemsPanel>,
+    tests_panel: Entity<crate::tests_panel::TestsPanel>,
     /// The outline of the file in front, for the Structure panel and
     /// the breadcrumbs: found only while one of them is on screen.
     outline: Arc<Vec<crate::outline::Node>>,
@@ -474,6 +479,20 @@ impl Workspace {
             );
         let extension_views =
             cx.new(|cx| crate::extension_views::ExtensionViews::new(extensions.clone(), cx));
+        let tests_panel =
+            cx.new(|cx| crate::tests_panel::TestsPanel::new(root.clone(), extensions.clone(), cx));
+        let tests_events = cx.subscribe_in(&tests_panel, window, |this, _, event, window, cx| {
+            let crate::tests_panel::TestsEvent::Open(path, line) = event;
+            this.open_path(
+                path.clone(),
+                Some(Jump::Point {
+                    row: line.saturating_sub(1) as usize,
+                    column: 0,
+                }),
+                window,
+                cx,
+            );
+        });
         let structure_panel = cx.new(crate::outline::StructurePanel::new);
         let problems_panel = {
             let root = project.read(cx).root().to_path_buf();
@@ -790,6 +809,7 @@ impl Workspace {
         let mut subscriptions = subscriptions;
         subscriptions.push(structure_events);
         subscriptions.push(problems_events);
+        subscriptions.push(tests_events);
         if let Some(store) = LspStore::global(cx) {
             subscriptions.push(
                 cx.subscribe_in(&store, window, |this, _, event, window, cx| match event {
@@ -884,6 +904,7 @@ impl Workspace {
             ai_panel,
             extensions_panel,
             extension_views,
+            tests_panel,
             structure_panel,
             problems_panel,
             outline: Arc::default(),
@@ -1980,6 +2001,7 @@ impl Workspace {
             Panel::ExtensionViews => self.extension_views.focus_handle(cx),
             Panel::Structure => self.structure_panel.focus_handle(cx),
             Panel::Problems => self.problems_panel.focus_handle(cx),
+            Panel::Tests => self.tests_panel.focus_handle(cx),
             Panel::Chat => self.chat.focus_handle(cx),
             Panel::Agent => self.agent.focus_handle(cx),
             Panel::Debug => self.debug_panel.focus_handle(cx),
@@ -2540,6 +2562,9 @@ impl Workspace {
     fn tell_panels(&mut self, now: Option<Panel>, cx: &mut Context<Self>) {
         let visible = self.shown(Panel::ExtensionViews);
         self.extension_views
+            .update(cx, |p, cx| p.set_visible(visible, cx));
+        let visible = self.shown(Panel::Tests);
+        self.tests_panel
             .update(cx, |p, cx| p.set_visible(visible, cx));
         let visible = self.shown(Panel::Problems);
         self.problems_panel
@@ -3477,6 +3502,11 @@ impl Workspace {
         });
     }
 
+    fn show_tests(&mut self, _: &ShowTests, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_panel(Panel::Tests, cx);
+        window.focus(&self.tests_panel.focus_handle(cx));
+    }
+
     fn show_problems(&mut self, _: &ShowProblems, window: &mut Window, cx: &mut Context<Self>) {
         self.show_panel(Panel::Problems, cx);
         window.focus(&self.problems_panel.focus_handle(cx));
@@ -3636,6 +3666,49 @@ impl Workspace {
     fn debug_pick(&mut self, _: &DebugPick, _: &mut Window, cx: &mut Context<Self>) {
         self.show_debug_tab(false, cx);
         self.debug_panel.update(cx, |p, cx| p.toggle_picker(cx));
+    }
+
+    fn breakpoint_prompt(
+        &mut self,
+        field: crate::breakpoint::Field,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.active_editor() else {
+            return;
+        };
+        let editor = editor.read(cx);
+        let Some(path) = editor.path(cx).map(Path::to_path_buf) else {
+            return;
+        };
+        let line = editor.cursor_position(cx).0 as u32;
+        let prompt = crate::breakpoint::Prompt::new(self.debug.clone(), path, line, field);
+        let value = prompt.value(cx);
+        self.toggle_modal(window, cx, move |window, cx| {
+            let mut picker = Picker::new(prompt, window, cx);
+            picker.set_query(&value, cx);
+            picker.refresh(window, cx);
+            picker
+        });
+    }
+    fn breakpoint_condition(
+        &mut self,
+        _: &SetBreakpointCondition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.breakpoint_prompt(crate::breakpoint::Field::Condition, window, cx);
+    }
+    fn breakpoint_hits(
+        &mut self,
+        _: &SetBreakpointHitCondition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.breakpoint_prompt(crate::breakpoint::Field::Hits, window, cx);
+    }
+    fn breakpoint_log(&mut self, _: &SetLogpoint, window: &mut Window, cx: &mut Context<Self>) {
+        self.breakpoint_prompt(crate::breakpoint::Field::Log, window, cx);
     }
 
     fn debug_stop(&mut self, _: &DebugStop, _: &mut Window, cx: &mut Context<Self>) {
@@ -5641,6 +5714,7 @@ impl Workspace {
                             }
                             Panel::Structure => this.show_structure(&ShowStructure, window, cx),
                             Panel::Problems => this.show_problems(&ShowProblems, window, cx),
+                            Panel::Tests => this.show_tests(&ShowTests, window, cx),
                             Panel::Chat => this.show_right(false, window, cx),
                             Panel::Agent => this.show_right(true, window, cx),
                             _ => {}
@@ -5724,6 +5798,7 @@ impl Workspace {
                     Panel::ExtensionViews => d.child(self.extension_views.clone()),
                     Panel::Structure => d.child(self.structure_panel.clone()),
                     Panel::Problems => d.child(self.problems_panel.clone()),
+                    Panel::Tests => d.child(self.tests_panel.clone()),
                     Panel::Chat => d.pt_1().child(self.chat.clone()),
                     Panel::Agent => d.pt_1().child(self.agent.clone()),
                     Panel::Debug => d.child(self.debug_panel.clone()),
@@ -6433,10 +6508,14 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_extension_views))
             .on_action(cx.listener(Self::show_structure))
             .on_action(cx.listener(Self::show_problems))
+            .on_action(cx.listener(Self::show_tests))
             .on_action(cx.listener(Self::import_settings))
             .on_action(cx.listener(Self::debug_start))
             .on_action(cx.listener(Self::debug_pick))
             .on_action(cx.listener(Self::debug_stop))
+            .on_action(cx.listener(Self::breakpoint_condition))
+            .on_action(cx.listener(Self::breakpoint_hits))
+            .on_action(cx.listener(Self::breakpoint_log))
             .on_action(cx.listener(Self::debug_over))
             .on_action(cx.listener(Self::debug_in))
             .on_action(cx.listener(Self::debug_out))
@@ -6601,6 +6680,71 @@ mod tests {
                 .active_editor()
                 .and_then(|e| e.read(cx).path(cx).map(Path::to_path_buf))
         })
+    }
+
+    #[gpui::test]
+    fn project_tests_discover_run_show_failures_and_open_their_source(cx: &mut TestAppContext) {
+        let root = fixture("project-tests");
+        let path = root.join("test_sample.py");
+        std::fs::write(&path, "import unittest\nclass Tests(unittest.TestCase):\n    def test_good(self): self.assertTrue(True)\n    def test_bad(self): self.fail('a clear failure')\n").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        cx.dispatch_action(ShowTests);
+        let panel = cx.read(|cx| ws.read(cx).tests_panel.clone());
+        assert!(cx.read(|cx| panel.read(cx).index("test_bad").is_none()));
+        bounds_soon(cx, "tests-discover");
+        click(cx, "tests-discover");
+        wait_for(cx, "the project's tests", &|cx| {
+            panel.read(cx).index("test_bad").is_some()
+        });
+        let bad = cx.read(|cx| panel.read(cx).index("test_bad").unwrap());
+        assert_eq!(bad, 1);
+        bounds_soon(cx, "project-test-1");
+        click(cx, "project-test-1");
+        wait_for(cx, "the test's file", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|e| e.read(cx).path(cx) == Some(path.as_path()))
+        });
+        assert_eq!(
+            cx.read(|cx| ws
+                .read(cx)
+                .active_editor()
+                .unwrap()
+                .read(cx)
+                .cursor_position(cx)
+                .0),
+            4
+        );
+        bounds_soon(cx, "tests-run");
+        click(cx, "tests-run");
+        wait_for(cx, "the failed test", &|cx| {
+            panel
+                .read(cx)
+                .result("test_bad")
+                .is_some_and(|(state, _)| *state == crate::test_runner::State::Failed)
+        });
+        assert!(cx.read(|cx| {
+            panel
+                .read(cx)
+                .result("test_bad")
+                .unwrap()
+                .1
+                .contains("a clear failure")
+        }));
+        assert!(
+            cx.read(|cx| *panel.read(cx).result("test_good").unwrap().0
+                == crate::test_runner::State::Ready)
+        );
+        cx.dispatch_action(ShowTests);
+        bounds_soon(cx, "tests-all");
+        click(cx, "tests-all");
+        wait_for(cx, "the passing test", &|cx| {
+            panel
+                .read(cx)
+                .result("test_good")
+                .is_some_and(|(state, _)| *state == crate::test_runner::State::Passed)
+        });
     }
 
     #[gpui::test]
@@ -12239,6 +12383,247 @@ mod tests {
 
     fn paused_line(store: &Entity<crate::debug::DebugStore>, cx: &App) -> Option<u32> {
         store.read(cx).paused.as_ref()?.frame().map(|f| f.line)
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    fn python_debugger_uses_project_interpreter_and_reports_missing_debugpy(
+        cx: &mut TestAppContext,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = fixture("debug-python");
+        let file = root.join("app.py");
+        std::fs::write(&file, "value = 1\nvalue += 2\nprint(value)\n").unwrap();
+        let interpreter = root.join(".venv/bin/python");
+        let log = root.join("launch.json");
+        let adapter =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_dap_stdio.py");
+        let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+        std::fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
+        std::fs::write(
+            &interpreter,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = -c ]; then exit 0; fi\nexec python3 {} {}\n",
+                quote(&adapter),
+                quote(&log)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(file.clone(), None, window, cx)
+        });
+        wait_for(cx, "app.py", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|e| e.read(cx).layout.is_some())
+        });
+        let store = cx.read(|cx| ws.read(cx).debug.clone());
+        store.update(cx, |s, cx| s.toggle(&file, 3, cx));
+        cx.dispatch_action(DebugStart);
+        wait_for(cx, "the Python pause", &|cx| {
+            paused_line(&store, cx) == Some(3)
+        });
+        let request: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&log).unwrap()).unwrap();
+        assert_eq!(request["python"], serde_json::json!([interpreter]));
+        assert_eq!(request["program"], serde_json::json!(file));
+        assert_eq!(request["console"], "internalConsole");
+        assert_eq!(request["subProcess"], false);
+        store.update(cx, |s, cx| s.resume(cx));
+        wait_for(cx, "the Python end", &|cx| !store.read(cx).state.active());
+        let missing = root.join("missing-python");
+        std::fs::write(&missing, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&missing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cx.update(|_, cx| {
+            cx.set_global(Settings {
+                python_path: Some(missing.clone()),
+                ..Default::default()
+            })
+        });
+        let config = crate::python_debug::configuration(&root, &file);
+        store.update(cx, |s, cx| s.start(config, root.clone(), cx));
+        wait_for(
+            cx,
+            "the missing Python module",
+            &|cx| matches!(&store.read(cx).state, crate::debug::State::Failed(message) if message.contains("debugpy") && message.contains(missing.to_str().unwrap())),
+        );
+        assert!(cx.read(|cx| store.read(cx).sessions.is_empty()));
+    }
+
+    #[gpui::test]
+    fn real_debugpy_stops_on_a_condition_steps_and_writes_logpoints(cx: &mut TestAppContext) {
+        let Some(python) = std::env::var_os("SOLDER_TEST_DEBUGPY_PYTHON") else {
+            assert!(
+                std::env::var_os("GITHUB_ACTIONS").is_none(),
+                "CI must provide the approved debugpy environment"
+            );
+            eprintln!("real debugpy test skipped: SOLDER_TEST_DEBUGPY_PYTHON is not set");
+            return;
+        };
+        let root = fixture("real-debugpy");
+        let file = root.join("app.py");
+        std::fs::write(&file, "total = 0\nfor i in range(4):\n    total += i\n    print('tick', i)\nprint('done', total)\n").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(file.clone(), None, window, cx)
+        });
+        wait_for(cx, "the Python document", &|cx| {
+            ws.read(cx).active_editor().is_some()
+        });
+        let store = cx.read(|cx| ws.read(cx).debug.clone());
+        let mut config = crate::python_debug::configuration(&root, &file);
+        config.request["python"] = serde_json::json!([PathBuf::from(python)]);
+        store.update(cx, |s, cx| {
+            s.set_options(
+                &file,
+                3,
+                crate::debug::BreakpointOptions {
+                    condition: "i == 2".into(),
+                    ..Default::default()
+                },
+                cx,
+            );
+            s.set_options(
+                &file,
+                4,
+                crate::debug::BreakpointOptions {
+                    log: "iteration {i}".into(),
+                    ..Default::default()
+                },
+                cx,
+            );
+            s.start(config, root.clone(), cx);
+        });
+        wait_for_with_timeout(
+            cx,
+            "real debugpy's conditional pause",
+            Duration::from_secs(20),
+            &|cx| paused_line(&store, cx) == Some(3),
+        );
+        assert_eq!(
+            cx.read(|cx| store
+                .read(cx)
+                .paused
+                .as_ref()
+                .unwrap()
+                .frame()
+                .unwrap()
+                .path
+                .clone()),
+            Some(file)
+        );
+        wait_for(cx, "Python variables", &|cx| {
+            store
+                .read(cx)
+                .children
+                .values()
+                .flatten()
+                .any(|v| v.name == "i" && v.value == "2")
+        });
+        assert!(cx.read(|cx| {
+            store
+                .read(cx)
+                .children
+                .values()
+                .flatten()
+                .any(|v| v.name == "total" && v.value == "1")
+        }));
+        store.update(cx, |s, cx| s.step_over(cx));
+        wait_for(cx, "Python's next line", &|cx| {
+            paused_line(&store, cx) == Some(4)
+        });
+        wait_for(cx, "the updated Python variable", &|cx| {
+            store
+                .read(cx)
+                .children
+                .values()
+                .flatten()
+                .any(|v| v.name == "total" && v.value == "3")
+        });
+        store.update(cx, |s, cx| s.resume(cx));
+        wait_for_with_timeout(cx, "Python's normal exit", Duration::from_secs(15), &|cx| {
+            !store.read(cx).state.active()
+        });
+        let console = cx.read(|cx| {
+            store
+                .read(cx)
+                .console
+                .iter()
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>()
+        });
+        for i in [0, 1, 3] {
+            assert!(
+                console
+                    .iter()
+                    .any(|line| line.contains(&format!("iteration {i}"))),
+                "{console:?}"
+            );
+        }
+        assert!(
+            console.iter().any(|line| line.contains("done")),
+            "{console:?}"
+        );
+        assert!(
+            console
+                .iter()
+                .any(|line| line.contains("Exited with code 0")),
+            "{console:?}"
+        );
+        assert!(cx.read(|cx| store.read(cx).sessions.is_empty()));
+    }
+
+    #[gpui::test]
+    fn breakpoint_prompts_keep_conditions_and_log_without_stopping(cx: &mut TestAppContext) {
+        let (root, store, ws, cx) = debug_setup(cx, "debug-conditions");
+        let path = root.join("app.js");
+        cx.dispatch_action(SetBreakpointCondition);
+        bounds_soon(cx, "picker-matches-viewport");
+        cx.simulate_input("false");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read(|cx| store.read(cx).options(&path, 1).condition),
+            "false"
+        );
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        editor.update_in(cx, |e, window, cx| {
+            e.go_to_point(1, 0, cx);
+            window.focus(&e.focus_handle(cx));
+        });
+        cx.dispatch_action(SetLogpoint);
+        bounds_soon(cx, "picker-matches-viewport");
+        cx.simulate_input("value {a}");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read(|cx| store.read(cx).options(&path, 2).log),
+            "value {a}"
+        );
+        store.update(cx, |s, cx| s.toggle(&path, 3, cx));
+        cx.dispatch_action(DebugStart);
+        wait_for(cx, "the unconditional pause", &|cx| {
+            paused_line(&store, cx) == Some(3)
+        });
+        assert!(cx.read(|cx| {
+            store
+                .read(cx)
+                .console
+                .iter()
+                .any(|line| line.text == "value 2")
+        }));
+        // Changing a condition replaces the file's complete set; clearing a
+        // point removes its settings too, including for the next run.
+        store.update(cx, |s, cx| s.toggle(&path, 2, cx));
+        assert_eq!(
+            cx.read(|cx| store.read(cx).options(&path, 2)),
+            crate::debug::BreakpointOptions::default()
+        );
+        store.update(cx, |s, cx| s.stop(cx));
     }
 
     #[gpui::test]
@@ -18238,6 +18623,7 @@ exports.activate = (context) => {
                 Ai,
                 Extensions,
                 ExtensionViews,
+                Tests,
                 Structure
             ]
         );
@@ -18933,6 +19319,24 @@ exports.activate = (context) => {
         panel.update(cx, |panel, cx| panel.pick(all, cx));
         wait_for(cx, "the test to pass", &|cx| {
             panel.read(cx).has_mark("Passed")
+        });
+        cx.dispatch_action(ShowTests);
+        cx.run_until_parked();
+        bounds_soon(cx, "tests-extensions");
+        click(cx, "tests-extensions");
+        let only_tests = cx.read(|cx| ws.read(cx).tests_panel.read(cx).extension_view());
+        wait_for(cx, "the dedicated test controller", &|cx| {
+            only_tests.read(cx).has("Tests")
+        });
+        assert!(
+            !cx.read(
+                |cx| only_tests.read(cx).has("Demo tree") || only_tests.read(cx).has("Changes")
+            )
+        );
+        let controller = cx.read(|cx| only_tests.read(cx).index("Tests").unwrap());
+        only_tests.update(cx, |p, cx| p.pick(controller, cx));
+        wait_for(cx, "the dedicated test result", &|cx| {
+            only_tests.read(cx).has_mark("Passed")
         });
         let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
         wait_for(cx, "the text annotation", &|cx| {
