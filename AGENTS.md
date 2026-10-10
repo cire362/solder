@@ -42,6 +42,10 @@ stack and the measured performance numbers.
 - If you work in parallel with another agent, use a separate `git worktree`
   so neither of you touches the other's uncommitted files.
 - Tick the box in `editor/ROADMAP.md` in the same PR that finishes an item.
+  A tick says the item works and is tested, no more. What it leaves
+  unchecked (a platform, a screen, a published extension, a number that
+  was not measured) or unmade goes under "Not verified, not finished"
+  there, in the same PR, and comes out in the PR that checks or makes it.
 
 ## Ask before
 
