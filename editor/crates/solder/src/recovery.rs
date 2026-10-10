@@ -255,6 +255,15 @@ impl Workspace {
     /// Begins keeping unsaved text for this window's project, and puts
     /// back what an earlier run of the editor left.
     pub(super) fn start_recovery(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A benchmark types into a real file and quits. What it typed is
+        // nobody's unsaved work: kept, it would be put into that file's
+        // tab the next time its project is opened.
+        let benchmark = |(name, _): (std::ffi::OsString, std::ffi::OsString)| {
+            name.to_string_lossy().starts_with("SOLDER_BENCH")
+        };
+        if std::env::vars_os().any(benchmark) {
+            return;
+        }
         self.recovery = Some(Recovery::new(folder(&self.root(cx))));
         self.recover_unsaved(window, cx);
         // Asked to quit, the last of what was typed is kept first: the
