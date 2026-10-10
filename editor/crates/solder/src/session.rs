@@ -8,9 +8,46 @@ use std::sync::mpsc;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(super) struct File {
-    path: PathBuf,
-    cursors: Vec<(usize, usize)>,
-    scroll: (f32, f32),
+    pub(super) path: PathBuf,
+    pub(super) cursors: Vec<(usize, usize)>,
+    pub(super) scroll: (f32, f32),
+    /// Kept at the start of its pane, and not closed by the key.
+    #[serde(default)]
+    pub(super) pinned: bool,
+}
+
+impl File {
+    /// A tab as it is now: its file, its cursors and how far it is
+    /// scrolled. Nothing for a tab that is no file.
+    pub(super) fn of(tab: &Tab, cx: &App) -> Option<Self> {
+        let editor = tab.editor.read(cx);
+        Some(Self {
+            path: editor.path(cx)?.to_path_buf(),
+            cursors: editor
+                .selections
+                .iter()
+                .map(|selection| (selection.anchor, selection.head))
+                .collect(),
+            scroll: (editor.scroll.x.into(), editor.scroll.y.into()),
+            pinned: tab.pinned,
+        })
+    }
+
+    /// Puts the cursors and the scroll back into a view of the file.
+    pub(super) fn put(&self, editor: &Entity<Editor>, cx: &mut App) {
+        editor.update(cx, |editor, cx| {
+            let ranges: Vec<_> = self
+                .cursors
+                .iter()
+                .map(|(anchor, head)| *anchor..*head)
+                .collect();
+            editor.select_ranges(&ranges, cx);
+            if self.scroll.0.is_finite() && self.scroll.1.is_finite() {
+                editor.scroll = point(px(self.scroll.0.max(0.)), px(self.scroll.1.max(0.)));
+                editor.autoscroll = false;
+            }
+        });
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -107,18 +144,7 @@ impl Workspace {
             .map(|pane| {
                 pane.tabs
                     .iter()
-                    .filter_map(|tab| {
-                        let editor = tab.editor.read(cx);
-                        Some(File {
-                            path: editor.path(cx)?.to_path_buf(),
-                            cursors: editor
-                                .selections
-                                .iter()
-                                .map(|selection| (selection.anchor, selection.head))
-                                .collect(),
-                            scroll: (editor.scroll.x.into(), editor.scroll.y.into()),
-                        })
-                    })
+                    .filter_map(|tab| File::of(tab, cx))
                     .collect()
             })
             .collect();
@@ -283,14 +309,10 @@ impl Workspace {
                         let known = this.panes[pane].tabs.iter().position(|tab| tab.editor.read(cx).path(cx) == Some(file.path.as_path()));
                         let editor = if let Some(known) = known { this.panes[pane].tabs[known].editor.clone() }
                             else { this.add_tab(editor.clone(), window, cx); editor };
-                        editor.update(cx, |editor, cx| {
-                            let ranges = file.cursors.iter().map(|(anchor, head)| *anchor..*head).collect::<Vec<_>>();
-                            editor.select_ranges(&ranges, cx);
-                            if file.scroll.0.is_finite() && file.scroll.1.is_finite() {
-                                editor.scroll = point(px(file.scroll.0.max(0.)), px(file.scroll.1.max(0.)));
-                                editor.autoscroll = false;
-                            }
-                        });
+                        file.put(&editor, cx);
+                        if let Some((pane, tab)) = this.locate(&editor) {
+                            this.panes[pane].tabs[tab].pinned = file.pinned;
+                        }
                         if saved.active.get(pane) == Some(&Some(ix)) { active = this.locate(&editor).map(|(_, tab)| tab); }
                     }
                     if let Some(active) = active { this.activate(pane, active, window, cx); }

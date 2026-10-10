@@ -401,9 +401,9 @@ update. They come after phase 9, in this order unless one is needed sooner.
 ### The editor
 - [ ] Folding of blocks, indent guides, lines wrapped at the window's edge
 - [ ] Selection by column (a rectangle of cursors)
-- [ ] Pinned tabs; the tab closed last opened again (`cmd-shift-t`). Tabs,
-      split panes, cursors and scroll positions now return per project,
-      along with notebooks and pages whose extensions provide a serializer
+- [x] Pinned tabs; the tab closed last opened again (`cmd-shift-t`). Tabs,
+      split panes, cursors and scroll positions return per project, along
+      with notebooks and pages whose extensions provide a serializer
 - [ ] Unsaved text kept aside as it is typed and offered back after a crash
 - [ ] Line endings and encoding of a file kept as they were; files too large
       to edit opened for reading, with the reason said

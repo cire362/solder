@@ -84,6 +84,8 @@ actions!(
         GoToSymbol,
         GoToProjectSymbol,
         SplitRight,
+        TogglePinTab,
+        ReopenClosedTab,
         FocusNextPane,
         FocusPrevPane,
         ToggleTerminal,
@@ -126,6 +128,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-p", ToggleFileFinder, None),
         KeyBinding::new("secondary-shift-o", GoToSymbol, None),
         KeyBinding::new("secondary-t", GoToProjectSymbol, None),
+        KeyBinding::new("secondary-shift-t", ReopenClosedTab, None),
+        KeyBinding::new("secondary-k shift-enter", TogglePinTab, None),
         KeyBinding::new("ctrl-g", GoToLine, Some("Editor")),
         KeyBinding::new("secondary-f", Find, None),
         KeyBinding::new("secondary-alt-f", FindReplace, None),
@@ -205,8 +209,14 @@ struct Modal {
 
 struct Tab {
     editor: Entity<Editor>,
+    /// Kept before the tabs that are not, and closed only once let go:
+    /// the key that closes a tab leaves it.
+    pinned: bool,
     _subscriptions: [Subscription; 2],
 }
+
+/// How many closed tabs are remembered to be opened again.
+const CLOSED_TABS: usize = 32;
 
 #[path = "session.rs"]
 mod session;
@@ -282,6 +292,9 @@ pub struct Workspace {
     session_writer: Option<session::Writer>,
     _session_tick: Option<Task<()>>,
     restoring: bool,
+    /// The files of the tabs closed last, the latest at the end, each
+    /// with the pane it was in.
+    closed_tabs: Vec<(session::File, usize)>,
     /// The panel each dock shows; `None` for a dock that is closed. Which
     /// dock a panel is in is the layout's to say.
     left: Option<Panel>,
@@ -767,6 +780,7 @@ impl Workspace {
             session_writer: None,
             _session_tick: None,
             restoring: false,
+            closed_tabs: Vec::new(),
             left,
             right,
             bottom,
@@ -939,6 +953,7 @@ impl Workspace {
         let pane = &mut self.panes[self.active_pane];
         pane.tabs.push(Tab {
             editor,
+            pinned: false,
             _subscriptions: [events, focus],
         });
         let ix = pane.tabs.len() - 1;
@@ -1073,7 +1088,13 @@ impl Workspace {
             return;
         }
         if let Some(editor) = self.active_editor().cloned() {
-            self.close(&editor, window, cx);
+            // A pinned tab is let go first, by its pin.
+            let pinned = self
+                .locate(&editor)
+                .map(|(p, t)| self.panes[p].tabs[t].pinned);
+            if pinned != Some(true) {
+                self.close(&editor, window, cx);
+            }
         }
     }
 
@@ -1127,7 +1148,12 @@ impl Workspace {
         {
             self.discard_inline_edit(cx);
         }
-        self.panes[p].tabs.remove(ix);
+        let closed = self.panes[p].tabs.remove(ix);
+        if let Some(file) = session::File::of(&closed, cx) {
+            self.closed_tabs.push((file, p));
+            let over = self.closed_tabs.len().saturating_sub(CLOSED_TABS);
+            self.closed_tabs.drain(..over);
+        }
         if self.panes[p].tabs.is_empty() && self.panes.len() > 1 {
             // An empty split closes; focus moves to its neighbour.
             self.panes.remove(p);
@@ -1152,6 +1178,85 @@ impl Workspace {
             None => 0,
         };
         self.activate(p, next, window, cx);
+    }
+
+    /// Pins the tab in front, or lets it go. The pinned tabs of a pane
+    /// are its first, in the order they were pinned.
+    fn toggle_pin_tab(&mut self, _: &TogglePinTab, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor().cloned() else {
+            return;
+        };
+        self.toggle_pin(&editor, window, cx);
+    }
+
+    fn toggle_pin(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((p, ix)) = self.locate(editor) else {
+            return;
+        };
+        let pane = &mut self.panes[p];
+        let front = pane
+            .active
+            .and_then(|active| pane.tabs.get(active))
+            .map(|tab| tab.editor.clone());
+        let mut tab = pane.tabs.remove(ix);
+        tab.pinned = !tab.pinned;
+        // After the tabs that stay pinned: the last of them when it is
+        // pinned, the first of the rest when it is let go.
+        let pinned = pane.tabs.iter().take_while(|tab| tab.pinned).count();
+        pane.tabs.insert(pinned, tab);
+        let front = front.and_then(|front| pane.tabs.iter().position(|tab| tab.editor == front));
+        if let Some(front) = front {
+            self.activate(p, front, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Opens again the file of the tab closed last, where its cursors
+    /// were. One that is open already, or gone from disk, is passed over
+    /// for the one closed before it.
+    fn reopen_closed_tab(
+        &mut self,
+        _: &ReopenClosedTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (file, pane) = loop {
+            let Some((file, pane)) = self.closed_tabs.pop() else {
+                return;
+            };
+            let open = self
+                .all_editors()
+                .any(|editor| editor.read(cx).path(cx) == Some(file.path.as_path()));
+            if !open {
+                break (file, pane);
+            }
+        };
+        let path = file.path.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let text = cx
+                .background_executor()
+                .spawn(async move { std::fs::read(&path) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                let Ok(bytes) = text else {
+                    // Gone: the one closed before it, then.
+                    this.reopen_closed_tab(&ReopenClosedTab, window, cx);
+                    return;
+                };
+                this.close_file_diff(window, cx);
+                this.active_pane = pane.min(this.panes.len() - 1);
+                let text = String::from_utf8_lossy(&bytes);
+                this.add_editor(Some(file.path.clone()), &text, None, window, cx);
+                if let Some(editor) = this.active_editor().cloned() {
+                    file.put(&editor, cx);
+                    if file.pinned {
+                        this.toggle_pin(&editor, window, cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn confirm_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -4950,6 +5055,8 @@ impl Workspace {
                     .path()
                     .and_then(|path| crate::file_icons::file(path, cx));
                 let dirty = doc.is_dirty();
+                let pinned = tab.pinned;
+                let pin_editor = editor.clone();
                 let active = pane.active == Some(ix)
                     && self.web_front.is_none()
                     && self.notebook_front.is_none();
@@ -4986,7 +5093,9 @@ impl Workspace {
                     .on_mouse_down(
                         MouseButton::Middle,
                         cx.listener(move |this, _, window, cx| {
-                            this.close(&middle_editor, window, cx)
+                            if !pinned {
+                                this.close(&middle_editor, window, cx)
+                            }
                         }),
                     )
                     .when_some(icon, |d, icon| {
@@ -5009,10 +5118,20 @@ impl Workspace {
                             .rounded(theme.shape.token)
                             .text_color(theme.fg_subtle)
                             .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                            .child(if dirty { "●" } else { "×" })
+                            // A pinned tab has its pin where the others
+                            // have what closes them: a click lets it go.
+                            .map(|d| match (pinned, dirty) {
+                                (true, _) => d
+                                    .debug_selector(move || format!("tab-pin-{ix}"))
+                                    .when(dirty, |d| d.text_color(theme.accent))
+                                    .child(crate::icons::draw("push-pin")),
+                                (false, true) => d.child("●"),
+                                (false, false) => d.child("×"),
+                            })
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.close(&close_editor, window, cx)
+                            .on_click(cx.listener(move |this, _, window, cx| match pinned {
+                                true => this.toggle_pin(&pin_editor, window, cx),
+                                false => this.close(&close_editor, window, cx),
                             })),
                     )
                     .into_any_element()
@@ -5821,6 +5940,8 @@ impl Render for Workspace {
             }))
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::toggle_pin_tab))
+            .on_action(cx.listener(Self::reopen_closed_tab))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
             .on_action(cx.listener(Self::toggle_hud))
@@ -13336,6 +13457,101 @@ exports.activate = (context) => {
         });
         cx.run_until_parked();
         assert_eq!(cx.read(|cx| pages(cx)), (Vec::new(), None));
+    }
+
+    /// A pinned tab is kept before the others and is not closed by the
+    /// key; the tab closed last comes back with its cursor.
+    #[gpui::test]
+    fn tabs_are_pinned_and_the_one_closed_last_is_opened_again(cx: &mut TestAppContext) {
+        let root = fixture("pinned-tabs");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let names = |cx: &App| -> Vec<String> {
+            let tabs = ws.read(cx).panes[0].tabs.iter();
+            tabs.map(|tab| {
+                let name = tab.editor.read(cx).doc(cx).title();
+                match tab.pinned {
+                    true => format!("{name} (pinned)"),
+                    false => name,
+                }
+            })
+            .collect()
+        };
+        let front = |cx: &App| {
+            let editor = ws.read(cx).active_editor().unwrap().read(cx);
+            editor.doc(cx).title()
+        };
+        for file in ["src/main.rs", "README.md", "src/util/strings.rs"] {
+            ws.update_in(cx, |w, window, cx| {
+                w.open_path(root.join(file), None, window, cx)
+            });
+            wait_for(cx, "the file", &|cx| {
+                ws.read(cx)
+                    .active_editor()
+                    .is_some_and(|e| e.read(cx).path(cx) == Some(root.join(file).as_path()))
+            });
+        }
+        assert_eq!(
+            cx.read(|cx| names(cx)),
+            ["main.rs", "README.md", "strings.rs"]
+        );
+
+        // Pinned, the tab in front goes before the others and stays in
+        // front. A second one goes after the first.
+        cx.simulate_keystrokes("secondary-k shift-enter");
+        assert_eq!(
+            cx.read(|cx| names(cx)),
+            ["strings.rs (pinned)", "main.rs", "README.md"]
+        );
+        assert_eq!(cx.read(|cx| front(cx)), "strings.rs");
+        ws.update_in(cx, |w, window, cx| w.activate(0, 2, window, cx));
+        cx.dispatch_action(TogglePinTab);
+        assert_eq!(
+            cx.read(|cx| names(cx)),
+            ["strings.rs (pinned)", "README.md (pinned)", "main.rs"]
+        );
+        // The key that closes a tab leaves a pinned one, and a click on
+        // its pin lets it go: it is then the first of the others.
+        cx.simulate_keystrokes("secondary-w");
+        assert_eq!(cx.read(|cx| names(cx)).len(), 3);
+        ws.update_in(cx, |w, window, cx| w.activate(0, 0, window, cx));
+        click(cx, "tab-pin-0");
+        assert_eq!(
+            cx.read(|cx| names(cx)),
+            ["README.md (pinned)", "strings.rs", "main.rs"]
+        );
+        assert_eq!(cx.read(|cx| front(cx)), "strings.rs");
+        // What is pinned is kept with the tabs of the project.
+        let kept = cx.read(|cx| serde_json::to_value(ws.read(cx).snapshot(cx)).unwrap());
+        let pinned: Vec<bool> = kept["panes"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["pinned"] == true)
+            .collect();
+        assert_eq!(pinned, [true, false, false]);
+
+        // Closed with its cursor somewhere, a tab comes back as it was;
+        // asked again, the one closed before it does.
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let word = std::slice::from_ref(&(7..13));
+        editor.update(cx, |editor, cx| editor.select_ranges(word, cx));
+        cx.simulate_keystrokes("secondary-w");
+        ws.update_in(cx, |w, window, cx| w.activate(0, 1, window, cx));
+        cx.simulate_keystrokes("secondary-w");
+        assert_eq!(cx.read(|cx| names(cx)), ["README.md (pinned)"]);
+        cx.simulate_keystrokes("secondary-shift-t");
+        wait_for(cx, "the tab closed last", &|cx| names(cx).len() == 2);
+        assert_eq!(cx.read(|cx| names(cx))[1], "main.rs");
+        cx.simulate_keystrokes("secondary-shift-t");
+        wait_for(cx, "the one closed before it", &|cx| names(cx).len() == 3);
+        assert_eq!(cx.read(|cx| front(cx)), "strings.rs");
+        let cursor = cx.read(|cx| ws.read(cx).active_editor().unwrap().read(cx).newest_range());
+        assert_eq!(cursor, 7..13);
+        // With nothing left to bring back, the key does nothing.
+        cx.simulate_keystrokes("secondary-shift-t");
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| names(cx)).len(), 3);
     }
 
     #[gpui::test]

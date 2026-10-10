@@ -1020,6 +1020,15 @@ Untitled text and terminal sessions are not restored, and this is not a
 backup of unsaved edits. State is written off the UI thread, in order, once
 per second when it changed and when the window closes.
 
+A tab can be **pinned** (`cmd-k shift-enter`, or **Workspace: Toggle pin
+tab** in the palette): it goes before the tabs that are not, shows a pin
+where they have their cross, and `cmd-w` and the middle button leave it
+open. A click on the pin lets it go. Pinned tabs are remembered with the
+rest. `cmd-shift-t` opens again the file of the tab closed last, with its
+cursors and where it was scrolled to, then the one closed before it, up to
+32 back; a file that is open already or gone from disk is passed over.
+Closed tabs are remembered while the window is open, not across a restart.
+
 Which extensions work is not claimed from the list above: it is found out.
 With each release the fifty most installed extensions of Open VSX are
 installed, their code is started with a made-up project to look at, and
