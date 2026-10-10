@@ -5601,7 +5601,17 @@ mod tests {
     }
 
     fn wait_for(cx: &mut VisualTestContext, what: &str, f: &dyn Fn(&App) -> bool) {
-        for _ in 0..500 {
+        wait_for_with_timeout(cx, what, Duration::from_secs(5), f);
+    }
+
+    fn wait_for_with_timeout(
+        cx: &mut VisualTestContext,
+        what: &str,
+        patience: Duration,
+        f: &dyn Fn(&App) -> bool,
+    ) {
+        let deadline = Instant::now() + patience;
+        while Instant::now() < deadline {
             // Debounce timers run on the test executor's virtual clock.
             cx.executor().advance_clock(Duration::from_millis(50));
             cx.run_until_parked();
@@ -5610,7 +5620,18 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        panic!("timed out waiting for {what}");
+        let lsp =
+            cx.read(|cx| LspStore::global(cx).and_then(|store| store.read(cx).status().cloned()));
+        let debugger = cx.read(|cx| {
+            crate::debug::DebugStore::try_global(cx).map(|store| {
+                let store = store.read(cx);
+                (store.state.clone(), store.console.last().cloned())
+            })
+        });
+        panic!(
+            "timed out waiting for {what} after {patience:?}; \
+             language server: {lsp:?}; debugger: {debugger:?}"
+        );
     }
 
     /// Where an element is, once it is on screen.
@@ -12336,12 +12357,19 @@ brackets = [
                 .active_editor()
                 .map(|e| e.read(cx).document().clone())
         };
-        wait_for(cx, "the extension's server", &|cx| {
-            document(cx).is_some_and(|document| {
-                LspStore::global(cx)
-                    .is_some_and(|store| store.read(cx).document_symbols(&document).is_some())
-            })
-        });
+        // This includes compiling the real Ruby component, which is much
+        // larger than the other fixtures and takes longer on CI runners.
+        wait_for_with_timeout(
+            cx,
+            "the extension's server",
+            Duration::from_secs(30),
+            &|cx| {
+                document(cx).is_some_and(|document| {
+                    LspStore::global(cx)
+                        .is_some_and(|store| store.read(cx).document_symbols(&document).is_some())
+                })
+            },
+        );
 
         // The server lists a module and two functions. The extension has
         // a way to show a module (its name, colored as one is where it
@@ -12480,6 +12508,16 @@ brackets = [
         assert_eq!(launch["cwd"], root.display().to_string());
         assert_eq!(launch["stopOnEntry"], true);
         assert_eq!(launch["trace"][0], "app.demo");
+        let requests = std::fs::read_to_string(log.with_extension("requests")).unwrap();
+        assert_eq!(
+            requests.lines().take(4).collect::<Vec<_>>(),
+            [
+                "initialize",
+                "launch",
+                "setBreakpoints",
+                "configurationDone"
+            ]
+        );
         debug.update(cx, |s, cx| s.stop(cx));
         cx.run_until_parked();
         assert!(cx.read(|cx| !debug.read(cx).state.active()));

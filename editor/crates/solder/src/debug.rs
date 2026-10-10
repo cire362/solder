@@ -563,7 +563,14 @@ impl DebugStore {
         self.next_id += 1;
         let run = self.run;
         let conn_events = conn.clone();
+        let (launch_sent, ready) = futures::channel::oneshot::channel();
         let task = cx.spawn(async move |this, cx| {
+            // The initialize reply and initialized event wake different
+            // tasks. Configuration must follow the launch/attach request,
+            // whichever task the executor schedules first.
+            if ready.await.is_err() {
+                return;
+            }
             while let Some(message) = incoming.next().await {
                 let alive = this
                     .update(cx, |this, cx| {
@@ -611,6 +618,7 @@ impl DebugStore {
             // The answer to launch comes only after configurationDone, which
             // waits for `initialized`: do not wait for it here.
             let launched = conn.request(&kind, arguments);
+            let _ = launch_sent.send(());
             if let Err(e) = launched.await {
                 this.update(cx, |this, cx| {
                     this.log("stderr", e.to_string());

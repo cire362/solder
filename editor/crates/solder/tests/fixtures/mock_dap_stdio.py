@@ -9,21 +9,24 @@ that gets the launch it was given.
 
 import json
 import sys
+from pathlib import Path
 
 log = sys.argv[1] if len(sys.argv) > 1 else None
 out = sys.stdout.buffer
 seq = 0
 launched = {}
 lines = {}
+launch_request = None
 
 
-def send(message):
+def send(message, flush=True):
     global seq
     seq += 1
     message["seq"] = seq
     body = json.dumps(message).encode()
     out.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
-    out.flush()
+    if flush:
+        out.flush()
 
 
 def event(name, body=None):
@@ -50,6 +53,9 @@ while True:
     if request is None:
         break
     command, args = request.get("command"), request.get("arguments") or {}
+    if log:
+        with open(Path(log).with_suffix(".requests"), "a") as f:
+            f.write(command + "\n")
     body = {}
     if command == "initialize":
         body = {"supportsConfigurationDoneRequest": True}
@@ -58,6 +64,9 @@ while True:
         if log:
             with open(log, "w") as f:
                 json.dump(args, f)
+        # Real adapters may not answer launch until configuration is done.
+        launch_request = request
+        continue
     elif command == "setBreakpoints":
         path = args.get("source", {}).get("path")
         lines[path] = [b["line"] for b in args.get("breakpoints", [])]
@@ -73,10 +82,15 @@ while True:
     elif command == "scopes":
         body = {"scopes": []}
     send({"type": "response", "request_seq": request["seq"], "success": True,
-          "command": command, "body": body})
+          "command": command, "body": body}, flush=command != "initialize")
     if command == "initialize":
+        # Both arrive together, so the client cannot rely on its launch
+        # task getting scheduled before the initialized event's task.
         event("initialized")
     elif command == "configurationDone":
+        if launch_request:
+            send({"type": "response", "request_seq": launch_request["seq"], "success": True,
+                  "command": "launch", "body": {}})
         if lines.get(launched.get("program")):
             event("stopped", {"reason": "breakpoint", "threadId": 1, "allThreadsStopped": True})
         else:
