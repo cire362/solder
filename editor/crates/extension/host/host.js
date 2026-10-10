@@ -15,6 +15,7 @@ const Module = require('module');
 const types = require('./types');
 const { Documents } = require('./documents');
 const buildApi = require('./api');
+const buildLanguages = require('./languages');
 
 const { Disposable, EventEmitter, Uri } = types.classes;
 
@@ -59,6 +60,17 @@ for (const level of ['log', 'info', 'debug', 'warn', 'error']) {
 process.on('uncaughtException', (error) => say('error', [error && error.stack || error]));
 process.on('unhandledRejection', (error) => say('error', [error && error.stack || error]));
 types.report.error = (error) => say('error', [error && error.stack || error]);
+
+// What came over the wire, with the files in it as the Uris they were
+// before they went: a command given a file expects to be given a Uri.
+function revive(value) {
+  if (Array.isArray(value)) return value.map(revive);
+  if (!value || typeof value !== 'object') return value;
+  if (typeof value.$uri === 'string') return Uri.parse(value.$uri);
+  const out = {};
+  for (const [key, inner] of Object.entries(value)) out[key] = revive(inner);
+  return out;
+}
 
 // What can go over the wire of what an extension hands back.
 function plain(value) {
@@ -128,11 +140,18 @@ const core = {
 };
 core.docs = new Documents(core);
 const built = buildApi(core);
+const languages = buildLanguages(core);
+// The editor speaks to this host as to a language server.
+built.told.lsp = (params) => void languages.lsp(params);
 
 const vscode = {
-  version: '1.90.0',
+  // Extensions and their libraries refuse a VS Code older than they
+  // were written for; this says which one's API is meant.
+  version: '1.100.0',
   ...types.classes,
+  ...languages.classes,
   ...types.enums,
+  languages: languages.languages,
   window: built.window,
   workspace: built.workspace,
   env: built.env,
@@ -179,6 +198,8 @@ const api = new Proxy(vscode, {
     return target[key];
   },
 });
+
+core.vscode = api;
 
 // An extension asks for `vscode` as for any module; this is the one it gets.
 const load = Module._load;
@@ -286,7 +307,7 @@ const handlers = {
   executeCommand: async ({ id, args }) => {
     const own = commands.get(id);
     if (!own) throw new Error(`No command ${id}`);
-    return plain(await own.handler.apply(own.thisArg, args || []));
+    return plain(await own.handler.apply(own.thisArg, revive(args || [])));
   },
 };
 

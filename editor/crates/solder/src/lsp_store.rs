@@ -6,6 +6,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use futures::{FutureExt, StreamExt, future::BoxFuture};
@@ -17,7 +18,7 @@ use lsp::{Encoding, LanguageServer, Notification, ServerCommand, path_to_uri, ty
 use text::{Buffer, Point};
 
 use crate::{
-    document::{Diagnostic, Document, DocumentEvent, Severity},
+    document::{Diagnostic, Document, DocumentEvent, Inlay, Severity},
     extension_store::ExtensionServer,
     settings::Settings,
 };
@@ -174,8 +175,17 @@ struct DocEntry {
     servers: Vec<Attached>,
     uri: lt::Uri,
     version: i32,
+    /// Waits a moment after the last change, then asks the servers for
+    /// what they draw into the text.
+    hints: Option<Task<()>>,
     _subscriptions: [Subscription; 2],
 }
+
+/// How long after the last change a document's servers are asked for
+/// their hints and colors: once a pause in typing, not once a key.
+const HINTS_DEBOUNCE: Duration = Duration::from_millis(300);
+/// A hint longer than this is cut: it is a note in a line, not the line.
+const HINT_CHARS: usize = 60;
 
 /// A document's place in one server.
 struct Attached {
@@ -223,6 +233,7 @@ fn supports(caps: &lt::ServerCapabilities, method: &str) -> bool {
         "workspace/symbol" => yes(&caps.workspace_symbol_provider),
         "textDocument/rename" => yes(&caps.rename_provider),
         "textDocument/formatting" => yes(&caps.document_formatting_provider),
+        "textDocument/inlayHint" => yes(&caps.inlay_hint_provider),
         "textDocument/codeAction" => !matches!(
             caps.code_action_provider,
             None | Some(lt::CodeActionProviderCapability::Simple(false))
@@ -285,6 +296,10 @@ pub struct LspStore {
     /// Which servers the settings chose when the documents were last
     /// given theirs.
     chosen: Choice,
+    /// The servers that are the hosts of VS Code extensions, each with the
+    /// number its extension gave it: what an extension registers in code
+    /// answers for its languages as a server would.
+    hosts: HashMap<ServerKey, usize>,
 }
 
 /// What the settings say of which servers start: the choice of each
@@ -480,6 +495,7 @@ impl LspStore {
                 }
                 DocumentEvent::DirtyChanged
                 | DocumentEvent::DiagnosticsChanged
+                | DocumentEvent::HintsChanged
                 | DocumentEvent::GitChanged => {}
             }),
             cx.observe_release(document, move |this, _, _| {
@@ -494,6 +510,7 @@ impl LspStore {
                 uri: path_to_uri(Path::new("/")),
                 version: 0,
                 servers: Vec::new(),
+                hints: None,
                 _subscriptions: subscriptions,
             },
         );
@@ -581,6 +598,35 @@ impl LspStore {
                 asking = asking.filter(|(key, ..)| order.contains(&key.name));
             }
         }
+        // The code of VS Code extensions that registered something for the
+        // file's language answers for it as a server would. A file needs
+        // no language Solder knows for that.
+        let mut hosted: Vec<ServerKey> = Vec::new();
+        if let Some(path) = doc.path() {
+            entry.uri = path_to_uri(path);
+            let mut names = vec![doc.language_id().to_string()];
+            names.extend(doc.language_ids_at(0));
+            let hosts = crate::extension_store::ExtensionStore::try_global(cx)
+                .map(|store| store.read(cx).language_hosts(&names))
+                .unwrap_or_default();
+            let settings = Settings::get(cx);
+            for extension in hosts {
+                let key = ServerKey {
+                    name: intern(&extension),
+                    // One for all its files, wherever they are.
+                    root: PathBuf::from("/"),
+                };
+                let off = settings
+                    .language_servers
+                    .get(key.name)
+                    .is_some_and(|server| server.disabled);
+                if off || wanted.iter().any(|(attached, ..)| attached.key == key) {
+                    continue;
+                }
+                hosted.push(key.clone());
+                wanted.push((Attached::new(key, None), None, None));
+            }
+        }
         // A server the document stays in keeps it open; one it leaves is
         // told it closed.
         let before = std::mem::take(&mut entry.servers);
@@ -637,6 +683,7 @@ impl LspStore {
                 }
                 (None, Some(spec), _) => self.start(key, spec, cx),
                 (None, None, Some(server)) => self.start_from_extension(key, server, cx),
+                (None, None, None) if hosted.contains(&key) => self.start_from_host(key, cx),
                 (None, None, None) => {}
             }
         }
@@ -730,6 +777,65 @@ impl LspStore {
         for id in self.docs.keys().copied().collect::<Vec<_>>() {
             self.attach(id, cx);
         }
+    }
+
+    /// Which VS Code extensions answer for which languages changed, or
+    /// what one of them can do did. What a server can do is read once, so
+    /// each such server whose extension no longer speaks through it is
+    /// closed, and the documents join the ones there are now.
+    pub fn hosts_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = crate::extension_store::ExtensionStore::try_global(cx) else {
+            return;
+        };
+        let stale: Vec<ServerKey> = self
+            .hosts
+            .iter()
+            .filter(|(key, number)| !store.read(cx).is_language_server(key.name, **number))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale {
+            self.hosts.remove(&key);
+            self.servers.remove(&key);
+            for entry in self.docs.values_mut() {
+                for attached in &mut entry.servers {
+                    if attached.key == key {
+                        attached.opened = false;
+                    }
+                }
+            }
+        }
+        self.extension_servers_changed(cx);
+        cx.notify();
+    }
+
+    /// Takes the host of a VS Code extension as a server. It runs already
+    /// and only has to say what it can do.
+    fn start_from_host(&mut self, key: ServerKey, cx: &mut Context<Self>) {
+        let store = crate::extension_store::ExtensionStore::global(cx);
+        let linked = store.update(cx, |store, _| store.language_server(key.name));
+        let Some((server, notifications, number)) = linked else {
+            return;
+        };
+        self.servers.insert(key.clone(), ServerState::Starting);
+        self.hosts.insert(key.clone(), number);
+        cx.spawn(async move |this, cx| {
+            let ready = server.initialize(&key.root, None).await;
+            this.update(cx, |this, cx| {
+                // What it registered changed while it was asked: the
+                // start after this one has the newer answer.
+                if this.hosts.get(&key) != Some(&number) {
+                    return;
+                }
+                match ready {
+                    Ok(()) => this.started(key, server, notifications, cx),
+                    Err(_) => {
+                        this.servers.insert(key, ServerState::Failed);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Starts a server an extension brings. The extension is asked for the
@@ -999,6 +1105,7 @@ impl LspStore {
         {
             attached.opened = true;
         }
+        self.schedule_hints(id, cx);
     }
 
     fn did_change(&mut self, id: EntityId, edits: &Arc<[text::Edit]>, cx: &mut Context<Self>) {
@@ -1062,6 +1169,126 @@ impl LspStore {
                 },
             );
         }
+        self.schedule_hints(id, cx);
+    }
+
+    /// Asks, a moment from now, for what the document's servers draw into
+    /// it. Asked for again before that, the moment starts over.
+    fn schedule_hints(&mut self, id: EntityId, cx: &mut Context<Self>) {
+        let Some(entry) = self.docs.get_mut(&id) else {
+            return;
+        };
+        entry.hints = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HINTS_DEBOUNCE).await;
+            this.update(cx, |this, cx| this.ask_hints(id, cx)).ok();
+        }));
+    }
+
+    /// Asks the document's servers for the hints they put into its lines
+    /// (every server that has some) and for what each word is (the first
+    /// that says). An answer about a text that has changed since is
+    /// dropped: the change asked again.
+    fn ask_hints(&mut self, id: EntityId, cx: &mut Context<Self>) {
+        let Some(entry) = self.docs.get(&id) else {
+            return;
+        };
+        let Some(document) = entry.document.upgrade() else {
+            return;
+        };
+        let settings = Settings::get(cx);
+        let (hints, colors) = (settings.inlay_hints, settings.semantic_highlighting);
+        let version = document.read(cx).version();
+        let asked = match hints {
+            true => self.request_all::<lt::request::InlayHintRequest>(
+                &document,
+                cx,
+                |text_document, encoding, buffer| lt::InlayHintParams {
+                    work_done_progress_params: Default::default(),
+                    text_document,
+                    range: lt::Range::new(
+                        lt::Position::new(0, 0),
+                        to_position(buffer, buffer.len(), encoding),
+                    ),
+                },
+            ),
+            false => Vec::new(),
+        };
+        if asked.is_empty() {
+            // Turned off, or no server left that has any.
+            if !document.read(cx).inlays().is_empty() {
+                document.update(cx, |document, cx| document.set_inlays(Vec::new(), cx));
+            }
+        } else {
+            let document = document.downgrade();
+            cx.spawn(async move |_, cx| {
+                let mut answers = Vec::new();
+                for (_, encoding, request) in asked {
+                    if let Ok(Some(hints)) = request.await {
+                        answers.push((encoding, hints));
+                    }
+                }
+                document
+                    .update(cx, |document, cx| {
+                        if document.version() != version {
+                            return;
+                        }
+                        let buffer = document.text();
+                        let inlays = answers
+                            .iter()
+                            .flat_map(|(encoding, hints)| {
+                                hints.iter().map(move |hint| (encoding, hint))
+                            })
+                            .map(|(encoding, hint)| Inlay {
+                                offset: to_offset(buffer, hint.position, *encoding),
+                                text: inlay_text(hint),
+                            })
+                            .collect();
+                        document.set_inlays(inlays, cx);
+                    })
+                    .ok();
+            })
+            .detach();
+        }
+
+        let Some(entry) = self.docs.get(&id) else {
+            return;
+        };
+        let colored = self
+            .opened(entry)
+            .filter(|_| colors)
+            .find_map(|(_, server)| Some((legend(&server.capabilities())?, server.clone())));
+        let Some((legend, server)) = colored else {
+            if !document.read(cx).semantic().is_empty() {
+                document.update(cx, |document, cx| document.set_semantic(Vec::new(), cx));
+            }
+            return;
+        };
+        let encoding = server.encoding();
+        let request =
+            server.request::<lt::request::SemanticTokensFullRequest>(lt::SemanticTokensParams {
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                text_document: lt::TextDocumentIdentifier {
+                    uri: entry.uri.clone(),
+                },
+            });
+        let document = document.downgrade();
+        cx.spawn(async move |_, cx| {
+            let tokens = match request.await {
+                Ok(Some(lt::SemanticTokensResult::Tokens(tokens))) => tokens.data,
+                Ok(Some(lt::SemanticTokensResult::Partial(tokens))) => tokens.data,
+                _ => return,
+            };
+            document
+                .update(cx, |document, cx| {
+                    if document.version() == version {
+                        let spans = semantic_spans(document.text(), &tokens, &legend, encoding);
+                        document.set_semantic(spans, cx);
+                    }
+                })
+                .ok();
+        })
+        .detach();
     }
 
     fn did_save(&mut self, id: EntityId) {
@@ -1426,6 +1653,105 @@ fn sync_kind(caps: &lt::ServerCapabilities) -> lt::TextDocumentSyncKind {
 
 fn position(p: Point) -> lt::Position {
     lt::Position::new(p.row as u32, p.column as u32)
+}
+
+/// A hint as it is drawn: its words on one line, with the space the
+/// server asks for around it.
+fn inlay_text(hint: &lt::InlayHint) -> String {
+    let label: String = match &hint.label {
+        lt::InlayHintLabel::String(text) => text.clone(),
+        lt::InlayHintLabel::LabelParts(parts) => {
+            parts.iter().map(|part| part.value.as_str()).collect()
+        }
+    };
+    let mut label: String = label
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if label.chars().count() > HINT_CHARS {
+        label = label.chars().take(HINT_CHARS - 1).collect();
+        label.push('\u{2026}');
+    }
+    if label.trim().is_empty() {
+        return String::new();
+    }
+    let pad = |on: Option<bool>| if on == Some(true) { " " } else { "" };
+    format!(
+        "{}{label}{}",
+        pad(hint.padding_left),
+        pad(hint.padding_right)
+    )
+}
+
+/// The kinds of words a server that colors whole files names, in the
+/// order its answers number them.
+fn legend(caps: &lt::ServerCapabilities) -> Option<Vec<lt::SemanticTokenType>> {
+    let options = match caps.semantic_tokens_provider.as_ref()? {
+        lt::SemanticTokensServerCapabilities::SemanticTokensOptions(options) => options,
+        lt::SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(options) => {
+            &options.semantic_tokens_options
+        }
+    };
+    let whole = !matches!(
+        options.full,
+        None | Some(lt::SemanticTokensFullOptions::Bool(false))
+    );
+    whole.then(|| options.legend.token_types.clone())
+}
+
+/// The color of a kind of word as the protocol names it. One the editor
+/// has no color for keeps what the grammar gave it.
+fn token_kind(name: &str) -> Option<syntax::HighlightKind> {
+    use syntax::HighlightKind::*;
+    Some(match name {
+        "namespace" | "type" | "class" | "enum" | "interface" | "struct" | "typeParameter" => Type,
+        "parameter" | "variable" => Variable,
+        "property" | "event" => Property,
+        "enumMember" => Constant,
+        "function" | "method" | "macro" => Function,
+        "keyword" | "modifier" => Keyword,
+        "comment" => Comment,
+        "string" | "regexp" => String,
+        "number" => Number,
+        "operator" => Operator,
+        "decorator" => Attribute,
+        _ => return None,
+    })
+}
+
+/// What a server said each word is, as ranges in the text. Its answer is
+/// a run of numbers: each word by how far it is from the one before.
+fn semantic_spans(
+    buffer: &Buffer,
+    tokens: &[lt::SemanticToken],
+    legend: &[lt::SemanticTokenType],
+    encoding: Encoding,
+) -> Vec<(Range<usize>, syntax::HighlightKind)> {
+    let lines = buffer.line_count() as u32;
+    let (mut line, mut start) = (0u32, 0u32);
+    let mut spans = Vec::new();
+    for token in tokens {
+        if token.delta_line > 0 {
+            line = line.saturating_add(token.delta_line);
+            start = token.delta_start;
+        } else {
+            start = start.saturating_add(token.delta_start);
+        }
+        // A text that is shorter than the server thought.
+        if line >= lines {
+            break;
+        }
+        let kind = legend
+            .get(token.token_type as usize)
+            .and_then(|name| token_kind(name.as_str()));
+        let Some(kind) = kind else {
+            continue;
+        };
+        let end = start.saturating_add(token.length);
+        let range = lt::Range::new(lt::Position::new(line, start), lt::Position::new(line, end));
+        spans.push((from_range(buffer, range, encoding), kind));
+    }
+    spans
 }
 
 pub fn to_position(buffer: &Buffer, offset: usize, encoding: Encoding) -> lt::Position {

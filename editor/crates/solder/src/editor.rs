@@ -267,7 +267,8 @@ struct Drag {
 
 /// Highlights for the rows on screen, reused until the text, tree or viewport changes.
 pub(crate) struct HighlightCache {
-    pub key: (u64, u64, Range<usize>),
+    /// The text's version, the tree's, the server's colors', and the rows.
+    pub key: (u64, u64, u64, Range<usize>),
     pub spans: Arc<Vec<(Range<usize>, HighlightKind)>>,
 }
 
@@ -343,7 +344,9 @@ impl Editor {
                 cx.notify();
             }
             DocumentEvent::Saved => cx.emit(EditorEvent::Saved),
-            DocumentEvent::DiagnosticsChanged | DocumentEvent::GitChanged => cx.notify(),
+            DocumentEvent::DiagnosticsChanged
+            | DocumentEvent::HintsChanged
+            | DocumentEvent::GitChanged => cx.notify(),
         });
         Self {
             mode: EditorMode::Full,

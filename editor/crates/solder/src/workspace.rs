@@ -5711,6 +5711,121 @@ mod tests {
         assert!(cx.read(|cx| editor.read(cx).signature.is_none()));
     }
 
+    /// What a server draws into the text: hints in the lines, and colors
+    /// over the grammar's. Against `tests/fixtures/mock_lsp.py --hints`.
+    #[gpui::test]
+    fn a_server_draws_hints_and_colors_into_the_text(cx: &mut TestAppContext) {
+        use crate::document::Inlay;
+        use syntax::HighlightKind;
+        let root = fixture("lsp-hints");
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        let file = root.join("src/main.rs");
+        std::fs::write(&file, "fn helper() {}\n// TODO fix\n").unwrap();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let with = |hints: bool, colors: bool| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "rust-analyzer".into(),
+                settings::ServerOverride {
+                    command: Some("python3".into()),
+                    args: Some(vec![script.display().to_string(), "--hints".into()]),
+                    ..Default::default()
+                },
+            );
+            settings.inlay_hints = hints;
+            settings.semantic_highlighting = colors;
+            settings
+        };
+        cx.update(|_, cx| cx.set_global(with(true, true)));
+        ws.update_in(cx, |w, window, cx| {
+            let content = std::fs::read_to_string(&file).unwrap();
+            w.add_editor(Some(file.clone()), &content, None, window, cx)
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let drawn = |cx: &App| {
+            let editor = editor.read(cx);
+            let doc = editor.doc(cx);
+            ((**doc.inlays()).clone(), (**doc.semantic()).clone())
+        };
+        let hint = |offset: usize| Inlay {
+            offset,
+            text: ": fn ".into(),
+        };
+
+        // Asked a moment after the file opened: a hint after the name of
+        // the function, and the two words the server has a color for. The
+        // third kind it names is none the editor knows, and is left out.
+        wait_for(cx, "hints and colors", &|cx| {
+            let (hints, colors) = drawn(cx);
+            !hints.is_empty() && !colors.is_empty()
+        });
+        assert_eq!(
+            cx.read(|cx| drawn(cx)),
+            (
+                vec![hint(9)],
+                vec![
+                    (3..9, HighlightKind::Function),
+                    (18..22, HighlightKind::Function)
+                ]
+            )
+        );
+        // The hint is in the row and is no place in the file: the cursor
+        // after `helper` stands before it, and `(` comes after it.
+        cx.run_until_parked();
+        let (before, after, inside) = cx.read(|cx| {
+            let editor = editor.read(cx);
+            let layout = editor.layout.as_ref().expect("the editor was drawn");
+            let line = &layout.lines[0];
+            let (before, after) = (line.x_for(9), line.x_for(10));
+            let middle = gpui::point(
+                layout.text_left + (before + after) / 2.,
+                layout.bounds.top() + layout.line_height / 2.,
+            );
+            let buffer = editor.doc(cx).text();
+            let inside = layout.offset_for_position(buffer, gpui::Point::default(), middle);
+            (before, after, inside)
+        });
+        let em = cx.read(|cx| editor.read(cx).layout.as_ref().unwrap().em_width);
+        // Five characters of hint and the `(` itself.
+        assert!(
+            (after - before - em * 6.).abs() < px(1.),
+            "{before:?} {after:?} {em:?}"
+        );
+        assert_eq!(inside, 9);
+
+        // Typed before them, they move with the text at once, and the
+        // server's next answer says the same.
+        let focus = cx.read(|cx| editor.focus_handle(cx));
+        cx.update(|window, _| window.focus(&focus));
+        cx.dispatch_action(crate::editor::MoveToStart);
+        cx.simulate_input("x");
+        assert_eq!(cx.read(|cx| drawn(cx).0), [hint(10)]);
+        wait_for(cx, "the server's answer", &|cx| {
+            drawn(cx).1
+                == [
+                    (4..10, HighlightKind::Function),
+                    (19..23, HighlightKind::Function),
+                ]
+        });
+        assert_eq!(cx.read(|cx| drawn(cx).0), [hint(10)]);
+        // A second function gets a hint of its own.
+        cx.dispatch_action(crate::editor::MoveToEnd);
+        cx.simulate_input("fn two() {}");
+        wait_for(cx, "the second hint", &|cx| drawn(cx).0.len() == 2);
+        assert_eq!(cx.read(|cx| drawn(cx).0[1].offset), 34);
+
+        // Each can be turned off, and is gone at the next change.
+        cx.update(|_, cx| cx.set_global(with(false, true)));
+        cx.simulate_input(" ");
+        wait_for(cx, "the hints to go", &|cx| drawn(cx).0.is_empty());
+        assert!(!cx.read(|cx| drawn(cx).1.is_empty()));
+        cx.update(|_, cx| cx.set_global(with(false, false)));
+        cx.simulate_input(" ");
+        wait_for(cx, "the colors to go", &|cx| drawn(cx).1.is_empty());
+    }
+
     /// A real PTY: type a command, read its output off the grid, exit.
     #[gpui::test]
     fn terminal_runs_commands(cx: &mut TestAppContext) {
@@ -12017,6 +12132,346 @@ exports.activate = async (context) => {
             store.set_off(Origin::VsCode, "Acme.api", true, cx)
         });
         assert!(cx.read(|cx| store.read(cx).bar().is_empty()));
+    }
+
+    /// What `language_server_features` asks of a server, asked of the code
+    /// of a VS Code extension: the same file, the same keys.
+    #[gpui::test]
+    fn an_extension_gives_language_features_in_code(cx: &mut TestAppContext) {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let (base, _) = serve(vec![
+            (
+                "/api/-/search",
+                Served::ok(br#"{"extensions":[]}"#.to_vec()),
+            ),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-lang", &base);
+        let root = cx.read(|cx| ws.read(cx).root(cx));
+        let folder = cx.read(|cx| store.read(cx).root.clone());
+        let dir = folder.join("vscode/acme.lang");
+        write_file(
+            &dir.join("package.json"),
+            r#"{ "name": "lang", "publisher": "Acme", "version": "1.0.0", "main": "main.js",
+  "activationEvents": ["onLanguage:plaintext"] }"#,
+        );
+        write_file(
+            &dir.join("main.js"),
+            r#"const vscode = require('vscode');
+exports.activate = (context) => {
+  // A file of no language Solder has a server for, or a grammar.
+  const selector = { scheme: 'file', language: 'plaintext' };
+  const legend = new vscode.SemanticTokensLegend(['keyword']);
+  const problems = vscode.languages.createDiagnosticCollection('lang');
+  const check = (document) => {
+    if (document.languageId !== 'plaintext') return;
+    const found = [];
+    for (let line = 0; line < document.lineCount; line++) {
+      const text = document.lineAt(line).text;
+      for (const [word, severity] of [['TODO', vscode.DiagnosticSeverity.Warning], ['boom', vscode.DiagnosticSeverity.Error]]) {
+        const at = text.indexOf(word);
+        if (at < 0) continue;
+        const one = new vscode.Diagnostic(new vscode.Range(line, at, line, at + word.length), `${word} here`, severity);
+        one.source = 'lang';
+        found.push(one);
+      }
+    }
+    problems.set(document.uri, found);
+  };
+  vscode.workspace.textDocuments.forEach(check);
+  const all = (document, word) => {
+    const ranges = [];
+    const text = document.getText();
+    for (let at = text.indexOf(word); at >= 0; at = text.indexOf(word, at + 1)) {
+      ranges.push(new vscode.Range(document.positionAt(at), document.positionAt(at + word.length)));
+    }
+    return ranges;
+  };
+  context.subscriptions.push(
+    problems,
+    vscode.workspace.onDidOpenTextDocument(check),
+    vscode.workspace.onDidChangeTextDocument((e) => check(e.document)),
+    vscode.languages.registerCompletionItemProvider(selector, {
+      provideCompletionItems() {
+        const item = new vscode.CompletionItem('println', vscode.CompletionItemKind.Function);
+        item.insertText = new vscode.SnippetString('println!("$1")');
+        item.detail = 'macro';
+        return new vscode.CompletionList([item, new vscode.CompletionItem('print', vscode.CompletionItemKind.Function)]);
+      },
+    }),
+    vscode.languages.registerHoverProvider(selector, {
+      provideHover(document, position) {
+        const range = document.getWordRangeAtPosition(position);
+        return range ? new vscode.Hover(new vscode.MarkdownString(`**${document.getText(range)}** is a word`), range) : undefined;
+      },
+    }),
+    vscode.languages.registerDefinitionProvider(selector, {
+      provideDefinition: (document) => new vscode.Location(document.uri, new vscode.Range(0, 3, 0, 9)),
+    }),
+    vscode.languages.registerRenameProvider(selector, {
+      provideRenameEdits(document, position, newName) {
+        const edit = new vscode.WorkspaceEdit();
+        const word = document.getText(document.getWordRangeAtPosition(position));
+        for (const range of all(document, word)) edit.replace(document.uri, range, newName);
+        return edit;
+      },
+    }),
+    vscode.languages.registerDocumentFormattingEditProvider(selector, {
+      provideDocumentFormattingEdits(document) {
+        const edits = [];
+        for (let line = 0; line < document.lineCount; line++) {
+          const text = document.lineAt(line).text;
+          const kept = text.trimEnd().length;
+          if (kept < text.length) edits.push(vscode.TextEdit.delete(new vscode.Range(line, kept, line, text.length)));
+        }
+        return edits;
+      },
+    }),
+    vscode.languages.registerCodeActionsProvider(selector, {
+      provideCodeActions(document) {
+        const header = new vscode.CodeAction('Add header', vscode.CodeActionKind.QuickFix);
+        header.target = document.uri;
+        const touch = new vscode.CodeAction('Touch', vscode.CodeActionKind.Refactor);
+        touch.command = { title: 'Touch', command: 'lang.touch', arguments: [document.uri] };
+        return [header, touch];
+      },
+      // What the first one changes is worked out only once it is chosen.
+      resolveCodeAction(action) {
+        action.edit = new vscode.WorkspaceEdit();
+        action.edit.insert(action.target, new vscode.Position(0, 0), '// header\n');
+        return action;
+      },
+    }),
+    vscode.languages.registerCodeLensProvider(selector, {
+      provideCodeLenses: (document) => [new vscode.CodeLens(new vscode.Range(0, 0, 0, 2), { title: 'Count lines', command: 'lang.count', arguments: [document.uri] })],
+    }),
+    vscode.commands.registerCommand('lang.touch', async (uri) => {
+      const edit = new vscode.WorkspaceEdit();
+      edit.insert(uri, new vscode.Position(0, 0), '// touched\n');
+      await vscode.workspace.applyEdit(edit);
+    }),
+    vscode.commands.registerCommand('lang.count', (uri) => {
+      const document = vscode.workspace.textDocuments.find((one) => one.uri.toString() === uri.toString());
+      vscode.window.showInformationMessage(`${document.lineCount} lines`);
+    }),
+    vscode.languages.registerInlayHintsProvider(selector, {
+      provideInlayHints: () => [new vscode.InlayHint(new vscode.Position(0, 2), ' (a function)')],
+    }),
+    vscode.languages.registerDocumentSemanticTokensProvider(selector, {
+      provideDocumentSemanticTokens(document) {
+        const builder = new vscode.SemanticTokensBuilder(legend);
+        const word = /[A-Za-z_]+/.exec(document.lineAt(0).text);
+        if (word) builder.push(new vscode.Range(0, word.index, 0, word.index + word[0].length), 'keyword');
+        return builder.build();
+      },
+    }, legend),
+    vscode.languages.registerDocumentSymbolProvider(selector, {
+      provideDocumentSymbols: () => [new vscode.DocumentSymbol('helper', 'fn', vscode.SymbolKind.Function, new vscode.Range(0, 0, 0, 14), new vscode.Range(0, 3, 0, 9))],
+    }),
+    vscode.languages.registerSignatureHelpProvider(selector, {
+      provideSignatureHelp(document, position) {
+        const help = new vscode.SignatureHelp();
+        const info = new vscode.SignatureInformation('assist(a: i32, b: i32)');
+        info.parameters = [new vscode.ParameterInformation('a: i32'), new vscode.ParameterInformation('b: i32')];
+        help.signatures = [info];
+        const before = document.lineAt(position.line).text.slice(0, position.character);
+        help.activeParameter = (before.slice(before.lastIndexOf('(')).match(/,/g) || []).length;
+        return help;
+      },
+    }, '(', ','),
+  );
+};"#,
+        );
+        let file = root.join("notes.txt");
+        std::fs::write(&file, "fn helper() {}\n// TODO fix\n").unwrap();
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.scan(cx);
+        });
+        wait_for(cx, "the extension", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.lang").is_some()
+        });
+        store.update(cx, |store, cx| store.allow(Origin::VsCode, "Acme.lang", cx));
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(file.clone(), None, window, cx)
+        });
+        wait_for(cx, "notes.txt", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|editor| editor.read(cx).path(cx) == Some(file.as_path()))
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let focus = cx.read(|cx| editor.focus_handle(cx));
+        cx.update(|window, _| window.focus(&focus));
+        let wait = wait_for;
+
+        // What it reports is in the file as a server's diagnostics are.
+        wait(cx, "diagnostics", &|cx| {
+            !editor.read(cx).doc(cx).diagnostics().is_empty()
+        });
+        assert_eq!(
+            cx.read(|cx| store.read(cx).code("Acme.lang").unwrap().languages.clone()),
+            ["*", "plaintext"]
+        );
+        let diag = cx.read(|cx| editor.read(cx).doc(cx).diagnostics()[0].clone());
+        assert_eq!(diag.range, 18..22);
+        assert_eq!(diag.severity, crate::document::Severity::Warning);
+        assert_eq!(diag.message, "TODO here");
+        // It draws into the text as a server does: a hint in the line, and
+        // a color for a word of a file that has no grammar at all.
+        wait(cx, "its hint and its color", &|cx| {
+            let editor = editor.read(cx);
+            let doc = editor.doc(cx);
+            !doc.inlays().is_empty() && !doc.semantic().is_empty()
+        });
+        let drawn = cx.read(|cx| {
+            let editor = editor.read(cx);
+            let doc = editor.doc(cx);
+            (doc.inlays()[0].clone(), doc.semantic()[0].clone())
+        });
+        assert_eq!(
+            drawn,
+            (
+                crate::document::Inlay {
+                    offset: 2,
+                    text: " (a function)".into()
+                },
+                (0..2, syntax::HighlightKind::Keyword)
+            )
+        );
+        // It reads what is typed as it is typed.
+        cx.dispatch_action(crate::editor::MoveToEnd);
+        cx.simulate_input("boom");
+        wait(cx, "error diagnostic", &|cx| {
+            editor
+                .read(cx)
+                .doc(cx)
+                .diagnostics()
+                .iter()
+                .any(|d| d.severity == crate::document::Severity::Error)
+        });
+
+        // Completion: the menu opens as a word is typed, and Enter puts
+        // in the snippet with the cursor in its place.
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("pri");
+        wait(cx, "completions", &|cx| {
+            editor.read(cx).completion.is_some()
+        });
+        cx.simulate_input("ntl");
+        let top = cx.read(|cx| {
+            let editor = editor.read(cx);
+            let menu = editor.completion.as_ref().unwrap();
+            menu.selected_item().unwrap().label.clone()
+        });
+        assert_eq!(top, "println");
+        cx.simulate_keystrokes("enter");
+        let text = cx.read(|cx| editor.read(cx).text(cx));
+        assert!(text.ends_with("boom\nprintln!(\"\")"), "{text:?}");
+        assert_eq!(
+            cx.read(|cx| editor.read(cx).newest_range()).start,
+            text.len() - 2
+        );
+
+        // Hover, definition, rename and formatting.
+        cx.dispatch_action(crate::editor::MoveToStart);
+        cx.simulate_keystrokes("right right right right");
+        cx.dispatch_action(crate::editor::ShowHover);
+        wait(cx, "hover", &|cx| editor.read(cx).hover.is_some());
+        cx.simulate_keystrokes("escape");
+        cx.dispatch_action(crate::editor::MoveToStart);
+        cx.simulate_keystrokes("f12");
+        wait(cx, "definition", &|cx| {
+            editor.read(cx).newest_range() == (3..9)
+        });
+        cx.simulate_keystrokes("f2");
+        cx.simulate_input("assist");
+        cx.simulate_keystrokes("enter");
+        wait(cx, "rename", &|cx| {
+            editor.read(cx).text(cx).starts_with("fn assist()")
+        });
+        cx.simulate_keystrokes("end");
+        cx.simulate_input("   ");
+        cx.simulate_keystrokes("shift-alt-f");
+        wait(cx, "formatting", &|cx| {
+            editor.read(cx).text(cx).starts_with("fn assist() {}\n")
+        });
+
+        // Code actions: one whose edit is worked out when it is chosen,
+        // one that runs a command of the extension, which edits the file.
+        cx.simulate_keystrokes("secondary-.");
+        wait(cx, "code actions", &|cx| ws.read(cx).modal.is_some());
+        cx.simulate_keystrokes("enter");
+        wait(cx, "the edit worked out late", &|cx| {
+            editor.read(cx).text(cx).starts_with("// header\n")
+        });
+        cx.simulate_keystrokes("secondary-.");
+        wait(cx, "code actions", &|cx| ws.read(cx).modal.is_some());
+        cx.simulate_input("touch");
+        cx.simulate_keystrokes("enter");
+        wait(cx, "the command's edit", &|cx| {
+            editor.read(cx).text(cx).starts_with("// touched\n")
+        });
+        // A code lens of the line is among what can be done with it.
+        cx.dispatch_action(crate::editor::MoveToStart);
+        cx.simulate_keystrokes("secondary-.");
+        wait(cx, "code actions", &|cx| ws.read(cx).modal.is_some());
+        cx.simulate_input("count");
+        cx.simulate_keystrokes("enter");
+        wait(cx, "the lens to run", &|cx| {
+            store
+                .read(cx)
+                .bar()
+                .iter()
+                .any(|item| item.text == "6 lines")
+        });
+
+        // The file's symbols are the extension's.
+        cx.simulate_keystrokes("secondary-shift-o");
+        wait(cx, "symbols", &|cx| ws.read(cx).modal.is_some());
+        cx.simulate_input("help");
+        cx.simulate_keystrokes("enter");
+        wait(cx, "the symbol", &|cx| {
+            ws.read(cx).modal.is_none() && editor.read(cx).newest_range().start == 3
+        });
+
+        // Signature help follows the argument under the cursor.
+        cx.dispatch_action(crate::editor::MoveToEnd);
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("assist(");
+        let active = |cx: &App| {
+            editor
+                .read(cx)
+                .signature
+                .as_ref()
+                .and_then(|s| s.active.clone().map(|r| s.label[r].to_string()))
+        };
+        wait(cx, "signature", &|cx| {
+            active(cx).as_deref() == Some("a: i32")
+        });
+        cx.simulate_input("1,");
+        wait(cx, "second parameter", &|cx| {
+            active(cx).as_deref() == Some("b: i32")
+        });
+        cx.simulate_keystrokes("escape");
+
+        // Its code ended, what it reported goes with it.
+        store.update(cx, |store, cx| {
+            store.set_off(Origin::VsCode, "Acme.lang", true, cx)
+        });
+        wait(cx, "its diagnostics to go", &|cx| {
+            editor.read(cx).doc(cx).diagnostics().is_empty()
+        });
     }
 
     /// What extensions reach outside their sandbox through, for the test

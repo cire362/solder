@@ -738,6 +738,18 @@ impl ExtensionsPanel {
                         }
                     }
                     if let Some(code) = code {
+                        // What it answers for as a language server would.
+                        if !code.languages.is_empty() {
+                            let every = code.languages.iter().any(|language| language == "*");
+                            let of = match every {
+                                true => "every language".to_string(),
+                                false => code.languages.join(", "),
+                            };
+                            details = details.child(line(
+                                format!("Gives language features for {of}").into(),
+                                theme.fg_muted,
+                            ));
+                        }
                         if !code.missing.is_empty() {
                             let mut names =
                                 code.missing.iter().take(12).cloned().collect::<Vec<_>>();

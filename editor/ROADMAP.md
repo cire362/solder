@@ -246,11 +246,15 @@ to build them.
       input boxes, status bar items, output channels, configuration, the
       workspace's folders and files, open documents, their edits and events.
       Lists pick one, and there is one visible editor, the file in front
-- [ ] Language features: the providers for completion, hover, definition,
+- [x] Language features: the providers for completion, hover, definition,
       references, rename, formatting, code actions, symbols, semantic tokens,
       inlay hints and code lenses, and diagnostic collections. This is what
       `vscode-languageclient` is built on, so it carries most language
-      extensions (and Prettier and ESLint)
+      extensions (and Prettier and ESLint). The host answers the editor as
+      a language server does. Inlay hints and semantic colors were added
+      to the editor for this, for every server; a code lens is among the
+      code actions of its line. Not tried against a published extension
+      yet: that is the release check below
 - [ ] Commands, menus and key bindings an extension contributes, in the
       palette and the keymap
 - [ ] Debugging: adapters and configurations that extensions register in

@@ -59,6 +59,9 @@ TAG = os.environ.get("MOCK_LSP_TAG", "")
 # asked something through the editor whenever a file opens or changes, and
 # writes down what comes back.
 ASKS_TSSERVER = bool(os.environ.get("MOCK_LSP_ASKS_TSSERVER"))
+# Started with --hints, the server also draws into the text: a hint after
+# the name of every function, and a color for every `helper` and `TODO`.
+HINTS = "--hints" in sys.argv
 
 
 def ask_tsserver(uri):
@@ -120,6 +123,13 @@ while True:
             "codeActionProvider": {"resolveProvider": True},
             "executeCommandProvider": {"commands": ["mock.touch"]},
             "signatureHelpProvider": {"triggerCharacters": ["("], "retriggerCharacters": [","]},
+            **({
+                "inlayHintProvider": True,
+                "semanticTokensProvider": {
+                    "legend": {"tokenTypes": ["function", "comment", "somethingElse"], "tokenModifiers": []},
+                    "full": True,
+                },
+            } if HINTS else {}),
         }}})
     elif method == "workspace/didChangeConfiguration":
         note("configuration", params.get("settings"))
@@ -152,6 +162,35 @@ while True:
             {"label": f"{TAG}_println", "kind": 3},
             {"label": f"{TAG}_title", "kind": 10, "detail": "a prop"},
         ]})
+    elif method == "textDocument/inlayHint":
+        text = docs[params["textDocument"]["uri"]]
+        hints = []
+        at = text.find("fn ")
+        while at >= 0:
+            end = at + 3
+            while end < len(text) and (text[end].isalnum() or text[end] == "_"):
+                end += 1
+            hints.append({
+                "position": position(text, len(text[:end].encode())),
+                "label": [{"value": ": "}, {"value": "fn"}],
+                "paddingRight": True,
+            })
+            at = text.find("fn ", end)
+        send({"jsonrpc": "2.0", "id": mid, "result": hints})
+    elif method == "textDocument/semanticTokens/full":
+        text = docs[params["textDocument"]["uri"]]
+        data = []
+        last = (0, 0)
+        for number, line in enumerate(text.split("\n")):
+            found = []
+            for word, kind in (("fn", 2), ("helper", 0), ("TODO", 0)):
+                at = line.find(word)
+                if at >= 0:
+                    found.append((len(line[:at].encode()), len(word.encode()), kind))
+            for start, length, kind in sorted(found):
+                data += [number - last[0], start - last[1] if number == last[0] else start, length, kind, 0]
+                last = (number, start)
+        send({"jsonrpc": "2.0", "id": mid, "result": {"data": data}})
     elif method == "textDocument/hover":
         send({"jsonrpc": "2.0", "id": mid, "result": {"contents": {
             "kind": "markdown", "value": "```rust\nfn helper()\n```\nDoes help."}}})

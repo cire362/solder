@@ -116,6 +116,13 @@ pub struct NodeCode {
     started: Started,
     /// Tells whoever waits that its code is up, or why it is not.
     resolve: Option<oneshot::Sender<Result<Arc<VsHost>, String>>>,
+    /// The languages it registered something for in code (`*` for every
+    /// one): its host answers for files of them as a language server.
+    pub languages: Vec<String>,
+    /// How that server's answers reach the editor, once it was asked for,
+    /// and which asking this is.
+    pub(crate) link: Option<lsp::Link>,
+    pub(crate) links: usize,
     /// Which start this is: what an older one still says is not about it.
     run: usize,
 }
@@ -1800,6 +1807,9 @@ impl ExtensionStore {
     fn stop_code(&mut self, id: &str, cx: &mut Context<Self>) {
         if let Some(code) = self.code.remove(id) {
             self.clear_shown(id, cx);
+            if !code.languages.is_empty() {
+                self.languages_changed(cx);
+            }
             cx.background_executor()
                 .spawn(async move {
                     if let Some(host) = &code.host {
@@ -1875,6 +1885,9 @@ impl ExtensionStore {
                 host: None,
                 started: started.shared(),
                 resolve: Some(resolve),
+                languages: Vec::new(),
+                link: None,
+                links: 0,
                 run,
             },
         );
@@ -1896,6 +1909,15 @@ impl ExtensionStore {
             code.state = CodeState::Stopped(why.unwrap_or_else(|| STOPPED.into()));
         }
         code.commands.clear();
+        // Nothing answers for its languages any more.
+        let spoke = !std::mem::take(&mut code.languages).is_empty();
+        code.link = None;
+        if spoke {
+            self.languages_changed(cx);
+        }
+        let Some(code) = self.code.get_mut(id) else {
+            return;
+        };
         if let (Some(resolve), CodeState::Stopped(why)) = (code.resolve.take(), &code.state) {
             let _ = resolve.send(Err(why.clone()));
         }

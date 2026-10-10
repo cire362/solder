@@ -81,6 +81,12 @@ pub struct Settings {
     pub languages: BTreeMap<String, LanguageSettings>,
     /// Format with the language server before every save.
     pub format_on_save: bool,
+    /// What a language server puts into lines: the types it worked out,
+    /// the names of parameters.
+    pub inlay_hints: bool,
+    /// Colors from the language server over the grammar's, where it says
+    /// what a word is.
+    pub semantic_highlighting: bool,
     /// The icon theme of an installed extension, by name: pictures next
     /// to file names in the tree and on tabs. None by default.
     pub icon_theme: Option<String>,
@@ -287,6 +293,8 @@ impl Default for Settings {
             language_servers: BTreeMap::new(),
             languages: BTreeMap::new(),
             format_on_save: false,
+            inlay_hints: true,
+            semantic_highlighting: true,
             icon_theme: None,
             context_servers: BTreeMap::new(),
             other: BTreeMap::new(),

@@ -888,9 +888,22 @@ What is in the module today is what every extension starts from:
 | See open documents and the editor in front | Every file open in a tab, with its text, kept up to date as it is typed, saved and closed, and the cursor of the one in front. There is one visible editor: the file in front |
 | Change text | `TextEditor.edit` and `workspace.applyEdit`, in open files and on disk, with files made, renamed and deleted. A snippet is put in as text, its places taken out |
 | Use the clipboard, open a link | Yes; a link only to the web or to mail |
+| Give language features in code (`vscode.languages`) | Completions, hovers, definitions, references, rename, formatting, code actions, document and project symbols, signature help, inlay hints, semantic colors, and diagnostics from its collections. A code lens is offered among the code actions of its line (`cmd-.`), not drawn above it |
 
 None of this costs anything while no extension's code runs: documents and
 cursors are followed only once a host is up.
+
+Language features need nothing of the editor that a language server does not
+already use. To the editor the host of such an extension is a language
+server: it is asked in the Language Server Protocol, and the host answers
+from what the extension registered. So an extension's completions are in the
+same menu as a server's, its diagnostics under the same squiggles, its rename
+behind the same key, and it works for a file of a language Solder has no
+grammar for. This is also what `vscode-languageclient` is written against,
+the library most language extensions use to talk to their own server. What
+an extension registers for a feature the editor does not have (folding
+ranges, document links, colors, call hierarchies) is taken and listed in the
+tab with the rest of what is not here.
 
 An extension that throws ends nothing but its own start. One that ends its
 process is shown as stopped, with its last words. One that never returns stops
@@ -974,6 +987,20 @@ With nothing said, a language whose extension brings alternatives starts what
 Zed starts for it (`solargraph` for Ruby, `phpactor` for PHP, `elixir-ls` for
 Elixir); any other starts all its servers. Open files go to the chosen servers
 as soon as the settings are saved.
+
+Two things a server draws into the text are shown for every server that has
+them, an extension's or Solder's own. **Inlay hints** are the types a server
+worked out and the names of parameters, in the line in a quieter color; they
+are no part of the file, the cursor steps over them, and one longer than 60
+characters is cut. **Semantic colors** are what the server says each word
+is, over what the grammar says: a server knows a constant from a variable
+where a grammar sees a name. Both are asked for a moment after the last key,
+and move with the text until the answer comes. Each has a setting, on unless
+turned off:
+
+```json
+{ "inlay_hints": true, "semantic_highlighting": true }
+```
 
 That is why such an extension **asks first**. It is downloaded and read, and
 then waits: the tab shows what installing it allows (the servers it gets, the

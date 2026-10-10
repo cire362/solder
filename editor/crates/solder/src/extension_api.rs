@@ -687,10 +687,96 @@ impl ExtensionStore {
         }
     }
 
+    /// The extensions whose code answers for files of a language as a
+    /// language server would: the ones that registered something for one
+    /// of the names the language goes by, or for every language.
+    pub fn language_hosts(&self, names: &[String]) -> Vec<String> {
+        let mut hosts: Vec<String> = self
+            .code
+            .iter()
+            .filter(|(_, code)| code.host.is_some())
+            .filter(|(_, code)| {
+                let for_it = |language: &String| language == "*" || names.contains(language);
+                code.languages.iter().any(for_it)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        hosts.sort();
+        hosts
+    }
+
+    /// The language server that the host of `extension` is: what it is
+    /// asked goes to the host, a message at a time, and what the host
+    /// answers comes back through a link the store keeps. Asked for again,
+    /// it is a new server, and the one before it is closed. The number
+    /// says which asking this was.
+    pub fn language_server(
+        &mut self,
+        extension: &str,
+    ) -> Option<(
+        Arc<lsp::LanguageServer>,
+        futures::channel::mpsc::UnboundedReceiver<lsp::Notification>,
+        usize,
+    )> {
+        let code = self.code.get_mut(extension)?;
+        let host = code.host.clone()?;
+        let (server, link, notes) = lsp::LanguageServer::linked(extension, move |message| {
+            host.notify("lsp", json!({ "message": message }));
+        })
+        .ok()?;
+        code.link = Some(link);
+        code.links += 1;
+        Some((server, notes, code.links))
+    }
+
+    /// Whether the server given under this number is still the one its
+    /// extension speaks through.
+    pub fn is_language_server(&self, extension: &str, number: usize) -> bool {
+        self.code
+            .get(extension)
+            .is_some_and(|code| code.link.is_some() && code.links == number)
+    }
+
+    /// Which extensions answer for which languages changed. Said once
+    /// this update is over: the documents ask this store which are theirs.
+    pub(crate) fn languages_changed(&mut self, cx: &mut Context<Self>) {
+        cx.defer(|cx| {
+            if let Some(lsp) = crate::lsp_store::LspStore::global(cx) {
+                lsp.update(cx, |lsp, cx| lsp.hosts_changed(cx));
+            }
+        });
+    }
+
     /// Something a host said that waits for no answer.
     pub(crate) fn said(&mut self, id: &str, method: &str, params: Value, cx: &mut Context<Self>) {
         let text = |value: &Value| value.as_str().map(str::to_string);
         match method {
+            // An answer of the language server its host is, or something
+            // that server says on its own.
+            "lsp" => {
+                if let Some(link) = self.code.get(id).and_then(|code| code.link.as_ref()) {
+                    link.receive(params["message"].clone());
+                }
+            }
+            // What it registered in code changed. What it can do is read
+            // once by the editor, when a server starts, so the server it
+            // was is closed and the documents get a new one.
+            "providers" => {
+                let mut languages: Vec<String> = params["languages"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(text)
+                    .collect();
+                languages.sort();
+                languages.dedup();
+                let Some(code) = self.code.get_mut(id) else {
+                    return;
+                };
+                code.languages = languages;
+                code.link = None;
+                self.languages_changed(cx);
+            }
             "status" => {
                 let key = (id.to_string(), params["id"].as_u64().unwrap_or_default());
                 if params["gone"] == true {

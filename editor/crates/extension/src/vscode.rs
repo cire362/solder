@@ -35,6 +35,7 @@ const HOST: &[(&str, &str)] = &[
     ("types.js", include_str!("../host/types.js")),
     ("documents.js", include_str!("../host/documents.js")),
     ("api.js", include_str!("../host/api.js")),
+    ("languages.js", include_str!("../host/languages.js")),
 ];
 
 /// Puts the host where Node can read it, under `dir`. A file is written
@@ -650,6 +651,9 @@ mod tests {
                         lock(&kept).push((method, params));
                     }
                     Told::Said { method, params } => lock(&kept).push((method, params)),
+                    Told::Missing(name) => {
+                        lock(&kept).push(("missing".into(), json!({ "name": name })))
+                    }
                     _ => {}
                 }
             }
@@ -898,6 +902,221 @@ exports.activate = async (context) => {
             [json!({ "key": "demo.level", "value": 9 })]
         );
         assert_eq!(sent("clipboardWrite"), [json!({ "text": "copied" })]);
+    }
+
+    #[test]
+    fn a_host_answers_as_a_language_server() {
+        let code = r#"
+const vscode = require('vscode');
+exports.activate = (context) => {
+  const problems = vscode.languages.createDiagnosticCollection('demo');
+  const legend = new vscode.SemanticTokensLegend(['keyword', 'function', 'variable'], ['readonly']);
+  context.subscriptions.push(
+    vscode.languages.registerReferenceProvider('rust', {
+      provideReferences: (document, position, context) => [
+        new vscode.Location(document.uri, new vscode.Range(0, 3, 0, 7)),
+        ...(context.includeDeclaration ? [new vscode.Location(document.uri, new vscode.Position(1, 0))] : []),
+      ],
+    }),
+    vscode.languages.registerRenameProvider({ language: 'rust' }, {
+      prepareRename: (document, position) => document.getWordRangeAtPosition(position),
+      provideRenameEdits: () => undefined,
+    }),
+    vscode.languages.registerWorkspaceSymbolProvider({
+      provideWorkspaceSymbols: (query) => [
+        new vscode.SymbolInformation(query + '_found', vscode.SymbolKind.Struct, 'mod', new vscode.Location(vscode.Uri.file('/tmp/a.rs'), new vscode.Range(2, 0, 2, 5))),
+      ],
+    }),
+    vscode.languages.registerHoverProvider(['rust', 'go'], {
+      provideHover: () => new vscode.Hover(['plain', { language: 'rust', value: 'fn main()' }]),
+    }),
+    vscode.languages.registerCompletionItemProvider('go', { provideCompletionItems: () => [] }, '.', ':'),
+    vscode.languages.registerInlayHintsProvider('rust', {
+      provideInlayHints(document, range) {
+        const typed = new vscode.InlayHint(new vscode.Position(1, 5), [new vscode.InlayHintLabelPart(': '), new vscode.InlayHintLabelPart('i32')], vscode.InlayHintKind.Type);
+        typed.paddingRight = true;
+        return [typed, new vscode.InlayHint(range.end, 'end')];
+      },
+    }),
+    vscode.languages.registerDocumentSemanticTokensProvider('rust', {
+      provideDocumentSemanticTokens(document) {
+        const builder = new vscode.SemanticTokensBuilder(legend);
+        // In any order: the builder sorts them.
+        builder.push(new vscode.Range(1, 4, 1, 5), 'variable', ['readonly']);
+        builder.push(new vscode.Range(0, 3, 0, 7), 'function');
+        builder.push(0, 0, 2, 0, 0);
+        return builder.build();
+      },
+    }, legend),
+    vscode.commands.registerCommand('demo.mark', (uri) => {
+      problems.set(uri, [new vscode.Diagnostic(new vscode.Range(0, 0, 0, 2), 'marked', vscode.DiagnosticSeverity.Hint)]);
+      return vscode.languages.getDiagnostics(uri).length;
+    }),
+  );
+  // What VS Code has and Solder does not is taken without a word of
+  // complaint, and said to the editor.
+  vscode.languages.registerFoldingRangeProvider('rust', {});
+};
+"#;
+        let Some((host, told, dir)) = hosted("vscode-lsp", code) else {
+            return;
+        };
+        let host = Arc::new(host);
+        let said = editor(&host, told, |method, _| Err(format!("no {method} here")));
+        let file = format!("file://{}/a.rs", dir.display());
+        host.notify(
+            "init",
+            json!({ "documents": [
+                { "uri": file, "languageId": "rust", "version": 1, "text": "fn main() {}\nlet a = 1;\n" },
+            ] }),
+        );
+        host.request("activate", json!({}), SOON).unwrap();
+        // Asks the server the host is, and gives its answer.
+        let ask = |id: u64, method: &str, params: Value| -> Value {
+            let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+            host.notify("lsp", json!({ "message": message }));
+            let until = std::time::Instant::now() + SOON;
+            loop {
+                let answer = lock(&said).iter().find_map(|(method, params)| {
+                    (method == "lsp" && params["message"]["id"] == id)
+                        .then(|| params["message"].clone())
+                });
+                if let Some(answer) = answer {
+                    return answer;
+                }
+                assert!(std::time::Instant::now() < until, "no answer to {method}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let at = |line: u64, character: u64| json!({ "textDocument": { "uri": file }, "position": { "line": line, "character": character } });
+
+        // It says for which languages it has something, and what.
+        let until = std::time::Instant::now() + SOON;
+        let languages = loop {
+            let last = lock(&said)
+                .iter()
+                .rev()
+                .find(|(method, _)| method == "providers")
+                .map(|(_, params)| params["languages"].clone());
+            if let Some(languages) = last {
+                break languages;
+            }
+            assert!(std::time::Instant::now() < until, "no providers said");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(languages, json!(["rust", "*", "go"]));
+        let can = ask(1, "initialize", json!({}))["result"]["capabilities"].clone();
+        assert_eq!(can["referencesProvider"], true);
+        assert_eq!(can["renameProvider"], json!({ "prepareProvider": true }));
+        assert_eq!(can["workspaceSymbolProvider"], true);
+        assert_eq!(
+            can["completionProvider"],
+            json!({ "triggerCharacters": [".", ":"] })
+        );
+        assert_eq!(
+            can["textDocumentSync"],
+            json!({ "openClose": true, "change": 0 })
+        );
+        assert!(can["definitionProvider"].is_null() && can["codeActionProvider"].is_null());
+        assert_eq!(can["inlayHintProvider"], true);
+        assert_eq!(
+            can["semanticTokensProvider"],
+            json!({ "full": true, "legend": {
+                "tokenTypes": ["keyword", "function", "variable"], "tokenModifiers": ["readonly"],
+            } })
+        );
+
+        let mut references = at(0, 4);
+        references["context"] = json!({ "includeDeclaration": true });
+        let range = |a: u64, b: u64, c: u64, d: u64| json!({ "start": { "line": a, "character": b }, "end": { "line": c, "character": d } });
+        assert_eq!(
+            ask(2, "textDocument/references", references)["result"],
+            json!([
+                { "uri": file, "range": range(0, 3, 0, 7) },
+                { "uri": file, "range": range(1, 0, 1, 0) },
+            ])
+        );
+        assert_eq!(
+            ask(3, "textDocument/prepareRename", at(0, 4))["result"],
+            range(0, 3, 0, 7)
+        );
+        assert_eq!(
+            ask(4, "workspace/symbol", json!({ "query": "ma" }))["result"],
+            json!([{
+                "name": "ma_found", "kind": 23, "containerName": "mod",
+                "location": { "uri": "file:///tmp/a.rs", "range": range(2, 0, 2, 5) },
+            }])
+        );
+        assert_eq!(
+            ask(5, "textDocument/hover", at(0, 4))["result"]["contents"],
+            json!({ "kind": "markdown", "value": "plain\n\n```rust\nfn main()\n```" })
+        );
+        // What it draws into the text: hints, and what each word is as the
+        // run of numbers the protocol has for it.
+        let whole = json!({ "textDocument": { "uri": file }, "range": range(0, 0, 2, 0) });
+        assert_eq!(
+            ask(10, "textDocument/inlayHint", whole)["result"],
+            json!([
+                { "position": { "line": 1, "character": 5 }, "kind": 1, "paddingRight": true,
+                  "label": [{ "value": ": " }, { "value": "i32" }] },
+                { "position": { "line": 2, "character": 0 }, "label": "end" },
+            ])
+        );
+        assert_eq!(
+            ask(
+                11,
+                "textDocument/semanticTokens/full",
+                json!({ "textDocument": { "uri": file } })
+            )["result"],
+            json!({ "data": [0, 0, 2, 0, 0, 0, 3, 4, 1, 0, 1, 4, 1, 2, 1] })
+        );
+        // What it has no provider for, and a file it was not told of.
+        assert!(
+            ask(6, "textDocument/definition", at(0, 4))["result"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let elsewhere = json!({ "textDocument": { "uri": "file:///nowhere.rs" }, "position": { "line": 0, "character": 0 } });
+        assert!(ask(7, "textDocument/hover", elsewhere)["result"].is_null());
+        assert_eq!(
+            ask(8, "textDocument/foldingRange", at(0, 0))["error"]["code"],
+            -32601
+        );
+
+        // What it reports goes out as a server's diagnostics do, and again
+        // to an editor that begins to listen.
+        let published = || -> Vec<Value> {
+            lock(&said)
+                .iter()
+                .filter(|(method, params)| {
+                    method == "lsp"
+                        && params["message"]["method"] == "textDocument/publishDiagnostics"
+                })
+                .map(|(_, params)| params["message"]["params"].clone())
+                .collect()
+        };
+        assert!(published().is_empty());
+        // A file given to a command arrives as the Uri it was.
+        let marked = host.request(
+            "executeCommand",
+            json!({ "id": "demo.mark", "args": [{ "$uri": file }] }),
+            SOON,
+        );
+        assert_eq!(marked, Ok(json!(1)));
+        let one = json!({ "uri": file, "diagnostics": [{
+            "range": range(0, 0, 0, 2), "message": "marked", "severity": 4,
+        }] });
+        assert_eq!(published(), std::slice::from_ref(&one));
+        host.notify(
+            "lsp",
+            json!({ "message": { "jsonrpc": "2.0", "method": "initialized", "params": {} } }),
+        );
+        ask(9, "shutdown", Value::Null);
+        assert_eq!(published(), [one.clone(), one]);
+        assert!(lock(&said).iter().any(|(method, params)| {
+            method == "missing" && params["name"] == "languages.registerFoldingRangeProvider"
+        }));
     }
 
     #[test]

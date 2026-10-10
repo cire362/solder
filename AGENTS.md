@@ -111,6 +111,13 @@ Never guess a signature.
 - Language-server requests triggered by typing must run after the current
   effect cycle (`cx.defer`), so the `didChange` for what was just typed
   reaches the server first. See `Editor::after_typing`.
+- What a server draws into the text (inlay hints, semantic colors) is the
+  document's (`Document::inlays`, `Document::semantic`), asked for a
+  moment after the last change (`LspStore::schedule_hints`), never per
+  key, and moved with the text until the answer comes. A hint is in the
+  row and not in the file: `DisplayLine` maps columns both ways, as it
+  does for tabs, and nothing else may assume a column is a place on
+  screen.
 - Git goes through `git.rs`, which shells out to `git` with stable
   `--porcelain=v2 -z` formats. Everything in it blocks: call it from
   `cx.background_executor()`.
@@ -203,6 +210,14 @@ Never guess a signature.
   its answer goes through `Reply`, which answers "nothing" when dropped,
   so no extension waits forever. What extensions say in the status bar is
   `ExtensionStore::bar`, drawn by the `extensions` item.
+  Language features of extensions add nothing to the editor's own: the
+  host is a language server to it (`lsp::LanguageServer::linked`, a server
+  that is no process), asked in the protocol and answered by
+  `host/languages.js` from the providers the extension registered. A new
+  feature for extensions is first a feature the editor has for language
+  servers, then a handler there. What a server can do is read once, so
+  when an extension registers something more its server is closed and
+  the documents get a new one (`LspStore::hosts_changed`).
 
 ### Performance rules
 

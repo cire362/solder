@@ -40,24 +40,64 @@ pub struct DisplayLine {
     pub shaped: ShapedLine,
     /// `(byte column of a tab, extra bytes it expanded into)`, in order.
     tabs: Vec<(usize, usize)>,
+    /// `(byte column a hint is drawn before, its bytes)`, in order: text
+    /// of a language server's that is in the row and not in the file.
+    inlays: Vec<(usize, usize)>,
     /// Byte length of the row that was shaped (rows can be truncated).
     len: usize,
 }
 
 impl DisplayLine {
+    /// Where a column of the file is in what was drawn. A hint at the
+    /// column itself comes after it: the cursor stands before the hint.
     fn expand(&self, col: usize) -> usize {
         let col = col.min(self.len);
-        col + self
-            .tabs
-            .iter()
-            .take_while(|(at, _)| *at < col)
-            .map(|(_, extra)| extra)
-            .sum::<usize>()
+        let before = |list: &[(usize, usize)]| -> usize {
+            list.iter()
+                .take_while(|(at, _)| *at < col)
+                .map(|(_, extra)| extra)
+                .sum()
+        };
+        col + before(&self.tabs) + before(&self.inlays)
+    }
+
+    /// The same, past the hints drawn at the column.
+    fn expand_after(&self, col: usize) -> usize {
+        let col = col.min(self.len);
+        let here = self.inlays.iter().filter(|(at, _)| *at == col);
+        self.expand(col) + here.map(|(_, bytes)| bytes).sum::<usize>()
     }
 
     fn collapse(&self, expanded: usize) -> usize {
         let mut shift = 0;
-        for (at, extra) in &self.tabs {
+        let (mut tabs, mut inlays) = (self.tabs.iter().peekable(), self.inlays.iter().peekable());
+        loop {
+            // What was put into the row, in the order it stands there: a
+            // hint at a tab's column is drawn before the tab.
+            let hint_first = match (inlays.peek(), tabs.peek()) {
+                (Some((hint, _)), Some((tab, _))) => hint <= tab,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            if hint_first {
+                let Some((at, bytes)) = inlays.next() else {
+                    break;
+                };
+                let start = at + shift;
+                if expanded <= start {
+                    break;
+                }
+                // Inside a hint is the column it is drawn at.
+                if expanded < start + bytes {
+                    return *at;
+                }
+                shift += bytes;
+                continue;
+            }
+            let Some((at, extra)) = tabs.next() else {
+                break;
+            };
             let start = at + shift;
             if expanded <= start {
                 break;
@@ -419,6 +459,10 @@ fn layout(
 
     let mut lines = Vec::with_capacity(end_row - first_row);
     let mut span_ix = spans.partition_point(|(r, _)| r.end <= visible.start);
+    // What a language server puts into the rows on screen.
+    let inlays = doc.inlays();
+    let mut inlay_ix = inlays.partition_point(|inlay| inlay.offset < visible.start);
+    let mut hints: Vec<(usize, &str)> = Vec::new();
     for row in first_row..end_row {
         let line_start = buffer.line_start(row);
         let full = buffer.line_str(row);
@@ -437,13 +481,24 @@ fn layout(
         };
         let (segments, next_ix) = color_segments(text, line_start, &spans, span_ix, theme);
         span_ix = next_ix;
+        hints.clear();
+        while let Some(inlay) = inlays
+            .get(inlay_ix)
+            .filter(|i| i.offset <= line_start + full.len())
+        {
+            // Not in the part of a very long row that is left undrawn.
+            if inlay.offset <= line_start + len && !editor.masked {
+                hints.push((inlay.offset.saturating_sub(line_start), &inlay.text));
+            }
+            inlay_ix += 1;
+        }
         lines.push(shape_row(
             text,
             line_start,
             segments,
             &underlines,
-            &code_font,
-            font_size,
+            (&hints, theme.fg_subtle),
+            (&code_font, font_size),
             window,
         ));
     }
@@ -866,22 +921,62 @@ fn highlights(
     doc: &Document,
     range: Range<usize>,
 ) -> Arc<Vec<(Range<usize>, HighlightKind)>> {
-    let key = (doc.version(), doc.syntax_generation(), range.clone());
+    let key = (
+        doc.version(),
+        doc.syntax_generation(),
+        doc.semantic_generation(),
+        range.clone(),
+    );
     if let Some(cache) = &editor.highlight_cache
         && cache.key == key
     {
         return cache.spans.clone();
     }
-    let spans = Arc::new(
-        doc.syntax()
-            .map(|tree| tree.highlights(doc.text().rope(), range))
-            .unwrap_or_default(),
-    );
+    let from_grammar = doc
+        .syntax()
+        .map(|tree| tree.highlights(doc.text().rope(), range.clone()))
+        .unwrap_or_default();
+    let spans = Arc::new(overlaid(from_grammar, doc.semantic(), &range));
     editor.highlight_cache = Some(HighlightCache {
         key,
         spans: spans.clone(),
     });
     spans
+}
+
+/// The grammar's colors with a language server's over them: where the
+/// server says what a word is, its word wins, and the grammar keeps the
+/// rest. Both come sorted, and the answer is.
+fn overlaid(
+    base: Vec<(Range<usize>, HighlightKind)>,
+    over: &[(Range<usize>, HighlightKind)],
+    visible: &Range<usize>,
+) -> Vec<(Range<usize>, HighlightKind)> {
+    let over = &over[over.partition_point(|(range, _)| range.end <= visible.start)..];
+    let over = &over[..over.partition_point(|(range, _)| range.start < visible.end)];
+    if over.is_empty() {
+        return base;
+    }
+    let mut out = Vec::with_capacity(base.len() + over.len());
+    for (range, kind) in base {
+        let mut start = range.start;
+        let first = over.partition_point(|(covering, _)| covering.end <= start);
+        for (covering, _) in &over[first..] {
+            if covering.start >= range.end {
+                break;
+            }
+            if covering.start > start {
+                out.push((start..covering.start, kind));
+            }
+            start = start.max(covering.end);
+        }
+        if start < range.end {
+            out.push((start..range.end, kind));
+        }
+    }
+    out.extend(over.iter().cloned());
+    out.sort_by_key(|(range, _)| range.start);
+    out
 }
 
 /// Splits a row into `(byte range within the row, color)` segments covering it
@@ -926,16 +1021,23 @@ fn shape_row(
     line_start: usize,
     segments: Vec<(Range<usize>, gpui::Hsla)>,
     underlines: &[(Range<usize>, UnderlineStyle)],
-    code_font: &gpui::Font,
-    font_size: Pixels,
+    (hints, hint_color): (&[(usize, &str)], gpui::Hsla),
+    (code_font, font_size): (&gpui::Font, Pixels),
     window: &mut Window,
 ) -> DisplayLine {
-    // Expand tabs to the next stop so columns line up with `display_column`.
+    // Expand tabs to the next stop so columns line up with `display_column`,
+    // and put each hint before the character it stands at.
     let mut tabs = Vec::new();
-    let expanded: SharedString = if text.contains('\t') {
+    let mut inlays = Vec::new();
+    let expanded: SharedString = if text.contains('\t') || !hints.is_empty() {
         let mut out = String::with_capacity(text.len() + 16);
         let mut col = 0;
+        let mut hints = hints.iter().peekable();
         for (i, g) in text.grapheme_indices(true) {
+            while let Some((_, hint)) = hints.next_if(|(at, _)| *at <= i) {
+                out.push_str(hint);
+                inlays.push((i, hint.len()));
+            }
             if g == "\t" {
                 let width = text::TAB_SIZE - col % text::TAB_SIZE;
                 out.extend(std::iter::repeat_n(' ', width));
@@ -946,6 +1048,11 @@ fn shape_row(
                 col += 1;
             }
         }
+        // The ones at the end of the row.
+        for (_, hint) in hints {
+            out.push_str(hint);
+            inlays.push((text.len(), hint.len()));
+        }
         out.into()
     } else {
         SharedString::from(text.to_owned())
@@ -953,6 +1060,7 @@ fn shape_row(
     let line = DisplayLine {
         shaped: ShapedLine::default(),
         tabs,
+        inlays,
         len: text.len(),
     };
 
@@ -970,6 +1078,16 @@ fn shape_row(
         })
         .collect();
     let mut runs = Vec::with_capacity(segments.len() + 2);
+    let hint_run = |bytes: usize| TextRun {
+        len: bytes,
+        font: code_font.clone(),
+        color: hint_color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    // How many of the row's hints have a run already.
+    let mut hinted = 0;
     for (range, color) in segments {
         let mut cuts = vec![range.start, range.end];
         for (u, _) in &underlines {
@@ -979,10 +1097,22 @@ fn shape_row(
                 }
             }
         }
+        // A hint inside a word of one color parts it in two.
+        cuts.extend(
+            line.inlays
+                .iter()
+                .map(|(at, _)| *at)
+                .filter(|at| *at > range.start && *at < range.end),
+        );
         cuts.sort_unstable();
         cuts.dedup();
         for w in cuts.windows(2) {
             let (a, b) = (w[0], w[1]);
+            // The hints that stand at `a` come first, in their own color.
+            while let Some((_, bytes)) = line.inlays.get(hinted).filter(|(at, _)| *at <= a) {
+                runs.push(hint_run(*bytes));
+                hinted += 1;
+            }
             let underline = underlines
                 .iter()
                 .find(|(u, _)| a >= u.start && b <= u.end)
@@ -991,7 +1121,7 @@ fn shape_row(
                     ..*style
                 });
             runs.push(TextRun {
-                len: line.expand(b) - line.expand(a),
+                len: line.expand(b) - line.expand_after(a),
                 font: code_font.clone(),
                 color,
                 background_color: None,
@@ -1000,8 +1130,116 @@ fn shape_row(
             });
         }
     }
+    for (_, bytes) in &line.inlays[hinted..] {
+        runs.push(hint_run(*bytes));
+    }
     let shaped = window
         .text_system()
         .shape_line(expanded, font_size, &runs, None);
     DisplayLine { shaped, ..line }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(tabs: &[(usize, usize)], inlays: &[(usize, usize)], len: usize) -> DisplayLine {
+        DisplayLine {
+            shaped: ShapedLine::default(),
+            tabs: tabs.to_vec(),
+            inlays: inlays.to_vec(),
+            len,
+        }
+    }
+
+    #[test]
+    fn a_hint_in_a_row_moves_what_is_after_it_and_is_no_column() {
+        // `let a = f(b)` with `: i32` before the space at 5 and `x: `
+        // before the `b` at 10.
+        let line = row(&[], &[(5, 5), (10, 3)], 12);
+        // The cursor at a hint's column stands before the hint.
+        assert_eq!(line.expand(5), 5);
+        assert_eq!(line.expand_after(5), 10);
+        assert_eq!(line.expand(6), 11);
+        assert_eq!(line.expand(10), 15);
+        assert_eq!(line.expand(12), 20);
+        // A place before, in and after a hint is a column of the file.
+        assert_eq!(line.collapse(4), 4);
+        for inside in 5..10 {
+            assert_eq!(line.collapse(inside), 5, "{inside}");
+        }
+        assert_eq!(line.collapse(10), 5);
+        assert_eq!(line.collapse(11), 6);
+        for inside in 15..18 {
+            assert_eq!(line.collapse(inside), 10);
+        }
+        assert_eq!(line.collapse(19), 11);
+        assert_eq!(line.collapse(99), 12);
+        // Every column goes there and back.
+        for col in 0..=12 {
+            assert_eq!(line.collapse(line.expand(col)), col);
+        }
+
+        // With a tab before the hints (three spaces more at column 0), a
+        // hint at the tab's own column, and one at the end of the row.
+        let line = row(&[(0, 3)], &[(0, 2), (4, 2)], 4);
+        assert_eq!(line.expand(0), 0);
+        assert_eq!(line.expand(1), 6);
+        assert_eq!(line.expand(4), 9);
+        assert_eq!(line.expand_after(4), 11);
+        assert_eq!((line.collapse(1), line.collapse(2)), (0, 0));
+        // In the spaces of the tab: the nearer side of it.
+        assert_eq!((line.collapse(3), line.collapse(5)), (0, 1));
+        assert_eq!(
+            (line.collapse(6), line.collapse(9), line.collapse(11)),
+            (1, 4, 4)
+        );
+        // A row with neither is itself.
+        let plain = row(&[], &[], 3);
+        assert_eq!(
+            (plain.expand(2), plain.collapse(2), plain.collapse(9)),
+            (2, 2, 3)
+        );
+    }
+
+    #[test]
+    fn a_server_s_colors_go_over_the_grammar_s() {
+        use HighlightKind::*;
+        let grammar = vec![(0..2, Keyword), (3..9, Variable), (10..20, Comment)];
+        // Nothing from the server on screen: the grammar's as they are.
+        assert_eq!(overlaid(grammar.clone(), &[], &(0..20)), grammar);
+        assert_eq!(
+            overlaid(grammar.clone(), &[(30..40, Type)], &(0..20)),
+            grammar
+        );
+        // The server's word wins where it is, whole or part of a span,
+        // and the grammar keeps the rest on both sides.
+        let server = [(3..9, Function), (12..14, Type), (16..18, Constant)];
+        assert_eq!(
+            overlaid(grammar.clone(), &server, &(0..20)),
+            [
+                (0..2, Keyword),
+                (3..9, Function),
+                (10..12, Comment),
+                (12..14, Type),
+                (14..16, Comment),
+                (16..18, Constant),
+                (18..20, Comment),
+            ]
+        );
+        // One over two of the grammar's, and where the grammar has none.
+        assert_eq!(
+            overlaid(
+                vec![(0..4, Keyword), (4..8, String)],
+                &[(2..6, Type), (9..11, Number)],
+                &(0..20)
+            ),
+            [
+                (0..2, Keyword),
+                (2..6, Type),
+                (6..8, String),
+                (9..11, Number)
+            ]
+        );
+    }
 }
