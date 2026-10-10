@@ -237,6 +237,11 @@ while True:
         # Every function of the file, inside one module.
         uri = params["textDocument"]["uri"]
         text = docs[uri]
+        # A file that says so has none listed, as with a server that
+        # lists none for a kind of file.
+        if "mock: no symbols" in text:
+            send({"jsonrpc": "2.0", "id": mid, "result": None})
+            continue
         functions = [{
             "name": m.group(1), "kind": 12,
             "range": rng(text, m.start(), m.end()),

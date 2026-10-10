@@ -150,6 +150,12 @@ Never guess a signature.
   a cursor lands in it. A lens is kept only if a
   click can do it: its command is one its server said it runs, or one
   of the few the editor does itself (`editor_lsp::LENS_COMMANDS`).
+- The outline of the file in front (`outline.rs`) is the workspace's,
+  one for the Structure panel and the breadcrumbs both: from the file's
+  server, else the language's outline off the UI thread. It is found a
+  moment after the file changed (`Workspace::keep_outline`), never per
+  key, and not at all while nothing on screen shows it. A new thing that
+  shows symbols of the file in front reads it; it does not ask again.
 - Git goes through `git.rs`, which shells out to `git` with stable
   `--porcelain=v2 -z` formats. Everything in it blocks: call it from
   `cx.background_executor()`.

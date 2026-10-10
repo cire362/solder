@@ -148,6 +148,24 @@ closed before it, up to 32 back; a file that is open already or gone from
 disk is passed over. Closed tabs are remembered while the window is open,
 not across a restart.
 
+## Structure and breadcrumbs
+
+**Show structure** (in the palette, or the **Structure** tab of the left
+dock) lists the symbols of the file in front in the order they are written,
+each as far in as it is inside others, with the one the cursor is in marked.
+A click on one, or Enter with the arrows in the list, puts the cursor on
+its name. The **breadcrumbs** in the title bar say the same of the cursor:
+the way to the file from the project's folder, then the symbols it is in.
+
+Both read one outline. It comes from the file's language server where one
+lists symbols, and from the language's own outline where none does, or
+where the server lists nothing for the file. An outline of that second kind
+says only where each symbol begins: its symbols are one under another, none
+inside another, and each reaches to where the next begins. The outline is
+found again a quarter of a second after the file last changed, and not at
+all while neither the panel nor the breadcrumbs are on screen. Up to 5000
+symbols of a file are kept.
+
 ## Review changes
 
 Open the Git sidebar with `ctrl-shift-g` and click a file to compare both versions.
@@ -1325,11 +1343,11 @@ applied as soon as it is saved.
 {
   "left": {
     "width": 390,
-    "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions"]
+    "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions", "extension_views", "structure"]
   },
   "right": { "width": 380, "panels": ["chat", "agent"] },
   "bottom": { "height": 280, "panels": ["terminal", "debug", "response", "results"] },
-  "title_bar": { "height": 38, "left": ["project"], "right": [] },
+  "title_bar": { "height": 38, "left": ["project", "breadcrumbs"], "right": [] },
   "tab_bar": { "height": 34, "place": "top" },
   "status_bar": {
     "height": 26,
@@ -1405,6 +1423,7 @@ such as the branch, keep their actions after moving.
 |---|---|
 | `project` | the project's name |
 | `file` | the file in front, from the project's folder |
+| `breadcrumbs` | the way to the file in front from the project's folder, then the symbols the cursor is in, the outermost first; a click on the way shows the file in the tree, a click on a symbol opens the list of the file's symbols |
 | `branch` | the branch; a click opens the list of branches |
 | `position` | the line and column of the cursor, and how many cursors |
 | `indent` | spaces or tabs, and how many |

@@ -95,6 +95,8 @@ pub enum Panel {
     Ai,
     Extensions,
     ExtensionViews,
+    /// The outline of the file in front.
+    Structure,
     Chat,
     Agent,
     /// The terminals: each has a tab of its own where this panel is.
@@ -127,7 +129,7 @@ impl Place {
 }
 
 impl Panel {
-    pub const ALL: [Panel; 15] = [
+    pub const ALL: [Panel; 16] = [
         Panel::Files,
         Panel::Search,
         Panel::Git,
@@ -137,6 +139,7 @@ impl Panel {
         Panel::Ai,
         Panel::Extensions,
         Panel::ExtensionViews,
+        Panel::Structure,
         Panel::Chat,
         Panel::Agent,
         Panel::Terminal,
@@ -157,6 +160,7 @@ impl Panel {
             Panel::Ai => "AI",
             Panel::Extensions => "Extensions",
             Panel::ExtensionViews => "Views",
+            Panel::Structure => "Structure",
             Panel::Chat => "Chat",
             Panel::Agent => "Agent",
             Panel::Terminal => "Terminal",
@@ -178,6 +182,7 @@ impl Panel {
             Panel::Ai => "ai",
             Panel::Extensions => "extensions",
             Panel::ExtensionViews => "extension_views",
+            Panel::Structure => "structure",
             Panel::Chat => "chat",
             Panel::Agent => "agent",
             Panel::Terminal => "terminal",
@@ -224,6 +229,8 @@ pub enum Item {
     Project,
     /// What is in front: the file, or the view that took its place.
     File,
+    /// Where the cursor is: the file's path, and the symbols it is in.
+    Breadcrumbs,
     /// The branch the repository is on. Opens the list of branches.
     Branch,
     /// The line and the column of the cursor, and how many cursors.
@@ -276,9 +283,10 @@ impl<'de> Deserialize<'de> for Item {
 }
 
 impl Item {
-    pub const ALL: [Item; 13] = [
+    pub const ALL: [Item; 14] = [
         Item::Project,
         Item::File,
+        Item::Breadcrumbs,
         Item::Branch,
         Item::Position,
         Item::Indent,
@@ -296,6 +304,7 @@ impl Item {
         match self {
             Item::Project => "Project",
             Item::File => "File",
+            Item::Breadcrumbs => "Breadcrumbs",
             Item::Branch => "Branch",
             Item::Position => "Position",
             Item::Indent => "Indent",
@@ -316,6 +325,7 @@ impl Item {
         match self {
             Item::Project => "project",
             Item::File => "file",
+            Item::Breadcrumbs => "breadcrumbs",
             Item::Branch => "branch",
             Item::Position => "position",
             Item::Indent => "indent",
@@ -404,7 +414,7 @@ impl BarEnd {
 }
 
 /// The items of the bars as they come. `file` and `branch` are in none.
-const TITLE_LEFT: &[Item] = &[Item::Project];
+const TITLE_LEFT: &[Item] = &[Item::Project, Item::Breadcrumbs];
 const TITLE_RIGHT: &[Item] = &[];
 const STATUS_LEFT: &[Item] = &[
     Item::Position,
@@ -1575,7 +1585,7 @@ mod tests {
         use Item::*;
         // As they come.
         let standard = Layout::default();
-        assert_eq!(standard.title_bar.left(), [Project]);
+        assert_eq!(standard.title_bar.left(), [Project, Breadcrumbs]);
         assert!(standard.title_bar.right().is_empty());
         assert_eq!(
             standard.status_bar.left(),
@@ -1622,7 +1632,7 @@ mod tests {
         )
         .unwrap();
         assert!(bare.status_bar.left().is_empty() && bare.status_bar.right().is_empty());
-        assert_eq!(bare.title_bar.left(), [Project]);
+        assert_eq!(bare.title_bar.left(), [Project, Breadcrumbs]);
         assert_eq!(bare.tab_bar.place, TabsAt::None);
         // A name that is no item is a mistake, said with the file's name.
         let error = parse(r#"{ "status_bar": { "left": ["clock"] } }"#).unwrap_err();
@@ -1749,7 +1759,7 @@ mod tests {
             .moved_item(Language, TitleLeft, None)
             .moved_item(File, TitleRight, None)
             .moved_item(Position, StatusLeft, Some(Indent));
-        assert_eq!(moved.title_bar.left(), [Language]);
+        assert_eq!(moved.title_bar.left(), [Breadcrumbs, Language]);
         assert_eq!(moved.title_bar.right(), [File]);
         assert_eq!(
             moved.status_bar.right(),
@@ -1867,7 +1877,7 @@ mod tests {
     #[test]
     fn every_panel_is_in_one_dock_or_hidden() {
         use Panel::*;
-        // As it comes: nine on the left, the chat and the agent on the
+        // As it comes: ten on the left, the chat and the agent on the
         // right, the terminals, the debugger and the two kinds of answers
         // at the bottom, none hidden.
         let standard = Layout::default();
@@ -1882,7 +1892,8 @@ mod tests {
                 Api,
                 Ai,
                 Extensions,
-                ExtensionViews
+                ExtensionViews,
+                Structure
             ]
         );
         assert_eq!(standard.right.panels, [Chat, Agent]);
@@ -1913,7 +1924,8 @@ mod tests {
                 Services,
                 Database,
                 Extensions,
-                ExtensionViews
+                ExtensionViews,
+                Structure
             ]
         );
         assert_eq!(layout.right.panels, [Search, Terminal]);
@@ -1940,11 +1952,11 @@ mod tests {
         assert_eq!(parse(&file(&layout)).unwrap(), layout);
         // A dock can be emptied: everything it had is elsewhere.
         let empty = parse(
-            r#"{ "right": { "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions", "extension_views", "chat", "agent"] } }"#,
+            r#"{ "right": { "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions", "extension_views", "structure", "chat", "agent"] } }"#,
         )
         .unwrap();
         assert!(empty.left.panels.is_empty());
-        assert_eq!(empty.right.panels.len(), 11);
+        assert_eq!(empty.right.panels.len(), 12);
         assert_eq!(empty.bottom.panels.len(), 4);
     }
 }

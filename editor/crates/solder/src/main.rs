@@ -56,6 +56,7 @@ mod locations;
 mod lsp_store;
 mod mcp_store;
 mod notebook;
+mod outline;
 mod perf;
 mod picker;
 mod plugin_store;

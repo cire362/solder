@@ -37,7 +37,11 @@ something of its own unchecked or unmade adds it here.
       looked at
 - [ ] A real language server for the lenses the editor does itself:
       rust-analyzer's "Run" and the places of a symbol are tested against
-      the mock server, which CI has; rust-analyzer it has not
+      the mock server, which CI has; rust-analyzer it has not. The same
+      goes for the Structure panel and the breadcrumbs: the mock server's
+      symbols and the outline of Rust, no real server's
+- [ ] On screen: the Structure panel and the breadcrumbs in the title
+      bar. Tested in a headless window only
 - [ ] A file over 64 MB (opened to be read) and one over 512 MB (not
       read): the limits are tested with a small file and a small limit
 - [ ] Memory of the editor block of phase 10: 132 MB in three runs and 140
@@ -63,6 +67,11 @@ something of its own unchecked or unmade adds it here.
       are shown with the wrong letters (saved byte for byte all the same).
       Cyrillic is told from Western by a guess. A file with both line
       endings keeps the one most of its lines have, not each line's own
+- [ ] The outline of a file with no server, or one whose server lists
+      nothing, is flat: the language's outline says where a symbol begins
+      and not what it is inside of. A symbol of the breadcrumbs is not a
+      place to go to by itself: a click opens the list of the file's
+      symbols
 - [ ] A file undone back to what is on disk stays marked as changed
 - [ ] `cmd-q` quits without asking about files that are not saved. Their
       text is kept and comes back, but nothing says so before the quit
@@ -496,8 +505,9 @@ update. They come after phase 9, in this order unless one is needed sooner.
       the language server, painted as an extension says (`labels-for-symbols`).
       Done ahead of the rest of the block, to close the item of phase 8. A
       file with no server that lists them has its language's outline
-- [ ] A Structure panel: the file's outline, from the server or from the
-      language's outline query
+- [x] A Structure panel: the file's outline, from the server or from the
+      language's outline query. It follows the cursor; the breadcrumbs
+      below read the same outline
 - [ ] A Problems panel: every diagnostic of the project, by file
 - [ ] The other places a symbol is used lit up; go to implementations;
       breadcrumbs with the path and the symbol under the cursor

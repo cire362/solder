@@ -247,6 +247,7 @@ pub fn panel(panel: Panel) -> &'static str {
         Panel::Ai => "sparkle",
         Panel::Extensions => "puzzle-piece",
         Panel::ExtensionViews => "puzzle-piece",
+        Panel::Structure => "list",
         Panel::Chat => "chat-circle",
         Panel::Agent => "robot",
         Panel::Terminal => "terminal-window",
@@ -267,6 +268,7 @@ pub fn item(item: &Item) -> &'static str {
     match item {
         Item::Project => "folder",
         Item::File => "file",
+        Item::Breadcrumbs => "list",
         Item::Branch => "git-branch",
         Item::Position => "cursor-text",
         Item::Indent => "text-indent",
