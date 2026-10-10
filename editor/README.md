@@ -226,6 +226,14 @@ lines say **Not committed**. It is refreshed after typing pauses and when
 Git status changes. Turning it off removes its work and its gutter. History
 and blame use the Git CLI on background threads; neither loads at startup.
 
+**Stash** saves tracked changes and untracked files on disk. **Stashes**
+opens the list: **Apply** keeps the stash, **Pop** removes it after a successful
+apply, and **Delete** asks before discarding it. Apply and pop restore the
+index too. A conflict leaves the stash available. Unsaved editor text stays
+in the editor and is not included: save it first to stash it. **Fetch** updates
+all remotes without merging. Git uses existing credentials and reports an
+error if it needs a terminal prompt. Operations run one at a time.
+
 ## Run the stack
 
 Open the Services tab with `cmd-shift-s` (`ctrl-shift-s` on Linux). Solder lists the

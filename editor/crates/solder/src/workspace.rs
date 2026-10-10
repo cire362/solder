@@ -7801,6 +7801,60 @@ mod tests {
     }
 
     #[gpui::test]
+    fn git_stash_runs_in_the_panel_and_a_dropped_waiter_does_not_cancel_git(
+        cx: &mut TestAppContext,
+    ) {
+        let root = git_fixture("stash-window");
+        std::fs::write(root.join("a.txt"), "changed").unwrap();
+        std::fs::write(root.join("extra.txt"), "extra").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let git = cx.read(|cx| ws.read(cx).git.clone());
+        wait_for(cx, "repository", &|cx| {
+            git.read(cx).loaded_status().is_some()
+        });
+        cx.dispatch_action(ShowGit);
+        cx.dispatch_action(git_panel::StashChanges);
+        let panel = cx.read(|cx| ws.read(cx).git_panel.clone());
+        wait_for(cx, "stash list", &|cx| {
+            panel
+                .read(cx)
+                .stashes
+                .as_ref()
+                .is_some_and(|s| s.len() == 1)
+        });
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+        assert!(!root.join("extra.txt").exists());
+        let (send, receive) = std::sync::mpsc::channel();
+        let waiter = git.update(cx, |g, cx| {
+            g.run(
+                move |_| {
+                    receive.recv().unwrap();
+                    Ok(())
+                },
+                cx,
+            )
+        });
+        drop(waiter);
+        assert!(cx.read(|cx| git.read(cx).busy));
+        git.update(cx, |g, cx| {
+            g.run(|_| panic!("overlapping Git operation"), cx).detach()
+        });
+        assert!(cx.read(|cx| {
+            git.read(cx)
+                .last_error
+                .as_ref()
+                .is_some_and(|e| e.contains("Wait"))
+        }));
+        send.send(()).unwrap();
+        wait_for(cx, "detached Git operation", &|cx| !git.read(cx).busy);
+        assert!(cx.read(|cx| git.read(cx).last_error.is_none()));
+    }
+
+    #[gpui::test]
     fn git_stage_lines_revert_and_commit(cx: &mut TestAppContext) {
         let root = git_fixture("git-flow");
         cx.executor().allow_parking();

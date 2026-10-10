@@ -151,7 +151,7 @@ fn blame_lines(out: &str) -> Vec<Blame> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::process::Command;
 

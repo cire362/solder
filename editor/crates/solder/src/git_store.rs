@@ -36,6 +36,7 @@ pub struct GitStore {
     refresh_task: Option<Task<()>>,
     /// The last failed operation, shown in the git panel until the next success.
     pub last_error: Option<SharedString>,
+    pub busy: bool,
 }
 
 impl GitStore {
@@ -60,6 +61,7 @@ impl GitStore {
             status_loaded: false,
             refresh_task: None,
             last_error: None,
+            busy: false,
         }
     }
 
@@ -128,19 +130,36 @@ impl GitStore {
         let Some(repo) = self.repo.clone() else {
             return Task::ready(false);
         };
+        if self.busy {
+            self.last_error = Some("Wait for the current Git operation.".into());
+            cx.notify();
+            return Task::ready(false);
+        }
+        self.busy = true;
+        self.last_error = None;
+        cx.notify();
+        let (sent, received) = futures::channel::oneshot::channel();
+        // The operation must finish even if its UI stops awaiting the answer.
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { op(&repo) })
                 .await;
-            this.update(cx, |this, cx| {
-                let ok = result.is_ok();
-                this.last_error = result.err().map(|e| e.0.into());
-                this.refresh_now(cx);
-                ok
-            })
-            .unwrap_or(false)
+            let ok = this
+                .update(cx, |this, cx| {
+                    this.busy = false;
+                    this.last_error = result.err().map(|e| e.0.into());
+                    this.refresh_now(cx);
+                    // A commit can change HEAD without changing the status list.
+                    cx.emit(GitStoreEvent::StatusChanged);
+                    cx.notify();
+                    this.last_error.is_none()
+                })
+                .unwrap_or(false);
+            sent.send(ok).ok();
         })
+        .detach();
+        cx.spawn(async move |_, _| received.await.unwrap_or(false))
     }
 
     /// Initializes a repository in `root` (the panel's empty state offers it).

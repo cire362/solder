@@ -21,6 +21,9 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] Fetch with SSH or a credential helper against a hosted remote. The
+      stash and fetch tests use local repositories; Git runs without
+      terminal credential prompts here
 - [ ] Git history and blame in a real window, and a large repository.
       Rename and merge history, commit patches and unsaved blame are tested
       with local repositories and a headless window. Other platforms and
@@ -541,7 +544,7 @@ update. They come after phase 9, in this order unless one is needed sooner.
 
 ### Git history
 - [x] The history as a graph, the history of one file, blame in the gutter
-- [ ] Stash and fetch
+- [x] Stash and fetch
 - [ ] A check before a commit: keys and secrets in what is staged stop it
 - [ ] A commit message proposed by the model from what is staged
 - [ ] The pull request of the branch and the state of its checks, through `gh`
