@@ -63,8 +63,8 @@ impl Repo {
             .map(|out| history_rows(&String::from_utf8_lossy(&out)))
     }
 
-    pub fn commit_patch(&self, id: &str, file: Option<&str>) -> Result<String> {
-        let mut args = vec![
+    pub fn commit_patch(&self, id: &str) -> Result<String> {
+        let args = [
             "show",
             "--no-color",
             "--no-ext-diff",
@@ -76,9 +76,6 @@ impl Repo {
             id,
             "--",
         ];
-        if let Some(file) = file {
-            args.push(file);
-        }
         self.run(&args).map(|out| {
             let mut text = String::from_utf8_lossy(&out).into_owned();
             if text.len() > 500_000 {
@@ -212,14 +209,9 @@ pub(crate) mod tests {
                 .any(|r| r.graph.contains('\\') || r.graph.contains('/'))
         );
         let merge = graph.iter().find_map(|r| r.commit.as_ref()).unwrap();
-        let merged_patch = f.0.commit_patch(&merge.id, None).unwrap();
+        let merged_patch = f.0.commit_patch(&merge.id).unwrap();
         assert!(merged_patch.contains("diff --git a/side.txt b/side.txt"));
         assert!(merged_patch.contains("+side"));
-        assert!(
-            !f.0.commit_patch(&merge.id, Some("after name.txt"))
-                .unwrap()
-                .contains("diff --git")
-        );
         let file = f.0.history(Some("after name.txt"), 200).unwrap();
         let titles: Vec<_> = file
             .iter()
@@ -227,7 +219,7 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(titles, ["rename", "initial"]);
         let first = file.last().unwrap().commit.as_ref().unwrap();
-        let patch = f.0.commit_patch(&first.id, None).unwrap();
+        let patch = f.0.commit_patch(&first.id).unwrap();
         assert!(patch.contains("+one"));
         let blame = f.0.blame("after name.txt", "one\nchanged\ntwo\n").unwrap();
         assert_eq!(blame.len(), 3);

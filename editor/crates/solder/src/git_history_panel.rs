@@ -74,11 +74,12 @@ impl HistoryPanel {
         let Some(commit) = self.rows.get(ix).and_then(|r| r.commit.clone()) else {
             return;
         };
-        let (repo, file) = (self.repo.clone(), self.file.clone());
+        let repo = self.repo.clone();
         self.patch_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { repo.commit_patch(&commit.id, file.as_deref()) })
+                // A file's current name may not exist in an older commit.
+                .spawn(async move { repo.commit_patch(&commit.id) })
                 .await;
             this.update(cx, |this, cx| {
                 match result {

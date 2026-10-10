@@ -218,7 +218,8 @@ The Git panel's **History** shows the graph across local and remote branches.
 **File history** follows the file in front through renames on the current
 branch. Each reads the latest 200 commits; **Older commits** adds 200 and
 **Refresh** rereads them. Click a commit to open its message and patch as a
-read-only tab (the first 500 KB of a large patch).
+read-only tab (the first 500 KB of a large patch). File history opens the
+whole commit too, so changes made under an earlier filename remain visible.
 For a merge, the patch shows what changed from its first parent.
 
 **Blame** toggles a hash and author beside each line of the file in front, in

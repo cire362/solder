@@ -7821,6 +7821,48 @@ mod tests {
     }
 
     #[gpui::test]
+    fn file_history_opens_changes_made_before_a_rename(cx: &mut TestAppContext) {
+        let root = git_fixture("renamed-history-window");
+        let repo = crate::git::Repo::discover(&root).unwrap();
+        repo.run(&["mv", "a.txt", "renamed.txt"]).unwrap();
+        repo.commit("rename", false).unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(
+                Some(root.join("renamed.txt")),
+                "one\ntwo\n",
+                None,
+                window,
+                cx,
+            );
+        });
+        wait_for(cx, "repository", &|cx| {
+            ws.read(cx).git.read(cx).repo().is_some()
+        });
+        cx.dispatch_action(git_panel::FileHistory);
+        let panel = cx.read(|cx| ws.read(cx).git_panel.clone());
+        wait_for(cx, "renamed file history", &|cx| {
+            panel
+                .read(cx)
+                .history
+                .as_ref()
+                .is_some_and(|h| h.read(cx).rows.len() == 2)
+        });
+        let commit = bounds_soon(cx, "history-row-1");
+        cx.simulate_click(commit.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        wait_for(cx, "patch before rename", &|cx| {
+            ws.read(cx).active_editor().is_some_and(|e| {
+                let e = e.read(cx);
+                e.doc(cx).is_read_only()
+                    && e.text(cx).contains("diff --git a/a.txt b/a.txt")
+                    && e.text(cx).contains("+one")
+            })
+        });
+    }
+
+    #[gpui::test]
     fn git_stash_runs_in_the_panel_and_a_dropped_waiter_does_not_cancel_git(
         cx: &mut TestAppContext,
     ) {
