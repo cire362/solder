@@ -57,7 +57,8 @@ something of its own unchecked or unmade adds it here.
       (`benchmarks/daily-editor.md`)
 - [ ] Not measured at all: an editor with extensions running, a notebook
       open, a file with lenses, folding, a file of many megabytes with
-      wrapping on, a file in another encoding
+      wrapping on, a file in another encoding; Structure and Problems
+      with large lists, and symbol highlights while typing with a server
 - [ ] The numbers on the website (`src/components/performance.tsx`) are
       placeholders, marked so. The measurements in `benchmarks/` are local
       comparisons of a branch with main, not what the site may claim
