@@ -38,6 +38,7 @@ const HOST: &[(&str, &str)] = &[
     ("languages.js", include_str!("../host/languages.js")),
     ("debug.js", include_str!("../host/debug.js")),
     ("shell.js", include_str!("../host/shell.js")),
+    ("views.js", include_str!("../host/views.js")),
 ];
 
 /// Puts the host where Node can read it, under `dir`. A file is written
@@ -224,6 +225,12 @@ impl VsHost {
             answered(Err(error));
         }
         id
+    }
+
+    /// A native view gave up waiting. Drop its reply closure too; a late
+    /// answer has nothing to replace after that view was refreshed.
+    pub fn cancel(&self, id: u64) {
+        lock(&self.waiting).remove(&id);
     }
 
     /// Asks the host something and waits for its answer, no longer than
@@ -485,7 +492,7 @@ mod tests {
                   vscode.commands.executeCommand('editor.hello', 'x')),
               );
               // A part of the API that is not here does not stop it.
-              const tree = vscode.window.createTreeView('demo', {});
+              const tree = vscode.window.createWebviewPanel('demo', 'Demo', 1, {});
               tree.dispose();
               process.stdout.write('printed\n');
               return { api: 1 };
@@ -518,7 +525,7 @@ mod tests {
                 }
         });
         heard(&told, |told| {
-            *told == Told::Missing("window.createTreeView".into())
+            *told == Told::Missing("window.createWebviewPanel".into())
         });
         heard(
             &told,
@@ -1271,5 +1278,192 @@ exports.activate = (context) => {
         assert!(wakes(&events(&["onStartupFinished"]), "*"));
         assert!(!wakes(&events(&["onStartupFinished"]), "onLanguage:go"));
         assert!(!wakes(&[], "*"));
+    }
+    #[test]
+    fn trees_keep_actions_bound_to_nodes_when_a_branch_is_refreshed() {
+        let code = r#"
+const v = require('vscode');
+exports.activate = (context) => {
+  const changes = new v.EventEmitter();
+  const a = {label:'A'}, b = {label:'B'}, child = {label:'Child'};
+  const tree = v.window.createTreeView('demo', { treeDataProvider: {
+    onDidChangeTreeData: changes.event,
+    getChildren: (parent) => parent ? [child] : [a, b],
+    getTreeItem: (node) => Object.assign(new v.TreeItem(node.label, node === a ? 1 : 0), {
+      id: node.label, command: {command:'choose',arguments:[node.label]},
+    }),
+  }});
+  tree.onDidChangeSelection(({selection}) => console.log('selected', selection[0].label));
+  tree.onDidExpandElement(({element}) => console.log('expanded', element.label));
+  tree.onDidChangeVisibility(({visible}) => console.log('visible', visible));
+  context.subscriptions.push(tree);
+  v.commands.registerCommand('choose', (label) => console.log('chosen', label));
+  v.commands.registerCommand('refresh', () => { changes.fire(); tree.title = 'New title'; });
+};
+"#;
+        let Some((host, told, dir)) = hosted("vscode-trees", code) else {
+            return;
+        };
+        host.request("activate", json!({}), SOON).unwrap();
+        let roots = host
+            .request("view.children", json!({"id":"demo"}), SOON)
+            .unwrap();
+        let a = &roots[0]["key"];
+        let b_action = &roots[1]["run"];
+        assert_eq!(roots[0]["label"], "A");
+        let child = host
+            .request("view.children", json!({"id":"demo", "node":a}), SOON)
+            .unwrap();
+        host.request("view.children", json!({"id":"demo", "node":a}), SOON)
+            .unwrap();
+        // Refreshing A neither renumbers B's callback nor forgets its node.
+        host.request("view.run", json!({"id":"demo", "run":b_action}), SOON)
+            .unwrap();
+        heard(
+            &told,
+            |told| matches!(told, Told::Log { text, .. } if text == "chosen B"),
+        );
+        host.request(
+            "view.run",
+            json!({"id":"demo", "run":child[0]["run"]}),
+            SOON,
+        )
+        .unwrap();
+        heard(
+            &told,
+            |told| matches!(told, Told::Log { text, .. } if text == "chosen Child"),
+        );
+        host.request(
+            "view.expand",
+            json!({"id":"demo", "node":a, "open":true}),
+            SOON,
+        )
+        .unwrap();
+        heard(
+            &told,
+            |told| matches!(told, Told::Log { text, .. } if text == "expanded A"),
+        );
+        host.request("view.visible", json!({"id":"demo", "visible":true}), SOON)
+            .unwrap();
+        heard(
+            &told,
+            |told| matches!(told, Told::Log { text, .. } if text == "visible true"),
+        );
+        host.request("executeCommand", json!({"id":"refresh"}), SOON)
+            .unwrap();
+        heard(
+            &told,
+            |told| matches!(told, Told::Said { method, params } if method == "view" && params["title"] == "New title"),
+        );
+        host.request("deactivate", json!({}), SOON).unwrap();
+        assert_eq!(
+            host.request("view.children", json!({"id":"demo"}), SOON),
+            Ok(json!([]))
+        );
+        host.stop();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn source_control_tests_and_file_decorators_send_their_native_model() {
+        let code = r#"
+const v = require('vscode');
+exports.activate = (context) => {
+  const oldControl = v.scm.createSourceControl('demo', 'Old changes');
+  const control = v.scm.createSourceControl('demo', 'Changes', v.Uri.file('/project'));
+  oldControl.dispose();
+  control.inputBox.value = 'Recorded';
+  const group = control.createResourceGroup('modified', 'Modified');
+  group.resourceStates = [{resourceUri:v.Uri.file('/project/one.rs'), command:{command:'commit'}}];
+  control.acceptInputCommand = {command:'commit',title:'Commit'};
+  v.commands.registerCommand('commit', () => console.log('commit',control.inputBox.value));
+  const oldTests = v.tests.createTestController('demo','Old tests');
+  const tests = v.tests.createTestController('demo','Tests');
+  oldTests.dispose();
+  tests.resolveHandler = (parent) => {
+    if (parent) parent.children.add(tests.createTestItem('child','Child'));
+    else { const test = tests.createTestItem('suite','Suite'); test.canResolveChildren = true; tests.items.add(test); }
+  };
+  tests.createRunProfile('Run',v.TestRunProfileKind.Run,(request) => {
+    const run = tests.createTestRun(request,'Once');
+    const item = request.include ? request.include[0] : tests.items.get('suite');
+    run.started(item); run.failed(item, new v.TestMessage('Expected one\nFound two'),2);
+    run.appendOutput('ran\r\n'); run.end();
+  },true);
+  context.subscriptions.push(control, tests, v.window.registerFileDecorationProvider({
+    provideFileDecoration:(uri) => ({badge:'M',tooltip:uri.fsPath}),
+  }));
+};
+"#;
+        let Some((host, told, dir)) = hosted("vscode-view-models", code) else {
+            return;
+        };
+        host.request("activate", json!({}), SOON).unwrap();
+        let roots = host
+            .request("view.children", json!({"id":"scm:demo"}), SOON)
+            .unwrap();
+        assert_eq!(roots[0]["label"], "Recorded");
+        let resources = host
+            .request(
+                "view.children",
+                json!({"id":"scm:demo","node":roots[2]["key"]}),
+                SOON,
+            )
+            .unwrap();
+        assert_eq!(resources[0]["label"], "one.rs");
+        host.request(
+            "view.run",
+            json!({"id":"scm:demo","run":resources[0]["run"]}),
+            SOON,
+        )
+        .unwrap();
+        heard(
+            &told,
+            |told| matches!(told, Told::Log { text, .. } if text == "commit Recorded"),
+        );
+        let roots = host
+            .request("view.children", json!({"id":"tests:demo"}), SOON)
+            .unwrap();
+        assert_eq!(roots[0]["label"], "Run all");
+        assert_eq!(roots[1]["label"], "Suite");
+        let children = host
+            .request(
+                "view.children",
+                json!({"id":"tests:demo","node":roots[1]["key"]}),
+                SOON,
+            )
+            .unwrap();
+        assert_eq!(children[0]["label"], "Child");
+        host.request(
+            "view.run",
+            json!({"id":"tests:demo","run":roots[1]["actions"][0]["run"]}),
+            SOON,
+        )
+        .unwrap();
+        let roots = host
+            .request("view.children", json!({"id":"tests:demo"}), SOON)
+            .unwrap();
+        assert_eq!(roots[1]["mark"], "Failed");
+        assert_eq!(roots[1]["description"], "Expected one");
+        assert_eq!(roots[1]["tooltip"], "Expected one\nFound two");
+        let badges = host
+            .request(
+                "files.decorate",
+                json!({"uris":["file:///project/one.rs"]}),
+                SOON,
+            )
+            .unwrap();
+        assert_eq!(badges[0]["badge"], "M");
+        host.request("deactivate", json!({}), SOON).unwrap();
+        assert_eq!(
+            host.request(
+                "files.decorate",
+                json!({"uris":["file:///project/one.rs"]}),
+                SOON
+            ),
+            Ok(json!([]))
+        );
+        host.stop();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

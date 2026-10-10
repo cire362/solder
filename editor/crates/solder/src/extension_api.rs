@@ -244,6 +244,8 @@ pub enum ExtensionEvent {
     Asked,
     /// What extensions show in the status bar changed.
     Bar,
+    Views,
+    Files,
 }
 
 impl EventEmitter<ExtensionEvent> for ExtensionStore {}
@@ -259,6 +261,8 @@ struct Followed {
 /// extensions put on screen.
 #[derive(Default)]
 pub struct Api {
+    pub(crate) files: crate::extension_decorations::Files,
+    pub(crate) views: BTreeMap<(String, String), crate::extension_views::View>,
     /// The windows' workspaces and their folders, the one in front first.
     workspaces: Vec<(WeakEntity<Workspace>, PathBuf)>,
     _front: Option<Subscription>,
@@ -763,6 +767,9 @@ impl ExtensionStore {
 
     /// Everything of an extension that was on screen goes with its code.
     pub(crate) fn clear_shown(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.clear_extension_decorations(id, cx);
+        self.api.views.retain(|(owner, _), _| owner != id);
+        cx.emit(ExtensionEvent::Views);
         let (status, progress) = (self.api.status.len(), self.api.progress.len());
         self.api.status.retain(|(of, _), _| of != id);
         self.api.progress.retain(|(of, _), _| of != id);
@@ -1044,6 +1051,10 @@ impl ExtensionStore {
     pub(crate) fn said(&mut self, id: &str, method: &str, params: Value, cx: &mut Context<Self>) {
         let text = |value: &Value| value.as_str().map(str::to_string);
         match method {
+            "decorations" | "decorations.gone" | "files.provider" | "files.changed" => {
+                self.decoration_said(id, method, params, cx)
+            }
+            "view" | "view.changed" => self.view_said(id, method, params, cx),
             // An answer of the language server its host is, or something
             // that server says on its own.
             "lsp" => {

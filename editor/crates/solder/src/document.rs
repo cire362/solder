@@ -140,7 +140,11 @@ pub struct Document {
     /// Sorted by start.
     diagnostics: Arc<Vec<Diagnostic>>,
     /// Sorted by where they are.
+    server_inlays: Arc<Vec<Inlay>>,
     inlays: Arc<Vec<Inlay>>,
+    decorations:
+        std::collections::BTreeMap<(String, String), Vec<crate::extension_decorations::Decoration>>,
+    decoration_ranges: Vec<crate::extension_decorations::Decoration>,
     /// What a language server says each word is, sorted, none over
     /// another. Counted so that what was drawn from it can be told stale.
     semantic: Arc<Vec<(Range<usize>, syntax::HighlightKind)>>,
@@ -173,7 +177,10 @@ impl Document {
             indent_unit,
             was_dirty: false,
             diagnostics: Arc::default(),
+            server_inlays: Arc::default(),
             inlays: Arc::default(),
+            decorations: Default::default(),
+            decoration_ranges: Vec::new(),
             semantic: Arc::default(),
             semantic_generation: 0,
             diff_base: None,
@@ -422,11 +429,67 @@ impl Document {
         &self.inlays
     }
 
+    pub fn decorations(&self) -> &[crate::extension_decorations::Decoration] {
+        &self.decoration_ranges
+    }
+
+    pub fn set_decorations(
+        &mut self,
+        owner: &str,
+        kind: &str,
+        decorations: Vec<crate::extension_decorations::Decoration>,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (owner.to_string(), kind.to_string());
+        if decorations.is_empty() {
+            self.decorations.remove(&key);
+        } else {
+            self.decorations.insert(key, decorations);
+        }
+        self.rebuild_decorations();
+        cx.emit(DocumentEvent::HintsChanged);
+        cx.notify();
+    }
+
+    pub fn clear_decorations(&mut self, owner: &str, kind: Option<&str>, cx: &mut Context<Self>) {
+        let before = self.decorations.len();
+        self.decorations
+            .retain(|(of, name), _| of != owner || kind.is_some_and(|kind| kind != name));
+        if before != self.decorations.len() {
+            self.rebuild_decorations();
+            cx.emit(DocumentEvent::HintsChanged);
+            cx.notify();
+        }
+    }
+
+    fn rebuild_decorations(&mut self) {
+        self.decoration_ranges = self.decorations.values().flatten().cloned().collect();
+        self.decoration_ranges
+            .sort_by_key(|decoration| decoration.range.start);
+        let mut inlays = (*self.server_inlays).clone();
+        for decoration in &self.decoration_ranges {
+            for (offset, text) in [
+                (decoration.range.start, &decoration.before),
+                (decoration.range.end, &decoration.after),
+            ] {
+                if let Some(text) = text {
+                    inlays.push(Inlay {
+                        offset,
+                        text: text.clone(),
+                    });
+                }
+            }
+        }
+        inlays.sort_by_key(|inlay| inlay.offset);
+        self.inlays = Arc::new(inlays);
+    }
+
     pub fn set_inlays(&mut self, mut inlays: Vec<Inlay>, cx: &mut Context<Self>) {
         inlays.retain(|inlay| !inlay.text.is_empty());
         inlays.sort_by_key(|inlay| inlay.offset);
-        if *self.inlays != inlays {
-            self.inlays = Arc::new(inlays);
+        if *self.server_inlays != inlays {
+            self.server_inlays = Arc::new(inlays);
+            self.rebuild_decorations();
             cx.emit(DocumentEvent::HintsChanged);
             cx.notify();
         }
@@ -608,16 +671,23 @@ impl Document {
         }
         // The same for what a server draws into the text: it stays with
         // the code it is about until the server answers again.
-        if !self.inlays.is_empty() {
+        if !self.server_inlays.is_empty() {
             let moved = self
-                .inlays
+                .server_inlays
                 .iter()
                 .map(|inlay| Inlay {
                     offset: map_offset(inlay.offset, &edits),
                     text: inlay.text.clone(),
                 })
                 .collect();
-            self.inlays = Arc::new(moved);
+            self.server_inlays = Arc::new(moved);
+        }
+        for decoration in self.decorations.values_mut().flatten() {
+            decoration.range = map_offset(decoration.range.start, &edits)
+                ..map_offset(decoration.range.end, &edits);
+        }
+        if !self.server_inlays.is_empty() || !self.decorations.is_empty() {
+            self.rebuild_decorations();
         }
         if !self.semantic.is_empty() {
             let moved = self

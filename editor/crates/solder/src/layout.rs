@@ -94,6 +94,7 @@ pub enum Panel {
     Api,
     Ai,
     Extensions,
+    ExtensionViews,
     Chat,
     Agent,
     /// The terminals: each has a tab of its own where this panel is.
@@ -126,7 +127,7 @@ impl Place {
 }
 
 impl Panel {
-    pub const ALL: [Panel; 14] = [
+    pub const ALL: [Panel; 15] = [
         Panel::Files,
         Panel::Search,
         Panel::Git,
@@ -135,6 +136,7 @@ impl Panel {
         Panel::Api,
         Panel::Ai,
         Panel::Extensions,
+        Panel::ExtensionViews,
         Panel::Chat,
         Panel::Agent,
         Panel::Terminal,
@@ -154,6 +156,7 @@ impl Panel {
             Panel::Api => "API",
             Panel::Ai => "AI",
             Panel::Extensions => "Extensions",
+            Panel::ExtensionViews => "Views",
             Panel::Chat => "Chat",
             Panel::Agent => "Agent",
             Panel::Terminal => "Terminal",
@@ -174,6 +177,7 @@ impl Panel {
             Panel::Api => "api",
             Panel::Ai => "ai",
             Panel::Extensions => "extensions",
+            Panel::ExtensionViews => "extension_views",
             Panel::Chat => "chat",
             Panel::Agent => "agent",
             Panel::Terminal => "terminal",
@@ -1854,13 +1858,23 @@ mod tests {
     #[test]
     fn every_panel_is_in_one_dock_or_hidden() {
         use Panel::*;
-        // As it comes: eight on the left, the chat and the agent on the
+        // As it comes: nine on the left, the chat and the agent on the
         // right, the terminals, the debugger and the two kinds of answers
         // at the bottom, none hidden.
         let standard = Layout::default();
         assert_eq!(
             standard.left.panels,
-            [Files, Search, Git, Services, Database, Api, Ai, Extensions]
+            [
+                Files,
+                Search,
+                Git,
+                Services,
+                Database,
+                Api,
+                Ai,
+                Extensions,
+                ExtensionViews
+            ]
         );
         assert_eq!(standard.right.panels, [Chat, Agent]);
         assert_eq!(standard.bottom.panels, [Terminal, Debug, Response, Results]);
@@ -1883,7 +1897,15 @@ mod tests {
         .unwrap();
         assert_eq!(
             layout.left.panels,
-            [Chat, Git, Files, Services, Database, Extensions]
+            [
+                Chat,
+                Git,
+                Files,
+                Services,
+                Database,
+                Extensions,
+                ExtensionViews
+            ]
         );
         assert_eq!(layout.right.panels, [Search, Terminal]);
         assert_eq!(layout.bottom.panels, [Agent, Debug, Response, Results]);
@@ -1909,11 +1931,11 @@ mod tests {
         assert_eq!(parse(&file(&layout)).unwrap(), layout);
         // A dock can be emptied: everything it had is elsewhere.
         let empty = parse(
-            r#"{ "right": { "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions", "chat", "agent"] } }"#,
+            r#"{ "right": { "panels": ["files", "search", "git", "services", "database", "api", "ai", "extensions", "extension_views", "chat", "agent"] } }"#,
         )
         .unwrap();
         assert!(empty.left.panels.is_empty());
-        assert_eq!(empty.right.panels.len(), 10);
+        assert_eq!(empty.right.panels.len(), 11);
         assert_eq!(empty.bottom.panels.len(), 4);
     }
 }

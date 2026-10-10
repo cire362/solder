@@ -174,8 +174,24 @@ class TextEditor {
   revealRange(range) {
     this._core.notify('reveal', { uri: this.document.uri.toString(), range: toRange(range).toJSON() });
   }
-  setDecorations() {
-    this._core.missing('TextEditor.setDecorations');
+  // What is drawn over these ranges: a background, and words before or
+  // after them that are no part of the file.
+  setDecorations(type, rangesOrOptions) {
+    const ranges = (rangesOrOptions || []).map((one) => {
+      const own = one.renderOptions || {};
+      return {
+        range: toRange(one.range || one).toJSON(),
+        before: own.before && own.before.contentText,
+        after: own.after && own.after.contentText,
+      };
+    });
+    this._core.notify('decorations', {
+      uri: this.document.uri.toString(),
+      version: this.document.version,
+      type: type.key,
+      options: type._options,
+      ranges,
+    });
   }
   show() {}
   hide() {}

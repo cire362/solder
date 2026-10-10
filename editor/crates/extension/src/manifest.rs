@@ -164,6 +164,9 @@ pub struct Extension {
     pub menus: Vec<MenuItem>,
     /// The keys it binds to them, the ones for this machine.
     pub keys: Vec<KeyContribution>,
+    /// The views it names for the sidebar, each by its id and its title:
+    /// its code says what is in them.
+    pub views: Vec<(String, String)>,
 }
 
 /// A command a VS Code extension's code has, as its manifest names it for
@@ -650,6 +653,7 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         contributed: Vec::new(),
         menus: Vec::new(),
         keys: Vec::new(),
+        views: Vec::new(),
     })
 }
 
@@ -1085,6 +1089,23 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
             None => unbound += 1,
         }
     }
+    // The views it names, wherever VS Code would put them: Solder has one
+    // place for them all.
+    let mut views: Vec<(String, String)> = Vec::new();
+    for (_, listed) in contributes["views"].as_object().into_iter().flatten() {
+        for view in listed.as_array().into_iter().flatten() {
+            let id = text(&view["id"]);
+            // One drawn as a web page is not a tree.
+            if id.is_empty()
+                || view["type"] == "webview"
+                || views.iter().any(|(known, _)| *known == id)
+            {
+                continue;
+            }
+            let name = label(&text(&view["name"]));
+            views.push((id.clone(), if name.is_empty() { id } else { name }));
+        }
+    }
     if unbound > 0 {
         missing.push(match unbound {
             1 => "A key binding (a key Solder cannot bind)".to_string(),
@@ -1122,6 +1143,7 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         contributed,
         menus,
         keys,
+        views,
         servers: Vec::new(),
         debug_adapters: Vec::new(),
         context_servers: Vec::new(),

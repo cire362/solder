@@ -101,6 +101,7 @@ pub struct ProjectPanel {
     edit: Option<EditState>,
     _edit_subscription: Option<Subscription>,
     tints: std::collections::HashMap<PathBuf, crate::git_store::Tint>,
+    _decorations: Option<Subscription>,
 }
 
 const ROW: Pixels = px(24.);
@@ -140,6 +141,13 @@ fn read_dir(dir: &Path, depth: usize) -> Vec<Entry> {
 impl ProjectPanel {
     pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
         let entries = read_dir(&root, 0);
+        let decorations = crate::extension_store::ExtensionStore::try_global(cx).map(|store| {
+            cx.subscribe(&store, |_, _, event, cx| {
+                if matches!(event, crate::extension_api::ExtensionEvent::Files) {
+                    cx.notify();
+                }
+            })
+        });
         Self {
             root,
             focus_handle: cx.focus_handle(),
@@ -150,6 +158,7 @@ impl ProjectPanel {
             edit: None,
             _edit_subscription: None,
             tints: Default::default(),
+            _decorations: decorations,
         }
     }
 
@@ -735,6 +744,13 @@ impl Render for ProjectPanel {
                     cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
                         let theme = cx.theme().clone();
                         let rows = this.display_rows();
+                        let paths = range
+                            .clone()
+                            .filter_map(|row_ix| {
+                                rows[row_ix].map(|ix| this.entries[ix].path.clone())
+                            })
+                            .collect();
+                        crate::extension_decorations::ask_visible(paths, cx);
                         range
                             .map(|row_ix| {
                                 let row = rows[row_ix];
@@ -860,6 +876,33 @@ impl Render for ProjectPanel {
                                                 .child(icon),
                                         )
                                     })
+                                    .children(
+                                        path.as_deref()
+                                            .into_iter()
+                                            .flat_map(|path| {
+                                                crate::extension_store::ExtensionStore::try_global(
+                                                    cx,
+                                                )
+                                                .map(|store| store.read(cx).file_marks(path))
+                                                .unwrap_or_default()
+                                            })
+                                            .enumerate()
+                                            .map(|(i, mark)| {
+                                                div()
+                                                    .id(("extension-file-mark", row_ix * 100 + i))
+                                                    .text_size(crate::theme::UI_FONT_SMALL)
+                                                    .text_color(theme.fg_subtle)
+                                                    .child(mark.badge)
+                                                    .when_some(mark.tooltip, |d, tooltip| {
+                                                        d.tooltip(move |_, cx| {
+                                                            cx.new(|_| {
+                                                                crate::ui::Tooltip(tooltip.clone())
+                                                            })
+                                                            .into()
+                                                        })
+                                                    })
+                                            }),
+                                    )
                                     .child(label)
                                     .when_some(row, |d, ix| {
                                         d.on_mouse_down(

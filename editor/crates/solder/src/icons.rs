@@ -241,6 +241,7 @@ pub fn panel(panel: Panel) -> &'static str {
         Panel::Api => "plugs",
         Panel::Ai => "sparkle",
         Panel::Extensions => "puzzle-piece",
+        Panel::ExtensionViews => "puzzle-piece",
         Panel::Chat => "chat-circle",
         Panel::Agent => "robot",
         Panel::Terminal => "terminal-window",

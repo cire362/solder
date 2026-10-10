@@ -267,8 +267,13 @@ to build them.
       task is a command in one, listed by **Run extension task**. Not
       there: terminals and tasks that are the extension's own code (`pty`,
       `CustomExecution`), and problem matchers
-- [ ] Source control providers, views in the sidebar (trees), decorations and
-      test controllers
+- [x] Source control providers, views in the sidebar (trees), decorations and
+      test controllers. **Show extension views** opens native lists in any
+      dock: open branches lazily, run commands, edit source-control input,
+      run test profiles and show their results. Decorations: file badges,
+      text backgrounds and words before/after ranges. Not there yet: tree
+      checkboxes and programmatic reveal, source-control quick diffs, test
+      coverage and cancellation, arbitrary CSS decoration styles
 - [ ] Webviews, custom editors and notebooks. They need a browser view inside
       the window, which GPUI does not have; decided when the rest is done
 - [ ] A check that runs with each release: the most installed extensions of

@@ -18,6 +18,7 @@ const buildApi = require('./api');
 const buildLanguages = require('./languages');
 const buildDebug = require('./debug');
 const buildShell = require('./shell');
+const buildViews = require('./views');
 
 const { Disposable, EventEmitter, Uri } = types.classes;
 
@@ -153,6 +154,29 @@ const shell = buildShell(core);
 Object.assign(built.told, shell.told);
 Object.defineProperties(built.window, Object.getOwnPropertyDescriptors(shell.windowMembers));
 built.workspace.createFileSystemWatcher = shell.createFileSystemWatcher;
+// Trees in the sidebar, and the two things shown as trees there.
+const views = buildViews(core);
+Object.defineProperties(built.window, Object.getOwnPropertyDescriptors(views.windowMembers));
+// What is drawn over the text of a file. A kind of decoration is made
+// once and then put on ranges, file by file.
+let nextDecoration = 1;
+built.window.createTextEditorDecorationType = (options = {}) => {
+  for (const name of Object.keys(options)) {
+    if (!['backgroundColor', 'isWholeLine', 'before', 'after'].includes(name)) missing(`TextEditorDecorationType.${name}`);
+  }
+  const tint = (value) => (value && typeof value === 'object' ? { theme: value.id } : value);
+  const key = `d${nextDecoration++}`;
+  return {
+    key,
+    _options: {
+      background: tint(options.backgroundColor),
+      wholeLine: !!options.isWholeLine,
+      before: options.before && options.before.contentText,
+      after: options.after && options.after.contentText,
+    },
+    dispose: () => notify('decorations.gone', { type: key }),
+  };
+};
 
 const vscode = {
   // Extensions and their libraries refuse a VS Code older than they
@@ -162,9 +186,13 @@ const vscode = {
   ...languages.classes,
   ...debugging.classes,
   ...shell.classes,
+  ...views.classes,
   ...types.enums,
   ...debugging.enums,
   ...shell.enums,
+  ...views.enums,
+  scm: views.scm,
+  tests: views.tests,
   languages: languages.languages,
   debug: debugging.debug,
   tasks: shell.tasks,
@@ -327,7 +355,7 @@ const handlers = {
   },
 };
 
-Object.assign(handlers, debugging.asked, shell.asked);
+Object.assign(handlers, debugging.asked, shell.asked, views.asked);
 
 async function handle(message) {
   if (message.method === undefined) {

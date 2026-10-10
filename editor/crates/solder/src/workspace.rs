@@ -95,6 +95,7 @@ actions!(
         ShowAi,
         ShowPlugins,
         ShowExtensions,
+        ShowExtensionViews,
         ImportSettings,
         ToggleChat,
         ShowAgent,
@@ -235,6 +236,7 @@ pub struct Workspace {
     api_panel: Entity<crate::api_panel::ApiPanel>,
     ai_panel: Entity<crate::ai_panel::AiPanel>,
     extensions_panel: Entity<crate::extensions_panel::ExtensionsPanel>,
+    extension_views: Entity<crate::extension_views::ExtensionViews>,
     chat: Entity<crate::chat_panel::ChatPanel>,
     agent: Entity<crate::agent_panel::AgentPanel>,
     /// Pushes started, for tests: the terminal running one may be gone.
@@ -414,9 +416,13 @@ impl Workspace {
                 window,
                 |this, _, event, window, cx| match event {
                     crate::extension_api::ExtensionEvent::Asked => this.extension_asks(window, cx),
-                    crate::extension_api::ExtensionEvent::Bar => cx.notify(),
+                    crate::extension_api::ExtensionEvent::Bar
+                    | crate::extension_api::ExtensionEvent::Views
+                    | crate::extension_api::ExtensionEvent::Files => cx.notify(),
                 },
             );
+        let extension_views =
+            cx.new(|cx| crate::extension_views::ExtensionViews::new(extensions.clone(), cx));
         let extensions_panel =
             cx.new(|cx| crate::extensions_panel::ExtensionsPanel::new(extensions, cx));
         let weak = cx.entity().downgrade();
@@ -766,6 +772,7 @@ impl Workspace {
             api_panel: api_panel.clone(),
             ai_panel,
             extensions_panel,
+            extension_views,
             chat,
             agent,
             #[cfg(test)]
@@ -1614,6 +1621,7 @@ impl Workspace {
             Panel::Api => self.api_panel.focus_handle(cx),
             Panel::Ai => self.ai_panel.focus_handle(cx),
             Panel::Extensions => self.extensions_panel.focus_handle(cx),
+            Panel::ExtensionViews => self.extension_views.focus_handle(cx),
             Panel::Chat => self.chat.focus_handle(cx),
             Panel::Agent => self.agent.focus_handle(cx),
             Panel::Debug => self.debug_panel.focus_handle(cx),
@@ -2172,6 +2180,9 @@ impl Workspace {
     /// Tells the panels what the docks show now: the one that came into
     /// view reads what it shows, and services stop watching when unseen.
     fn tell_panels(&mut self, now: Option<Panel>, cx: &mut Context<Self>) {
+        let visible = self.shown(Panel::ExtensionViews);
+        self.extension_views
+            .update(cx, |p, cx| p.set_visible(visible, cx));
         let visible = self.shown(Panel::Services);
         self.services.update(cx, |s, cx| s.set_visible(visible, cx));
         match now {
@@ -3103,6 +3114,16 @@ impl Workspace {
         self.toggle_modal(window, cx, move |_, cx| {
             crate::plugins_view::PluginsView::new(store, cx)
         });
+    }
+
+    fn show_extension_views(
+        &mut self,
+        _: &ShowExtensionViews,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_panel(Panel::ExtensionViews, cx);
+        window.focus(&self.extension_views.focus_handle(cx));
     }
 
     fn show_extensions(&mut self, _: &ShowExtensions, window: &mut Window, cx: &mut Context<Self>) {
@@ -4625,6 +4646,9 @@ impl Workspace {
                             Panel::Api => this.show_api(&ShowApi, window, cx),
                             Panel::Ai => this.show_ai(&ShowAi, window, cx),
                             Panel::Extensions => this.show_extensions(&ShowExtensions, window, cx),
+                            Panel::ExtensionViews => {
+                                this.show_extension_views(&ShowExtensionViews, window, cx)
+                            }
                             Panel::Chat => this.show_right(false, window, cx),
                             Panel::Agent => this.show_right(true, window, cx),
                             _ => {}
@@ -4705,6 +4729,7 @@ impl Workspace {
                     Panel::Api => d.pt_1().child(self.api_panel.clone()),
                     Panel::Ai => d.pt_1().child(self.ai_panel.clone()),
                     Panel::Extensions => d.pt_1().child(self.extensions_panel.clone()),
+                    Panel::ExtensionViews => d.child(self.extension_views.clone()),
                     Panel::Chat => d.pt_1().child(self.chat.clone()),
                     Panel::Agent => d.pt_1().child(self.agent.clone()),
                     Panel::Debug => d.child(self.debug_panel.clone()),
@@ -5322,6 +5347,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_agent))
             .on_action(cx.listener(Self::show_plugins))
             .on_action(cx.listener(Self::show_extensions))
+            .on_action(cx.listener(Self::show_extension_views))
             .on_action(cx.listener(Self::import_settings))
             .on_action(cx.listener(Self::debug_start))
             .on_action(cx.listener(Self::debug_pick))
@@ -15251,7 +15277,16 @@ exports.activate = (context) => {
         drag(cx, "panel-files", "panel-database");
         assert_eq!(
             layout(cx).left.panels,
-            [Search, Services, Files, Database, Api, Ai, Extensions]
+            [
+                Search,
+                Services,
+                Files,
+                Database,
+                Api,
+                Ai,
+                Extensions,
+                ExtensionViews
+            ]
         );
         assert_eq!(docks(cx).0, Some(Files));
         // Onto a tab of another dock: before it there, and shown there.
@@ -15831,5 +15866,145 @@ exports.activate = (context) => {
         });
         start(cx);
         assert!(cx.read(|cx| mcp.read(cx).servers.is_empty()));
+    }
+    #[gpui::test]
+    fn native_extension_views_load_expand_run_refresh_and_clear_decorations(
+        cx: &mut TestAppContext,
+    ) {
+        let Some(node) = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        }) else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let _languages = extension_languages();
+        let (_config, store, ws, cx) =
+            extension_setup(cx, "ext-native-views", "http://127.0.0.1:1");
+        let installed = cx.read(|cx| store.read(cx).root.join("vscode/acme.views"));
+        write_file(
+            &installed.join("package.json"),
+            r#"{
+          "name":"views", "publisher":"Acme", "version":"1.0.0", "main":"main.js",
+          "contributes":{"views":{"explorer":[{"id":"demo","name":"Demo tree"}]}}
+        }"#,
+        );
+        write_file(
+            &installed.join("main.js"),
+            r#"
+const v = require('vscode');
+exports.activate = (context) => {
+  const changes = new v.EventEmitter();
+  const root = {label:'Root'}, child = {label:'Child'};
+  const tree = v.window.createTreeView('demo', { treeDataProvider: {
+    onDidChangeTreeData: changes.event,
+    getChildren: (node) => node ? [child] : [root],
+    getTreeItem: (node) => Object.assign(new v.TreeItem(node.label,node === root ? 1 : 0), {
+      id: node === root ? 'root' : 'child', command:{command:'demo.choose',arguments:[node.label]},
+    }),
+  }});
+  v.commands.registerCommand('demo.choose', (label) => { child.label = 'Updated'; changes.fire(); console.log('chosen',label); });
+  const tests = v.tests.createTestController('demo','Tests');
+  const test = tests.createTestItem('one','A long test name that leaves enough room for its complete action'); tests.items.add(test);
+  tests.createRunProfile('Run', v.TestRunProfileKind.Run, (request) => {
+    const run = tests.createTestRun(request); run.passed(test); run.end();
+  }, true);
+  const control = v.scm.createSourceControl('demo','Changes');
+  control.createResourceGroup('modified','Modified').resourceStates = [
+    {resourceUri:v.workspace.textDocuments[0].uri,command:{command:'demo.choose',arguments:['file']}},
+  ];
+  const kind = v.window.createTextEditorDecorationType({backgroundColor:new v.ThemeColor('editor.findMatchHighlightBackground'), after:{contentText:' annotation'}});
+  const editor = v.window.activeTextEditor;
+  editor.setDecorations(kind,[new v.Range(0,0,0,1)]);
+  context.subscriptions.push(tree, tests, control, kind, v.window.registerFileDecorationProvider({provideFileDecoration: () => ({badge:'M',tooltip:'Changed by extension'})}));
+};
+"#,
+        );
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.scan(cx);
+        });
+        wait_for(cx, "the manifest", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.views").is_some()
+        });
+        store.update(cx, |store, cx| {
+            store.allow(Origin::VsCode, "Acme.views", cx)
+        });
+        cx.dispatch_action(ShowExtensionViews);
+        click(cx, "extension-view-0");
+        let panel = cx.read(|cx| ws.read(cx).extension_views.clone());
+        wait_for(cx, "the tree's root", &|cx| panel.read(cx).has("Root"));
+        // The same native list lives in any dock its layout names.
+        assert!(cx.read(|cx| ws.read(cx).shown(Panel::ExtensionViews)));
+        let root = cx.read(|cx| panel.read(cx).index("Root").unwrap());
+        panel.update(cx, |panel, cx| panel.pick(root, cx));
+        wait_for(cx, "the child", &|cx| panel.read(cx).has("Child"));
+        let child = cx.read(|cx| panel.read(cx).index("Child").unwrap());
+        panel.update(cx, |panel, cx| panel.pick(child, cx));
+        wait_for(cx, "the refreshed child", &|cx| {
+            panel.read(cx).has("Updated")
+        });
+        assert!(cx.read(|cx| !panel.read(cx).has("Child")));
+        let tests = cx.read(|cx| panel.read(cx).index("Tests").unwrap());
+        cx.update(|_, cx| {
+            let mut layout = Layout::get(cx).clone();
+            layout.left.width = 280.;
+            cx.set_global(layout);
+        });
+        ws.update(cx, |_, cx| cx.notify());
+        panel.update(cx, |panel, cx| panel.pick(tests, cx));
+        wait_for(cx, "the controller's tests", &|cx| {
+            panel
+                .read(cx)
+                .has("A long test name that leaves enough room for its complete action")
+        });
+        let test = cx.read(|cx| {
+            panel
+                .read(cx)
+                .index("A long test name that leaves enough room for its complete action")
+                .unwrap()
+        });
+        // GPUI keeps debug selectors in a static callback even in a single test.
+        let selector = Box::leak(format!("extension-view-action-{test}-0").into_boxed_str());
+        let action = bounds_soon(cx, selector);
+        let dock = bounds_soon(cx, "dock-left");
+        assert!(action.left() >= dock.left());
+        assert!(
+            action.right() <= dock.right(),
+            "{action:?} outside {dock:?}"
+        );
+        let all = cx.read(|cx| panel.read(cx).index("Run all").unwrap());
+        panel.update(cx, |panel, cx| panel.pick(all, cx));
+        wait_for(cx, "the test to pass", &|cx| {
+            panel.read(cx).has_mark("Passed")
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        wait_for(cx, "the text annotation", &|cx| {
+            !editor.read(cx).doc(cx).decorations().is_empty()
+        });
+        assert!(cx.read(|cx| {
+            editor
+                .read(cx)
+                .doc(cx)
+                .inlays()
+                .iter()
+                .any(|inlay| inlay.text == " annotation")
+        }));
+        let file = cx.read(|cx| editor.read(cx).doc(cx).path().unwrap().to_path_buf());
+        store.update(cx, |store, cx| store.decorate_files(vec![file.clone()], cx));
+        wait_for(cx, "the file badge", &|cx| {
+            !store.read(cx).file_marks(&file).is_empty()
+        });
+        store.update(cx, |store, cx| {
+            store.set_off(Origin::VsCode, "Acme.views", true, cx)
+        });
+        wait_for(cx, "its views and decorations to go", &|cx| {
+            store.read(cx).views().is_empty() && editor.read(cx).doc(cx).decorations().is_empty()
+        });
+        assert!(cx.read(|cx| store.read(cx).file_marks(&file).is_empty()));
+        assert!(cx.read(|cx| editor.read(cx).doc(cx).inlays().is_empty()));
     }
 }

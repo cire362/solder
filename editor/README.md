@@ -908,6 +908,26 @@ What is in the module today is what every extension starts from:
 | Watch files | `createFileSystemWatcher`, for the folders of the open windows: files made, changed and deleted, but for `.git` and `node_modules` |
 | Give language features in code (`vscode.languages`) | Completions, hovers, definitions, references, rename, formatting, code actions, document and project symbols, signature help, inlay hints, semantic colors, and diagnostics from its collections. A code lens is offered among the code actions of its line (`cmd-.`), not drawn above it |
 
+**Show extension views** opens the **Views** panel. Trees an extension names
+are listed before its code starts; choosing one starts the approved code.
+Source control groups and test controllers appear when registered. The
+panel moves between docks through `layout.json` (`extension_views`) like
+Files or Git. Open branches load on demand; Refresh keeps those branches
+open and replaces their contents. Arrow keys move and expand, Enter opens
+or runs a node, and Cmd+Enter (Ctrl+Enter on Linux) runs its first test
+profile. Profile buttons also run and debug individual tests. Failed test
+messages are in the row and its tooltip; output is in the extension's log.
+
+Source control has an editable message and the command the provider gave
+it, then groups of files and their commands. File-decoration providers are
+asked only for visible file-tree entries. Text decorations support hex and
+known theme background colors, whole-line backgrounds and text before or
+after a range. UTF-16 positions are converted and ranges follow edits.
+Disposing a decoration type or disabling the extension removes its marks
+without removing a language server's hints. Tree checkboxes, programmatic
+reveal, source-control quick diffs, test coverage and cancellation, and
+other CSS decoration styles are not implemented yet.
+
 None of this costs anything while no extension's code runs: documents and
 cursors are followed only once a host is up.
 

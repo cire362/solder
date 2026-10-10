@@ -654,6 +654,31 @@ fn layout(
     }
 
     let mut highlights = Vec::new();
+    for decoration in doc
+        .decorations()
+        .iter()
+        .take_while(|decoration| decoration.range.start <= visible.end)
+    {
+        if decoration.range.end < visible.start {
+            continue;
+        }
+        if let Some(color) = theme.decoration(&decoration.background) {
+            if decoration.whole_line {
+                let start = buffer.offset_to_point(decoration.range.start).row;
+                let end = buffer.offset_to_point(decoration.range.end).row;
+                for row in start.max(first_row)..=end.min(end_row - 1) {
+                    highlights.push(fill(
+                        Bounds::new(point(text_left, row_y(row)), size(text_width, lh)),
+                        color,
+                    ));
+                }
+            } else {
+                for rect in range_rects(decoration.range.clone()) {
+                    highlights.push(fill(rect, color));
+                }
+            }
+        }
+    }
     let matches = editor.search_matches.clone();
     let first_match = matches.partition_point(|m| m.end < visible.start);
     for (i, m) in matches.iter().enumerate().skip(first_match) {

@@ -1200,13 +1200,28 @@ impl ExtensionStore {
             Some(code) => code.started.clone(),
             None => return Task::ready(Err(format!("{id} has no code to ask"))),
         };
+        let executor = cx.background_executor().clone();
         cx.background_executor().spawn(async move {
             let host = started.await.unwrap_or_else(|_| Err(STOPPED.into()))?;
             let (tx, rx) = oneshot::channel();
-            host.ask(method, params, move |answer| {
+            let id = host.ask(method, params, move |answer| {
                 let _ = tx.send(answer);
             });
-            rx.await.unwrap_or_else(|_| Err(STOPPED.into()))
+            // Read-only providers can return a never-resolving promise while
+            // their host still answers pings. Commands may wait for input.
+            if matches!(method, "view.children" | "view.refresh" | "files.decorate") {
+                match futures::future::select(rx, executor.timer(Duration::from_secs(30))).await {
+                    futures::future::Either::Left((answer, _)) => {
+                        answer.unwrap_or_else(|_| Err(STOPPED.into()))
+                    }
+                    futures::future::Either::Right(_) => {
+                        host.cancel(id);
+                        Err("The extension did not answer. Restart its code in Extensions.".into())
+                    }
+                }
+            } else {
+                rx.await.unwrap_or_else(|_| Err(STOPPED.into()))
+            }
         })
     }
 
