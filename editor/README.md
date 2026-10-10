@@ -997,6 +997,18 @@ are not built in: a generic renderer module does not make every Jupyter
 widget or the Jupyter extension compatible. Outputs opened in a separate
 tab are transient and are reopened from the notebook, not restored as pages.
 
+Published notebook extensions have not yet been tried. The isolated census
+workflow accepts an exact version, for example `vscode.ipynb@1.95.3`, and
+checks activation, reading a sample `.ipynb` and saving its cell back. This
+checks a serializer, not a kernel or every notebook feature. Locally this
+path is tested against a catalog served by the test itself, with code
+written for that test.
+
+Live macOS check on 2026-10-10: typed into a Jupyter cell, saved and checked
+the file; opened its HTML table and a renderer counter; clicked the counter
+and received its extension's reply; restarted the project and saw the saved
+notebook again. The renderer in that check was written here, not downloaded.
+
 Files, split panes, cursors, scroll positions and notebook tabs are remembered
 per project in `sessions/` beside the settings. Pages of extensions return
 through `registerWebviewPanelSerializer`, with the last `setState` value;

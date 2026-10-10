@@ -292,7 +292,9 @@ to build them.
       Open VSX are installed, activated and asked for their main feature, and
       the result is the list of what works. `extension-census`, run by the
       **Extensions of Open VSX** workflow on a release or by hand; tested
-      against a catalog served locally. It has not been run against Open
+      against a catalog served locally. An exact extension version can be
+      selected; notebook readers are asked to read and save a sample `.ipynb`.
+      It has not been run against Open
       VSX itself yet: it runs the code of third parties, so its first list
       is the first run of the workflow, not something made on a
       developer's machine
