@@ -80,8 +80,12 @@ Status: `[x]` done, `[~]` partial, `[ ]` not started.
 - [x] Context servers for the agent (MCP): servers named in `settings.json`
       are started with a task, their tools are offered to the model next to
       the agent's own, and the first call of each waits for the user
-- [ ] Context servers reached over the network (HTTP), and what a server has
-      besides tools: prompts and resources
+- [x] Context servers reached over the network (HTTP), and what a server has
+      besides tools: prompts and resources. An address and headers in place
+      of a command (streamable HTTP; the older two-connection way and
+      signing in through a browser are not there). Resources are two more
+      tools for the agent; prompts are chosen by the user and put in the
+      agent's field
 
 ## 7. Debugger, plugins, onboarding
 - [x] Debugger over DAP; one session across browser and server; query timeline
@@ -164,8 +168,9 @@ to build them.
 - [x] Completion labels as the extension paints them
       (`labels-for-completions`): colored as code in the file's language,
       with the typed word matched against the part that is the name
-- [ ] Symbol labels (`labels-for-symbols`). The editor has no list of a
-      file's or a project's symbols to paint them in; it comes with one
+- [x] Symbol labels (`labels-for-symbols`), in the lists of a file's and of
+      the project's symbols, which came with them (the first item of
+      "Symbols and problems" in phase 10)
 - [x] The languages Zed builds in and so does not list in its catalog (C,
       C++, Markdown, YAML, shell): built in here too, as grammars in the
       binary, with the servers Zed has for them (clangd, yaml-language-server)
@@ -180,43 +185,54 @@ to build them.
       granted or refused per extension (Zed's capabilities): commands, npm,
       downloads and single hosts, each taken back or given again in the
       extension's details
-- [ ] A time limit for a grammar's scanner, which today can hold a parse.
+- [x] A time limit for a grammar's scanner, which could hold a parse.
       tree-sitter 0.26 makes the WebAssembly store itself and has no way to
       put a deadline on it (with interruption turned on in the engine, its
-      store would trap at once). What is left is to reach into its store, to
-      parse such grammars off the UI thread and give up on one that hangs,
-      or to change tree-sitter. Decided on 2026-10-05: left open until
-      tree-sitter has a way of its own, as Zed has no such limit either
+      store would trap at once), so a scanner cannot be stopped. Decided
+      again on 2026-10-10: an extension's grammar parses on a thread of its
+      own, whoever asked waits no longer than it can, and a grammar that has
+      not answered in ten seconds is given up on until the editor starts
+      again. The thread it holds stays held: that is the price
 - [x] Debug adapters of extensions, in the debugger: the open file with
       each adapter its language names, started as the extension says, over
       a port or the adapter's own input and output
-- [ ] Which of a language's servers start. Every server an extension lists
-      for a language is started today, and Ruby's lists eight: the user's
-      choice per language (`language_servers`, with `!name` to leave one
-      out), and Zed's defaults for the languages that need them
+- [x] Which of a language's servers start. Every server an extension lists
+      for a language was started, and Ruby's lists seven for Ruby: the
+      user's choice per language (`languages.<name>.language_servers`, with
+      `!name` to leave one out and `...` for the rest), and Zed's defaults
+      for the languages whose extensions bring alternatives
 - [x] Context servers of extensions, in the agent. They are MCP servers
       (context7, GitHub and Postgres are the most installed): the extension
       says how to start one and reads the user's settings for it, and the
       agent uses its tools like those of a server named in `settings.json`
 - [ ] Each new version of Zed's API as it is published (0.8 is the next;
-      0.7.0 was still the newest on 2026-10-05)
+      0.7.0 was still the newest on 2026-10-10, so there is nothing to add)
 
 ### VS Code extensions: what needs no code
-- [ ] TextMate grammars: highlighting for the languages only VS Code has an
-      extension for (needs a regular expression engine with look-behind,
-      which is a dependency to decide on)
-- [ ] Language configuration: brackets, pairs that close themselves, comments,
-      indentation rules, and which files are which language
-- [ ] Themes in the old `.tmTheme` format
+- [x] TextMate grammars: highlighting for the languages only VS Code has an
+      extension for. A tokenizer of Solder's own on `fancy-regex` (agreed
+      on 2026-10-10), a line at a time, read again only as far as a change
+      reaches; such a language has colors and no tree
+- [x] Language configuration: brackets, pairs that close themselves, comments,
+      indentation rules, and which files are which language (by endings
+      and names; not by a first line or a pattern that is more than an
+      ending)
+- [x] Themes in the old `.tmTheme` format: a property list, read by a
+      reader of Solder's own into what a JSON theme says
 - [x] Icon themes, through the same file icons as Zed's: the ones drawn
       with pictures, by a file's name, ending and language and a folder's
       name. One drawn with a font is said not to run here
-- [ ] The settings an extension declares, with their defaults, in
-      `settings.json`
-- [ ] Debuggers an extension declares with a program to start, in the
-      debugger
-- [ ] The build for this machine when an extension has one per platform, and
-      the extensions it depends on or packs, installed with it
+- [x] The settings an extension declares, with their defaults, in
+      `settings.json`: kept there under their own names, listed in the
+      Extensions tab with what each is now, and resolved to one object as
+      an extension's code will ask for them
+- [x] Debuggers an extension declares with a program to start, in the
+      debugger: for the files of the languages they name, started with the
+      launch the manifest suggests. One only its code starts is said not
+      to run here
+- [x] The build for this machine when an extension has one per platform, and
+      the extensions it depends on or packs, installed with it. The catalog
+      is asked for this platform first; parts of VS Code itself are left out
 
 ### VS Code extensions: their code
 - [ ] An extension host: a Node process next to the editor that loads
@@ -320,11 +336,11 @@ file, so the two never disagree. It starts after the Zed items of phase 8.
 - [x] Every color in the window comes from a token a theme can set: the ones
       still written in code become tokens. They were the terminal's sixteen;
       themes from VS Code and Zed bring theirs
-- [~] Shapes as tokens next to colors: the radii, the spacing, the width of
-      borders. The radii and the width of borders are (`shapes` in a theme
-      file and in `theme_overrides`). Spacing is not a theme's: it is in
-      rems like the text, so it follows `ui_font_size`, and a token of its
-      own would need every text size to know of it
+- [x] Shapes as tokens next to colors: the radii, the spacing, the width of
+      borders (`shapes` in a theme file and in `theme_overrides`). Spacing
+      is a number to multiply by. Gaps and text are both in rems, so a text
+      size is a type of its own that leaves the spacing out where it
+      becomes a length
 - [x] A theme file is applied as it is saved, and any token can be set in
       `settings.json` on top of the theme in use (`theme_overrides`)
 
@@ -354,8 +370,10 @@ update. They come after phase 9, in this order unless one is needed sooner.
       to edit opened for reading, with the reason said
 
 ### Symbols and problems
-- [ ] Symbols of the file (`cmd-shift-o`) and of the project (`cmd-t`), from
-      the language server, painted as an extension says (`labels-for-symbols`)
+- [x] Symbols of the file (`cmd-shift-o`) and of the project (`cmd-t`), from
+      the language server, painted as an extension says (`labels-for-symbols`).
+      Done ahead of the rest of the block, to close the item of phase 8. A
+      file with no server that lists them has its language's outline
 - [ ] A Structure panel: the file's outline, from the server or from the
       language's outline query
 - [ ] A Problems panel: every diagnostic of the project, by file

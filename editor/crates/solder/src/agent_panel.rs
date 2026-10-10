@@ -69,6 +69,13 @@ impl AgentPanel {
         self.input.clone()
     }
 
+    /// Says what went wrong with something done for the task from
+    /// outside the panel.
+    pub fn failed(&mut self, error: String, cx: &mut Context<Self>) {
+        self.error = Some(error.into());
+        cx.notify();
+    }
+
     pub fn shown(&mut self, cx: &mut Context<Self>) {
         self.store.update(cx, |s, cx| {
             s.load(cx);

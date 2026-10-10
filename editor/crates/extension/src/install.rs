@@ -568,8 +568,15 @@ mod tests {
         assert_eq!(installed.id, "Acme.demo");
         assert_eq!(installed.name, "Acme Demo");
         assert_eq!(installed.code, Code::Node);
-        assert_eq!(installed.themes.len(), 1);
-        assert_eq!(installed.themes[0].name, "Acme Dark");
+        // Its themes, the one in TextMate's old format too.
+        let themes: Vec<&str> = installed.themes.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(themes, ["Acme Dark", "Acme Old"]);
+        let old = &installed.themes[1];
+        assert_eq!(old.appearance, "dark");
+        assert_eq!(old.colors["bg"], "#272822");
+        assert_eq!(old.colors["selection"], "#49483e");
+        assert_eq!(old.syntax["comment"], "#75715e");
+        assert_eq!(old.syntax["keyword"], "#f92672");
         // One file for two languages; the one outside the folder is ignored.
         assert_eq!(installed.snippets.len(), 1);
         assert_eq!(
@@ -581,7 +588,34 @@ mod tests {
         assert_eq!(language.suffixes, ["dm", "Demofile"]);
         assert_eq!(language.aliases, ["demo", "Demo Lang"]);
         assert_eq!(language.line_comment.as_deref(), Some("#"));
+        // Its grammar is TextMate's, by the name it goes by, and its
+        // configuration says how it is typed.
         assert!(language.grammar.is_none());
+        let (grammar, scope) = language.textmate.as_ref().unwrap();
+        assert!(grammar.ends_with("demo.tmLanguage.json") && grammar.is_file());
+        assert_eq!(scope, "source.demo");
+        assert_eq!(installed.grammars.len(), 1);
+        assert_eq!(
+            language.block_comment,
+            Some(("/*".to_string(), "*/".to_string()))
+        );
+        let pairs: Vec<_> = language
+            .pairs
+            .iter()
+            .map(|p| (p.start.as_str(), p.end.as_str(), p.close, p.newline))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("{", "}", true, true),
+                // A bracket the file does not let close itself.
+                ("(", ")", false, true),
+                ("\"", "\"", true, false),
+            ]
+        );
+        assert_eq!(language.pairs[2].not_in, ["string", "comment"]);
+        assert_eq!(language.increase_indent.as_deref(), Some(r"\{\s*$"));
+        assert_eq!(language.decrease_indent.as_deref(), Some(r"^\s*\}"));
         // Its icon theme, and the same for a light background, since it
         // draws some files differently there. The one drawn with a font
         // is said to be missing.
@@ -602,16 +636,34 @@ mod tests {
         assert_eq!(
             installed.missing,
             [
-                "1 of its themes (not in the JSON format)",
+                "1 of its themes (could not be read)",
                 "An icon theme (drawn with a font, or not readable)",
-                "Highlighting (a TextMate grammar)",
                 "Its code, which needs VS Code",
                 "Key bindings for its commands",
             ]
         );
         assert_eq!(
             installed.provides(),
-            "1 theme, 2 icon themes, 1 snippet file"
+            "2 themes, 2 icon themes, 1 snippet file"
+        );
+        // The settings it declares, each with what it is by default; one
+        // declared twice is the first.
+        let settings: Vec<_> = installed
+            .settings
+            .iter()
+            .map(|s| (s.key.as_str(), s.default.clone(), s.description.as_str()))
+            .collect();
+        assert_eq!(
+            settings,
+            [
+                ("acme.format", serde_json::json!(true), "Formats on save."),
+                (
+                    "acme.lint.level",
+                    serde_json::json!(2),
+                    "How strict the linter is"
+                ),
+                ("acme.name", serde_json::Value::Null, ""),
+            ]
         );
     }
 

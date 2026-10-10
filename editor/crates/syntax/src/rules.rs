@@ -158,7 +158,7 @@ pub struct Indent {
 impl SyntaxTree {
     /// Whether the language at `offset` has a say on indentation at all.
     pub fn indents_at(&self, offset: usize) -> bool {
-        let (language, _) = self.tree_at(offset);
+        let language = self.language_at(offset);
         language.rules().indents.is_some()
             || language
                 .editing()
@@ -173,7 +173,14 @@ impl SyntaxTree {
         let above = line.above_row;
         let mut from_above = increase;
         let mut back_to: Option<usize> = None;
-        let (language, tree) = self.tree_at(line.cut);
+        // With no tree, the two patterns are all there is to go by.
+        let Some((language, tree)) = self.tree_at(line.cut) else {
+            return Indent {
+                row: above,
+                levels: i8::from(increase) - i8::from(decrease),
+                in_error: false,
+            };
+        };
         if let Some(indents) = &language.rules().indents {
             // A range starts and ends at a byte. One that is the end of a
             // node stays with the row above when the cut falls right on it;
@@ -314,14 +321,30 @@ impl SyntaxTree {
                 return Some(Some(pair));
             }
         }
-        let (language, _) = self.tree_at(offset);
+        let language = self.language_at(offset);
         language.rules().brackets.as_ref().map(|_| None)
     }
 
     /// Whether `offset` is inside one of the scopes the language's
     /// `overrides.scm` gives names to: `string`, `comment`.
     pub fn in_scope(&self, rope: &Rope, offset: usize, scopes: &[String]) -> bool {
-        let (language, tree) = self.tree_at(offset);
+        // A language colored line by line says where it is by the
+        // color there: what is a string or a comment is in one.
+        if let Some(lines) = &self.lines {
+            let mut at = Vec::new();
+            lines.highlights(rope, offset.saturating_sub(1)..offset + 1, &mut at);
+            return at.iter().any(|(range, kind)| {
+                let name = match kind {
+                    crate::HighlightKind::String => "string",
+                    crate::HighlightKind::Comment => "comment",
+                    _ => return false,
+                };
+                range.start < offset && offset <= range.end && scopes.iter().any(|s| s == name)
+            });
+        }
+        let Some((language, tree)) = self.tree_at(offset) else {
+            return false;
+        };
         let Some(overrides) = &language.rules().overrides else {
             return false;
         };

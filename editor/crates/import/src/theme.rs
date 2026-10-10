@@ -75,6 +75,7 @@ pub const SHAPES: &[&str] = &[
     "control_radius",
     "token_radius",
     "border_width",
+    "spacing",
 ];
 
 /// The terminal's colors, in the order programs number them.
@@ -552,8 +553,38 @@ pub fn from_vscode(name: &str, theme: &Value, ui_theme: Option<&str>) -> Option<
 }
 
 /// Reads a VS Code theme file, following `include`; blocking.
+/// A theme in TextMate's own format, as the JSON one says the same: the
+/// entry with no scope gives the colors of the editor, the others color
+/// what their scopes name.
+fn from_tm_theme(list: &Value) -> Option<Value> {
+    let mut colors = serde_json::Map::new();
+    let mut rules = Vec::new();
+    for entry in list["settings"].as_array()? {
+        if entry.get("scope").is_some() {
+            rules.push(entry.clone());
+            continue;
+        }
+        for (theirs, ours) in [
+            ("background", "editor.background"),
+            ("foreground", "editor.foreground"),
+            ("selection", "editor.selectionBackground"),
+            ("lineHighlight", "editor.lineHighlightBackground"),
+        ] {
+            if let Some(color) = entry["settings"][theirs].as_str() {
+                colors.insert(ours.to_string(), color.into());
+            }
+        }
+    }
+    Some(serde_json::json!({ "colors": colors, "tokenColors": rules }))
+}
+
 fn read_vscode(path: &Path, depth: usize) -> Option<Value> {
-    let mut theme = jsonc::parse(&std::fs::read_to_string(path).ok()?).ok()?;
+    let source = std::fs::read_to_string(path).ok()?;
+    // The old format is a property list, whatever the file is called.
+    if source.trim_start().starts_with('<') {
+        return from_tm_theme(&crate::plist::parse(&source).ok()?);
+    }
+    let mut theme = jsonc::parse(&source).ok()?;
     let included = theme["include"].as_str().map(str::to_string);
     if let Some(include) = included.filter(|_| depth < 4)
         && let Some(base) = read_vscode(&path.parent()?.join(include), depth + 1)

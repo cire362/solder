@@ -78,6 +78,9 @@ actions!(
         SaveKeyLayout,
         OpenKeyLayout,
         ResetLayout,
+        UseContextPrompt,
+        GoToSymbol,
+        GoToProjectSymbol,
         SplitRight,
         FocusNextPane,
         FocusPrevPane,
@@ -118,6 +121,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-p", ToggleCommandPalette, None),
         KeyBinding::new("f1", ToggleCommandPalette, None),
         KeyBinding::new("secondary-p", ToggleFileFinder, None),
+        KeyBinding::new("secondary-shift-o", GoToSymbol, None),
+        KeyBinding::new("secondary-t", GoToProjectSymbol, None),
         KeyBinding::new("ctrl-g", GoToLine, Some("Editor")),
         KeyBinding::new("secondary-f", Find, None),
         KeyBinding::new("secondary-alt-f", FindReplace, None),
@@ -653,15 +658,14 @@ impl Workspace {
             ),
             cx.observe_window_appearance(window, |_, window, cx| {
                 let theme = Settings::get(cx).theme(window.appearance());
-                cx.set_global(theme);
+                crate::theme::put(theme, window, cx);
                 window.refresh();
             }),
             // Settings changed: the theme mode may have too, and the size
             // of the interface's text.
             cx.observe_global_in::<Settings>(window, |_, window, cx| {
                 let theme = Settings::get(cx).theme(window.appearance());
-                cx.set_global(theme);
-                window.set_rem_size(Settings::get(cx).rem_size());
+                crate::theme::put(theme, window, cx);
                 window.refresh();
             }),
         ];
@@ -690,7 +694,7 @@ impl Workspace {
                 }
             }
         });
-        window.set_rem_size(Settings::get(cx).rem_size());
+        crate::theme::fit(window, cx);
         // The docks start on the panels they were left on. The terminals,
         // the debugger and the answers have nothing to show yet, so a dock
         // left on one of them starts closed.
@@ -2475,6 +2479,102 @@ impl Workspace {
 
     fn show_agent(&mut self, _: &ShowAgent, window: &mut Window, cx: &mut Context<Self>) {
         self.show_right(true, window, cx);
+    }
+
+    /// The symbols of the file in front, to go to one.
+    fn go_to_symbol(&mut self, _: &GoToSymbol, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(document) = self.active_editor().map(|e| e.read(cx).document().clone()) else {
+            return;
+        };
+        let Some((path, source)) = crate::symbols::file_of(&document, cx) else {
+            return;
+        };
+        let asked =
+            LspStore::global(cx).and_then(|store| store.read(cx).document_symbols(&document));
+        let workspace = cx.weak_entity();
+        self.toggle_modal(window, cx, move |window, cx| {
+            let picker = Picker::new(crate::symbols::Symbols::of_file(workspace), window, cx);
+            crate::symbols::Symbols::load_file(asked, path, source, window, cx);
+            picker
+        });
+    }
+
+    /// The symbols of the project, as its language servers find them
+    /// for the name being typed.
+    fn go_to_project_symbol(
+        &mut self,
+        _: &GoToProjectSymbol,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (workspace, root) = (cx.weak_entity(), self.root(cx));
+        self.toggle_modal(window, cx, move |window, cx| {
+            Picker::new(
+                crate::symbols::Symbols::of_project(workspace, root),
+                window,
+                cx,
+            )
+        });
+    }
+
+    /// Lists the prompts of the context servers, to put one in the
+    /// agent's field. The servers start for it as they do for a task.
+    fn use_context_prompt(
+        &mut self,
+        _: &UseContextPrompt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let root = self.root(cx);
+        let starting = crate::mcp_store::McpStore::global(cx)
+            .update(cx, |store, cx| store.start_all(&root, cx));
+        let workspace = cx.weak_entity();
+        self.toggle_modal(window, cx, move |window, cx| {
+            let picker = Picker::new(crate::context_prompts::Prompts::new(workspace), window, cx);
+            crate::context_prompts::Prompts::load(starting, window, cx);
+            picker
+        });
+    }
+
+    /// Asks for what the chosen prompt still has to be told, one thing
+    /// at a time from `asked` on; then the server writes the prompt and
+    /// it goes into the agent's field, for the user to read and send.
+    pub fn fill_prompt(
+        &mut self,
+        chosen: crate::mcp_store::ServerPrompt,
+        told: Vec<(String, String)>,
+        asked: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if asked < chosen.prompt.arguments.len() {
+            let workspace = cx.weak_entity();
+            self.toggle_modal(window, cx, move |window, cx| {
+                let line = crate::context_prompts::Told::new(workspace, chosen, told, asked);
+                Picker::new(line, window, cx)
+            });
+            return;
+        }
+        self.show_right(true, window, cx);
+        let agent = self.agent.clone();
+        let writing = cx
+            .background_executor()
+            .spawn(async move { chosen.text(&told) });
+        cx.spawn(async move |_, cx| {
+            let written = writing.await;
+            agent
+                .update(cx, |agent, cx| match written {
+                    Ok(text) => {
+                        let text = crate::context_prompts::one_line(&text);
+                        agent
+                            .input()
+                            .update(cx, |input, cx| input.set_text(&text, false, cx));
+                    }
+                    Err(error) => agent.failed(error, cx),
+                })
+                .ok();
+        })
+        .detach();
     }
 
     /// Shows the chat or the agent, in the dock it is in, and focuses its
@@ -4389,6 +4489,16 @@ impl Workspace {
                 if self.project.read(cx).is_scanning() {
                     parts.push(says("Indexing files...".into()));
                 }
+                // An extension's grammar that stopped answering: its
+                // files are plain text until the editor starts again.
+                for language in syntax::hung_grammars() {
+                    parts.push(BarPart {
+                        text: format!("{language} grammar hung: no highlighting until restart"),
+                        id: None,
+                        color: Some(theme.warning),
+                        action: None,
+                    });
+                }
                 parts
             }
             Item::Connection => {
@@ -4793,6 +4903,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_key_layout))
             .on_action(cx.listener(Self::open_key_layout))
             .on_action(cx.listener(Self::reset_layout))
+            .on_action(cx.listener(Self::use_context_prompt))
+            .on_action(cx.listener(Self::go_to_symbol))
+            .on_action(cx.listener(Self::go_to_project_symbol))
             .on_action(cx.listener(Self::split_right))
             .on_action(cx.listener(Self::focus_next_pane))
             .on_action(cx.listener(Self::focus_prev_pane))
@@ -5148,6 +5261,133 @@ mod tests {
         assert_eq!(active_text(&ws, cx), ">> abc");
     }
 
+    #[gpui::test]
+    fn symbols_of_a_file_and_of_the_project_are_listed_to_go_to(cx: &mut TestAppContext) {
+        use crate::symbols::Symbols;
+        let root = fixture("lsp-symbols");
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        let file = root.join("src/main.rs");
+        let other = root.join("src/lib.rs");
+        std::fs::write(&file, "fn helper() {}\n\nfn main() {\n    helper();\n}\n").unwrap();
+        std::fs::write(&other, "// a library\npub fn mainly() {}\n").unwrap();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        // What the list shows, and where the cursor of the file in front is.
+        let shown = |cx: &mut VisualTestContext| -> Vec<(String, String, Option<String>)> {
+            cx.read(|cx| {
+                let modal = ws.read(cx).modal.as_ref()?;
+                let picker = modal.view.clone().downcast::<Picker<Symbols>>().ok()?;
+                Some(picker.read(cx).delegate.shown())
+            })
+            .unwrap_or_default()
+        };
+        let listed = |cx: &mut VisualTestContext, names: &[&str]| {
+            for _ in 0..400 {
+                cx.run_until_parked();
+                let now: Vec<String> = shown(cx).into_iter().map(|row| row.0).collect();
+                if now == names {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the list never showed {names:?}, but {:?}", shown(cx));
+        };
+        let at = |cx: &mut VisualTestContext| {
+            cx.read(|cx| {
+                let editor = ws.read(cx).active_editor().unwrap().read(cx);
+                let (line, column, _) = editor.cursor_position(cx);
+                (editor.path(cx).map(Path::to_path_buf), line, column)
+            })
+        };
+
+        // With no server that lists them (the language's is turned off
+        // here), a file's symbols are the ones its outline finds.
+        cx.update(|_, cx| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "rust-analyzer".into(),
+                settings::ServerOverride {
+                    disabled: true,
+                    ..Default::default()
+                },
+            );
+            cx.set_global(settings);
+        });
+        ws.update_in(cx, |w, window, cx| {
+            let content = std::fs::read_to_string(&file).unwrap();
+            w.add_editor(Some(file.clone()), &content, None, window, cx)
+        });
+        cx.simulate_keystrokes("secondary-shift-o");
+        listed(cx, &["helper", "main"]);
+        assert_eq!(shown(cx)[0].1, "fn");
+        cx.simulate_input("mai");
+        listed(cx, &["main"]);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+        assert_eq!(at(cx), (Some(file.clone()), 3, 1));
+
+        // With a server, they are the server's, each with what it is in.
+        cx.update(|_, cx| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "rust-analyzer".into(),
+                settings::ServerOverride {
+                    command: Some("python3".into()),
+                    args: Some(vec![script.display().to_string()]),
+                    ..Default::default()
+                },
+            );
+            cx.set_global(settings);
+        });
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(other.clone(), None, window, cx)
+        });
+        let document = |cx: &App| {
+            ws.read(cx)
+                .active_editor()
+                .unwrap()
+                .read(cx)
+                .document()
+                .clone()
+        };
+        wait_for(cx, "the server", &|cx| {
+            LspStore::global(cx)
+                .is_some_and(|store| store.read(cx).document_symbols(&document(cx)).is_some())
+        });
+        cx.simulate_keystrokes("secondary-shift-o");
+        listed(cx, &["crate", "mainly"]);
+        assert_eq!(shown(cx)[1].1, "crate");
+        cx.simulate_input("mainly");
+        listed(cx, &["mainly"]);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        // The name itself is selected, not the line it is on.
+        assert_eq!(at(cx), (Some(other.clone()), 2, 14));
+
+        // The project's symbols are asked of the servers as the name is
+        // typed, and say which file each is in. Going to one opens it.
+        cx.simulate_keystrokes("secondary-t");
+        cx.simulate_input("mainl");
+        listed(cx, &["mainly"]);
+        assert_eq!(shown(cx)[0].1, "crate  src/lib.rs:2");
+        cx.simulate_keystrokes("escape");
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(file.clone(), None, window, cx)
+        });
+        wait_for(cx, "the first file at the server", &|cx| {
+            LspStore::global(cx)
+                .is_some_and(|store| store.read(cx).document_symbols(&document(cx)).is_some())
+        });
+        cx.simulate_keystrokes("secondary-t");
+        cx.simulate_input("main");
+        listed(cx, &["main", "mainly"]);
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        assert_eq!(at(cx), (Some(other), 2, 14));
+    }
+
     /// Runs the real client against `tests/fixtures/mock_lsp.py` over stdio.
     #[gpui::test]
     fn language_server_features(cx: &mut TestAppContext) {
@@ -5361,7 +5601,17 @@ mod tests {
     }
 
     fn wait_for(cx: &mut VisualTestContext, what: &str, f: &dyn Fn(&App) -> bool) {
-        for _ in 0..500 {
+        wait_for_with_timeout(cx, what, Duration::from_secs(5), f);
+    }
+
+    fn wait_for_with_timeout(
+        cx: &mut VisualTestContext,
+        what: &str,
+        patience: Duration,
+        f: &dyn Fn(&App) -> bool,
+    ) {
+        let deadline = Instant::now() + patience;
+        while Instant::now() < deadline {
             // Debounce timers run on the test executor's virtual clock.
             cx.executor().advance_clock(Duration::from_millis(50));
             cx.run_until_parked();
@@ -5370,7 +5620,18 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        panic!("timed out waiting for {what}");
+        let lsp =
+            cx.read(|cx| LspStore::global(cx).and_then(|store| store.read(cx).status().cloned()));
+        let debugger = cx.read(|cx| {
+            crate::debug::DebugStore::try_global(cx).map(|store| {
+                let store = store.read(cx);
+                (store.state.clone(), store.console.last().cloned())
+            })
+        });
+        panic!(
+            "timed out waiting for {what} after {patience:?}; \
+             language server: {lsp:?}; debugger: {debugger:?}"
+        );
     }
 
     /// Where an element is, once it is on screen.
@@ -8745,6 +9006,132 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_context_server_over_http_has_tools_resources_and_prompts(cx: &mut TestAppContext) {
+        use crate::mcp_store::{McpStore, State};
+        use std::io::BufRead;
+        // The stand-in server, on a port of its own on this machine.
+        struct Ended(std::process::Child);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../ai/tests/fixtures/mock_mcp_http.py");
+        let mut mock = Ended(
+            std::process::Command::new("python3")
+                .arg(script)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut port = String::new();
+        std::io::BufReader::new(mock.0.stdout.take().unwrap())
+            .read_line(&mut port)
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}/mcp", port.trim());
+
+        let root = db::testing::dir("ws-mcp-http").canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "plain\n").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        // In the settings it is an address and a key, not a command.
+        let settings = serde_json::json!({ "context_servers": {
+            "notes": { "url": url, "headers": { "Authorization": "Bearer t" } },
+        } });
+        cx.update(|_, cx| cx.set_global(settings::parse_settings(&settings.to_string()).unwrap()));
+
+        // The list of prompts starts the servers, as a task does.
+        cx.dispatch_action(UseContextPrompt);
+        let store = cx.update(|_, cx| McpStore::global(cx));
+        wait_for(cx, "the server", &|cx| {
+            matches!(
+                store.read(cx).servers.first().map(|entry| &entry.state),
+                Some(State::Running(..) | State::Failed(_))
+            )
+        });
+        let offer = cx.read(|cx| match &store.read(cx).servers[0].state {
+            State::Running(_, offer) => offer.clone(),
+            State::Failed(why) => panic!("{why}"),
+            _ => unreachable!(),
+        });
+        assert_eq!(offer.tools.len(), 2);
+        assert_eq!(offer.prompts.len(), 2);
+        assert_eq!(offer.resources.len(), 2);
+
+        // What it has to read is two more tools for the agent, next to
+        // its own.
+        let tools = cx.read(|cx| store.read(cx).tools());
+        let names: Vec<&str> = tools.iter().map(|tool| tool.spec.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "mcp_notes_echo",
+                "mcp_notes_slow",
+                "mcp_notes_list_resources",
+                "mcp_notes_read_resource"
+            ]
+        );
+        let run = |name: &str, input: serde_json::Value| {
+            tools
+                .iter()
+                .find(|tool| tool.spec.name == name)
+                .unwrap()
+                .run(input)
+        };
+        assert_eq!(
+            run("mcp_notes_echo", serde_json::json!({ "text": "hi" })),
+            ("hi".into(), false)
+        );
+        let (listed, failed) = run("mcp_notes_list_resources", serde_json::json!({}));
+        assert!(!failed);
+        assert_eq!(
+            listed,
+            "notes://today (Today): What is planned\nnotes://logo"
+        );
+        assert_eq!(
+            run(
+                "mcp_notes_read_resource",
+                serde_json::json!({ "uri": "notes://today" })
+            ),
+            ("Ship the layout.".into(), false)
+        );
+        assert!(run("mcp_notes_read_resource", serde_json::json!({})).1);
+        // The user is shown what such a call is before allowing it.
+        let read = tools.iter().find(|tool| tool.tool == "read resource");
+        assert!(
+            read.unwrap()
+                .shown(&serde_json::json!({ "uri": "notes://today" }))
+                .starts_with("read resource of notes")
+        );
+
+        // A prompt is chosen from the list and told what it needs: one
+        // thing that must be said, one that may be left out. What the
+        // server writes goes into the agent's field, for the user to send.
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        cx.simulate_input("review");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        // Nothing typed for what must be said: the line stays.
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        cx.simulate_input("main");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).modal.is_some()));
+        cx.simulate_keystrokes("enter");
+        let field = |cx: &App| ws.read(cx).agent.read(cx).input().read(cx).text(cx);
+        wait_for(cx, "the prompt", &|cx| !field(cx).is_empty());
+        assert_eq!(cx.read(|cx| field(cx)), "Review main. Be kind.");
+        assert!(cx.read(|cx| ws.read(cx).modal.is_none()));
+        assert_eq!(cx.read(|cx| ws.read(cx).right), Some(Panel::Agent));
+    }
+
+    #[gpui::test]
     fn the_agent_uses_a_context_servers_tools_after_asking(cx: &mut TestAppContext) {
         use crate::agent_task::{Entry, Status};
         // The model calls one tool of a context server twice, then another,
@@ -10740,7 +11127,112 @@ brackets = [
     }
 
     #[gpui::test]
+    fn a_pack_of_extensions_brings_what_it_is_made_of(cx: &mut TestAppContext) {
+        // A pack: one extension that names another it is made of, and
+        // says it needs a part of VS Code itself, which no catalog has.
+        let dir = db::testing::dir("ws-ext-pack-archive");
+        let package = |folder: &str, name: &str, more: &str| {
+            let dir = dir.join(folder).join("extension");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("package.json"),
+                format!(
+                    r#"{{ "name": "{name}", "publisher": "Acme", "version": "1.0.0", "contributes": {{}}{more} }}"#
+                ),
+            )
+            .unwrap();
+        };
+        package(
+            "pack",
+            "pack",
+            r#", "extensionPack": ["Acme.member"], "extensionDependencies": ["vscode.git", "acme.member"]"#,
+        );
+        // The member needs the pack back: that ends where it began.
+        package(
+            "member",
+            "member",
+            r#", "extensionDependencies": ["Acme.pack"]"#,
+        );
+        let (Some(pack), Some(member)) = (
+            zip(&dir.join("pack"), "extension"),
+            zip(&dir.join("member"), "extension"),
+        ) else {
+            eprintln!("skipped: no python3 to build a .vsix");
+            return;
+        };
+        let (files, _) = serve(vec![
+            ("/pack.vsix", Served::ok(pack)),
+            ("/member.vsix", Served::ok(member)),
+        ]);
+        let search = format!(
+            r#"{{"extensions":[{{"namespace":"Acme","name":"pack","version":"1.0.0","files":{{"download":"{files}/pack.vsix"}}}}]}}"#
+        );
+        let found = format!(
+            r#"{{"namespace":"Acme","name":"member","version":"1.0.0","files":{{"download":"{files}/member.vsix"}}}}"#
+        );
+        let (base, requests) = serve(vec![
+            ("/api/-/search", Served::ok(search.into_bytes())),
+            ("/api/Acme/member", Served::ok(found.into_bytes())),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (_config, store, _ws, cx) = extension_setup(cx, "ext-pack", &base);
+        cx.dispatch_action(ShowExtensions);
+        wait_for(cx, "the catalog", &|cx| {
+            !store.read(cx).catalog(Origin::VsCode).entries.is_empty()
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        // The pack is installed, and then what it is made of, with no
+        // more asked of the user.
+        let both = |cx: &App| {
+            let store = store.read(cx);
+            store.find(Origin::VsCode, "Acme.pack").is_some()
+                && store.find(Origin::VsCode, "Acme.member").is_some()
+        };
+        for _ in 0..300 {
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+            if cx.read(|cx| both(cx)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            cx.read(|cx| both(cx)),
+            "installed {:?}, errors {:?}, asked {:?}",
+            cx.read(|cx| store
+                .read(cx)
+                .installed
+                .iter()
+                .map(|e| e.id.clone())
+                .collect::<Vec<_>>()),
+            cx.read(|cx| store.read(cx).errors.values().cloned().collect::<Vec<_>>()),
+            requests.lock().unwrap()
+        );
+        let pack = cx.read(|cx| store.read(cx).find(Origin::VsCode, "Acme.pack").cloned());
+        assert_eq!(pack.unwrap().needs, ["Acme.member", "vscode.git"]);
+        cx.run_until_parked();
+        let asked = requests.lock().unwrap().clone();
+        // The member was asked for once, for this machine, and the part
+        // of VS Code and the pack itself not at all.
+        let member = format!("/api/Acme/member/{}", extension::catalog::target());
+        assert_eq!(
+            asked.iter().filter(|r| **r == member).count(),
+            1,
+            "{asked:?}"
+        );
+        assert!(
+            !asked
+                .iter()
+                .any(|r| r.contains("vscode") || r.contains("/api/Acme/pack"))
+        );
+    }
+
+    #[gpui::test]
     fn a_vscode_extension_says_what_does_not_run_and_points_to_zed(cx: &mut TestAppContext) {
+        // Its language becomes one of the editor's: the set of them is
+        // one per process.
+        let _languages = extension_languages();
         let dir = db::testing::dir("ws-ext-vsx-archive");
         extension::testing::vscode_extension(&dir.join("extension"));
         let manifest = std::fs::read_to_string(dir.join("extension/package.json"))
@@ -10777,20 +11269,89 @@ brackets = [
         });
         let installed = cx.read(|cx| store.read(cx).find(Origin::VsCode, "Vue.volar").cloned());
         let installed = installed.unwrap();
-        assert_eq!(installed.themes.len(), 1);
+        assert_eq!(installed.themes.len(), 2);
         assert!(
             installed
                 .missing
                 .iter()
                 .any(|m| m.contains("needs VS Code"))
         );
-        // Its language (files ending in .dm) has no grammar here, so it is
-        // not a language of the editor. Asked of the registry and not of the
-        // open file: the registry is one per process, and the test next to
-        // this one installs Vue into it.
+        // Its language (files ending in .dm) is colored by the TextMate
+        // grammar it brings, and typed as its configuration says.
         assert_eq!(installed.languages[0].suffixes, ["dm", "Demofile"]);
-        assert!(syntax::language_for_path(Path::new("notes.dm")).is_none());
+        let language = syntax::language_for_path(Path::new("notes.dm")).unwrap();
+        assert_eq!(language.name, "Demo Lang");
         assert!(cx.read(|cx| ws.read(cx).left == Some(Panel::Extensions)));
+
+        let notes = cx.read(|cx| ws.read(cx).root(cx)).join("notes.dm");
+        std::fs::write(&notes, "if 1 # one\n").unwrap();
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(notes.clone(), None, window, cx)
+        });
+        let editor = |cx: &App| ws.read(cx).active_editor().unwrap().clone();
+        wait_for(cx, "the colors of notes.dm", &|cx| {
+            editor(cx).read(cx).path(cx) == Some(notes.as_path())
+                && editor(cx).read(cx).doc(cx).syntax().is_some()
+        });
+        let colors = cx.read(|cx| {
+            let editor = editor(cx);
+            let doc = editor.read(cx).doc(cx);
+            let rope = doc.text().rope();
+            doc.syntax()
+                .unwrap()
+                .highlights(rope, 0..rope.len_bytes())
+                .into_iter()
+                .map(|(range, kind)| (rope.byte_slice(range).to_string(), kind))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            colors,
+            [
+                ("if".to_string(), syntax::HighlightKind::Keyword),
+                ("1".to_string(), syntax::HighlightKind::Number),
+                ("# one".to_string(), syntax::HighlightKind::Comment),
+            ]
+        );
+        assert_eq!(
+            cx.read(|cx| editor(cx).read(cx).doc(cx).language_name()),
+            Some("Demo Lang")
+        );
+        // A brace closes itself, and Enter inside it goes a level in,
+        // by the configuration's pairs and its two patterns.
+        let focus = cx.read(|cx| editor(cx).focus_handle(cx));
+        cx.update(|window, _| window.focus(&focus));
+        cx.dispatch_action(crate::editor::MoveToEnd);
+        cx.simulate_input("{");
+        cx.run_until_parked();
+        let text = |cx: &mut VisualTestContext| cx.read(|cx| editor(cx).read(cx).text(cx));
+        assert_eq!(text(cx), "if 1 # one\n{}");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(text(cx), "if 1 # one\n{\n    \n}");
+        cx.dispatch_action(ShowExtensions);
+        cx.run_until_parked();
+
+        // The settings it declares are what it says by default until
+        // settings.json says otherwise, with the dots or as objects.
+        let configured = |cx: &mut VisualTestContext, section: &str| {
+            cx.read(|cx| store.read(cx).configuration(section, cx))
+        };
+        assert_eq!(
+            configured(cx, "acme"),
+            serde_json::json!({ "lint": { "level": 2 }, "format": true })
+        );
+        assert_eq!(configured(cx, "acme.lint.level"), 2);
+        assert_eq!(configured(cx, "acme.name"), serde_json::Value::Null);
+        cx.update(|_, cx| {
+            let set = r#"{ "acme.lint.level": 3, "acme": { "format": false, "name": "x" } }"#;
+            cx.set_global(settings::parse_settings(set).unwrap());
+        });
+        assert_eq!(
+            configured(cx, "acme"),
+            serde_json::json!({ "lint": { "level": 3 }, "format": false, "name": "x" })
+        );
+        assert_eq!(configured(cx, "")["acme"]["lint"]["level"], 3);
+        cx.update(|_, cx| cx.set_global(Settings::default()));
 
         // Its icon theme is drawn with pictures, so it is one Solder has:
         // the tab offers it, and chosen, files get its pictures. The one
@@ -11623,6 +12184,346 @@ brackets = [
     }
 
     #[gpui::test]
+    fn a_language_starts_the_servers_chosen_for_it(cx: &mut TestAppContext) {
+        let _languages = extension_languages();
+        // Zed's real Ruby extension, which lists seven servers for Ruby.
+        // (Its grammar here is Vue's: the test needs a language, not its
+        // colors.) None of them is on this machine, and none is needed:
+        // what is checked is which of them the file is given to.
+        let root = db::testing::dir("ws-ruby-servers").canonicalize().unwrap();
+        let app = root.join("app.rb");
+        std::fs::write(&app, "puts 1\n").unwrap();
+        let data = db::testing::dir("ws-ruby-servers-data");
+        let installed = data.join("extensions/zed/ruby");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        std::fs::create_dir_all(installed.join("grammars")).unwrap();
+        for file in ["extension.toml", "extension.wasm"] {
+            std::fs::copy(
+                fixtures.join("extension/tests/fixtures/ruby").join(file),
+                installed.join(file),
+            )
+            .unwrap();
+        }
+        std::fs::copy(
+            fixtures.join("syntax/tests/fixtures/vue/vue.wasm"),
+            installed.join("grammars/vue.wasm"),
+        )
+        .unwrap();
+        write_file(
+            &installed.join("languages/ruby/config.toml"),
+            "name = \"Ruby\"\ngrammar = \"vue\"\npath_suffixes = [\"rb\"]\n",
+        );
+        cx.executor().allow_parking();
+        let extensions = cx.update(|cx| {
+            let extensions = cx.new(|cx| {
+                let mut store =
+                    ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
+                store.world = Some(std::sync::Arc::new(ServerOnPath("nothing", String::new())));
+                store
+            });
+            ExtensionStore::set_global(extensions.clone(), cx);
+            extensions.update(cx, |s, cx| s.scan(cx));
+            extensions
+        });
+        let (ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "the extensions folder", &|cx| {
+            extensions.read(cx).loaded
+        });
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(app.clone(), None, window, cx)
+        });
+        let servers = |cx: &App| -> Vec<&'static str> {
+            let Some(editor) = ws.read(cx).active_editor() else {
+                return Vec::new();
+            };
+            let document = editor.read(cx).document().entity_id();
+            LspStore::global(cx)
+                .map(|store| store.read(cx).servers_of(document))
+                .unwrap_or_default()
+        };
+        // With nothing said, the one Zed starts for Ruby, of the seven.
+        wait_for(cx, "Ruby's server", &|cx| servers(cx) == ["solargraph"]);
+
+        // The user's choice for the language, as Zed writes it: these
+        // two in this order, and the open file goes to them at once.
+        let choose = |cx: &mut VisualTestContext, names: Option<&[&str]>| {
+            cx.update(|_, cx| {
+                let mut settings = Settings::get(cx).clone();
+                settings.languages.insert(
+                    "Ruby".into(),
+                    settings::LanguageSettings {
+                        language_servers: names
+                            .map(|names| names.iter().map(|name| name.to_string()).collect()),
+                    },
+                );
+                cx.set_global(settings);
+            });
+            cx.run_until_parked();
+        };
+        choose(cx, Some(&["ruby-lsp", "rubocop"]));
+        assert_eq!(cx.read(|cx| servers(cx)), ["ruby-lsp", "rubocop"]);
+        // One left out of all the rest.
+        choose(cx, Some(&["...", "!solargraph", "!sorbet"]));
+        assert_eq!(
+            cx.read(|cx| servers(cx)),
+            [
+                "fuzzy-ruby-server",
+                "kanayago",
+                "rubocop",
+                "ruby-lsp",
+                "steep"
+            ]
+        );
+        // A server turned off by its own name stays off whatever the
+        // language says.
+        cx.update(|_, cx| {
+            let mut settings = Settings::get(cx).clone();
+            settings.language_servers.insert(
+                "rubocop".into(),
+                settings::ServerOverride {
+                    disabled: true,
+                    ..Default::default()
+                },
+            );
+            cx.set_global(settings);
+        });
+        cx.run_until_parked();
+        assert!(!cx.read(|cx| servers(cx)).contains(&"rubocop"));
+        // Nothing said again: Zed's choice.
+        choose(cx, None);
+        assert_eq!(cx.read(|cx| servers(cx)), ["solargraph"]);
+    }
+
+    #[gpui::test]
+    fn an_extension_paints_the_symbols_its_server_lists(cx: &mut TestAppContext) {
+        use crate::symbols::Symbols;
+        let _languages = extension_languages();
+        // Zed's real Ruby extension, with `solargraph` "on the PATH" as a
+        // script that starts the stand-in server. (The grammar is Vue's:
+        // the test needs a language, not its colors.)
+        let root = db::testing::dir("ws-ruby-symbols").canonicalize().unwrap();
+        let app = root.join("app.rb");
+        std::fs::write(&app, "fn total\nfn tax\n").unwrap();
+        let data = db::testing::dir("ws-ruby-symbols-data");
+        let installed = data.join("extensions/zed/ruby");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        std::fs::create_dir_all(installed.join("grammars")).unwrap();
+        for file in ["extension.toml", "extension.wasm"] {
+            std::fs::copy(
+                fixtures.join("extension/tests/fixtures/ruby").join(file),
+                installed.join(file),
+            )
+            .unwrap();
+        }
+        std::fs::copy(
+            fixtures.join("syntax/tests/fixtures/vue/vue.wasm"),
+            installed.join("grammars/vue.wasm"),
+        )
+        .unwrap();
+        write_file(
+            &installed.join("languages/ruby/config.toml"),
+            "name = \"Ruby\"\ngrammar = \"vue\"\npath_suffixes = [\"rb\"]\n",
+        );
+        let mock = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        let solargraph = db::testing::dir("ws-ruby-symbols-bin").join("solargraph");
+        executable(
+            &solargraph,
+            &format!("#!/bin/sh\nexec python3 '{}'\n", mock.display()),
+        );
+        cx.executor().allow_parking();
+        let extensions = cx.update(|cx| {
+            let extensions = cx.new(|cx| {
+                let mut store =
+                    ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
+                store.world = Some(std::sync::Arc::new(ServerOnPath(
+                    "solargraph",
+                    solargraph.to_string_lossy().into_owned(),
+                )));
+                store
+            });
+            ExtensionStore::set_global(extensions.clone(), cx);
+            extensions.update(cx, |s, cx| s.scan(cx));
+            extensions
+        });
+        let (ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "the extensions folder", &|cx| {
+            extensions.read(cx).loaded
+        });
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(app.clone(), None, window, cx)
+        });
+        let document = |cx: &App| {
+            ws.read(cx)
+                .active_editor()
+                .map(|e| e.read(cx).document().clone())
+        };
+        // This includes compiling the real Ruby component, which is much
+        // larger than the other fixtures and takes longer on CI runners.
+        wait_for_with_timeout(
+            cx,
+            "the extension's server",
+            Duration::from_secs(30),
+            &|cx| {
+                document(cx).is_some_and(|document| {
+                    LspStore::global(cx)
+                        .is_some_and(|store| store.read(cx).document_symbols(&document).is_some())
+                })
+            },
+        );
+
+        // The server lists a module and two functions. The extension has
+        // a way to show a module (its name, colored as one is where it
+        // is declared) and none for these functions, which stay as the
+        // server named them.
+        cx.simulate_keystrokes("secondary-shift-o");
+        let shown = |cx: &mut VisualTestContext| -> Vec<(String, String, Option<String>)> {
+            cx.read(|cx| {
+                let modal = ws.read(cx).modal.as_ref()?;
+                let picker = modal.view.clone().downcast::<Picker<Symbols>>().ok()?;
+                Some(picker.read(cx).delegate.shown())
+            })
+            .unwrap_or_default()
+        };
+        for _ in 0..400 {
+            cx.run_until_parked();
+            if shown(cx).first().is_some_and(|row| row.2.is_some()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let rows = shown(cx);
+        let names: Vec<&str> = rows.iter().map(|row| row.0.as_str()).collect();
+        assert_eq!(names, ["crate", "total", "tax"]);
+        assert_eq!(rows[0].2.as_deref(), Some("crate"));
+        assert_eq!((rows[1].2.as_deref(), rows[2].2.as_deref()), (None, None));
+        // The name is still what is typed to find it.
+        cx.simulate_input("crat");
+        cx.run_until_parked();
+        assert_eq!(shown(cx).len(), 1);
+        assert_eq!(shown(cx)[0].2.as_deref(), Some("crate"));
+    }
+
+    #[gpui::test]
+    fn a_debugger_a_vscode_extension_declares_debugs_a_file(cx: &mut TestAppContext) {
+        // A VS Code extension whose manifest says what its debug adapter
+        // is: a script and what runs it. None of its code is needed.
+        let root = db::testing::dir("ws-vsx-debug").canonicalize().unwrap();
+        let app = root.join("app.demo");
+        std::fs::write(&app, "one\ntwo\nthree\n").unwrap();
+        let data = db::testing::dir("ws-vsx-debug-data");
+        let log = data.join("launch.json");
+        let installed = data.join("extensions/vscode/acme.demo-debug");
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_dap_stdio.py"),
+            installed.join("adapter.py"),
+        )
+        .unwrap();
+        let manifest = serde_json::json!({
+            "name": "demo-debug", "publisher": "Acme", "version": "1.0.0",
+            "contributes": {
+                "languages": [{ "id": "demo", "extensions": [".demo"] }],
+                "breakpoints": [{ "language": "demo" }],
+                "debuggers": [
+                    {
+                        "type": "demo", "label": "Demo Debug",
+                        "runtime": "python3", "program": "./adapter.py", "args": [log],
+                        "initialConfigurations": [
+                            { "type": "demo", "request": "attach", "name": "Attach" },
+                            {
+                                "type": "demo", "request": "launch", "name": "Launch",
+                                "program": "${workspaceFolder}/${command:AskForProgramName}",
+                                "stopOnEntry": true, "trace": ["${fileBasename}"],
+                            },
+                        ],
+                    },
+                    // One whose adapter only its code knows how to start.
+                    { "type": "coded", "label": "Coded" },
+                ],
+            },
+        });
+        std::fs::write(installed.join("package.json"), manifest.to_string()).unwrap();
+        cx.executor().allow_parking();
+        let (extensions, debug) = cx.update(|cx| {
+            let extensions =
+                cx.new(|cx| ExtensionStore::new(data.join("extensions"), data.join("config"), cx));
+            ExtensionStore::set_global(extensions.clone(), cx);
+            extensions.update(cx, |s, cx| s.scan(cx));
+            let debug = cx.new(|_| {
+                crate::debug::DebugStore::new(
+                    data.join("debug"),
+                    crate::debug::AdapterSpec::JsDebug,
+                )
+            });
+            crate::debug::DebugStore::set_global(debug.clone(), cx);
+            (extensions, debug)
+        });
+        let (ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "the extensions folder", &|cx| {
+            extensions.read(cx).loaded
+        });
+        let found = cx.read(|cx| {
+            extensions
+                .read(cx)
+                .find(Origin::VsCode, "Acme.demo-debug")
+                .cloned()
+        });
+        let found = found.unwrap();
+        assert_eq!(found.debuggers.len(), 1);
+        assert_eq!(found.debuggers[0].languages, ["demo"]);
+        assert!(
+            found
+                .missing
+                .contains(&"A debugger its code starts".to_string())
+        );
+        assert_eq!(found.provides(), "1 debugger");
+
+        // The file has no language here, and is debugged all the same:
+        // the debugger says which files are its own.
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(app.clone(), None, window, cx)
+        });
+        let configs = cx.read(|cx| crate::debug_launch::from_extensions(&root, &app, cx));
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "demo app.demo");
+        let other = root.join("notes.txt");
+        assert!(cx.read(|cx| crate::debug_launch::from_extensions(&root, &other, cx).is_empty()));
+
+        // Started, the adapter runs as the manifest says and the run
+        // stops on the breakpoint in the file.
+        debug.update(cx, |s, cx| {
+            s.toggle(&app, 2, cx);
+            s.start(configs[0].clone(), root.clone(), cx)
+        });
+        wait_for(cx, "the pause in app.demo", &|cx| {
+            paused_line(&debug, cx) == Some(2)
+        });
+        // It was given the launch the manifest suggests, with its places
+        // filled in: the file where VS Code would ask for one.
+        let launch: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&log).unwrap()).unwrap();
+        assert_eq!(launch["type"], "demo");
+        assert_eq!(launch["request"], "launch");
+        assert_eq!(launch["program"], app.display().to_string());
+        assert_eq!(launch["cwd"], root.display().to_string());
+        assert_eq!(launch["stopOnEntry"], true);
+        assert_eq!(launch["trace"][0], "app.demo");
+        let requests = std::fs::read_to_string(log.with_extension("requests")).unwrap();
+        assert_eq!(
+            requests.lines().take(4).collect::<Vec<_>>(),
+            [
+                "initialize",
+                "launch",
+                "setBreakpoints",
+                "configurationDone"
+            ]
+        );
+        debug.update(cx, |s, cx| s.stop(cx));
+        cx.run_until_parked();
+        assert!(cx.read(|cx| !debug.read(cx).state.active()));
+    }
+
+    #[gpui::test]
     fn a_debug_adapter_of_an_extension_debugs_a_file_of_its_language(cx: &mut TestAppContext) {
         let _languages = extension_languages();
         // Zed's real Ruby extension, installed, with a Ruby language that
@@ -12032,6 +12933,41 @@ brackets = [
         // Back as it came when the file says nothing.
         settings(cx, "{}");
         assert_eq!(row(cx), (24., px(16.)));
+
+        // A theme that leaves more room around things: gaps and paddings
+        // grow, which is the rem, and the text stays the size it was.
+        let inset = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            let dock = cx.debug_bounds("dock-left").unwrap();
+            let tab = cx.debug_bounds("panel-files").unwrap();
+            f32::from(tab.left() - dock.left())
+        };
+        let text = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| {
+                gpui::Rems::from(crate::theme::UI_FONT_SIZE).to_pixels(window.rem_size())
+            })
+        };
+        let (tight, written) = (inset(cx), text(cx));
+        assert_eq!(written, px(12.5));
+        settings(
+            cx,
+            r#"{ "theme_overrides": { "shapes": { "spacing": 1.5 } } }"#,
+        );
+        assert_eq!(row(cx), (24., px(24.)));
+        assert_eq!(inset(cx), tight * 1.5);
+        assert_eq!(text(cx), px(12.5));
+        // With larger text as well: the two multiply, and the text is
+        // only as large as it was asked to be.
+        settings(
+            cx,
+            r#"{ "ui_font_size": 15, "theme_overrides": { "shapes": { "spacing": 1.5 } } }"#,
+        );
+        let near = |size: gpui::Pixels, wanted: f32| (f32::from(size) - wanted).abs() < 0.001;
+        assert!(near(cx.update(|window, _| window.rem_size()), 28.8));
+        assert!(near(text(cx), 15.));
+        settings(cx, "{}");
+        assert_eq!((inset(cx), text(cx)), (tight, px(12.5)));
     }
 
     #[gpui::test]
@@ -12984,7 +13920,7 @@ brackets = [
                 let entry = &mcp.servers[0];
                 assert_eq!(entry.extension.as_deref(), Some("postgres-context-server"));
                 match &entry.state {
-                    State::Running(_, tools) => format!("{} tools", tools.len()),
+                    State::Running(_, offer) => format!("{} tools", offer.tools.len()),
                     State::Failed(why) => why.to_string(),
                     _ => "not started".into(),
                 }

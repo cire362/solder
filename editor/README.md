@@ -537,10 +537,34 @@ what is missing when it is not there:
 `"enabled": false` under its name leaves it out, and an entry with a
 `command` of your own under the same name is used in place of the extension's.
 
-Only tools are used. A server's prompts and resources are not, and what a
-server asks of the client (to sample a model, to list folders) is refused.
-Servers are programs on this machine; one reached over the network is not
-supported yet.
+A server that is somewhere else is an address in place of a command, with
+what to send along with every message to it, which is usually a key:
+
+```json
+"context_servers": {
+  "issues": {
+    "url": "https://mcp.example.com/mcp",
+    "headers": { "Authorization": "Bearer ..." }
+  }
+}
+```
+
+It is reached over HTTP the way the protocol calls streamable: every message
+is a request to that address, answered at once or as a stream of events. The
+older way, where answers come over a second connection that stays open, and
+signing in through a browser are not supported; a server that wants a key says
+so in the AI tab.
+
+What a server has to read (its resources: files, tables, pages) the agent
+gets as two more tools of that server, one that lists them and one that reads
+one by its address, asked for like any other. Its prompts are for you: **Use
+context prompt** in the command palette lists the prompts of every server,
+asks for what the chosen one has to be told, and puts what the server writes
+into the agent's field, to read before sending.
+
+What a server asks of the client (to sample a model, to list folders) is
+refused, and nothing is listened for between requests, so a server that
+changes its list of tools is asked again only when it next starts.
 
 ### Review before push
 
@@ -732,11 +756,18 @@ here.
 | From | Solder uses | Does not run here |
 |---|---|---|
 | A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, icon themes, its language servers, its debug adapters, its context servers | |
-| A VS Code extension | Themes (JSON), icon themes drawn with pictures, snippets | Its code, TextMate grammars, icon themes drawn with a font, everything the code would add |
+| A VS Code extension | Languages (colors from its TextMate grammar; comments, pairs and indentation from its language configuration), themes (JSON and the older `.tmTheme`), icon themes drawn with pictures, snippets, debuggers whose manifest names the adapter's program | Its code, icon themes drawn with a font, debuggers only its code can start, everything the code would add |
 
 A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
 It is compiled on the first file that needs it and runs in wasmtime inside
 the parser, where it sees nothing but the text.
+
+It also cannot hold the editor. Such a grammar parses on a thread of its own,
+and typing waits for it no longer than a frame allows. One that has not
+answered in ten seconds, which is a scanner that never returns, is given up
+on: the status bar says so, and files of that language are plain text until
+Solder starts again. The thread such a grammar holds cannot be taken back
+before then.
 
 The other files of a language are read too, and mean here what they mean in
 Zed:
@@ -792,9 +823,57 @@ some files differently on a light background, there is a second theme for
 that, with ` Light` after the name. A theme drawn with the letters of a font
 and not with pictures is listed among what does not run here.
 
+A language that only a VS Code extension has is colored by the TextMate
+grammar the extension brings: rules made of regular expressions, read a line
+at a time, in JSON or in TextMate's own property lists. A change is read again
+from its line until a line ends as it did before, so typing in a long file
+reads a few lines and not all of it. A grammar may bring in another by name,
+among those installed. The expressions are Oniguruma's; the few that
+`fancy-regex` does not read leave their rule out, and the rest of the grammar
+colors what it can. There is no tree behind such a language, so nothing that
+needs one is there for it: no outline of its own, no brackets found by a
+query.
+
+How it is typed comes from the extension's language configuration: the line
+and block comments, the pairs that close themselves (and where they do not, a
+string or a comment, which is read off the colors), the brackets that stand a
+line apart on Enter, and the two patterns that say when a line goes a level in
+or out. Which files are of the language is by their endings and names; a
+pattern that is more than an ending, and a first line that says so, are not
+read.
+
+A debugger of a VS Code extension works where its manifest says what the
+debug adapter is: a program inside the extension, and what runs it (Node
+mostly, the machine's or Solder's own). It is offered for the files of the
+languages it names, even ones Solder has no grammar for, and started with the
+launch its manifest suggests: `${file}`, `${workspaceFolder}` and the like are
+filled in, and where VS Code would ask which program, it is the file in
+front. A debugger whose adapter only the extension's code can start is listed
+among what does not run here.
+
+The settings a VS Code extension declares are set in `settings.json` under
+their own names, as in VS Code: `"prettier.tabWidth": 2`, or as objects inside
+objects. The Extensions tab lists them with what each is now: what you set,
+or what the extension says it is when not set. They are what its code will be
+handed when it asks for its configuration; nothing else reads them yet.
+
+A VS Code extension that has a build for each platform is installed in the
+one for this machine. What it does not work without, and what it is a pack
+of, are installed with it; a part of VS Code itself that it names is left
+out, since no catalog has it.
+
 An extension may also paint the completions of its server: Vue's shows a
 property as a tag followed by its detail. Its answer is colored as code in
 the file's language, and what you type is matched against the name in it.
+
+The same goes for symbols. `cmd-shift-o` lists what the file in front
+declares and `cmd-t` what the project does, to go to one by typing its name;
+a name typed exactly comes first. They are the language server's lists: the
+file's with what each symbol is inside of, the project's asked again as you
+type, with the file and line of each. An extension paints them as it paints
+completions (Ruby's colors the name of a class as a class is colored). A
+file whose language has no server that lists symbols still has its list,
+from the language's own outline.
 
 A file can have several servers: the one Solder knows for its language and
 every one that installed extensions bring for it. Their diagnostics show
@@ -833,6 +912,26 @@ entry is handed to the extension when it asks for the user's settings, and
 some ask by a name of their own: Vue's reads `"vue"`, not the id of its
 server. A language's tab size comes from `indent_size`. A change takes effect
 when the server next starts.
+
+An extension may bring several servers that do the same work for a language:
+Ruby's lists seven. Which of them start is the language's to say, written as
+Zed writes it:
+
+```json
+{
+  "languages": {
+    "Ruby": { "language_servers": ["ruby-lsp", "!solargraph", "..."] }
+  }
+}
+```
+
+A name starts that server, `!name` keeps it from starting, and `"..."` stands
+for all the others. Without `"..."` only the named ones start. The first is
+the one asked what a single server answers, such as where a definition is.
+With nothing said, a language whose extension brings alternatives starts what
+Zed starts for it (`solargraph` for Ruby, `phpactor` for PHP, `elixir-ls` for
+Elixir); any other starts all its servers. Open files go to the chosen servers
+as soon as the settings are saved.
 
 That is why such an extension **asks first**. It is downloaded and read, and
 then waits: the tab shows what installing it allows (the servers it gets, the
@@ -1165,14 +1264,16 @@ A theme sets shapes next to its colors, in pixels, in its file or in
 `theme_overrides`:
 
 ```json
-"shapes": { "panel_radius": 16, "control_radius": 8, "token_radius": 6, "border_width": 1 }
+"shapes": { "panel_radius": 16, "control_radius": 8, "token_radius": 6, "border_width": 1, "spacing": 1 }
 ```
 
 `control_radius` is the corners of buttons, fields, tabs and rows;
 `token_radius` of what sits inside a line, like a key or an item of a menu;
 `panel_radius` of windows over the editor and cards. `border_width` is the
-lines between the parts of the window, 0 to 3. The room around text is not a
-theme's: it follows `ui_font_size`.
+lines between the parts of the window, 0 to 3. `spacing` is how much room
+there is around things, as a number to multiply by: 1 is what Solder comes
+with, 0.75 the tightest and 1.5 the airiest. It widens gaps and paddings and
+leaves the text the size `ui_font_size` gives it.
 
 ## Measured so far
 

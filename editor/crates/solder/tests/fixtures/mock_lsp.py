@@ -113,6 +113,8 @@ while True:
             "hoverProvider": True,
             "definitionProvider": True,
             "referencesProvider": True,
+            "documentSymbolProvider": True,
+            "workspaceSymbolProvider": True,
             "renameProvider": True,
             "documentFormattingProvider": True,
             "codeActionProvider": {"resolveProvider": True},
@@ -159,6 +161,27 @@ while True:
         start = text.find("helper")
         send({"jsonrpc": "2.0", "id": mid,
               "result": {"uri": uri, "range": rng(text, start, start + len("helper"))}})
+    elif method == "textDocument/documentSymbol":
+        # Every function of the file, inside one module.
+        uri = params["textDocument"]["uri"]
+        text = docs[uri]
+        functions = [{
+            "name": m.group(1), "kind": 12,
+            "range": rng(text, m.start(), m.end()),
+            "selectionRange": rng(text, m.start(1), m.end(1)),
+        } for m in re.finditer(r"fn (\w+)", text)]
+        send({"jsonrpc": "2.0", "id": mid, "result": [{
+            "name": "crate", "kind": 2, "children": functions,
+            "range": rng(text, 0, len(text)), "selectionRange": rng(text, 0, 0),
+        }]})
+    elif method == "workspace/symbol":
+        # The functions of every open file whose name has the query in it.
+        query = params.get("query", "")
+        found = [{
+            "name": m.group(1), "kind": 12, "containerName": "crate",
+            "location": {"uri": uri, "range": rng(text, m.start(1), m.end(1))},
+        } for uri, text in sorted(docs.items()) for m in re.finditer(r"fn (\w+)", text) if query in m.group(1)]
+        send({"jsonrpc": "2.0", "id": mid, "result": found})
     elif method == "textDocument/references":
         uri = params["textDocument"]["uri"]
         text = docs[uri]

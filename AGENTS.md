@@ -135,7 +135,9 @@ Never guess a signature.
   and random numbers. Do not add files or sockets there.
 
 - Context servers are Model Context Protocol servers the agent gets tools
-  from. The client is `ai::mcp` (no GPUI, everything in it blocks);
+  from: programs started here, or ones reached over HTTP. The client is
+  `ai::mcp` (no GPUI, everything in it blocks, whichever way the server
+  is talked to);
   `McpStore` (`mcp_store.rs`) starts the servers the settings name when an
   agent task begins, never at startup. A server's tool runs outside the
   agent's sandbox: a task asks the user before the first call of each
@@ -145,7 +147,14 @@ Never guess a signature.
   kept by `ExtensionStore` (`extension_store.rs`). A language from one is a
   tree-sitter grammar in WebAssembly: `crates/syntax` compiles it on the
   first file that needs it, never on the UI thread (`Language::is_ready`),
-  and parsers that run such grammars come from a pool. The network is used
+  and parsers that run such grammars come from a pool. Such a grammar
+  never parses on the thread that asked either: its scanner cannot be
+  stopped, so every parse goes through `parse_rope`, which runs it on a
+  thread of its own and gives up on a grammar that does not answer
+  (`wasm::Watch`). Do not call a pooled parser directly. A language of a
+  VS Code extension has a TextMate grammar instead (`textmate.rs`): its
+  `SyntaxTree` has lines and no tree, so anything that asks a tree must
+  take `None` for an answer (`SyntaxTree::tree_at`). The network is used
   only when the Extensions tab is opened, searches or installs, and only against
   Zed's catalog and Open VSX. An archive is unpacked in a staging folder
   and checked before it replaces anything. Highlight queries follow the
@@ -218,9 +227,11 @@ pattern for new widgets instead of calling `cx.propagate()` everywhere.
   (16px as it comes), `.control` (8px), `.token` (6px) for corners, and
   `.border` (1px) for the lines between parts, as in
   `.border_b(theme.shape.border)`.
-- Text sizes of the interface are rems, never pixels: `UI_FONT_SIZE`,
-  `UI_FONT_SMALL` or `theme::text(11.5)`, since a rem follows
-  `ui_font_size`. The height of a row of a list is `theme::row(ROW, cx)`,
+- Text sizes of the interface are `theme::TextSize`, never pixels or
+  plain rems: `UI_FONT_SIZE`, `UI_FONT_SMALL` or `theme::text(11.5)`. A
+  rem follows `ui_font_size` and the theme's `spacing`, and a `TextSize`
+  takes the first alone. A theme is put in use with `theme::put`, which
+  also sizes the rem: do not set the `Theme` global of a window directly. The height of a row of a list is `theme::row(ROW, cx)`,
   which follows `ui_density`. Code is sized by `buffer_font_size` alone.
 - Comments explain why, not what. Match the density of the surrounding code.
 - User-facing strings are short and plain, with no em dashes.

@@ -26,6 +26,8 @@ pub mod world;
 pub use catalog::Entry;
 pub use gate::{Event, Refusals};
 pub use icons::IconTheme;
-pub use manifest::{Code, Extension, Grammar, Language, Origin, Server, SnippetFile};
+pub use manifest::{
+    Code, Debugger, Extension, Grammar, Language, Origin, Server, Setting, SnippetFile,
+};
 pub use snippet::Snippet;
 pub use state::State;

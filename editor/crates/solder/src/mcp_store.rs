@@ -1,6 +1,9 @@
 //! The context servers the agent can use: Model Context Protocol servers
-//! named in `settings.json`. Each is a program the editor starts and that
-//! gives the model tools of its own.
+//! named in `settings.json`. Each is a program the editor starts, or one
+//! somewhere else that is reached over HTTP, and gives the model tools of
+//! its own. What a server has to read (its resources) is two more tools:
+//! one that lists them and one that reads one. Its prompts are for the
+//! user: texts the server writes to be sent as a task.
 //!
 //! Nothing starts with the editor. Servers are started when an agent task
 //! begins, and stay for the next one. A tool of a server runs outside the
@@ -10,7 +13,7 @@
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
 use ai::{
-    mcp::{Launch, Server, Tool},
+    mcp::{Launch, Prompt, Remote, Resource, Server, Tool},
     tools::ToolSpec,
 };
 use futures::FutureExt;
@@ -31,8 +34,42 @@ pub const CALL: Duration = Duration::from_secs(120);
 pub enum State {
     Stopped,
     Starting,
-    Running(Arc<Server>, Vec<Tool>),
+    Running(Arc<Server>, Offer),
     Failed(SharedString),
+}
+
+/// What a running server has, as it said when it started.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Offer {
+    pub tools: Vec<Tool>,
+    pub prompts: Vec<Prompt>,
+    pub resources: Vec<Resource>,
+}
+
+/// A prompt of a running server, for the user to choose.
+#[derive(Clone)]
+pub struct ServerPrompt {
+    pub server: Arc<Server>,
+    pub server_name: String,
+    pub prompt: Prompt,
+}
+
+impl ServerPrompt {
+    /// The text the server writes from what it was told. Blocking.
+    pub fn text(&self, told: &[(String, String)]) -> Result<String, String> {
+        self.server.prompt(&self.prompt.name, told, CALL)
+    }
+}
+
+/// What a tool the agent is offered does at its server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// Calls the server's tool of that name.
+    Tool,
+    /// Lists what the server has to read.
+    Resources,
+    /// Reads one of those, by its address.
+    Read,
 }
 
 pub struct Entry {
@@ -53,11 +90,39 @@ pub struct McpTool {
     pub spec: ToolSpec,
     pub server: Arc<Server>,
     pub server_name: String,
-    /// The tool's name at the server.
+    /// The tool's name at the server, or what it does there in words.
     pub tool: String,
+    pub kind: Kind,
 }
 
 impl McpTool {
+    /// Runs it: the answer as text, and whether it failed. Blocking.
+    pub fn run(&self, input: serde_json::Value) -> (String, bool) {
+        let ran = match self.kind {
+            Kind::Tool => self.server.call(&self.tool, input, CALL),
+            Kind::Resources => self.server.resources(LIST).map(|resources| {
+                let lines: Vec<String> = resources
+                    .iter()
+                    .map(|r| match (r.name == r.uri, r.description.is_empty()) {
+                        (true, true) => r.uri.clone(),
+                        (true, false) => format!("{}: {}", r.uri, r.description),
+                        (false, true) => format!("{} ({})", r.uri, r.name),
+                        (false, false) => format!("{} ({}): {}", r.uri, r.name, r.description),
+                    })
+                    .collect();
+                match lines.is_empty() {
+                    true => ("It has nothing to read now".to_string(), false),
+                    false => (lines.join("\n"), false),
+                }
+            }),
+            Kind::Read => match input["uri"].as_str() {
+                Some(uri) => self.server.read(uri, CALL).map(|text| (text, false)),
+                None => Ok(("Give the address of what to read as uri".into(), true)),
+            },
+        };
+        ran.unwrap_or_else(|error| (error, true))
+    }
+
     /// The call as the user is shown it before allowing it.
     pub fn shown(&self, input: &serde_json::Value) -> String {
         let mut arguments = input.to_string();
@@ -149,7 +214,8 @@ impl McpStore {
 
     /// Every context server there is to use, by name: what the settings
     /// say about it, and the extension that brings it, if one does. A
-    /// server of the settings that has a command is the user's own, even
+    /// server of the settings that has a command or an address is the
+    /// user's own, even
     /// under a name an extension also uses. One of an extension needs no
     /// entry in the settings; an entry may turn it off or give it what it
     /// reads.
@@ -166,7 +232,7 @@ impl McpStore {
             .unwrap_or_default();
         for (extension, server) in brought {
             let entry = listed.entry(server).or_default();
-            if entry.0.program().is_none() {
+            if entry.0.program().is_none() && entry.0.address().is_none() {
                 entry.1 = Some(extension);
             }
         }
@@ -238,9 +304,24 @@ impl McpStore {
                     // that may, not on the one that waited above.
                     background
                         .spawn(async move {
-                            let server = Server::start(&launch(&config, &root, env)?, START)?;
-                            let tools = server.tools(LIST)?;
-                            Ok::<_, String>((Arc::new(server), tools))
+                            let server = match config.address() {
+                                Some(url) => {
+                                    let remote = Remote {
+                                        url: url.to_string(),
+                                        headers: config.headers.clone().into_iter().collect(),
+                                    };
+                                    Server::connect(&remote, START)?
+                                }
+                                None => Server::start(&launch(&config, &root, env)?, START)?,
+                            };
+                            let offer = Offer {
+                                tools: server.tools(LIST)?,
+                                // A server that fails at these still has
+                                // its tools.
+                                prompts: server.prompts(LIST).unwrap_or_default(),
+                                resources: server.resources(LIST).unwrap_or_default(),
+                            };
+                            Ok::<_, String>((Arc::new(server), offer))
                         })
                         .await
                 });
@@ -253,7 +334,7 @@ impl McpStore {
                         };
                         entry.starting = None;
                         entry.state = match started {
-                            Ok((server, tools)) => State::Running(server, tools),
+                            Ok((server, offer)) => State::Running(server, offer),
                             Err(error) => State::Failed(error.into()),
                         };
                         cx.notify();
@@ -279,25 +360,78 @@ impl McpStore {
     pub fn tools(&self) -> Vec<McpTool> {
         let mut out: Vec<McpTool> = Vec::new();
         for entry in &self.servers {
-            let State::Running(server, tools) = &entry.state else {
+            let State::Running(server, offer) = &entry.state else {
                 continue;
             };
-            for tool in tools {
-                let name = tool_name(&entry.name, &tool.name);
-                // Two long names cut to the same one: the first stands.
+            let mut offered: Vec<(String, &str, serde_json::Value, String, Kind)> = offer
+                .tools
+                .iter()
+                .map(|tool| {
+                    (
+                        tool.name.clone(),
+                        tool.description.as_str(),
+                        tool.schema.clone(),
+                        tool.name.clone(),
+                        Kind::Tool,
+                    )
+                })
+                .collect();
+            // What the server has to read, as two tools of the editor's
+            // making: the model looks through the list and reads what it
+            // needs, and the user is asked as for any other tool.
+            if server.has_resources {
+                offered.push((
+                    "list_resources".into(),
+                    "Lists what this server has to read, each with the address to read it by",
+                    serde_json::json!({ "type": "object", "properties": {} }),
+                    "list resources".into(),
+                    Kind::Resources,
+                ));
+                offered.push((
+                    "read_resource".into(),
+                    "Reads one of the things this server has, by its address",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": { "uri": { "type": "string" } },
+                        "required": ["uri"],
+                    }),
+                    "read resource".into(),
+                    Kind::Read,
+                ));
+            }
+            for (called, description, parameters, tool, kind) in offered {
+                let name = tool_name(&entry.name, &called);
+                // Two long names cut to the same one, or a tool of the
+                // server's own called as one of these: the first stands.
                 if out.iter().any(|known| known.spec.name == name) {
                     continue;
                 }
                 out.push(McpTool {
                     spec: ToolSpec {
                         name,
-                        description: format!("{} (from {})", tool.description, entry.name),
-                        parameters: tool.schema.clone(),
+                        description: format!("{description} (from {})", entry.name),
+                        parameters,
                     },
                     server: server.clone(),
                     server_name: entry.name.clone(),
-                    tool: tool.name.clone(),
+                    tool,
+                    kind,
                 });
+            }
+        }
+        out
+    }
+
+    /// The prompts of the servers that run.
+    pub fn prompts(&self) -> Vec<ServerPrompt> {
+        let mut out = Vec::new();
+        for entry in &self.servers {
+            if let State::Running(server, offer) = &entry.state {
+                out.extend(offer.prompts.iter().map(|prompt| ServerPrompt {
+                    server: server.clone(),
+                    server_name: entry.name.clone(),
+                    prompt: prompt.clone(),
+                }));
             }
         }
         out

@@ -12,7 +12,7 @@ use crate::{
     agent::{self, Access, Change, Outcome, Phase, PlanStep, Sandbox, ToolBox, Worktree},
     ai_providers::{LOCAL, ModelRef},
     ai_store::AiStore,
-    mcp_store::{self, McpStore, McpTool},
+    mcp_store::{McpStore, McpTool},
 };
 
 /// Steps a task may take before it stops and asks.
@@ -425,10 +425,7 @@ impl AgentTask {
                     Some(tool) => {
                         cx.background_executor()
                             .spawn(async move {
-                                let (output, error) = tool
-                                    .server
-                                    .call(&tool.tool, c.input.clone(), mcp_store::CALL)
-                                    .unwrap_or_else(|error| (error, true));
+                                let (output, error) = tool.run(c.input.clone());
                                 Outcome::Result(ToolResult {
                                     id: c.id,
                                     output,

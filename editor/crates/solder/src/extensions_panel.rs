@@ -665,6 +665,29 @@ impl ExtensionsPanel {
                         details = details.child(line(what.into(), theme.fg_muted));
                     }
                 }
+                if !installed.settings.is_empty() {
+                    details = details.child(heading("SETTINGS, IN SETTINGS.JSON"));
+                    // What each is now: the user's value, or what the
+                    // extension says it is when not set.
+                    for setting in installed.settings.iter().take(40) {
+                        let now = store.configuration(&setting.key, cx);
+                        let value = match now {
+                            serde_json::Value::Null => "not set".to_string(),
+                            value => value.to_string(),
+                        };
+                        let own = now_set(&setting.key, cx);
+                        details = details.child(line(
+                            format!("{}: {value}", setting.key).into(),
+                            if own { theme.fg } else { theme.fg_muted },
+                        ));
+                    }
+                    if installed.settings.len() > 40 {
+                        details = details.child(line(
+                            format!("and {} more", installed.settings.len() - 40).into(),
+                            theme.fg_subtle,
+                        ));
+                    }
+                }
                 if !installed.themes.is_empty() {
                     details = details.child(heading("THEMES"));
                     let view = cx.entity();
@@ -1046,4 +1069,22 @@ impl Render for ExtensionsPanel {
             }))
             .children(details)
     }
+}
+
+/// Whether settings.json sets `key` itself, written with the dots or as
+/// objects inside objects.
+fn now_set(key: &str, cx: &App) -> bool {
+    let Some(settings) = cx.try_global::<crate::settings::Settings>() else {
+        return false;
+    };
+    if settings.other.contains_key(key) {
+        return true;
+    }
+    let mut parts = key.split('.');
+    let first = parts.next().unwrap_or_default();
+    settings
+        .other
+        .get(first)
+        .and_then(|inside| parts.try_fold(inside, |at, part| at.get(part)))
+        .is_some_and(|value| !value.is_null())
 }

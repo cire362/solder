@@ -77,6 +77,8 @@ pub struct Settings {
     /// Per-server overrides, keyed by server name (`rust-analyzer`,
     /// `typescript-language-server`, ...).
     pub language_servers: BTreeMap<String, ServerOverride>,
+    /// What is set for one language, by the language's name.
+    pub languages: BTreeMap<String, LanguageSettings>,
     /// Format with the language server before every save.
     pub format_on_save: bool,
     /// The icon theme of an installed extension, by name: pictures next
@@ -85,9 +87,15 @@ pub struct Settings {
     /// Model Context Protocol servers the agent may use, by a name of the
     /// user's choosing. Started when an agent task begins.
     pub context_servers: BTreeMap<String, ContextServer>,
+    /// What the file sets that is none of the above: the settings of
+    /// extensions, under the names their manifests declare, written with
+    /// the dots (`"prettier.tabWidth": 2`) or as objects inside objects.
+    #[serde(flatten)]
+    pub other: BTreeMap<String, serde_json::Value>,
 }
 
-/// One context server: the program to start and what to start it with.
+/// One context server: the program to start and what to start it with,
+/// or the address of one that is somewhere else.
 /// The command is written as Zed writes it, in either of its two forms:
 /// `"command": "npx", "args": [...]`, or
 /// `"command": { "path": "npx", "args": [...], "env": {...} }`.
@@ -97,6 +105,12 @@ pub struct ContextServer {
     pub command: Option<ServerCommand>,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// A server reached over HTTP, in place of a command: its address,
+    /// and what goes with every message to it (a key, mostly).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
     /// For a server an extension brings, under the extension's name for
     /// it: what the extension reads to start it (a database's address, a
     /// token). The extension says which it needs.
@@ -124,6 +138,8 @@ impl Default for ContextServer {
             command: None,
             args: Vec::new(),
             env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
             settings: None,
             enabled: true,
         }
@@ -131,6 +147,13 @@ impl Default for ContextServer {
 }
 
 impl ContextServer {
+    /// The address of a server that is somewhere else. A command wins:
+    /// an entry with both starts the program.
+    pub fn address(&self) -> Option<&str> {
+        let url = self.url.as_deref().map(str::trim)?;
+        (self.program().is_none() && !url.is_empty()).then_some(url)
+    }
+
     pub fn program(&self) -> Option<String> {
         match self.command.as_ref()? {
             ServerCommand::Program(program) | ServerCommand::Table { path: program, .. } => {
@@ -154,6 +177,18 @@ impl ContextServer {
         variables.extend(self.env.clone());
         variables
     }
+}
+
+/// The settings of one language.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LanguageSettings {
+    /// Which of the language's servers start, the first being the one
+    /// asked what only one can answer. Written as Zed writes it: a name,
+    /// `!name` for one that does not start, and `...` for all the others.
+    /// Without `...` only the ones named start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language_servers: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -250,9 +285,11 @@ impl Default for Settings {
             indent_size: 4,
             show_performance_hud: true,
             language_servers: BTreeMap::new(),
+            languages: BTreeMap::new(),
             format_on_save: false,
             icon_theme: None,
             context_servers: BTreeMap::new(),
+            other: BTreeMap::new(),
         }
     }
 }
@@ -671,6 +708,26 @@ mod tests {
         assert_eq!(parse_settings("").unwrap(), Settings::default());
         let url = parse_settings("{ \"buffer_font_family\": \"a//b\" }").unwrap();
         assert_eq!(url.buffer_font_family, "a//b");
+        // What the file sets that Solder has no setting for is kept, for
+        // the extension that declared it; what Solder has is not.
+        let kept = parse_settings(
+            r#"{ "indent_size": 2, "acme.lint.level": 3, "acme": { "format": false } }"#,
+        )
+        .unwrap();
+        assert_eq!(kept.indent_size, 2);
+        let keys: Vec<&str> = kept.other.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["acme", "acme.lint.level"]);
+        assert!(s.other.is_empty());
+        // Which servers a language starts, as Zed writes it.
+        let ruby = parse_settings(
+            r#"{ "languages": { "Ruby": { "language_servers": ["ruby-lsp", "!solargraph", "..."] } } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ruby.languages["Ruby"].language_servers.as_deref(),
+            Some(&["ruby-lsp".to_string(), "!solargraph".into(), "...".into()][..])
+        );
+        assert!(s.languages.is_empty());
         // The interface's text as it comes: a rem is 16 pixels, and rows
         // are as tall as they were written.
         assert_eq!(s.ui_font_family, UI_FONT);
@@ -714,6 +771,20 @@ mod tests {
         assert_eq!(servers["table"].variables()["A"], "b");
         assert!(!servers["table"].enabled);
         assert_eq!(servers["bare"].program(), None);
+        // One that is somewhere else: an address and what to send with
+        // each message. With a command too, the command is what counts.
+        let remote = parse_settings(
+            r#"{ "context_servers": {
+                "issues": { "url": " https://example.com/mcp ", "headers": { "Authorization": "Bearer k" } },
+                "both": { "url": "https://example.com/mcp", "command": "npx" }
+            } }"#,
+        )
+        .unwrap()
+        .context_servers;
+        assert_eq!(remote["issues"].address(), Some("https://example.com/mcp"));
+        assert_eq!(remote["issues"].headers["Authorization"], "Bearer k");
+        assert_eq!(remote["both"].address(), None);
+        assert_eq!(servers["flat"].address(), None);
     }
 
     #[test]
@@ -785,6 +856,16 @@ mod tests {
         let shape = shaped.theme(Dark).shape;
         assert_eq!((shape.control, shape.token), (px(2.), px(0.)));
         assert_eq!(shape.border, px(3.));
+        // How much room there is around things is a shape too: a number
+        // to multiply by, kept to what still reads.
+        assert_eq!(shape.spacing, 1.);
+        let airy =
+            parse_settings(r#"{ "theme_overrides": { "shapes": { "spacing": 1.25 } } }"#).unwrap();
+        assert_eq!(airy.theme(Dark).shape.spacing, 1.25);
+        assert!(airy.theme_overrides.mistakes().is_empty());
+        let wide =
+            parse_settings(r#"{ "theme_overrides": { "shapes": { "spacing": 9 } } }"#).unwrap();
+        assert_eq!(wide.theme(Dark).shape.spacing, 1.5);
         assert_eq!(shape.panel, crate::theme::Shapes::default().panel);
         assert_eq!(shaped.theme(Dark).bg, Theme::dark().bg);
         let mistakes = shaped.theme_overrides.mistakes();

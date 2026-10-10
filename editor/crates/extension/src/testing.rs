@@ -124,6 +124,19 @@ pub fn svg(name: &str) -> String {
     )
 }
 
+/// A TextMate grammar as a VS Code extension brings one, for a language
+/// of comments, strings, numbers and two words.
+pub const VSCODE_GRAMMAR: &str = r##"{
+  "scopeName": "source.demo",
+  "patterns": [
+    { "name": "comment.line.number-sign.demo", "match": "#.*$" },
+    { "name": "comment.block.demo", "begin": "/\\*", "end": "\\*/" },
+    { "name": "string.quoted.double.demo", "begin": "\"", "end": "\"" },
+    { "name": "keyword.control.demo", "match": "\\b(if|end)\\b" },
+    { "name": "constant.numeric.demo", "match": "\\b\\d+\\b" }
+  ]
+}"##;
+
 /// An icon theme as a VS Code extension writes one.
 pub const VSCODE_ICON_THEME: &str = r#"{
   // Pictures are named once, then given to files.
@@ -251,7 +264,8 @@ pub fn vscode_extension(dir: &Path) {
   "contributes": {
     "themes": [
       {"label": "Acme Dark", "uiTheme": "vs-dark", "path": "./themes/dark.json"},
-      {"label": "Acme Old", "uiTheme": "vs-dark", "path": "./themes/old.tmTheme"}
+      {"label": "Acme Old", "uiTheme": "vs-dark", "path": "./themes/old.tmTheme"},
+      {"label": "Acme Broken", "uiTheme": "vs-dark", "path": "./themes/broken.tmTheme"}
     ],
     "snippets": [
       {"language": "javascript", "path": "./snippets/js.json"},
@@ -266,13 +280,20 @@ pub fn vscode_extension(dir: &Path) {
       {"id": "acme-icons", "label": "%icons%", "path": "./dist/icons.json"},
       {"id": "acme-font", "label": "Acme Font", "path": "./dist/font.json"}
     ],
+    "configuration": [
+      {"title": "Acme", "properties": {
+        "acme.lint.level": {"type": "number", "default": 2, "description": "%level%"},
+        "acme.format": {"type": "boolean", "default": true, "markdownDescription": "Formats on save.\nAnd more."}
+      }},
+      {"properties": {"acme.name": {"type": "string"}, "acme.format": {"default": false}}}
+    ],
     "keybindings": [{"command": "demo.run", "key": "ctrl+r"}]
   }
 }"#,
     );
     write(
         &dir.join("package.nls.json"),
-        r#"{"title": "Acme Demo", "icons": "Acme Icons"}"#,
+        r#"{"title": "Acme Demo", "icons": "Acme Icons", "level": "How strict the linter is"}"#,
     );
     // Pictures beside the folder of the theme's file, as such themes
     // keep them.
@@ -301,15 +322,52 @@ pub fn vscode_extension(dir: &Path) {
         &dir.join("themes/dark.json"),
         r##"{"name":"Acme Dark","type":"dark","colors":{"editor.background":"#101014","editor.foreground":"#e0e0e6"},"tokenColors":[{"scope":"keyword","settings":{"foreground":"#ff8800"}}]}"##,
     );
-    write(&dir.join("themes/old.tmTheme"), "<plist/>");
+    // The format TextMate had: a property list.
+    write(
+        &dir.join("themes/old.tmTheme"),
+        r##"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>name</key><string>Acme Old</string>
+  <key>settings</key>
+  <array>
+    <dict><key>settings</key><dict>
+      <key>background</key><string>#272822</string>
+      <key>foreground</key><string>#F8F8F2</string>
+      <key>selection</key><string>#49483E</string>
+    </dict></dict>
+    <dict>
+      <key>name</key><string>Comment</string>
+      <key>scope</key><string>comment</string>
+      <key>settings</key><dict><key>foreground</key><string>#75715E</string></dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>keyword, storage</string>
+      <key>settings</key><dict><key>foreground</key><string>#F92672</string></dict>
+    </dict>
+  </array>
+</dict>
+</plist>"##,
+    );
+    write(&dir.join("themes/broken.tmTheme"), "<plist/>");
     write(
         &dir.join("snippets/js.json"),
         r#"{"Log": {"prefix": "clg", "body": "console.log($1)"}}"#,
     );
     write(
         &dir.join("language.json"),
-        r##"{ "comments": { "lineComment": "#", "blockComment": ["/*", "*/"] } } // trailing"##,
+        r##"{
+  "comments": { "lineComment": "#", "blockComment": ["/*", "*/"] },
+  "brackets": [["{", "}"], ["(", ")"]],
+  "autoClosingPairs": [
+    { "open": "{", "close": "}" },
+    { "open": "\"", "close": "\"", "notIn": ["string", "comment"] }
+  ],
+  "indentationRules": { "increaseIndentPattern": "\\{\\s*$", "decreaseIndentPattern": { "pattern": "^\\s*\\}" } }
+} // trailing"##,
     );
+    write(&dir.join("demo.tmLanguage.json"), VSCODE_GRAMMAR);
     write(&dir.join("out/main.js"), "module.exports = {}");
 }
 

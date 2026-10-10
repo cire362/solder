@@ -9,7 +9,7 @@ use std::{
 
 use extension::host::{
     CodeLabel, Command, Completion, DebugLaunch, FileKind, Host, HttpRequest, HttpResponse,
-    LabelSpan, Output, Release, Status, World,
+    LabelSpan, Output, Release, Status, Symbol, World,
 };
 
 const PACKAGE: &str = "@zed-industries/vscode-langservers-extracted";
@@ -505,6 +505,85 @@ fn every_version_that_can_label_completions_is_asked() {
         filter: 0..3,
     };
     assert_eq!(labels("vue"), Some(Ok(vec![Some(painted), None])));
+}
+
+#[test]
+fn an_extension_paints_the_symbols_of_its_server() {
+    // Zed's real Ruby extension: a class is shown as one is written.
+    let extension = fixture("ruby");
+    let work = work_dir("host-ruby-symbols");
+    let world = Arc::new(Script {
+        on_path: Some("/usr/local/bin/solargraph".into()),
+        ..Default::default()
+    });
+    let host = Host::load(&extension, &work, world).unwrap();
+    // It paints for a server it has started, as the editor's are.
+    host.language_server_command("solargraph", &work_dir("host-ruby-symbols-project"))
+        .unwrap();
+    let symbols = [
+        Symbol {
+            name: "Invoice".into(),
+            kind: 5,
+        },
+        // A method, named as this server names one.
+        Symbol {
+            name: "Invoice#total".into(),
+            kind: 6,
+        },
+        // A kind it has nothing to say about.
+        Symbol {
+            name: "app.rb".into(),
+            kind: 1,
+        },
+    ];
+    let labels = host
+        .labels_for_symbols("solargraph", &symbols)
+        .unwrap()
+        .unwrap();
+    assert_eq!(labels.len(), 3);
+    let class = labels[0].as_ref().unwrap();
+    assert_eq!(class.code, "class Invoice");
+    // The name is what a typed word is matched against.
+    let shown = |label: &CodeLabel| -> String {
+        label
+            .spans
+            .iter()
+            .map(|span| match span {
+                LabelSpan::Code(range) => label.code[range.clone()].to_string(),
+                LabelSpan::Literal { text, .. } => text.clone(),
+            })
+            .collect()
+    };
+    assert_eq!(&shown(class)[class.filter.clone()], "Invoice");
+    let method = labels[1].as_ref().unwrap();
+    assert_eq!(shown(method), "Invoice#total");
+    // Its parts are colored as what they are: a type and a method.
+    let colors: Vec<_> = method
+        .spans
+        .iter()
+        .filter_map(|span| match span {
+            LabelSpan::Literal { highlight, .. } => highlight.as_deref(),
+            LabelSpan::Code(_) => None,
+        })
+        .collect();
+    assert!(
+        colors.contains(&"type") && colors.iter().any(|c| c.starts_with("function")),
+        "{colors:?}"
+    );
+    assert_eq!(labels[2], None);
+    // An extension that paints none answers with none for each.
+    let vue = fixture("vue");
+    let host = Host::load(
+        &vue,
+        &work_dir("host-vue-symbols"),
+        Arc::new(Script::default()),
+    )
+    .unwrap();
+    let server = vue.servers[0].id.clone();
+    assert_eq!(
+        host.labels_for_symbols(&server, &symbols[..1]),
+        Some(Ok(vec![None]))
+    );
 }
 
 #[test]

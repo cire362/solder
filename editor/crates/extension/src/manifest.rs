@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use import::{ThemeFile, jsonc, theme};
 
+use crate::catalog::valid_id;
 use crate::icons::{self, IconTheme};
 use serde_json::Value;
 
@@ -81,8 +82,11 @@ pub struct Language {
     pub decrease_indent: Option<String>,
     /// The debug adapters that debug it, by name.
     pub debuggers: Vec<String>,
-    /// Missing for a VS Code language: its TextMate grammar is not read.
+    /// Missing for a VS Code language: it has `textmate` in its place.
     pub grammar: Option<Grammar>,
+    /// The TextMate grammar that colors it: the file, and the name the
+    /// grammar goes by among grammars (`source.demo`).
+    pub textmate: Option<(PathBuf, String)>,
 }
 
 /// A language server the extension knows how to get and start.
@@ -138,6 +142,48 @@ pub struct Extension {
     pub commands: Vec<(String, Vec<String>)>,
     /// What it has that Solder does not run, in words for the user.
     pub missing: Vec<String>,
+    /// The extensions it does not work without, and the ones it is a
+    /// pack of, by id: they are installed with it.
+    pub needs: Vec<String>,
+    /// The debug adapters its manifest gives the program of, which need
+    /// none of its code to start.
+    pub debuggers: Vec<Debugger>,
+    /// The settings its manifest declares, each with what it is when the
+    /// user has not set it.
+    pub settings: Vec<Setting>,
+    /// Every TextMate grammar it has, by the name it goes by: also the
+    /// ones that are no language of their own, which others ask for.
+    pub grammars: Vec<(String, PathBuf)>,
+}
+
+/// A setting a VS Code extension declares: its whole name with the dots
+/// in it (`prettier.tabWidth`), what it is by default, and what it is for.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Setting {
+    pub key: String,
+    pub default: Value,
+    pub description: String,
+}
+
+/// A debug adapter a VS Code extension declares with the program that is
+/// it. It talks on its input and output.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Debugger {
+    /// What configurations call it (`type`).
+    pub name: String,
+    pub label: String,
+    /// The ids of the languages it debugs, in small letters.
+    pub languages: Vec<String>,
+    /// The adapter, inside the extension: a program, or with `runtime`
+    /// a script for it.
+    pub program: PathBuf,
+    /// What runs the program: `node` mostly.
+    pub runtime: Option<String>,
+    pub runtime_args: Vec<String>,
+    pub args: Vec<String>,
+    /// The launch it suggests to start from, with places to fill in
+    /// (`${file}`).
+    pub initial: Option<Value>,
 }
 
 impl Extension {
@@ -219,6 +265,7 @@ impl Extension {
                 "context server",
                 "context servers",
             ),
+            count(self.debuggers.len(), "debugger", "debuggers"),
             count(self.themes.len(), "theme", "themes"),
             count(self.icon_themes.len(), "icon theme", "icon themes"),
             count(self.snippets.len(), "snippet file", "snippet files"),
@@ -447,6 +494,7 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
             increase_indent: pattern("increase_indent_pattern", "increase_indent_patterns"),
             decrease_indent: pattern("decrease_indent_pattern", "decrease_indent_patterns"),
             grammar,
+            textmate: None,
             name,
         });
     }
@@ -536,7 +584,82 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         code,
         commands,
         missing,
+        needs: Vec::new(),
+        debuggers: Vec::new(),
+        settings: Vec::new(),
+        grammars: Vec::new(),
     })
+}
+
+/// What a VS Code language's configuration says about typing in it, in
+/// the terms the editor has for that: comments, the pairs that close
+/// themselves and stand a line apart, and the two patterns of indentation.
+fn configure(language: &mut Language, config: &Value) {
+    language.line_comment = config["comments"]["lineComment"]
+        .as_str()
+        // Newer files give it with more said about it.
+        .or(config["comments"]["lineComment"]["comment"].as_str())
+        .map(str::to_string);
+    if let [start, end] = strings(&config["comments"]["blockComment"]).as_slice() {
+        language.block_comment = Some((start.clone(), end.clone()));
+    }
+    // Written as two strings, or by name with where it does not close.
+    let ends = |pair: &Value| -> Option<(String, String, Vec<String>)> {
+        match pair {
+            Value::Array(_) => match strings(pair).as_slice() {
+                [open, close] => Some((open.clone(), close.clone(), Vec::new())),
+                _ => None,
+            },
+            pair => Some((
+                pair["open"].as_str()?.to_string(),
+                pair["close"].as_str()?.to_string(),
+                strings(&pair["notIn"]),
+            )),
+        }
+    };
+    let list = |value: &Value| -> Vec<(String, String, Vec<String>)> {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(ends)
+            .collect()
+    };
+    let closing = list(&config["autoClosingPairs"]);
+    // Brackets stand a line apart on Enter; they close themselves if the
+    // file says so, or says nothing of what does.
+    for (start, end, _) in list(&config["brackets"]) {
+        let closes = closing.iter().find(|(open, ..)| *open == start);
+        language.pairs.push(Pair {
+            close: closes.is_some() || config["autoClosingPairs"].is_null(),
+            not_in: closes
+                .map(|(_, _, not_in)| not_in.clone())
+                .unwrap_or_default(),
+            newline: true,
+            start,
+            end,
+        });
+    }
+    for (start, end, not_in) in closing {
+        if !language.pairs.iter().any(|pair| pair.start == start) {
+            language.pairs.push(Pair {
+                start,
+                end,
+                close: true,
+                newline: false,
+                not_in,
+            });
+        }
+    }
+    let pattern = |value: &Value| {
+        value
+            .as_str()
+            .or(value["pattern"].as_str())
+            .map(str::to_string)
+    };
+    let rules = &config["indentationRules"];
+    language.increase_indent = pattern(&rules["increaseIndentPattern"]);
+    language.decrease_indent = pattern(&rules["decreaseIndentPattern"]);
 }
 
 fn read_vscode(dir: &Path) -> Result<Extension, String> {
@@ -568,7 +691,7 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
     let declared = list("themes").len();
     if themes.len() < declared {
         missing.push(format!(
-            "{} of its themes (not in the JSON format)",
+            "{} of its themes (could not be read)",
             declared - themes.len()
         ));
     }
@@ -622,8 +745,28 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         }
     }
 
-    // A language here is its file endings and its comment marker. The
-    // grammar is TextMate's, which is not read.
+    // Its TextMate grammars, by the name each goes by, and which of them
+    // is the grammar of which language.
+    let mut grammars: Vec<(String, PathBuf)> = Vec::new();
+    let mut of_language: Vec<(String, usize)> = Vec::new();
+    for entry in list("grammars") {
+        let scope = text(&entry["scopeName"]);
+        let path = entry["path"]
+            .as_str()
+            .and_then(|path| inside(dir, path))
+            .filter(|path| path.is_file());
+        let (Some(path), false) = (path, scope.is_empty()) else {
+            continue;
+        };
+        let language = text(&entry["language"]);
+        if !language.is_empty() {
+            of_language.push((language, grammars.len()));
+        }
+        grammars.push((scope, path));
+    }
+
+    // A language here is the files it is in, what colors them, and what
+    // its configuration says about typing in it.
     let mut languages = Vec::new();
     for entry in list("languages") {
         let id = text(&entry["id"]);
@@ -632,31 +775,36 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
             .map(|e| e.trim_start_matches('.').to_string())
             .collect();
         suffixes.extend(strings(&entry["filenames"]));
+        // A pattern that is only an ending says the same as an ending.
+        for pattern in strings(&entry["filenamePatterns"]) {
+            if let Some(ending) = pattern.strip_prefix("*.")
+                && !ending.contains(['*', '?', '[', '{', '/'])
+            {
+                suffixes.push(ending.to_string());
+            }
+        }
         if id.is_empty() || suffixes.is_empty() {
             continue;
         }
-        let line_comment = entry["configuration"]
+        let config = entry["configuration"]
             .as_str()
             .and_then(|p| inside(dir, p))
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|source| jsonc::parse(&source).ok())
-            .and_then(|config| {
-                config["comments"]["lineComment"]
-                    .as_str()
-                    .map(str::to_string)
-            });
+            .unwrap_or(Value::Null);
         let aliases = strings(&entry["aliases"]);
-        languages.push(Language {
+        let mut language = Language {
             name: aliases.first().cloned().unwrap_or_else(|| id.clone()),
             suffixes,
+            textmate: of_language
+                .iter()
+                .find(|(of, _)| *of == id)
+                .map(|(_, index)| (grammars[*index].1.clone(), grammars[*index].0.clone())),
             aliases: std::iter::once(id).chain(aliases).collect(),
-            line_comment,
             ..Default::default()
-        });
-    }
-
-    if !list("grammars").is_empty() {
-        missing.push("Highlighting (a TextMate grammar)".into());
+        };
+        configure(&mut language, &config);
+        languages.push(language);
     }
     let code = if manifest["main"].is_string() || manifest["browser"].is_string() {
         missing.push("Its code, which needs VS Code".into());
@@ -664,9 +812,99 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
     } else {
         Code::None
     };
+    // The settings it declares: one group of them, or several.
+    let mut settings: Vec<Setting> = Vec::new();
+    let groups = match &contributes["configuration"] {
+        Value::Array(groups) => groups.clone(),
+        Value::Null => Vec::new(),
+        group => vec![group.clone()],
+    };
+    for group in &groups {
+        for (key, declared) in group["properties"].as_object().into_iter().flatten() {
+            if key.trim().is_empty() || settings.iter().any(|known| known.key == *key) {
+                continue;
+            }
+            let said = [&declared["description"], &declared["markdownDescription"]]
+                .into_iter()
+                .map(|said| label(&text(said)))
+                .find(|said| !said.is_empty())
+                .unwrap_or_default();
+            settings.push(Setting {
+                key: key.clone(),
+                default: declared["default"].clone(),
+                // The first line is enough to say what it is for.
+                description: said.lines().next().unwrap_or_default().to_string(),
+            });
+        }
+    }
+    settings.sort_by(|a, b| a.key.cmp(&b.key));
+
+    // Debuggers whose manifest names the adapter's program. One that
+    // leaves that to its code cannot be started without it.
+    let mut debuggers: Vec<Debugger> = Vec::new();
+    let mut started_by_code = 0;
+    // A file a breakpoint may be set in is one its debuggers debug.
+    let breakable: Vec<String> = list("breakpoints")
+        .iter()
+        .map(|entry| text(&entry["language"]).to_lowercase())
+        .filter(|language| !language.is_empty())
+        .collect();
+    let platform = match std::env::consts::OS {
+        "macos" => "osx",
+        "windows" => "windows",
+        _ => "linux",
+    };
+    for entry in list("debuggers") {
+        // What it says for this platform comes before what it says for all.
+        let field = |key: &str| match &entry[platform][key] {
+            Value::Null => entry[key].clone(),
+            own => own.clone(),
+        };
+        let name = text(&entry["type"]);
+        let program = field("program")
+            .as_str()
+            .and_then(|program| inside(dir, program))
+            .filter(|program| program.is_file());
+        let (Some(program), false) = (program, name.is_empty()) else {
+            started_by_code += 1;
+            continue;
+        };
+        let mut languages: Vec<String> = strings(&entry["languages"])
+            .iter()
+            .map(|language| language.to_lowercase())
+            .collect();
+        languages.extend(breakable.iter().cloned());
+        languages.dedup();
+        let initial = entry["initialConfigurations"]
+            .as_array()
+            .and_then(|all| {
+                all.iter()
+                    .find(|config| config["request"] == "launch")
+                    .or(all.first())
+            })
+            .filter(|config| config.is_object())
+            .cloned();
+        debuggers.push(Debugger {
+            label: Some(label(&text(&entry["label"])))
+                .filter(|label| !label.is_empty())
+                .unwrap_or_else(|| name.clone()),
+            name,
+            languages,
+            program,
+            runtime: field("runtime").as_str().map(str::to_string),
+            runtime_args: strings(&field("runtimeArgs")),
+            args: strings(&field("args")),
+            initial,
+        });
+    }
+    if started_by_code > 0 {
+        missing.push(match started_by_code {
+            1 => "A debugger its code starts".to_string(),
+            n => format!("{n} debuggers its code starts"),
+        });
+    }
     for (key, what) in [
         ("productIconThemes", "Product icon themes"),
-        ("debuggers", "Debuggers"),
         ("keybindings", "Key bindings for its commands"),
     ] {
         if !list(key).is_empty() {
@@ -686,6 +924,21 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         icon_themes,
         snippets,
         languages,
+        needs: {
+            let mut needs: Vec<String> = Vec::new();
+            for id in strings(&manifest["extensionPack"])
+                .into_iter()
+                .chain(strings(&manifest["extensionDependencies"]))
+            {
+                if valid_id(&id) && !needs.iter().any(|known| known.eq_ignore_ascii_case(&id)) {
+                    needs.push(id);
+                }
+            }
+            needs
+        },
+        debuggers,
+        settings,
+        grammars,
         servers: Vec::new(),
         debug_adapters: Vec::new(),
         context_servers: Vec::new(),

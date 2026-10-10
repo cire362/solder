@@ -96,13 +96,16 @@ pub fn search(
             "{base}/extensions?max_schema_version=1&filter={}",
             encode(query.trim())
         ),
+        // Asked for this machine: an extension with a build for each
+        // platform answers with ours, and one with a single build with it.
         Origin::VsCode => format!(
-            "{base}/api/-/search?size=50&sortBy={}&sortOrder=desc&query={}",
+            "{base}/api/-/search?size=50&sortBy={}&sortOrder=desc&targetPlatform={}&query={}",
             if browsing {
                 "downloadCount"
             } else {
                 "relevance"
             },
+            target(),
             encode(query.trim())
         ),
     };
@@ -137,6 +140,22 @@ pub fn search(
         })
     });
     async move { handle.await.map_err(|e| e.to_string())? }
+}
+
+/// This machine, as VS Code's extensions name the platform a build is
+/// for. One that has a build for every platform has none called this
+/// but one called `universal`, which the catalog answers with then.
+pub fn target() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "darwin-arm64",
+        ("macos", _) => "darwin-x64",
+        ("linux", "aarch64") => "linux-arm64",
+        ("linux", "arm") => "linux-armhf",
+        ("linux", _) => "linux-x64",
+        ("windows", "aarch64") => "win32-arm64",
+        ("windows", _) => "win32-x64",
+        _ => "universal",
+    }
 }
 
 /// A name that is safe as a folder: what both catalogs use for ids.
@@ -196,7 +215,11 @@ fn parse_open_vsx(answer: &Value) -> Vec<Entry> {
 /// One extension as Open VSX describes it, in a search or on its own.
 fn open_vsx_entry(item: &Value) -> Option<Entry> {
     let id = format!("{}.{}", text(&item["namespace"]), text(&item["name"]));
-    let url = text(&item["files"]["download"]);
+    // Where it lists a download for each platform, ours; else the one it
+    // answered with.
+    let url = Some(text(&item["downloads"][target()]))
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| text(&item["files"]["download"]));
     (valid_id(&id) && !url.is_empty()).then(|| Entry {
         origin: Origin::VsCode,
         name: Some(text(&item["displayName"]))
@@ -263,7 +286,14 @@ pub fn latest(
                     let Some((namespace, name)) = id.split_once('.') else {
                         continue;
                     };
-                    match json(&format!("{base}/api/{namespace}/{name}")).await {
+                    // The build for this machine, if it has one of its
+                    // own; else the one for all of them.
+                    let ours = format!("{base}/api/{namespace}/{name}/{}", target());
+                    let answer = match json(&ours).await {
+                        Ok(answer) => Ok(answer),
+                        Err(_) => json(&format!("{base}/api/{namespace}/{name}")).await,
+                    };
+                    match answer {
                         Ok(answer) => entries.extend(open_vsx_entry(&answer)),
                         Err(error) => failure = Some(error),
                     }
@@ -348,6 +378,75 @@ mod tests {
     }
 
     #[test]
+    fn an_extension_with_a_build_for_each_platform_gives_ours() {
+        // Asked for by name, the catalog has a build for this machine.
+        let ours = format!(
+            r#"{{"namespace":"Acme","name":"native","version":"2.0.0","targetPlatform":"{}",
+                "files":{{"download":"https://open-vsx.org/native-ours.vsix"}}}}"#,
+            target()
+        );
+        let any = r#"{"namespace":"Acme","name":"native","version":"2.0.0",
+            "files":{"download":"https://open-vsx.org/native-other.vsix"}}"#;
+        // One with a single build is not known under this machine's name.
+        let plain = r#"{"namespace":"Acme","name":"plain","version":"1.0.0",
+            "files":{"download":"https://open-vsx.org/plain.vsix"}}"#;
+        let (base, requests) = serve(vec![
+            (
+                Box::leak(format!("/api/Acme/native/{}", target()).into_boxed_str()),
+                Served::ok(ours.into_bytes()),
+            ),
+            ("/api/Acme/native", Served::ok(any.as_bytes().to_vec())),
+            (
+                Box::leak(format!("/api/Acme/plain/{}", target()).into_boxed_str()),
+                Served::status(404),
+            ),
+            ("/api/Acme/plain", Served::ok(plain.as_bytes().to_vec())),
+        ]);
+        let found = block(latest(
+            Origin::VsCode,
+            &base,
+            vec!["Acme.native".into(), "Acme.plain".into()],
+        ))
+        .unwrap();
+        let urls: Vec<&str> = found.iter().map(|entry| entry.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://open-vsx.org/native-ours.vsix",
+                "https://open-vsx.org/plain.vsix"
+            ]
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .contains(&"/api/Acme/plain".to_string())
+        );
+
+        // A search says which machine it is for, and an answer that lists
+        // a download for each platform is read for ours.
+        let listed = format!(
+            r#"{{"extensions":[{{"namespace":"Acme","name":"native","version":"2.0.0",
+                "files":{{"download":"https://open-vsx.org/first.vsix"}},
+                "downloads":{{"{}":"https://open-vsx.org/listed-ours.vsix","web":"https://open-vsx.org/web.vsix"}}}}]}}"#,
+            target()
+        );
+        let (base, requests) = serve(vec![("/api/-/search", Served::ok(listed.into_bytes()))]);
+        let found = block(search(Origin::VsCode, &base, "native")).unwrap();
+        assert_eq!(found[0].url, "https://open-vsx.org/listed-ours.vsix");
+        assert!(
+            requests.lock().unwrap()[0].contains(&format!("targetPlatform={}", target())),
+            "{:?}",
+            requests.lock().unwrap()
+        );
+        assert!(
+            ["darwin", "linux", "win32", "universal"]
+                .iter()
+                .any(|os| target().starts_with(os))
+        );
+    }
+
+    #[test]
     fn a_catalog_that_fails_says_so() {
         let (base, _) = serve(vec![
             ("/extensions", Served::status(503)),
@@ -390,6 +489,13 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(found.len(), 1);
+        // It was asked for the build for this machine first.
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .contains(&format!("/api/Vue/volar/{}", target()))
+        );
         assert_eq!(
             (found[0].id.as_str(), found[0].version.as_str()),
             ("Vue.volar", "3.4.0")

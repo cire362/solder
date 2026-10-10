@@ -17,7 +17,7 @@ use std::{
 use extension::{
     Entry, Event, Extension, Origin, Refusals, Snippet, catalog,
     gate::{Did, Gate},
-    host::{CodeLabel, Completion, DebugAdapter, DebugLaunch, Host, Status, World},
+    host::{CodeLabel, Completion, DebugAdapter, DebugLaunch, Host, Status, Symbol, World},
     install::{self, Progress, Staged},
     world::{SettingsFor, System},
 };
@@ -102,12 +102,17 @@ pub struct ExtensionStore {
     snippets: Vec<SnippetSet>,
     /// The languages last given to the syntax registry.
     languages: Vec<syntax::LanguageSpec>,
+    /// The TextMate grammars last given to it, by the name each goes by.
+    grammars: std::collections::HashMap<String, PathBuf>,
     zed: Catalog,
     open_vsx: Catalog,
     /// The catalogs' addresses; tests point them at a local server.
     pub zed_url: String,
     pub open_vsx_url: String,
     pub installing: HashMap<Key, Arc<Progress>>,
+    /// What other extensions needed that was already looked for, by id
+    /// in small letters.
+    sought: std::collections::HashSet<String>,
     /// Downloaded and read, waiting for the user to allow what they would
     /// do outside a sandbox.
     pub pending: HashMap<Key, Staged>,
@@ -154,6 +159,124 @@ struct Gated {
 
 /// The loaded code of an extension: what its slot holds, or loaded now.
 /// Blocking, and slow the first time.
+/// Puts `value` where the dots of `key` lead: `a.b.c` is `c` in `b` in
+/// `a`. An object put where one is already is laid over it, name by name,
+/// so that `"a": { "b": 1 }` and `"a.c": 2` in one file both hold.
+fn put_at(into: &mut serde_json::Value, key: &str, value: serde_json::Value) {
+    let mut at = into;
+    for part in key.split('.').filter(|part| !part.is_empty()) {
+        if !at.is_object() {
+            *at = serde_json::json!({});
+        }
+        at = &mut at[part];
+    }
+    match (at.is_object(), value) {
+        (true, serde_json::Value::Object(fields)) => {
+            for (name, field) in fields {
+                put_at(at, &name, field);
+            }
+        }
+        (_, value) => *at = value,
+    }
+}
+
+/// The launch a declared debugger is given: the one its manifest suggests,
+/// with its places filled in for the file to debug, or with none
+/// suggested, the least any adapter is told.
+fn launch_of(
+    debugger: &extension::Debugger,
+    launch: &DebugLaunch,
+    root: &Path,
+) -> serde_json::Value {
+    let file = Path::new(&launch.program);
+    let part = |part: Option<&std::ffi::OsStr>| {
+        part.map(|part| part.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let relative = file
+        .strip_prefix(root)
+        .unwrap_or(file)
+        .display()
+        .to_string();
+    let places = [
+        ("${file}", launch.program.clone()),
+        ("${relativeFile}", relative.clone()),
+        ("${fileBasenameNoExtension}", part(file.file_stem())),
+        ("${fileBasename}", part(file.file_name())),
+        ("${fileDirname}", part(file.parent().map(Path::as_os_str))),
+        ("${workspaceFolder}", root.display().to_string()),
+        ("${workspaceRoot}", root.display().to_string()),
+    ];
+    fn fill(value: &mut serde_json::Value, places: &[(&str, String)], asked: &str) {
+        match value {
+            serde_json::Value::String(text) => {
+                for (place, with) in places {
+                    *text = text.replace(place, with);
+                }
+                // What VS Code would ask the user for is the file: it
+                // is the file in front that is being debugged.
+                while let Some(start) = text.find("${command:").or(text.find("${input:")) {
+                    let end = text[start..]
+                        .find('}')
+                        .map_or(text.len(), |end| start + end + 1);
+                    text.replace_range(start..end, asked);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                items.iter_mut().for_each(|item| fill(item, places, asked))
+            }
+            serde_json::Value::Object(fields) => fields
+                .values_mut()
+                .for_each(|field| fill(field, places, asked)),
+            _ => {}
+        }
+    }
+    let mut config = debugger
+        .initial
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    fill(&mut config, &places, &relative);
+    config["type"] = debugger.name.clone().into();
+    config["request"] = "launch".into();
+    config["name"] = launch.label.clone().into();
+    if config["program"].is_null() {
+        config["program"] = launch.program.clone().into();
+    }
+    if config["cwd"].is_null() {
+        config["cwd"] = launch
+            .cwd
+            .clone()
+            .unwrap_or_else(|| root.display().to_string())
+            .into();
+    }
+    if !launch.args.is_empty() {
+        config["args"] = launch.args.clone().into();
+    }
+    config
+}
+
+/// What an extension reaches outside through: the world tests give, or
+/// the real one, behind the gate of what the user took back from it.
+fn world_in(
+    work_dir: &Path,
+    world: Option<Arc<dyn World>>,
+    statuses: mpsc::UnboundedSender<(String, Status)>,
+    settings: SettingsFor,
+    gated: Gated,
+) -> Arc<Gate> {
+    let world = world.unwrap_or_else(|| {
+        let mut system = System::new(extension::world::user_env(), move |server, status| {
+            let _ = statuses.unbounded_send((server.to_string(), status));
+        });
+        system.settings = Some(settings);
+        // Next to the extensions: their work folders are `work/<id>` under
+        // the same root.
+        system.node_home = work_dir.ancestors().nth(2).map(install::node_dir);
+        Arc::new(system)
+    });
+    Arc::new(Gate::new(world, gated.refusals, gated.did))
+}
+
 fn host_in(
     slot: &Slot,
     extension: &Extension,
@@ -167,17 +290,7 @@ fn host_in(
     if let Some(host) = &*slot {
         return Ok(host.clone());
     }
-    let world = world.unwrap_or_else(|| {
-        let mut system = System::new(extension::world::user_env(), move |server, status| {
-            let _ = statuses.unbounded_send((server.to_string(), status));
-        });
-        system.settings = Some(settings);
-        // Next to the extensions: their work folders are `work/<id>` under
-        // the same root.
-        system.node_home = work_dir.ancestors().nth(2).map(install::node_dir);
-        Arc::new(system)
-    });
-    let world = Arc::new(Gate::new(world, gated.refusals, gated.did));
+    let world = world_in(work_dir, world, statuses, settings, gated);
     let host = Arc::new(Host::load(extension, work_dir, world)?);
     *slot = Some(host.clone());
     Ok(host)
@@ -248,11 +361,13 @@ impl ExtensionStore {
             loaded: false,
             snippets: Vec::new(),
             languages: Vec::new(),
+            grammars: Default::default(),
             zed: Catalog::default(),
             open_vsx: Catalog::default(),
             zed_url: catalog::ZED.into(),
             open_vsx_url: catalog::OPEN_VSX.into(),
             installing: HashMap::new(),
+            sought: Default::default(),
             pending: HashMap::new(),
             updates: HashMap::new(),
             state: extension::State::default(),
@@ -510,14 +625,22 @@ impl ExtensionStore {
             .filter(|extension| !self.is_off(extension.origin, &extension.id))
             .flat_map(|extension| &extension.languages)
             .filter_map(|language| {
-                let grammar = language.grammar.as_ref()?;
+                // A grammar of tree-sitter's, with the queries next to
+                // it, or one of TextMate's, which is all there is to it.
+                let none = extension::Grammar::default();
+                let (grammar, lines) = match (&language.grammar, &language.textmate) {
+                    (Some(grammar), _) => (grammar, None),
+                    (None, Some(lines)) => (&none, Some(lines)),
+                    (None, None) => return None,
+                };
                 Some(syntax::LanguageSpec {
                     name: language.name.clone(),
                     suffixes: language.suffixes.clone(),
                     aliases: language.aliases.clone(),
                     line_comment: language.line_comment.clone(),
-                    symbol: grammar.symbol.clone(),
-                    grammar: grammar.module.clone(),
+                    symbol: lines.map_or(grammar.symbol.clone(), |(_, scope)| scope.clone()),
+                    grammar: lines.map_or(grammar.module.clone(), |(path, _)| path.clone()),
+                    textmate: lines.is_some(),
                     highlights: grammar.highlights.clone(),
                     injections: grammar.injections.clone(),
                     editing: syntax::Editing {
@@ -554,6 +677,18 @@ impl ExtensionStore {
                 lsp.update(cx, |lsp, cx| lsp.extension_servers_changed(cx));
             }
         });
+        // Where each TextMate grammar is, by the name it goes by: one
+        // grammar asks for another by that name.
+        let grammars: std::collections::HashMap<String, PathBuf> = self
+            .installed
+            .iter()
+            .filter(|extension| !self.is_off(extension.origin, &extension.id))
+            .flat_map(|extension| extension.grammars.iter().cloned())
+            .collect();
+        if grammars != self.grammars {
+            self.grammars = grammars.clone();
+            syntax::textmate::set_grammars(grammars);
+        }
         if specs == self.languages {
             return;
         }
@@ -690,6 +825,147 @@ impl ExtensionStore {
             .collect()
     }
 
+    /// What the settings of installed extensions are under `section`
+    /// (`prettier`, or `editor.suggest`; all of them for an empty one):
+    /// what their manifests declare by default, with what the user set in
+    /// settings.json over it. An object, as VS Code hands one to an
+    /// extension that asks for its configuration.
+    pub fn configuration(&self, section: &str, cx: &App) -> serde_json::Value {
+        let mut all = serde_json::json!({});
+        let declared = self
+            .installed
+            .iter()
+            .filter(|e| !self.is_off(e.origin, &e.id))
+            .flat_map(|extension| &extension.settings);
+        for setting in declared {
+            if !setting.default.is_null() {
+                put_at(&mut all, &setting.key, setting.default.clone());
+            }
+        }
+        if let Some(settings) = cx.try_global::<Settings>() {
+            for (key, value) in &settings.other {
+                put_at(&mut all, key, value.clone());
+            }
+        }
+        section
+            .split('.')
+            .filter(|part| !part.is_empty())
+            .try_fold(&all, |at, part| at.get(part))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// The debug adapters there are for `file`: the extension's id and
+    /// the adapter's name. Those of Zed extensions go by the file's
+    /// language, if it has one here. Those a VS Code extension declares
+    /// go by the languages they name: one that is the file's language, or
+    /// one some installed extension says files so named are of.
+    pub fn debuggers_for_file(&self, file: &Path, language: Option<&str>) -> Vec<(String, String)> {
+        let mut found = language
+            .map(|language| self.debuggers_for(language))
+            .unwrap_or_default();
+        let name = file
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let on: Vec<&Extension> = self
+            .installed
+            .iter()
+            .filter(|e| e.origin == Origin::VsCode && !self.is_off(e.origin, &e.id))
+            .collect();
+        // The ids of the languages a file of this name is of.
+        let ids: Vec<String> = on
+            .iter()
+            .flat_map(|extension| &extension.languages)
+            .filter(|known| {
+                known
+                    .suffixes
+                    .iter()
+                    .any(|suffix| name == *suffix || name.ends_with(&format!(".{suffix}")))
+            })
+            .filter_map(|known| known.aliases.first())
+            .map(|id| id.to_lowercase())
+            .chain(language.map(str::to_lowercase))
+            .collect();
+        for extension in on {
+            for debugger in &extension.debuggers {
+                if debugger.languages.iter().any(|id| ids.contains(id)) {
+                    found.push((extension.id.clone(), debugger.name.clone()));
+                }
+            }
+        }
+        found
+    }
+
+    /// How to start an adapter a VS Code extension declares, with no
+    /// code of the extension's run: the program its manifest names, by
+    /// the runtime it names, and the launch it suggests with its places
+    /// filled in. Finding the runtime may take a download (Node, where
+    /// the machine has none), so this runs on a thread of its own.
+    fn declared_adapter(
+        &mut self,
+        id: &str,
+        launch: DebugLaunch,
+        root: &Path,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<DebugAdapter, String>> {
+        let found = self.find(Origin::VsCode, id).and_then(|extension| {
+            let debugger = extension
+                .debuggers
+                .iter()
+                .find(|debugger| debugger.name == launch.adapter)?;
+            Some((extension.clone(), debugger.clone()))
+        });
+        let Some((extension, debugger)) = found else {
+            return Task::ready(Err(format!("{id} has no debugger to start")));
+        };
+        let work_dir = install::work_dir(&self.root, &extension.id);
+        let world = self.world.clone();
+        let statuses = self.statuses.clone();
+        let settings = self.settings_for();
+        let gated = self.gated(&extension.id);
+        let root = root.to_path_buf();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("solder-extension".into())
+            .spawn(move || {
+                let program = debugger.program.to_string_lossy().into_owned();
+                let command = match debugger.runtime.as_deref() {
+                    None => Ok((program, debugger.args.clone())),
+                    Some(runtime) => {
+                        let runtime = match runtime {
+                            // The machine's Node, or one of Solder's own.
+                            "node" => world_in(&work_dir, world, statuses, settings, gated).node(),
+                            other => Ok(other.to_string()),
+                        };
+                        runtime.map(|runtime| {
+                            let mut args = debugger.runtime_args.clone();
+                            args.push(program);
+                            args.extend(debugger.args.clone());
+                            (runtime, args)
+                        })
+                    }
+                };
+                let answer = command.map(|(command, args)| DebugAdapter {
+                    command: Some(command),
+                    args,
+                    env: Vec::new(),
+                    cwd: Some(extension.dir.to_string_lossy().into_owned()),
+                    connection: None,
+                    attach: false,
+                    configuration: launch_of(&debugger, &launch, &root).to_string(),
+                });
+                let _ = tx.send(answer);
+            });
+        if let Err(error) = spawned {
+            return Task::ready(Err(error.to_string()));
+        }
+        cx.background_executor().spawn(async move {
+            rx.await
+                .unwrap_or_else(|_| Err("The debugger was not found".into()))
+        })
+    }
+
     /// Asks the extension how to start its debug adapter for `launch`. It
     /// may install the adapter first, so this runs on a thread of its own,
     /// like [`ExtensionStore::resolve`].
@@ -701,7 +977,8 @@ impl ExtensionStore {
         cx: &mut Context<Self>,
     ) -> Task<Result<DebugAdapter, String>> {
         let Some(extension) = self.find(Origin::Zed, extension).cloned() else {
-            return Task::ready(Err(format!("{extension} is not installed")));
+            // One a VS Code extension declares needs no code to ask.
+            return self.declared_adapter(extension, launch, root, cx);
         };
         let slot = self.hosts.entry(extension.id.clone()).or_default().clone();
         let work_dir = install::work_dir(&self.root, &extension.id);
@@ -740,6 +1017,33 @@ impl ExtensionStore {
         completions: Vec<Completion>,
         cx: &App,
     ) -> Option<Task<Vec<Option<CodeLabel>>>> {
+        let name = server.to_string();
+        self.painted(server, cx, move |host| {
+            host.labels_for_completions(&name, &completions)
+        })
+    }
+
+    /// The same for the symbols `server` lists.
+    pub fn symbol_labels(
+        &self,
+        server: &str,
+        symbols: Vec<Symbol>,
+        cx: &App,
+    ) -> Option<Task<Vec<Option<CodeLabel>>>> {
+        let name = server.to_string();
+        self.painted(server, cx, move |host| {
+            host.labels_for_symbols(&name, &symbols)
+        })
+    }
+
+    /// Asks the extension that brought `server` for labels, on a thread
+    /// of its own.
+    fn painted(
+        &self,
+        server: &str,
+        cx: &App,
+        ask: impl FnOnce(&Host) -> Option<Result<Vec<Option<CodeLabel>>, String>> + Send + 'static,
+    ) -> Option<Task<Vec<Option<CodeLabel>>>> {
         let extension = self.installed.iter().find(|extension| {
             extension.runs_code()
                 && !self.is_off(extension.origin, &extension.id)
@@ -751,15 +1055,11 @@ impl ExtensionStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()?;
-        let server = server.to_string();
         let (tx, rx) = futures::channel::oneshot::channel();
         std::thread::Builder::new()
             .name("solder-extension".into())
             .spawn(move || {
-                let labels = host
-                    .labels_for_completions(&server, &completions)
-                    .and_then(Result::ok)
-                    .unwrap_or_default();
+                let labels = ask(&host).and_then(Result::ok).unwrap_or_default();
                 let _ = tx.send(labels);
             })
             .ok()?;
@@ -1025,14 +1325,55 @@ impl ExtensionStore {
                 .await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(_) => {
+                    Ok(extension) => {
                         this.updates.remove(&key);
+                        this.install_needed(&extension, cx);
                     }
                     Err(error) => {
                         this.errors.insert(key, error);
                     }
                 }
                 this.scan(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Installs what an extension that was just installed does not work
+    /// without, and what it is a pack of. Each is looked up once: one the
+    /// catalog does not have, such as a part of VS Code itself, is left
+    /// out, and two that need each other end where they began.
+    fn install_needed(&mut self, extension: &Extension, cx: &mut Context<Self>) {
+        let wanted: Vec<String> = extension
+            .needs
+            .iter()
+            .filter(|id| !id.to_lowercase().starts_with("vscode."))
+            .filter(|id| {
+                !self.installed.iter().any(|known| {
+                    known.origin == extension.origin && known.id.eq_ignore_ascii_case(id)
+                })
+            })
+            .filter(|id| self.sought.insert(id.to_lowercase()))
+            .cloned()
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        let origin = extension.origin;
+        let base = match origin {
+            Origin::Zed => self.zed_url.clone(),
+            Origin::VsCode => self.open_vsx_url.clone(),
+        };
+        let asking = catalog::latest(origin, &base, wanted);
+        cx.spawn(async move |this, cx| {
+            let Ok(entries) = asking.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                for entry in entries {
+                    this.install(entry, cx);
+                }
             })
             .ok();
         })
