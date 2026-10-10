@@ -399,6 +399,13 @@ fn start(plan: &Plan, script: &Path, extension: &Extension) -> Code {
             opened.map_err(|e| line(&e)),
         ));
         if read_ok {
+            // Saving an unchanged cell would also pass if the serializer
+            // ignored edits and merely returned the original file.
+            let edited = "2 + 2\n";
+            host.notify(
+                "notebook.cell",
+                json!({"uri":uri(&file),"handle":0,"value":edited}),
+            );
             let saved = host
                 .request("notebook.save", json!({"uri":uri(&file)}), plan.patience)
                 .and_then(|answer| {
@@ -419,10 +426,10 @@ fn start(plan: &Plan, script: &Path, extension: &Extension) -> Code {
                             .as_array()
                             .map(|lines| lines.iter().filter_map(Value::as_str).collect::<String>())
                     });
-                    if value["nbformat"] == 4 && text.as_deref() == Some("1 + 1") {
+                    if value["nbformat"] == 4 && text.as_deref() == Some(edited) {
                         Ok(())
                     } else {
-                        Err("The saved file lost the sample cell".into())
+                        Err("The saved file lost the edited sample cell".into())
                     }
                 });
             started.asked.push((
@@ -529,22 +536,25 @@ mod tests {
             &extension.join("package.json"),
             r#"{
             "name":"book","publisher":"Test","version":"1.0.0","main":"main.js",
-            "contributes":{"notebooks":[{"type":"test-book","selector":[{"filenamePattern":"*.ipynb"}]}]}
+            "contributes":{"notebooks":[
+              {"type":"test-book","selector":[{"filenamePattern":"*.ipynb"}]},
+              {"type":"stale-book","selector":[{"filenamePattern":"*.ipynb"}]}
+            ]}
         }"#,
         );
         write(
             &extension.join("main.js"),
             r#"
 const v = require('vscode');
-exports.activate = () => v.workspace.registerNotebookSerializer('test-book', {
+exports.activate = () => ['test-book', 'stale-book'].forEach(type => v.workspace.registerNotebookSerializer(type, {
   deserializeNotebook(bytes) {
     const file = JSON.parse(Buffer.from(bytes).toString());
     return new v.NotebookData(file.cells.map(cell => new v.NotebookCellData(v.NotebookCellKind.Code, cell.source, 'python')));
   },
   serializeNotebook(data) {
-    return Buffer.from(JSON.stringify({nbformat:4,cells:data.cells.map(cell => ({source:cell.value}))}));
+    return Buffer.from(JSON.stringify({nbformat:4,cells:data.cells.map(cell => ({source:type === 'stale-book' ? '1 + 1' : cell.value}))}));
   }
-});
+}));
 "#,
         );
         let Some(vsix) = zip(&dir.join("book"), "extension") else {
@@ -593,6 +603,11 @@ exports.activate = () => v.workspace.registerNotebookSerializer('test-book', {
             [
                 ("read .ipynb (test-book)".into(), Ok(())),
                 ("save .ipynb (test-book)".into(), Ok(())),
+                ("read .ipynb (stale-book)".into(), Ok(())),
+                (
+                    "save .ipynb (stale-book)".into(),
+                    Err("The saved file lost the edited sample cell".into()),
+                ),
             ]
         );
         assert_eq!(rows[0].version, "1.0.0");
