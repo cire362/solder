@@ -40,6 +40,7 @@ mod git;
 mod git_history;
 mod git_history_panel;
 mod git_panel;
+mod git_secrets;
 mod git_stash;
 mod git_store;
 mod go_to_line;

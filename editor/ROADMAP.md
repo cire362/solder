@@ -71,6 +71,11 @@ something of its own unchecked or unmade adds it here.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] The commit guard recognizes private-key PEM headers and known AWS,
+      GitHub, GitLab, Slack, API-key and connection-password forms. It is
+      not a universal credential detector: arbitrary passwords, encoded
+      credentials and binary key containers are not recognized. A staged
+      file above 5 MB stops the editor commit because it is not scanned
 - [ ] Git history loads 200 more commits at a time by reading the enlarged
       range again. A commit opens a read-only patch, limited to 500 KB; there
       is no comparison picker between arbitrary commits. Blame shows the
@@ -545,7 +550,7 @@ update. They come after phase 9, in this order unless one is needed sooner.
 ### Git history
 - [x] The history as a graph, the history of one file, blame in the gutter
 - [x] Stash and fetch
-- [ ] A check before a commit: keys and secrets in what is staged stop it
+- [x] A check before a commit: keys and secrets in what is staged stop it
 - [ ] A commit message proposed by the model from what is staged
 - [ ] The pull request of the branch and the state of its checks, through `gh`
 

@@ -7855,6 +7855,39 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_secret_stops_the_panel_commit_and_keeps_its_message(cx: &mut TestAppContext) {
+        let root = git_fixture("secret-window");
+        let secret = ["ghp_", &"A".repeat(36)].concat();
+        std::fs::write(root.join("a.txt"), &secret).unwrap();
+        let repo = crate::git::Repo::discover(&root).unwrap();
+        repo.stage(&["a.txt"]).unwrap();
+        std::fs::write(root.join("a.txt"), "clean working file").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        let git = cx.read(|cx| ws.read(cx).git.clone());
+        wait_for(cx, "staged file", &|cx| {
+            git.read(cx)
+                .status()
+                .files
+                .iter()
+                .any(|f| f.staged.is_some())
+        });
+        cx.dispatch_action(ShowGit);
+        cx.simulate_input("Keep this message");
+        cx.simulate_keystrokes("secondary-enter");
+        wait_for(cx, "commit guard", &|cx| {
+            git.read(cx)
+                .last_error
+                .as_ref()
+                .is_some_and(|e| e.contains("Commit stopped"))
+        });
+        let message = cx.read(|cx| ws.read(cx).git_panel.read(cx).message.read(cx).text(cx));
+        assert_eq!(message, "Keep this message");
+        assert!(cx.read(|cx| !git.read(cx).last_error.as_ref().unwrap().contains(&secret)));
+        assert!(repo.show("HEAD:a.txt").unwrap().contains("one"));
+    }
+
+    #[gpui::test]
     fn git_stage_lines_revert_and_commit(cx: &mut TestAppContext) {
         let root = git_fixture("git-flow");
         cx.executor().allow_parking();

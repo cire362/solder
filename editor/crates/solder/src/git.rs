@@ -324,6 +324,7 @@ impl Repo {
 
     /// Commits the index. Returns the first line of git's summary.
     pub fn commit(&self, message: &str, amend: bool) -> Result<String> {
+        self.check_staged_secrets()?;
         let mut args = vec!["commit", "-F", "-"];
         if amend {
             args.push("--amend");

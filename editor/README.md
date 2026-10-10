@@ -234,6 +234,14 @@ in the editor and is not included: save it first to stash it. **Fetch** updates
 all remotes without merging. Git uses existing credentials and reports an
 error if it needs a terminal prompt. Operations run one at a time.
 
+Before **Commit** or **Amend**, the editor scans the contents of changed staged
+files for private keys and known credential formats. A match stops the commit
+and names the file, line and kind; it never shows the credential. Cleaning only
+the working file is not enough: stage the cleaned file too. Read failures and
+staged files over 5 MB also stop the commit. This is a guard for recognizable
+keys, not a promise to find every password. It applies to editor commits;
+commands typed into a terminal use Git's own hooks.
+
 ## Run the stack
 
 Open the Services tab with `cmd-shift-s` (`ctrl-shift-s` on Linux). Solder lists the
