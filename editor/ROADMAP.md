@@ -259,8 +259,10 @@ to build them.
       palette and the keymap. Menus: the editor's (`editor/context`), which
       Solder had none of, and the file tree's (`explorer/context`).
       Conditions (`when`) are read by a small reader of Solder's own
-- [ ] Debugging: adapters and configurations that extensions register in
-      code, in the debugger
+- [x] Debugging: adapters and configurations that extensions register in
+      code, in the debugger. An adapter that is an object in the code is
+      reached at a local port; a launch by name and adapters on named
+      pipes are not there
 - [ ] Tasks, terminals and file watching
 - [ ] Source control providers, views in the sidebar (trees), decorations and
       test controllers

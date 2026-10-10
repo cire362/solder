@@ -868,6 +868,19 @@ impl ExtensionStore {
         }
     }
 
+    /// Says to the extensions whose code runs that a program began to be
+    /// debugged, or that it ended.
+    pub fn debug_session(&self, began: bool, session: Value) {
+        self.tell(
+            if began {
+                "debug.started"
+            } else {
+                "debug.ended"
+            },
+            session,
+        );
+    }
+
     /// The extensions whose code answers for files of a language as a
     /// language server would: the ones that registered something for one
     /// of the names the language goes by, or for every language.
@@ -1169,6 +1182,60 @@ impl ExtensionStore {
                 cx.background_executor()
                     .spawn(async move { reply.send(written.await.map(|()| Value::Null)) })
                     .detach();
+            }
+            // A launch the extension put together itself, for a debugger
+            // some installed extension has. Started once this update is
+            // over: the debugger asks this store for the adapter.
+            "debug.start" => {
+                let configuration = params["configuration"].clone();
+                let kind = text(&configuration["type"]);
+                let owner = self
+                    .installed
+                    .iter()
+                    .filter(|e| e.origin == extension::Origin::VsCode)
+                    .filter(|e| !self.is_off(e.origin, &e.id))
+                    .find(|e| e.debuggers.iter().any(|debugger| debugger.name == kind))
+                    .map(|e| e.id.clone());
+                let root = path_of(&params["folder"])
+                    .or_else(|| params["folder"].as_str().map(PathBuf::from))
+                    .or_else(|| self.api.folders.first().cloned());
+                let (Some(extension), Some(root)) = (owner, root) else {
+                    reply.send(Ok(json!(false)));
+                    return;
+                };
+                let name = match text(&configuration["name"]) {
+                    name if name.is_empty() => kind.clone(),
+                    name => name,
+                };
+                let launch = extension::host::DebugLaunch {
+                    label: name.clone(),
+                    adapter: kind,
+                    program: text(&configuration["program"]),
+                    cwd: Some(root.display().to_string()),
+                    ..Default::default()
+                };
+                let config = crate::debug_launch::LaunchConfig {
+                    name,
+                    adapter: Some(crate::debug_launch::ExtensionAdapter {
+                        extension,
+                        launch,
+                        configuration: Some(configuration),
+                    }),
+                    ..Default::default()
+                };
+                cx.defer(move |cx| {
+                    let debug = crate::debug::DebugStore::global(cx);
+                    debug.update(cx, |debug, cx| debug.start(config, root, cx));
+                });
+                reply.send(Ok(json!(true)));
+            }
+            "debug.stop" => {
+                cx.defer(|cx| {
+                    if let Some(debug) = crate::debug::DebugStore::try_global(cx) {
+                        debug.update(cx, |debug, cx| debug.stop(cx));
+                    }
+                });
+                reply.send(Ok(Value::Null));
             }
             "clipboardRead" => {
                 let text = cx.read_from_clipboard().and_then(|item| item.text());

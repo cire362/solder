@@ -758,7 +758,7 @@ here.
 | From | Solder uses | Does not run here |
 |---|---|---|
 | A Zed extension | Languages (highlighting, the languages inside them, and how they are typed: indentation, brackets, pairs, comments, words), snippets, themes, icon themes, its language servers, its debug adapters, its context servers | |
-| A VS Code extension | Languages (colors from its TextMate grammar; comments, pairs and indentation from its language configuration), themes (JSON and the older `.tmTheme`), icon themes drawn with pictures, snippets, debuggers whose manifest names the adapter's program, and its code, once you allow it | Icon themes drawn with a font, debuggers only its code can start, and what its code asks of VS Code that Solder does not have yet |
+| A VS Code extension | Languages (colors from its TextMate grammar; comments, pairs and indentation from its language configuration), themes (JSON and the older `.tmTheme`), icon themes drawn with pictures, snippets, its debuggers, and its code, once you allow it | Icon themes drawn with a font, and what its code asks of VS Code that Solder does not have yet |
 
 A Zed extension's language is a tree-sitter grammar compiled to WebAssembly.
 It is compiled on the first file that needs it and runs in wasmtime inside
@@ -850,8 +850,23 @@ mostly, the machine's or Solder's own). It is offered for the files of the
 languages it names, even ones Solder has no grammar for, and started with the
 launch its manifest suggests: `${file}`, `${workspaceFolder}` and the like are
 filled in, and where VS Code would ask which program, it is the file in
-front. A debugger whose adapter only the extension's code can start is listed
-among what does not run here.
+front.
+
+A debugger may also be set up in the extension's code, and many are: the
+manifest names the kind of program and the code says what the adapter is.
+Once that code is allowed, such a debugger is offered like the others, and
+the code is started when a run is, not before. It is asked two things. Its
+configuration providers go over the launch and may add to it or call it off.
+Its adapter factory says where the adapter is: a program to start, a port
+where one listens already, or an object in the extension's own code, which
+the host puts behind a port of this machine so that the debugger reaches it
+like any adapter. With no factory, the adapter is the program the manifest
+names. An extension can start a run itself (`debug.startDebugging`, with a
+launch given whole) and hears when runs begin and end. A launch by its name
+in a file of launches, an adapter on a named pipe, and requests to the
+adapter of a running session are not here yet. In an extension with no
+code, a debugger whose manifest names no adapter is listed among what does
+not run here.
 
 The settings a VS Code extension declares are set in `settings.json` under
 their own names, as in VS Code: `"prettier.tabWidth": 2`, or as objects inside

@@ -16,6 +16,7 @@ const types = require('./types');
 const { Documents } = require('./documents');
 const buildApi = require('./api');
 const buildLanguages = require('./languages');
+const buildDebug = require('./debug');
 
 const { Disposable, EventEmitter, Uri } = types.classes;
 
@@ -132,6 +133,7 @@ const core = {
   namespace,
   extensionId,
   extensionDir,
+  manifest,
   state: { folders: [], configuration: {}, defaults: {}, dark: true },
   tabSize: () => {
     const size = core.state.configuration.editor && core.state.configuration.editor.tabSize;
@@ -143,6 +145,8 @@ const built = buildApi(core);
 const languages = buildLanguages(core);
 // The editor speaks to this host as to a language server.
 built.told.lsp = (params) => void languages.lsp(params);
+const debugging = buildDebug(core);
+Object.assign(built.told, debugging.told);
 
 const vscode = {
   // Extensions and their libraries refuse a VS Code older than they
@@ -150,8 +154,11 @@ const vscode = {
   version: '1.100.0',
   ...types.classes,
   ...languages.classes,
+  ...debugging.classes,
   ...types.enums,
+  ...debugging.enums,
   languages: languages.languages,
+  debug: debugging.debug,
   window: built.window,
   workspace: built.workspace,
   env: built.env,
@@ -310,6 +317,8 @@ const handlers = {
     return plain(await own.handler.apply(own.thisArg, revive(args || [])));
   },
 };
+
+Object.assign(handlers, debugging.asked);
 
 async function handle(message) {
   if (message.method === undefined) {

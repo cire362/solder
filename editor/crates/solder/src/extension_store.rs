@@ -325,6 +325,87 @@ fn launch_of(
     config
 }
 
+/// The adapter of a VS Code extension's debugger: where the extension's
+/// code said it is (a program, or a port it listens at already), else the
+/// program the manifest names. `node` finds Node for an adapter that is a
+/// script, and may take as long as a download.
+fn adapter_of(
+    said: &serde_json::Value,
+    configuration: serde_json::Value,
+    debugger: &extension::Debugger,
+    dir: &Path,
+    node: impl FnOnce() -> Result<String, String>,
+) -> Result<DebugAdapter, String> {
+    let text = |value: &serde_json::Value| value.as_str().map(str::to_string);
+    let strings = |value: &serde_json::Value| -> Vec<String> {
+        let list = value.as_array().into_iter().flatten();
+        list.filter_map(text).collect()
+    };
+    let attach = configuration["request"] == "attach";
+    let configuration = configuration.to_string();
+    // One that listens already is only connected to.
+    if let Some(port) = said["port"]
+        .as_u64()
+        .and_then(|port| u16::try_from(port).ok())
+    {
+        let host = text(&said["host"])
+            .and_then(|host| host.parse().ok())
+            .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+        return Ok(DebugAdapter {
+            command: None,
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+            connection: Some((host, port, None)),
+            attach,
+            configuration,
+        });
+    }
+    let (command, args, cwd, env) = match text(&said["command"]) {
+        Some(command) => {
+            let env = said["env"].as_object().into_iter().flatten();
+            let env = env.filter_map(|(name, value)| Some((name.clone(), text(value)?)));
+            (
+                command,
+                strings(&said["args"]),
+                text(&said["cwd"]),
+                env.collect(),
+            )
+        }
+        None => {
+            let program = debugger
+                .program
+                .as_ref()
+                .ok_or("Its code named no debug adapter")?
+                .to_string_lossy()
+                .into_owned();
+            let (command, args) = match debugger.runtime.clone() {
+                None => (program, debugger.args.clone()),
+                Some(runtime) => {
+                    let mut args = debugger.runtime_args.clone();
+                    args.push(program);
+                    args.extend(debugger.args.clone());
+                    (runtime, args)
+                }
+            };
+            (command, args, None, Vec::new())
+        }
+    };
+    let command = match command.as_str() {
+        "node" => node()?,
+        _ => command,
+    };
+    Ok(DebugAdapter {
+        command: Some(command),
+        args,
+        env,
+        cwd: cwd.or_else(|| Some(dir.to_string_lossy().into_owned())),
+        connection: None,
+        attach,
+        configuration,
+    })
+}
+
 /// What an extension reaches outside through: the world tests give, or
 /// the real one, behind the gate of what the user took back from it.
 fn world_in(
@@ -1015,7 +1096,9 @@ impl ExtensionStore {
             .collect();
         for extension in on {
             for debugger in &extension.debuggers {
-                if debugger.languages.iter().any(|id| ids.contains(id)) {
+                // One whose adapter only its code names needs that code.
+                let startable = debugger.program.is_some() || self.may_run(extension);
+                if startable && debugger.languages.iter().any(|id| ids.contains(id)) {
                     found.push((extension.id.clone(), debugger.name.clone()));
                 }
             }
@@ -1023,15 +1106,20 @@ impl ExtensionStore {
         found
     }
 
-    /// How to start an adapter a VS Code extension declares, with no
-    /// code of the extension's run: the program its manifest names, by
-    /// the runtime it names, and the launch it suggests with its places
-    /// filled in. Finding the runtime may take a download (Node, where
-    /// the machine has none), so this runs on a thread of its own.
+    /// How to start an adapter of a VS Code extension, and what to ask it
+    /// for. Where the extension's code may run it is asked first: its
+    /// providers go over the launch, and it may say what the adapter is.
+    /// Otherwise, and where the code says nothing, the adapter is the
+    /// program its manifest names, by the runtime it names, with the
+    /// launch the manifest suggests. `given` is a launch that came whole,
+    /// from the extension itself. Finding the runtime may take a download
+    /// (Node, where the machine has none), so that part runs on a thread
+    /// of its own.
     fn declared_adapter(
         &mut self,
         id: &str,
         launch: DebugLaunch,
+        given: Option<serde_json::Value>,
         root: &Path,
         cx: &mut Context<Self>,
     ) -> Task<Result<DebugAdapter, String>> {
@@ -1045,50 +1133,80 @@ impl ExtensionStore {
         let Some((extension, debugger)) = found else {
             return Task::ready(Err(format!("{id} has no debugger to start")));
         };
+        let configuration = given.unwrap_or_else(|| launch_of(&debugger, &launch, root));
+        let asked = self.may_run(&extension).then(|| {
+            let params = serde_json::json!({
+                "type": debugger.name,
+                "configuration": configuration,
+                "folder": root,
+            });
+            self.ask_host(&extension.id, "debug.adapter", params, cx)
+        });
+        if asked.is_none() && debugger.program.is_none() {
+            return Task::ready(Err(format!(
+                "{} says what its debugger is in code, which was not allowed to run",
+                extension.name
+            )));
+        }
         let work_dir = install::work_dir(&self.root, &extension.id);
         let world = self.world.clone();
         let statuses = self.statuses.clone();
         let settings = self.settings_for();
         let gated = self.gated(&extension.id);
-        let root = root.to_path_buf();
-        let (tx, rx) = futures::channel::oneshot::channel();
-        let spawned = std::thread::Builder::new()
-            .name("solder-extension".into())
-            .spawn(move || {
-                let program = debugger.program.to_string_lossy().into_owned();
-                let command = match debugger.runtime.as_deref() {
-                    None => Ok((program, debugger.args.clone())),
-                    Some(runtime) => {
-                        let runtime = match runtime {
-                            // The machine's Node, or one of Solder's own.
-                            "node" => world_in(&work_dir, world, statuses, settings, gated).node(),
-                            other => Ok(other.to_string()),
-                        };
-                        runtime.map(|runtime| {
-                            let mut args = debugger.runtime_args.clone();
-                            args.push(program);
-                            args.extend(debugger.args.clone());
-                            (runtime, args)
-                        })
-                    }
-                };
-                let answer = command.map(|(command, args)| DebugAdapter {
-                    command: Some(command),
-                    args,
-                    env: Vec::new(),
-                    cwd: Some(extension.dir.to_string_lossy().into_owned()),
-                    connection: None,
-                    attach: false,
-                    configuration: launch_of(&debugger, &launch, &root).to_string(),
-                });
-                let _ = tx.send(answer);
-            });
-        if let Err(error) = spawned {
-            return Task::ready(Err(error.to_string()));
-        }
         cx.background_executor().spawn(async move {
+            let said = match asked {
+                Some(asked) => asked.await?,
+                None => serde_json::Value::Null,
+            };
+            if said["cancelled"] == true {
+                return Err("The extension called the launch off".into());
+            }
+            let configuration = match &said["configuration"] {
+                serde_json::Value::Null => configuration,
+                resolved => resolved.clone(),
+            };
+            let (tx, rx) = oneshot::channel();
+            std::thread::Builder::new()
+                .name("solder-extension".into())
+                .spawn(move || {
+                    // The machine's Node, or one of Solder's own.
+                    let node = || world_in(&work_dir, world, statuses, settings, gated).node();
+                    let adapter = adapter_of(&said, configuration, &debugger, &extension.dir, node);
+                    let _ = tx.send(adapter);
+                })
+                .map_err(|e| e.to_string())?;
             rx.await
                 .unwrap_or_else(|_| Err("The debugger was not found".into()))
+        })
+    }
+
+    /// Asks the code of a VS Code extension something, starting it first
+    /// if it does not run yet.
+    pub(crate) fn ask_host(
+        &mut self,
+        id: &str,
+        method: &'static str,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<serde_json::Value, String>> {
+        if !self.code.contains_key(id) {
+            self.start_code(id, cx);
+        }
+        let started = match self.code.get(id) {
+            Some(NodeCode {
+                state: CodeState::Stopped(why),
+                ..
+            }) => return Task::ready(Err(why.clone())),
+            Some(code) => code.started.clone(),
+            None => return Task::ready(Err(format!("{id} has no code to ask"))),
+        };
+        cx.background_executor().spawn(async move {
+            let host = started.await.unwrap_or_else(|_| Err(STOPPED.into()))?;
+            let (tx, rx) = oneshot::channel();
+            host.ask(method, params, move |answer| {
+                let _ = tx.send(answer);
+            });
+            rx.await.unwrap_or_else(|_| Err(STOPPED.into()))
         })
     }
 
@@ -1099,12 +1217,12 @@ impl ExtensionStore {
         &mut self,
         extension: &str,
         launch: DebugLaunch,
+        given: Option<serde_json::Value>,
         root: &Path,
         cx: &mut Context<Self>,
     ) -> Task<Result<DebugAdapter, String>> {
         let Some(extension) = self.find(Origin::Zed, extension).cloned() else {
-            // One a VS Code extension declares needs no code to ask.
-            return self.declared_adapter(extension, launch, root, cx);
+            return self.declared_adapter(extension, launch, given, root, cx);
         };
         let slot = self.hosts.entry(extension.id.clone()).or_default().clone();
         let work_dir = install::work_dir(&self.root, &extension.id);
@@ -2047,26 +2165,8 @@ impl ExtensionStore {
         let Some(owner) = owner else {
             return Task::ready(Err(format!("No command {command}")));
         };
-        if !self.code.contains_key(&owner) {
-            self.start_code(&owner, cx);
-        }
-        let started = match self.code.get(&owner) {
-            Some(NodeCode {
-                state: CodeState::Stopped(why),
-                ..
-            }) => return Task::ready(Err(why.clone())),
-            Some(code) => code.started.clone(),
-            None => return Task::ready(Err(format!("No command {command}"))),
-        };
         let params = serde_json::json!({ "id": command, "args": args });
-        cx.background_executor().spawn(async move {
-            let host = started.await.unwrap_or_else(|_| Err(STOPPED.into()))?;
-            let (tx, rx) = oneshot::channel();
-            host.ask("executeCommand", params, move |answer| {
-                let _ = tx.send(answer);
-            });
-            rx.await.unwrap_or_else(|_| Err(STOPPED.into()))
-        })
+        self.ask_host(&owner, "executeCommand", params, cx)
     }
 
     /// Saves one of an extension's themes in the themes folder and makes it

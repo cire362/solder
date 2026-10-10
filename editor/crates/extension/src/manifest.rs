@@ -214,8 +214,9 @@ pub struct Debugger {
     /// The ids of the languages it debugs, in small letters.
     pub languages: Vec<String>,
     /// The adapter, inside the extension: a program, or with `runtime`
-    /// a script for it.
-    pub program: PathBuf,
+    /// a script for it. `None` for one only the extension's code names:
+    /// asked when a program is to be debugged.
+    pub program: Option<PathBuf>,
     /// What runs the program: `node` mostly.
     pub runtime: Option<String>,
     pub runtime_args: Vec<String>,
@@ -977,10 +978,12 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
             .as_str()
             .and_then(|program| inside(dir, program))
             .filter(|program| program.is_file());
-        let (Some(program), false) = (program, name.is_empty()) else {
+        // With no program named, the adapter is what the extension's
+        // code says it is; an extension with no code cannot say.
+        if name.is_empty() || (program.is_none() && !matches!(code, Code::Node { .. })) {
             started_by_code += 1;
             continue;
-        };
+        }
         let mut languages: Vec<String> = strings(&entry["languages"])
             .iter()
             .map(|language| language.to_lowercase())

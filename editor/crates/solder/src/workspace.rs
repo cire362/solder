@@ -12256,6 +12256,244 @@ exports.activate = async (context) => {
     }
 
     #[gpui::test]
+    fn a_debugger_an_extension_sets_up_in_code_debugs_a_file(cx: &mut TestAppContext) {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let root = db::testing::dir("ws-coded-debug").canonicalize().unwrap();
+        let app = root.join("app.demo");
+        std::fs::write(&app, "one\ntwo\nthree\n").unwrap();
+        let data = db::testing::dir("ws-coded-debug-data");
+        let installed = data.join("extensions/vscode/acme.coded");
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_dap_stdio.py"),
+            installed.join("adapter.py"),
+        )
+        .unwrap();
+        // Two debuggers whose manifest names no adapter: the code says
+        // what each is. One is a program the code names; the other is an
+        // object in the extension's own code.
+        write_file(
+            &installed.join("package.json"),
+            r#"{ "name": "coded", "publisher": "Acme", "version": "1.0.0", "main": "main.js",
+  "activationEvents": ["onDebugResolve:coded"],
+  "contributes": {
+    "languages": [{ "id": "demo", "extensions": [".demo"] }],
+    "breakpoints": [{ "language": "demo" }],
+    "debuggers": [{ "type": "coded", "label": "Coded" }, { "type": "inline", "label": "Inline" }]
+  } }"#,
+        );
+        write_file(
+            &installed.join("main.js"),
+            r#"const vscode = require('vscode');
+// An adapter that is an object here: it stops on the first breakpoint of
+// the program it was launched for, and ends when told to go on.
+class Inline {
+  constructor() {
+    this.sent = new vscode.EventEmitter();
+    this.onDidSendMessage = this.sent.event;
+    this.lines = {};
+    this.seq = 0;
+  }
+  say(message) {
+    this.sent.fire({ seq: ++this.seq, ...message });
+  }
+  handleMessage(request) {
+    const args = request.arguments || {};
+    let body = {};
+    if (request.command === 'initialize') body = { supportsConfigurationDoneRequest: true };
+    if (request.command === 'launch') this.program = args.program;
+    if (request.command === 'setBreakpoints') {
+      this.lines[args.source.path] = (args.breakpoints || []).map((one) => one.line);
+      body = { breakpoints: this.lines[args.source.path].map((line) => ({ verified: true, line })) };
+    }
+    if (request.command === 'threads') body = { threads: [{ id: 1, name: 'main' }] };
+    if (request.command === 'stackTrace') {
+      const line = (this.lines[this.program] || [1])[0];
+      body = { stackFrames: [{ id: 1, name: 'inline', line, column: 1, source: { path: this.program, name: 'program' } }], totalFrames: 1 };
+    }
+    if (request.command === 'scopes') body = { scopes: [] };
+    this.say({ type: 'response', request_seq: request.seq, success: true, command: request.command, body });
+    if (request.command === 'initialize') this.say({ type: 'event', event: 'initialized', body: {} });
+    if (request.command === 'configurationDone') this.say({ type: 'event', event: 'stopped', body: { reason: 'breakpoint', threadId: 1, allThreadsStopped: true } });
+    if (request.command === 'continue') this.say({ type: 'event', event: 'terminated', body: {} });
+  }
+  dispose() {
+    console.log('the adapter was let go');
+  }
+}
+exports.activate = (context) => {
+  context.subscriptions.push(
+    vscode.debug.registerDebugConfigurationProvider('coded', {
+      resolveDebugConfiguration(folder, launch) {
+        if (launch.name === 'Not this one') return undefined;
+        return { ...launch, stopOnEntry: true, folder: folder.name };
+      },
+    }),
+    vscode.debug.registerDebugAdapterDescriptorFactory('coded', {
+      createDebugAdapterDescriptor: (session) =>
+        new vscode.DebugAdapterExecutable('python3', [context.asAbsolutePath('adapter.py'), context.asAbsolutePath(session.configuration.name + '.json')]),
+    }),
+    vscode.debug.registerDebugAdapterDescriptorFactory('inline', {
+      createDebugAdapterDescriptor: () => new vscode.DebugAdapterInlineImplementation(new Inline()),
+    }),
+    vscode.debug.onDidStartDebugSession((session) => console.log(`started ${session.type} ${session.name}`)),
+    vscode.debug.onDidTerminateDebugSession((session) => console.log(`ended ${session.type}`)),
+    vscode.commands.registerCommand('coded.debug', (program, name) =>
+      vscode.debug.startDebugging(undefined, { type: 'coded', request: 'launch', name, program })),
+  );
+};"#,
+        );
+        cx.executor().allow_parking();
+        let (extensions, debug) = cx.update(|cx| {
+            let extensions = cx.new(|cx| {
+                let mut store =
+                    ExtensionStore::new(data.join("extensions"), data.join("config"), cx);
+                store.world = Some(std::sync::Arc::new(NodeOnly(
+                    node.to_string_lossy().into_owned(),
+                )));
+                store
+            });
+            ExtensionStore::set_global(extensions.clone(), cx);
+            extensions.update(cx, |s, cx| s.scan(cx));
+            let debug = cx.new(|_| {
+                crate::debug::DebugStore::new(
+                    data.join("debug"),
+                    crate::debug::AdapterSpec::JsDebug,
+                )
+            });
+            crate::debug::DebugStore::set_global(debug.clone(), cx);
+            (extensions, debug)
+        });
+        let (ws, cx) = setup(cx, root.clone());
+        wait_for(cx, "the extensions folder", &|cx| {
+            extensions.read(cx).loaded
+        });
+        ws.update_in(cx, |w, window, cx| {
+            w.open_path(app.clone(), None, window, cx)
+        });
+        let offered = |cx: &App| -> Vec<String> {
+            let configs = crate::debug_launch::from_extensions(&root, &app, cx);
+            configs.into_iter().map(|config| config.name).collect()
+        };
+        let said = |cx: &App, what: &str| {
+            let store = extensions.read(cx);
+            let code = store.code("Acme.coded");
+            code.is_some_and(|code| code.said.iter().any(|(_, text)| text == what))
+        };
+        // Its code was not allowed, so it has no debugger to offer: only
+        // the code knows what the adapters are.
+        assert!(cx.read(|cx| offered(cx)).is_empty());
+        extensions.update(cx, |store, cx| {
+            store.allow(Origin::VsCode, "Acme.coded", cx)
+        });
+        assert_eq!(
+            cx.read(|cx| offered(cx)),
+            ["coded app.demo", "inline app.demo"]
+        );
+        // Offering them started nothing: it waits to be asked.
+        assert!(cx.read(|cx| extensions.read(cx).code("Acme.coded").is_none()));
+
+        // The first: its code is started, goes over the launch, and names
+        // a program for the adapter. The run stops on the breakpoint.
+        let configs = cx.read(|cx| crate::debug_launch::from_extensions(&root, &app, cx));
+        debug.update(cx, |s, cx| {
+            s.toggle(&app, 2, cx);
+            s.start(configs[0].clone(), root.clone(), cx)
+        });
+        wait_for(cx, "the pause in app.demo", &|cx| {
+            paused_line(&debug, cx) == Some(2)
+        });
+        let launch: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(installed.join("coded app.demo.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(launch["program"], app.display().to_string());
+        // What its provider added to the launch.
+        assert_eq!(launch["stopOnEntry"], true);
+        assert_eq!(
+            launch["folder"],
+            root.file_name().unwrap().to_string_lossy().as_ref()
+        );
+        wait_for(cx, "the extension to hear of it", &|cx| {
+            said(cx, "started coded coded app.demo")
+        });
+        debug.update(cx, |s, cx| s.stop(cx));
+        cx.run_until_parked();
+        assert!(cx.read(|cx| !debug.read(cx).state.active()));
+
+        // The second: its adapter is an object in the extension's code,
+        // reached at a port of this machine like any adapter.
+        debug.update(cx, |s, cx| s.start(configs[1].clone(), root.clone(), cx));
+        wait_for(cx, "the pause by the adapter in code", &|cx| {
+            paused_line(&debug, cx) == Some(2)
+                && debug
+                    .read(cx)
+                    .paused
+                    .as_ref()
+                    .unwrap()
+                    .frame()
+                    .unwrap()
+                    .name
+                    == "inline"
+        });
+        debug.update(cx, |s, cx| s.resume(cx));
+        wait_for(cx, "the run to end", &|cx| !debug.read(cx).state.active());
+        wait_for(cx, "the extension to hear of the end", &|cx| {
+            said(cx, "ended inline") && said(cx, "the adapter was let go")
+        });
+
+        // The extension starts a run itself, with a launch of its own.
+        let running = extensions.update(cx, |store, cx| {
+            let args = serde_json::json!([app.display().to_string(), "From code"]);
+            store.run_command("coded.debug", args, cx)
+        });
+        wait_for(cx, "the pause in the run it started", &|cx| {
+            paused_line(&debug, cx) == Some(2)
+        });
+        assert_eq!(
+            cx.executor().block_test(running),
+            Ok(serde_json::json!(true))
+        );
+        assert!(installed.join("From code.json").is_file());
+        debug.update(cx, |s, cx| s.stop(cx));
+        cx.run_until_parked();
+        // A launch its provider calls off is not started, and says so.
+        let called_off = extensions.update(cx, |store, cx| {
+            let launch = extension::host::DebugLaunch {
+                adapter: "coded".into(),
+                ..Default::default()
+            };
+            let given = serde_json::json!({ "type": "coded", "name": "Not this one" });
+            store.debug_adapter("Acme.coded", launch, Some(given), &root, cx)
+        });
+        let answer = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let got = answer.clone();
+        cx.foreground_executor()
+            .spawn(async move { *got.borrow_mut() = Some(called_off.await) })
+            .detach();
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if answer.borrow().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let answer = answer.borrow_mut().take();
+        assert_eq!(
+            answer,
+            Some(Err("The extension called the launch off".to_string()))
+        );
+    }
+
+    #[gpui::test]
     fn what_an_extension_contributes_is_in_the_palette_the_menus_and_the_keys(
         cx: &mut TestAppContext,
     ) {

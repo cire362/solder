@@ -225,6 +225,12 @@ Never guess a signature.
   fact it lacks is false, so a new fact is added there, never guessed.
   The store cannot read the workspace it is asked from, which is in the
   middle of its own update: the workspace brings the facts.
+  The debugger starts adapters and speaks to them itself, so an
+  extension's code is only asked what the launch and the adapter are
+  (`debug.adapter`, through `ExtensionStore::ask_host`, which starts the
+  code if it does not run). An adapter that is an object in that code is
+  put behind a local port by `host/debug.js`: no second way to talk to
+  an adapter in Rust.
 
 ### Performance rules
 

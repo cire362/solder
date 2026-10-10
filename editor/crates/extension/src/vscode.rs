@@ -36,6 +36,7 @@ const HOST: &[(&str, &str)] = &[
     ("documents.js", include_str!("../host/documents.js")),
     ("api.js", include_str!("../host/api.js")),
     ("languages.js", include_str!("../host/languages.js")),
+    ("debug.js", include_str!("../host/debug.js")),
 ];
 
 /// Puts the host where Node can read it, under `dir`. A file is written
