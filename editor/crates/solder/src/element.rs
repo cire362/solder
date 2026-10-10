@@ -35,6 +35,9 @@ impl EditorElement {
     }
 }
 
+/// What sets a lens apart from the code, or from the lens before it.
+const LENS_GAP: &str = "   ";
+
 /// A shaped row plus the bookkeeping to map buffer columns to shaped columns.
 pub struct DisplayLine {
     pub shaped: ShapedLine,
@@ -43,6 +46,10 @@ pub struct DisplayLine {
     /// `(byte column a hint is drawn before, its bytes)`, in order: text
     /// of a language server's that is in the row and not in the file.
     inlays: Vec<(usize, usize)>,
+    /// What a language server offers to do with the row, said at its end:
+    /// the bytes of what was drawn that each one's words take, and which
+    /// of the document's lenses it is. A click there does it.
+    lenses: Vec<(Range<usize>, usize)>,
     /// Byte length of the row that was shaped (rows can be truncated).
     len: usize,
 }
@@ -134,6 +141,40 @@ impl LayoutSnapshot {
     pub(crate) fn row_at(&self, buffer: &Buffer, scroll: Point<Pixels>, y: Pixels) -> usize {
         let row = ((y - self.bounds.top() + scroll.y) / self.line_height).floor();
         (row.max(0.) as usize).min(buffer.line_count() - 1)
+    }
+
+    /// The lens whose words are under the pointer, as its place among the
+    /// document's.
+    pub fn lens_at(&self, scroll: Point<Pixels>, position: Point<Pixels>) -> Option<usize> {
+        if !self.bounds.contains(&position) || position.x < self.text_left {
+            return None;
+        }
+        let row = ((position.y - self.bounds.top() + scroll.y) / self.line_height).floor();
+        let line = self
+            .lines
+            .get((row.max(0.) as usize).checked_sub(self.first_row)?)?;
+        let at = line
+            .shaped
+            .index_for_x(position.x - self.text_left + scroll.x)?;
+        let found = line.lenses.iter().find(|(words, _)| words.contains(&at));
+        found.map(|(_, lens)| *lens)
+    }
+
+    /// The middle of the words of a row's lens, for a test to click.
+    #[cfg(test)]
+    pub(crate) fn lens_middle(&self, row: usize, nth: usize) -> Option<Point<Pixels>> {
+        let line = self.lines.get(row.checked_sub(self.first_row)?)?;
+        let (words, _) = line.lenses.get(nth)?;
+        let (start, end) = (
+            line.shaped.x_for_index(words.start),
+            line.shaped.x_for_index(words.end),
+        );
+        Some(gpui::point(
+            self.text_left + (start + end) / 2.,
+            self.bounds.top()
+                + self.line_height * (row - self.first_row) as f32
+                + self.line_height / 2.,
+        ))
     }
 
     pub fn offset_for_position(
@@ -462,7 +503,9 @@ fn layout(
     // What a language server puts into the rows on screen.
     let inlays = doc.inlays();
     let mut inlay_ix = inlays.partition_point(|inlay| inlay.offset < visible.start);
-    let mut hints: Vec<(usize, &str)> = Vec::new();
+    // And what it offers to do with them, said at the end of each.
+    let lenses = doc.lenses();
+    let mut lens_ix = lenses.partition_point(|lens| lens.offset < visible.start);
     for row in first_row..end_row {
         let line_start = buffer.line_start(row);
         let full = buffer.line_str(row);
@@ -481,7 +524,18 @@ fn layout(
         };
         let (segments, next_ix) = color_segments(text, line_start, &spans, span_ix, theme);
         span_ix = next_ix;
-        hints.clear();
+        // The lenses of this row, each set apart from what is before it.
+        let mut offered: Vec<(usize, String)> = Vec::new();
+        while let Some(lens) = lenses
+            .get(lens_ix)
+            .filter(|lens| lens.offset <= line_start + full.len())
+        {
+            if len == full.len() && !editor.masked {
+                offered.push((lens_ix, format!("{LENS_GAP}{}", lens.title)));
+            }
+            lens_ix += 1;
+        }
+        let mut hints: Vec<(usize, &str)> = Vec::new();
         while let Some(inlay) = inlays
             .get(inlay_ix)
             .filter(|i| i.offset <= line_start + full.len())
@@ -492,15 +546,26 @@ fn layout(
             }
             inlay_ix += 1;
         }
-        lines.push(shape_row(
+        let lens_from = hints.len();
+        hints.extend(offered.iter().map(|(_, words)| (len, words.as_str())));
+        let mut line = shape_row(
             text,
             line_start,
             segments,
             &underlines,
-            (&hints, theme.fg_subtle),
+            (&hints, theme.fg_subtle, lens_from, theme.accent),
             (&code_font, font_size),
             window,
-        ));
+        );
+        // Where each lens's words are in what was drawn: they are the
+        // last things in the row, one after another.
+        let mut end = line.expand_after(len);
+        for (lens, words) in offered.iter().rev() {
+            let start = end - words.len();
+            line.lenses.push((start + LENS_GAP.len()..end, *lens));
+            end = start;
+        }
+        lines.push(line);
     }
 
     // Horizontal: keep the newest cursor in view, then clamp to content width.
@@ -1046,7 +1111,7 @@ fn shape_row(
     line_start: usize,
     segments: Vec<(Range<usize>, gpui::Hsla)>,
     underlines: &[(Range<usize>, UnderlineStyle)],
-    (hints, hint_color): (&[(usize, &str)], gpui::Hsla),
+    (hints, hint_color, lens_from, lens_color): (&[(usize, &str)], gpui::Hsla, usize, gpui::Hsla),
     (code_font, font_size): (&gpui::Font, Pixels),
     window: &mut Window,
 ) -> DisplayLine {
@@ -1086,6 +1151,7 @@ fn shape_row(
         shaped: ShapedLine::default(),
         tabs,
         inlays,
+        lenses: Vec::new(),
         len: text.len(),
     };
 
@@ -1103,10 +1169,16 @@ fn shape_row(
         })
         .collect();
     let mut runs = Vec::with_capacity(segments.len() + 2);
-    let hint_run = |bytes: usize| TextRun {
+    // A hint in its quiet color; a lens, which can be clicked, in the
+    // accent. The lenses are the last of the row's hints.
+    let hint_run = |bytes: usize, hint: usize| TextRun {
         len: bytes,
         font: code_font.clone(),
-        color: hint_color,
+        color: if hint >= lens_from {
+            lens_color
+        } else {
+            hint_color
+        },
         background_color: None,
         underline: None,
         strikethrough: None,
@@ -1135,7 +1207,7 @@ fn shape_row(
             let (a, b) = (w[0], w[1]);
             // The hints that stand at `a` come first, in their own color.
             while let Some((_, bytes)) = line.inlays.get(hinted).filter(|(at, _)| *at <= a) {
-                runs.push(hint_run(*bytes));
+                runs.push(hint_run(*bytes, hinted));
                 hinted += 1;
             }
             let underline = underlines
@@ -1155,8 +1227,8 @@ fn shape_row(
             });
         }
     }
-    for (_, bytes) in &line.inlays[hinted..] {
-        runs.push(hint_run(*bytes));
+    for (hint, (_, bytes)) in line.inlays.iter().enumerate().skip(hinted) {
+        runs.push(hint_run(*bytes, hint));
     }
     let shaped = window
         .text_system()
@@ -1173,6 +1245,7 @@ mod tests {
             shaped: ShapedLine::default(),
             tabs: tabs.to_vec(),
             inlays: inlays.to_vec(),
+            lenses: Vec::new(),
             len,
         }
     }

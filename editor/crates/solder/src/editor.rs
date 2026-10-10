@@ -1775,6 +1775,12 @@ impl Editor {
             self.toggle_breakpoint_at(row, cx);
             return;
         }
+        // A click on a lens does what it offers, and moves no cursor.
+        let lens = self.layout.as_ref();
+        if let Some(lens) = lens.and_then(|layout| layout.lens_at(self.scroll, event.position)) {
+            self.run_lens(lens, cx);
+            return;
+        }
         let Some(offset) = self.offset_at(event.position, cx) else {
             return;
         };

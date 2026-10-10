@@ -501,12 +501,28 @@ module.exports = function build(core) {
 
   // A command the extension hands out with an answer. What it is given
   // may be anything, so it stays here and the editor gets its number.
-  const handed = [];
+  // A number is never given twice: the oldest are forgotten, and what is
+  // left keeps the number the editor knows it by.
+  const handed = new Map();
+  let handedNext = 0;
   function command(value) {
     if (!value || !value.command) return undefined;
-    handed.push(value);
-    if (handed.length > 2000) handed.splice(0, 1000);
-    return { title: String(value.title || value.command), command: 'solder.run', arguments: [handed.indexOf(value)] };
+    handed.set(handedNext, value);
+    if (handed.size > 2000) {
+      for (const old of handed.keys()) {
+        if (handed.size <= 1000) break;
+        handed.delete(old);
+      }
+    }
+    return { title: String(value.title || value.command), command: 'solder.run', arguments: [handedNext++] };
+  }
+  // A lens stays in its line for as long as the file is not asked again,
+  // so what it runs is kept with the file and not among the commands that
+  // are forgotten: its file and its place among the file's lenses.
+  const lensed = new Map();
+  function lensCommand(value, uri, nth) {
+    if (!value || !value.command) return undefined;
+    return { title: String(value.title || value.command), command: 'solder.lens', arguments: [uri, nth] };
   }
 
   // ------------------------------------------------------------ diagnostics
@@ -643,6 +659,8 @@ module.exports = function build(core) {
       // A code lens is offered where the editor offers what can be done
       // with a line: among its code actions.
       codeActionProvider: has('codeAction') || has('codeLens') ? { resolveProvider: true } : undefined,
+      // And said at the end of the line itself, where a click runs it.
+      codeLensProvider: has('codeLens') ? { resolveProvider: true } : undefined,
       documentSymbolProvider: has('documentSymbol') || undefined,
       workspaceSymbolProvider: has('workspaceSymbol') || undefined,
       signatureHelpProvider: has('signature') ? { triggerCharacters: triggers('signature') } : undefined,
@@ -650,7 +668,7 @@ module.exports = function build(core) {
       semanticTokensProvider: colors
         ? { legend: { tokenTypes: colors.legend.tokenTypes, tokenModifiers: colors.legend.tokenModifiers || [] }, full: true }
         : undefined,
-      executeCommandProvider: { commands: ['solder.run'] },
+      executeCommandProvider: { commands: ['solder.run', 'solder.lens'] },
     };
   }
 
@@ -778,6 +796,24 @@ module.exports = function build(core) {
       }
       return out;
     },
+    'textDocument/codeLens': async ({ document }) => {
+      const uri = document.uri.toString();
+      const found = await every('codeLens', document, (provider) => provider.provideCodeLenses(document, never));
+      lensed.set(uri, found);
+      return found.map(({ one }, nth) => ({
+        range: range(one.range),
+        command: lensCommand(one.command, uri, nth),
+        data: { uri, nth },
+      }));
+    },
+    // A lens that came without what it does is asked once it is drawn.
+    'codeLens/resolve': async ({ params }) => {
+      const { uri, nth } = params.data || {};
+      const known = (lensed.get(uri) || [])[nth];
+      if (!known || !known.entry.provider.resolveCodeLens) return params;
+      known.one = (await known.entry.provider.resolveCodeLens(known.one, never)) || known.one;
+      return { ...params, command: lensCommand(known.one.command, uri, nth) };
+    },
     'codeAction/resolve': async ({ params }) => {
       const known = offered[params.data];
       if (!known || !known.entry.provider.resolveCodeAction) return params;
@@ -818,7 +854,9 @@ module.exports = function build(core) {
       return tokens && tokens.data ? { data: Array.from(tokens.data) } : null;
     },
     'workspace/executeCommand': async ({ params }) => {
-      const known = params.command === 'solder.run' ? handed[params.arguments[0]] : undefined;
+      const given = params.arguments || [];
+      const lens = params.command === 'solder.lens' ? (lensed.get(given[0]) || [])[given[1]] : undefined;
+      const known = params.command === 'solder.run' ? handed.get(given[0]) : lens && lens.one.command;
       if (!known) throw new Error(`No command ${params.command}`);
       return core.plain(await core.vscode.commands.executeCommand(known.command, ...(known.arguments || [])));
     },
@@ -831,6 +869,7 @@ module.exports = function build(core) {
     if (message.id === undefined) {
       if (message.method === 'initialized') republish();
       if (message.method === 'textDocument/didOpen') republish(Uri.parse(params.textDocument.uri).toString());
+      if (message.method === 'textDocument/didClose') lensed.delete(Uri.parse(params.textDocument.uri).toString());
       return;
     }
     const handler = asked[message.method];

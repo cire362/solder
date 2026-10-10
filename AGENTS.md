@@ -111,13 +111,15 @@ Never guess a signature.
 - Language-server requests triggered by typing must run after the current
   effect cycle (`cx.defer`), so the `didChange` for what was just typed
   reaches the server first. See `Editor::after_typing`.
-- What a server draws into the text (inlay hints, semantic colors) is the
-  document's (`Document::inlays`, `Document::semantic`), asked for a
-  moment after the last change (`LspStore::schedule_hints`), never per
-  key, and moved with the text until the answer comes. A hint is in the
+- What a server draws into the text (inlay hints, semantic colors, code
+  lenses) is the document's (`Document::inlays`, `Document::semantic`,
+  `Document::lenses`), asked for a moment after the last change
+  (`LspStore::schedule_hints`), never per key, and moved with the text
+  until the answer comes. A hint is in the
   row and not in the file: `DisplayLine` maps columns both ways, as it
   does for tabs, and nothing else may assume a column is a place on
-  screen.
+  screen. A lens is the last thing in its row, and is kept only if a
+  click can do it: its command is one its server said it runs.
 - Git goes through `git.rs`, which shells out to `git` with stable
   `--porcelain=v2 -z` formats. Everything in it blocks: call it from
   `cx.background_executor()`.

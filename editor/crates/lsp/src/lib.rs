@@ -541,6 +541,7 @@ fn client_capabilities() -> ClientCapabilities {
                 "signatureInformation": { "parameterInformation": { "labelOffsetSupport": true } }
             },
             "inlayHint": {},
+            "codeLens": {},
             "semanticTokens": {
                 "requests": { "full": true },
                 "tokenTypes": SEMANTIC_TOKEN_TYPES,

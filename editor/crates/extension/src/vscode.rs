@@ -978,6 +978,18 @@ exports.activate = (context) => {
         return builder.build();
       },
     }, legend),
+    vscode.languages.registerCodeLensProvider('rust', {
+      provideCodeLenses: () => [
+        new vscode.CodeLens(new vscode.Range(0, 0, 0, 2), { title: 'Mark', command: 'demo.mark' }),
+        new vscode.CodeLens(new vscode.Range(1, 0, 1, 3)),
+      ],
+      // What the second one does is said only when it is asked.
+      resolveCodeLens(lens) {
+        lens.command = { title: 'Late', command: 'demo.late', arguments: [lens.range.start.line] };
+        return lens;
+      },
+    }),
+    vscode.commands.registerCommand('demo.late', (line) => `late ${line}`),
     vscode.commands.registerCommand('demo.mark', (uri) => {
       problems.set(uri, [new vscode.Diagnostic(new vscode.Range(0, 0, 0, 2), 'marked', vscode.DiagnosticSeverity.Hint)]);
       return vscode.languages.getDiagnostics(uri).length;
@@ -1049,7 +1061,12 @@ exports.activate = (context) => {
             can["textDocumentSync"],
             json!({ "openClose": true, "change": 0 })
         );
-        assert!(can["definitionProvider"].is_null() && can["codeActionProvider"].is_null());
+        assert!(can["definitionProvider"].is_null() && can["documentFormattingProvider"].is_null());
+        assert_eq!(can["codeLensProvider"], json!({ "resolveProvider": true }));
+        assert_eq!(
+            can["executeCommandProvider"],
+            json!({ "commands": ["solder.run", "solder.lens"] })
+        );
         assert_eq!(can["inlayHintProvider"], true);
         assert_eq!(
             can["semanticTokensProvider"],
@@ -1102,6 +1119,34 @@ exports.activate = (context) => {
             )["result"],
             json!({ "data": [0, 0, 2, 0, 0, 0, 3, 4, 1, 0, 1, 4, 1, 2, 1] })
         );
+        // What it offers to do with a line: the command is one of the
+        // host's own, which names the lens by its file and its place, so
+        // that a lens left in its line for an hour still runs what it said.
+        let lenses = ask(
+            12,
+            "textDocument/codeLens",
+            json!({ "textDocument": { "uri": file } }),
+        )["result"]
+            .clone();
+        assert_eq!(
+            lenses,
+            json!([
+                { "range": range(0, 0, 0, 2), "data": { "uri": file, "nth": 0 },
+                  "command": { "title": "Mark", "command": "solder.lens", "arguments": [file, 0] } },
+                { "range": range(1, 0, 1, 3), "data": { "uri": file, "nth": 1 } },
+            ])
+        );
+        let late = json!({ "title": "Late", "command": "solder.lens", "arguments": [file, 1] });
+        assert_eq!(
+            ask(13, "codeLens/resolve", lenses[1].clone())["result"]["command"],
+            late
+        );
+        let run = |id: u64, nth: u64| {
+            let params = json!({ "command": "solder.lens", "arguments": [file, nth] });
+            ask(id, "workspace/executeCommand", params)
+        };
+        assert_eq!(run(14, 1)["result"], "late 1");
+        assert_eq!(run(15, 7)["error"]["code"], -32603);
         // What it has no provider for, and a file it was not told of.
         assert!(
             ask(6, "textDocument/definition", at(0, 4))["result"]

@@ -252,9 +252,9 @@ to build them.
       `vscode-languageclient` is built on, so it carries most language
       extensions (and Prettier and ESLint). The host answers the editor as
       a language server does. Inlay hints and semantic colors were added
-      to the editor for this, for every server; a code lens is among the
-      code actions of its line. Not tried against a published extension
-      yet: that is the release check below
+      to the editor for this, for every server, and so was the code lens:
+      at the end of its line, run by a click. Not tried against a
+      published extension yet: that is the release check below
 - [x] Commands, menus and key bindings an extension contributes, in the
       palette and the keymap. Menus: the editor's (`editor/context`), which
       Solder had none of, and the file tree's (`explorer/context`).

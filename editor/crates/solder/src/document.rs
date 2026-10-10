@@ -56,6 +56,19 @@ pub struct Inlay {
     pub text: String,
 }
 
+/// Something a language server offers to do with a line, said at the
+/// line's end and done by a click: `Run`, `3 references`. `offset` is in
+/// the line it is of.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Lens {
+    pub offset: usize,
+    pub title: String,
+    /// The server that offered it, which is the one to run it.
+    pub server: &'static str,
+    pub command: String,
+    pub arguments: Vec<serde_json::Value>,
+}
+
 pub enum DocumentEvent {
     /// Edits in the order they were applied. `origin` is the editor that made
     /// them, so other views know to move their cursors.
@@ -142,6 +155,8 @@ pub struct Document {
     /// Sorted by where they are.
     server_inlays: Arc<Vec<Inlay>>,
     inlays: Arc<Vec<Inlay>>,
+    /// Sorted by where they are.
+    lenses: Arc<Vec<Lens>>,
     decorations:
         std::collections::BTreeMap<(String, String), Vec<crate::extension_decorations::Decoration>>,
     decoration_ranges: Vec<crate::extension_decorations::Decoration>,
@@ -179,6 +194,7 @@ impl Document {
             diagnostics: Arc::default(),
             server_inlays: Arc::default(),
             inlays: Arc::default(),
+            lenses: Arc::default(),
             decorations: Default::default(),
             decoration_ranges: Vec::new(),
             semantic: Arc::default(),
@@ -484,6 +500,20 @@ impl Document {
         self.inlays = Arc::new(inlays);
     }
 
+    pub fn lenses(&self) -> &Arc<Vec<Lens>> {
+        &self.lenses
+    }
+
+    pub fn set_lenses(&mut self, mut lenses: Vec<Lens>, cx: &mut Context<Self>) {
+        lenses.retain(|lens| !lens.title.trim().is_empty());
+        lenses.sort_by_key(|lens| lens.offset);
+        if *self.lenses != lenses {
+            self.lenses = Arc::new(lenses);
+            cx.emit(DocumentEvent::HintsChanged);
+            cx.notify();
+        }
+    }
+
     pub fn set_inlays(&mut self, mut inlays: Vec<Inlay>, cx: &mut Context<Self>) {
         inlays.retain(|inlay| !inlay.text.is_empty());
         inlays.sort_by_key(|inlay| inlay.offset);
@@ -688,6 +718,17 @@ impl Document {
         }
         if !self.server_inlays.is_empty() || !self.decorations.is_empty() {
             self.rebuild_decorations();
+        }
+        if !self.lenses.is_empty() {
+            let moved = self
+                .lenses
+                .iter()
+                .map(|lens| Lens {
+                    offset: map_offset(lens.offset, &edits),
+                    ..lens.clone()
+                })
+                .collect();
+            self.lenses = Arc::new(moved);
         }
         if !self.semantic.is_empty() {
             let moved = self

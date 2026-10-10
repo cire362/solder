@@ -6292,6 +6292,81 @@ mod tests {
         wait_for(cx, "the colors to go", &|cx| drawn(cx).1.is_empty());
     }
 
+    /// What a server offers to do with a line is said at the end of it,
+    /// and a click does it. Against `tests/fixtures/mock_lsp.py --hints`.
+    #[gpui::test]
+    fn a_lens_is_at_the_end_of_its_line_and_a_click_runs_it(cx: &mut TestAppContext) {
+        let root = fixture("lsp-lens");
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        let file = root.join("src/main.rs");
+        std::fs::write(&file, "fn helper() {}\n// TODO fix\n").unwrap();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let with = |lenses: bool| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "rust-analyzer".into(),
+                settings::ServerOverride {
+                    command: Some("python3".into()),
+                    args: Some(vec![script.display().to_string(), "--hints".into()]),
+                    ..Default::default()
+                },
+            );
+            settings.code_lens = lenses;
+            settings
+        };
+        cx.update(|_, cx| cx.set_global(with(true)));
+        ws.update_in(cx, |w, window, cx| {
+            let content = std::fs::read_to_string(&file).unwrap();
+            w.add_editor(Some(file.clone()), &content, None, window, cx)
+        });
+        let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
+        let lenses = |cx: &App| (**editor.read(cx).doc(cx).lenses()).clone();
+        let drawn = |row: usize, cx: &App| {
+            let layout = editor.read(cx).layout.as_ref()?;
+            layout.lens_middle(row, 0)
+        };
+
+        // Of the two the server offers for the line, the one it runs
+        // itself, which it named only when asked. The other is for the
+        // editor to run, and a click on it could do nothing.
+        wait_for(cx, "the lens", &|cx| !lenses(cx).is_empty());
+        let found = cx.read(|cx| lenses(cx));
+        assert_eq!(found.len(), 1, "{found:?}");
+        let lens = &found[0];
+        assert_eq!(
+            (lens.offset, lens.title.as_str(), lens.command.as_str()),
+            (0, "Touch", "mock.touch")
+        );
+        assert_eq!((lens.server, lens.arguments.len()), ("rust-analyzer", 1));
+
+        // It is after the code of its line, and no place in the file: a
+        // click on it runs the command, whose edit comes from the server.
+        wait_for(cx, "the lens in its line", &|cx| drawn(0, cx).is_some());
+        let (at, end) = cx.read(|cx| {
+            let layout = editor.read(cx).layout.as_ref().unwrap();
+            let end = layout.text_left + layout.lines[0].x_for(14);
+            (drawn(0, cx).unwrap(), end)
+        });
+        assert!(at.x > end, "{at:?} {end:?}");
+        cx.simulate_click(at, gpui::Modifiers::default());
+        wait_for(cx, "the command's edit", &|cx| {
+            editor.read(cx).text(cx).starts_with("// touched\n")
+        });
+        // The lens goes where its line went.
+        wait_for(cx, "the lens to follow its line", &|cx| {
+            lenses(cx).first().map(|lens| lens.offset) == Some(11) && drawn(1, cx).is_some()
+        });
+
+        // Turned off, they are gone at the next change.
+        cx.update(|_, cx| cx.set_global(with(false)));
+        let focus = cx.read(|cx| editor.focus_handle(cx));
+        cx.update(|window, _| window.focus(&focus));
+        cx.simulate_input(" ");
+        wait_for(cx, "the lens to go", &|cx| lenses(cx).is_empty());
+    }
+
     /// A real PTY: type a command, read its output off the grid, exit.
     #[gpui::test]
     fn terminal_runs_commands(cx: &mut TestAppContext) {
@@ -13691,6 +13766,22 @@ exports.activate = (context) => {
                 (0..2, syntax::HighlightKind::Keyword)
             )
         );
+        // And what it offers to do with a line is at the end of it, where
+        // a click runs the extension's command.
+        let lens = |cx: &App| {
+            let layout = editor.read(cx).layout.as_ref()?;
+            layout.lens_middle(0, 0)
+        };
+        wait(cx, "its lens", &|cx| lens(cx).is_some());
+        let at = cx.read(|cx| lens(cx).unwrap());
+        cx.simulate_click(at, gpui::Modifiers::default());
+        wait(cx, "the lens to run", &|cx| {
+            store
+                .read(cx)
+                .bar()
+                .iter()
+                .any(|item| item.text == "3 lines")
+        });
         // It reads what is typed as it is typed.
         cx.dispatch_action(crate::editor::MoveToEnd);
         cx.simulate_input("boom");

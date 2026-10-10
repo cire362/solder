@@ -907,7 +907,7 @@ What is in the module today is what every extension starts from:
 | Provide and run tasks | **Workspace: Run extension task** in the palette lists the tasks extensions provide and runs the one chosen in a terminal, whose tab stays when it ends. The extension hears what it ended with. A task that is the extension's own code (`CustomExecution`) runs in a terminal it draws. Problem matchers are not read |
 | Watch files | `createFileSystemWatcher`, for the folders of the open windows: files made, changed and deleted, but for `.git` and `node_modules` |
 | Show pages (webviews) and editors of its own for kinds of files | A tab drawn by the system's browser; see below |
-| Give language features in code (`vscode.languages`) | Completions, hovers, definitions, references, rename, formatting, code actions, document and project symbols, signature help, inlay hints, semantic colors, and diagnostics from its collections. A code lens is offered among the code actions of its line (`cmd-.`), not drawn above it |
+| Give language features in code (`vscode.languages`) | Completions, hovers, definitions, references, rename, formatting, code actions, document and project symbols, signature help, inlay hints, semantic colors, and diagnostics from its collections. A code lens is at the end of its line, where a click runs it, and among the code actions of the line (`cmd-.`) |
 
 **Show extension views** opens the **Views** panel. Trees an extension names
 are listed before its code starts; choosing one starts the approved code.
@@ -1095,18 +1095,25 @@ Zed starts for it (`solargraph` for Ruby, `phpactor` for PHP, `elixir-ls` for
 Elixir); any other starts all its servers. Open files go to the chosen servers
 as soon as the settings are saved.
 
-Two things a server draws into the text are shown for every server that has
+Three things a server draws into the text are shown for every server that has
 them, an extension's or Solder's own. **Inlay hints** are the types a server
 worked out and the names of parameters, in the line in a quieter color; they
 are no part of the file, the cursor steps over them, and one longer than 60
 characters is cut. **Semantic colors** are what the server says each word
 is, over what the grammar says: a server knows a constant from a variable
-where a grammar sees a name. Both are asked for a moment after the last key,
-and move with the text until the answer comes. Each has a setting, on unless
-turned off:
+where a grammar sees a name. A **code lens** is something the server offers
+to do with a line (run this test, show what refers to this): its words are
+at the end of the line, in the accent color, and a click does it. Other
+editors put a lens on a row of its own above the line; here every row is a
+line of the file, so it stands after the code. Only a lens the server runs
+itself is shown. One that names a command of the editor it was written for
+(rust-analyzer's "Run", which VS Code's extension carries out) could do
+nothing on a click, and is left out. All three are asked for a moment after
+the last key, and move with the text until the answer comes. Each has a
+setting, on unless turned off:
 
 ```json
-{ "inlay_hints": true, "semantic_highlighting": true }
+{ "inlay_hints": true, "semantic_highlighting": true, "code_lens": true }
 ```
 
 That is why such an extension **asks first**. It is downloaded and read, and

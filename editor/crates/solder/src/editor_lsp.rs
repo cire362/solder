@@ -1357,6 +1357,35 @@ impl Editor {
         .detach();
     }
 
+    /// Does what a lens at the end of a line offers: its command, run by
+    /// the server that offered it.
+    pub(crate) fn run_lens(&mut self, lens: usize, cx: &mut Context<Self>) {
+        let Some(lens) = self.doc(cx).lenses().get(lens).cloned() else {
+            return;
+        };
+        let Some(store) = LspStore::global(cx) else {
+            return;
+        };
+        let request = store
+            .read(cx)
+            .server_request::<lt::request::ExecuteCommand>(
+                &self.document,
+                lens.server,
+                lt::ExecuteCommandParams {
+                    command: lens.command,
+                    arguments: lens.arguments,
+                    work_done_progress_params: Default::default(),
+                },
+            );
+        if let Some(request) = request {
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = request.await;
+                })
+                .detach();
+        }
+    }
+
     /// Runs a chosen code action: its edit, resolved first if the server
     /// sent it without one, then its command. Both go to the server the
     /// action came from.
