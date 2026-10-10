@@ -997,12 +997,14 @@ are not built in: a generic renderer module does not make every Jupyter
 widget or the Jupyter extension compatible. Outputs opened in a separate
 tab are transient and are reopened from the notebook, not restored as pages.
 
-Published notebook extensions have not yet been tried. The isolated census
-workflow accepts an exact version, for example `vscode.ipynb@1.95.3`, and
-checks activation, reading a sample `.ipynb` and saving its cell back. This
-checks a serializer, not a kernel or every notebook feature. Locally this
-path is tested against a catalog served by the test itself, with code
-written for that test.
+The published `vscode.ipynb@1.95.3` reader from Open VSX has been checked on
+a disposable CI runner: its code activated, read a sample `.ipynb` and saved
+the edited cell. The census accepts an exact version and changes the sample
+cell before saving, so losing edits is reported as a failure. This checks
+a serializer, not a kernel or every notebook feature. Locally the same path is tested
+against a catalog served by the test itself, including a serializer that
+ignores edits. Published extension code is not run locally. The exact run
+and its limits are in [the reader check](extension-checks/vscode-ipynb-1.95.3.md).
 
 Live macOS check on 2026-10-10: typed into a Jupyter cell, saved and checked
 the file; opened its HTML table and a renderer counter; clicked the counter
