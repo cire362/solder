@@ -895,7 +895,7 @@ What is in the module today is what every extension starts from:
 |---|---|
 | Register commands and run its own or another extension's | As in VS Code. Of VS Code's own commands: `vscode.open`, `setContext`, `workbench.action.files.saveAll` |
 | Show a message | With nothing to choose, it is in the status bar for eight seconds, in its color. With answers, or `modal`, it is a list to pick the answer from |
-| Ask to pick from a list, or to type a line | The editor's own list, with the keys of the command palette. One is picked, also where the extension allows several. What is typed is checked by the extension and asked again with what is wrong. A password is not hidden |
+| Ask to pick from a list, or to type a line | The editor's own list, with the keys of the command palette. Where the extension allows several, Enter ticks a row and the first row answers with the ones ticked. What is typed is checked by the extension and asked again with what is wrong. A password is typed in stars |
 | Put items in the status bar | In the `extensions` item of the bars, as text: Solder has no font for the pictures VS Code draws there. A click runs the item's command. Work in progress (`withProgress`) is said there too |
 | Write to an output channel | Kept, the last 256 KB of each. **Show output** in the Extensions tab opens it in a tab, and so does the extension when it asks |
 | Read and set settings | What extensions declare, with what `settings.json` says, and `editor.tabSize`. `update` writes the key to `settings.json` |

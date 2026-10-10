@@ -245,7 +245,7 @@ to build them.
 - [x] The API every extension starts from: commands, messages, pickers and
       input boxes, status bar items, output channels, configuration, the
       workspace's folders and files, open documents, their edits and events.
-      Lists pick one, and there is one visible editor, the file in front
+      There is one visible editor, the file in front
 - [x] Language features: the providers for completion, hover, definition,
       references, rename, formatting, code actions, symbols, semantic tokens,
       inlay hints and code lenses, and diagnostic collections. This is what

@@ -305,16 +305,18 @@ module.exports = function build(core) {
     const chosen = await request('pick', {
       title: options.title,
       placeholder: options.placeHolder,
+      // A list where several may be ticked, some of them already.
+      many: options.canPickMany ? true : undefined,
       items: rows.map((item) =>
         typeof item === 'string'
           ? { label: item }
-          : { label: String(item.label), description: item.description, detail: item.detail },
+          : { label: String(item.label), description: item.description, detail: item.detail, picked: item.picked || undefined },
       ),
     });
+    if (options.canPickMany) return Array.isArray(chosen) ? chosen.map((index) => rows[index]) : undefined;
     if (typeof chosen !== 'number') return undefined;
     if (options.onDidSelectItem) options.onDidSelectItem(rows[chosen]);
-    // One at a time: a list where several are ticked is not here yet.
-    return options.canPickMany ? [rows[chosen]] : rows[chosen];
+    return rows[chosen];
   }
 
   async function showInputBox(options = {}) {
@@ -355,11 +357,13 @@ module.exports = function build(core) {
       onDidTriggerItemButton: never.event,
       onDidHide: hidden.event,
       show() {
-        showQuickPick(pick.items, { placeHolder: pick.placeholder, title: pick.title }).then((item) => {
-          if (item !== undefined) {
-            pick.selectedItems = [item];
-            pick.activeItems = [item];
-            selected.fire([item]);
+        const options = { placeHolder: pick.placeholder, title: pick.title, canPickMany: pick.canSelectMany };
+        showQuickPick(pick.items, options).then((answer) => {
+          if (answer !== undefined) {
+            const items = [].concat(answer);
+            pick.selectedItems = items;
+            pick.activeItems = items.slice(0, 1);
+            selected.fire(items);
             accepted.fire();
           }
           hidden.fire();

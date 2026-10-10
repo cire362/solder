@@ -14,25 +14,36 @@ use crate::{
 };
 
 /// A list an extension shows to pick one of: a message with its answers,
-/// or a quick pick.
+/// or a quick pick. In one where several may be picked, Enter ticks a row
+/// or takes the tick away, and the first row, which is none of the
+/// extension's, answers with the ones that are ticked.
 pub struct AskPick {
     title: String,
     rows: Vec<PickRow>,
-    /// The rows that match what was typed, with where.
-    matches: Vec<(usize, Vec<u32>)>,
+    many: bool,
+    /// The rows that match what was typed, with where. `None` is the row
+    /// that answers.
+    matches: Vec<(Option<usize>, Vec<u32>)>,
     selected: usize,
     reply: Option<Reply>,
 }
 
 impl AskPick {
-    pub fn new(title: String, rows: Vec<PickRow>, reply: Reply) -> Self {
+    pub fn new(title: String, rows: Vec<PickRow>, many: bool, reply: Reply) -> Self {
         Self {
             title,
             rows,
+            many,
             matches: Vec::new(),
             selected: 0,
             reply: Some(reply),
         }
+    }
+
+    #[cfg(test)]
+    pub fn picked(&self) -> Vec<&str> {
+        let picked = self.rows.iter().filter(|row| row.picked);
+        picked.map(|row| row.label.as_str()).collect()
     }
 }
 
@@ -61,25 +72,56 @@ impl PickerDelegate for AskPick {
     ) -> Task<()> {
         // With nothing typed, in the order the extension gave: it put the
         // likely one first.
-        self.matches = if query.is_empty() {
-            (0..self.rows.len()).map(|ix| (ix, Vec::new())).collect()
+        let mut matches: Vec<(Option<usize>, Vec<u32>)> = if query.is_empty() {
+            (0..self.rows.len())
+                .map(|ix| (Some(ix), Vec::new()))
+                .collect()
         } else {
             let labels = self.rows.iter().map(|row| row.label.as_str());
             fuzzy::fuzzy_match(labels, &query, 200, false)
                 .into_iter()
                 .map(|found| {
                     let label = &self.rows[found.index].label;
-                    (found.index, fuzzy::positions(label, &query, false))
+                    (Some(found.index), fuzzy::positions(label, &query, false))
                 })
                 .collect()
         };
-        self.selected = 0;
+        // The row that answers is there whatever was typed.
+        if self.many {
+            matches.insert(0, (None, Vec::new()));
+        }
+        self.matches = matches;
+        // In a list of several the first of the extension's rows is the
+        // one in hand: Enter there ticks, and does not answer by mistake.
+        self.selected = usize::from(self.many && self.matches.len() > 1);
         Task::ready(())
     }
 
     fn confirm(&mut self, _: &mut Window, cx: &mut Context<Picker<Self>>) {
-        if let (Some((ix, _)), Some(reply)) = (self.matches.get(self.selected), self.reply.take()) {
-            reply.send(Ok(serde_json::json!(ix)));
+        let Some((row, _)) = self.matches.get(self.selected).cloned() else {
+            cx.emit(DismissEvent);
+            return;
+        };
+        match (row, self.many) {
+            // One of several: ticked, or the tick taken away. The list stays.
+            (Some(ix), true) => {
+                self.rows[ix].picked = !self.rows[ix].picked;
+                cx.notify();
+                return;
+            }
+            (Some(ix), false) => {
+                if let Some(reply) = self.reply.take() {
+                    reply.send(Ok(serde_json::json!(ix)));
+                }
+            }
+            (None, _) => {
+                let picked: Vec<usize> = (0..self.rows.len())
+                    .filter(|ix| self.rows[*ix].picked)
+                    .collect();
+                if let Some(reply) = self.reply.take() {
+                    reply.send(Ok(serde_json::json!(picked)));
+                }
+            }
         }
         cx.emit(DismissEvent);
     }
@@ -93,7 +135,19 @@ impl PickerDelegate for AskPick {
     ) -> AnyElement {
         let theme = cx.theme();
         let (row, positions) = &self.matches[ix];
-        let row = &self.rows[*row];
+        let Some(row) = row.map(|row| &self.rows[row]) else {
+            let picked = self.rows.iter().filter(|row| row.picked).count();
+            let text = match picked {
+                0 => "Answer with none picked".to_string(),
+                1 => "Answer with the 1 picked".to_string(),
+                n => format!("Answer with the {n} picked"),
+            };
+            return div()
+                .text_size(UI_FONT_SIZE)
+                .text_color(theme.accent)
+                .child(text)
+                .into_any_element();
+        };
         let more = [&row.description, &row.detail]
             .into_iter()
             .filter(|text| !text.is_empty())
@@ -105,6 +159,16 @@ impl PickerDelegate for AskPick {
             .items_center()
             .gap_2()
             .text_size(UI_FONT_SIZE)
+            .when(self.many, |d| {
+                // The tick, or the room it takes, so that labels line up.
+                d.child(
+                    div()
+                        .w(px(14.))
+                        .flex_none()
+                        .text_color(theme.accent)
+                        .child(if row.picked { "\u{2713}" } else { "" }),
+                )
+            })
             .child(highlighted_text(
                 &row.label,
                 positions,

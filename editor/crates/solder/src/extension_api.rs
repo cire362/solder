@@ -164,20 +164,26 @@ pub struct PickRow {
     pub label: String,
     pub description: String,
     pub detail: String,
+    /// Ticked, in a list where several may be.
+    pub picked: bool,
 }
 
 /// What an extension asks that needs a window.
 pub enum Ask {
-    /// A list to pick one of: the answer is its number.
+    /// A list to pick one of: the answer is its number. With `many`,
+    /// several may be ticked, and the answer is their numbers.
     Pick {
         title: String,
         rows: Vec<PickRow>,
+        many: bool,
         reply: Reply,
     },
-    /// A line to type: the answer is the text.
+    /// A line to type: the answer is the text. A `secret` one is not
+    /// shown as it is typed.
     Input {
         title: String,
         value: String,
+        secret: bool,
         reply: Reply,
     },
     /// A file to bring to the front, at a place in it.
@@ -1331,7 +1337,16 @@ impl ExtensionStore {
                     Some(detail) if !detail.is_empty() => format!("{said} {detail}"),
                     _ => said,
                 };
-                self.ask(Ask::Pick { title, rows, reply }, cx);
+                let many = false;
+                self.ask(
+                    Ask::Pick {
+                        title,
+                        rows,
+                        many,
+                        reply,
+                    },
+                    cx,
+                );
             }
             "pick" => {
                 let rows = params["items"]
@@ -1342,6 +1357,7 @@ impl ExtensionStore {
                         label: text(&item["label"]),
                         description: text(&item["description"]),
                         detail: text(&item["detail"]),
+                        picked: item["picked"] == true,
                     })
                     .collect();
                 let title = [&params["placeholder"], &params["title"]]
@@ -1349,7 +1365,16 @@ impl ExtensionStore {
                     .map(text)
                     .find(|title| !title.is_empty())
                     .unwrap_or_else(|| "Pick one".into());
-                self.ask(Ask::Pick { title, rows, reply }, cx);
+                let many = params["many"] == true;
+                self.ask(
+                    Ask::Pick {
+                        title,
+                        rows,
+                        many,
+                        reply,
+                    },
+                    cx,
+                );
             }
             "input" => {
                 let title = [&params["prompt"], &params["placeholder"], &params["title"]]
@@ -1358,10 +1383,12 @@ impl ExtensionStore {
                     .find(|title| !title.is_empty())
                     .unwrap_or_else(|| "Type a value".into());
                 let value = text(&params["value"]);
+                let secret = params["password"] == true;
                 self.ask(
                     Ask::Input {
                         title,
                         value,
+                        secret,
                         reply,
                     },
                     cx,

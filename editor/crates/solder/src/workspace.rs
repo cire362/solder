@@ -4081,19 +4081,26 @@ impl Workspace {
             };
             match ask {
                 Ask::Webview { key } => self.open_webview(key, window, cx),
-                Ask::Pick { title, rows, reply } => {
-                    self.toggle_modal(window, cx, move |window, cx| {
-                        let pick = crate::extension_ask::AskPick::new(title, rows, reply);
-                        Picker::new(pick, window, cx)
-                    })
-                }
+                Ask::Pick {
+                    title,
+                    rows,
+                    many,
+                    reply,
+                } => self.toggle_modal(window, cx, move |window, cx| {
+                    let pick = crate::extension_ask::AskPick::new(title, rows, many, reply);
+                    Picker::new(pick, window, cx)
+                }),
                 Ask::Input {
                     title,
                     value,
+                    secret,
                     reply,
                 } => self.toggle_modal(window, cx, move |window, cx| {
                     let input = crate::extension_ask::AskInput::new(title, reply);
                     let mut picker = Picker::new(input, window, cx);
+                    if secret {
+                        picker.mask(cx);
+                    }
                     if !value.is_empty() {
                         picker.set_query(&value, cx);
                     }
@@ -12621,6 +12628,114 @@ exports.activate = async (context) => {
             store.set_off(Origin::VsCode, "Acme.api", true, cx)
         });
         assert!(cx.read(|cx| store.read(cx).bar().is_empty()));
+    }
+
+    #[gpui::test]
+    fn a_list_of_an_extension_takes_several_and_a_password_is_not_shown(cx: &mut TestAppContext) {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let (base, _) = serve(vec![
+            (
+                "/api/-/search",
+                Served::ok(br#"{"extensions":[]}"#.to_vec()),
+            ),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-many", &base);
+        let folder = cx.read(|cx| store.read(cx).root.clone());
+        let dir = folder.join("vscode/acme.many");
+        write_file(
+            &dir.join("package.json"),
+            r#"{ "name": "many", "publisher": "Acme", "version": "1.0.0", "main": "main.js",
+  "activationEvents": ["onCommand:many.ask"] }"#,
+        );
+        write_file(
+            &dir.join("main.js"),
+            r#"const vscode = require('vscode');
+exports.activate = (context) => {
+  context.subscriptions.push(vscode.commands.registerCommand('many.ask', async () => {
+    const picked = await vscode.window.showQuickPick(
+      [{ label: 'alpha' }, { label: 'beta', picked: true }, { label: 'gamma' }],
+      { canPickMany: true, placeHolder: 'Which ones' });
+    const none = await vscode.window.showQuickPick(['x', 'y'], { canPickMany: true });
+    const secret = await vscode.window.showInputBox({ prompt: 'Password', password: true });
+    console.log(`picked ${picked.map((item) => item.label)}; none ${JSON.stringify(none)}; secret ${secret}`);
+  }));
+};"#,
+        );
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.scan(cx);
+        });
+        wait_for(cx, "the extension", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.many").is_some()
+        });
+        store.update(cx, |store, cx| {
+            store.allow(Origin::VsCode, "Acme.many", cx);
+            store
+                .run_command("many.ask", serde_json::Value::Null, cx)
+                .detach()
+        });
+        let list = |cx: &App| {
+            let modal = ws.read(cx).modal.as_ref()?;
+            let picker = modal.view.clone();
+            picker
+                .downcast::<Picker<crate::extension_ask::AskPick>>()
+                .ok()
+        };
+        let picked = |cx: &App| -> Option<Vec<String>> {
+            let list = list(cx)?;
+            let picked = list.read(cx).delegate.picked();
+            Some(picked.into_iter().map(str::to_string).collect())
+        };
+
+        // The list comes with what the extension had ticked. Enter ticks
+        // the row in hand and the list stays; the first row answers.
+        wait_for(cx, "the list", &|cx| picked(cx).is_some());
+        assert_eq!(cx.read(|cx| picked(cx)).unwrap(), ["beta"]);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(cx.read(|cx| picked(cx)).unwrap(), ["alpha", "beta"]);
+        cx.simulate_keystrokes("down enter");
+        assert_eq!(cx.read(|cx| picked(cx)).unwrap(), ["alpha"]);
+        // What is typed narrows the rows, and the row that answers stays.
+        cx.simulate_input("gam");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(cx.read(|cx| picked(cx)).unwrap(), ["alpha", "gamma"]);
+        cx.simulate_keystrokes("up enter");
+        // The second list is answered with nothing ticked: an empty
+        // answer, which is not the same as none.
+        wait_for(cx, "the second list", &|cx| {
+            picked(cx).is_some_and(|picked| picked.is_empty())
+        });
+        cx.simulate_keystrokes("up enter");
+
+        // A password is typed in stars.
+        let line = |cx: &App| {
+            let modal = ws.read(cx).modal.as_ref()?;
+            let picker = modal.view.clone();
+            picker
+                .downcast::<Picker<crate::extension_ask::AskInput>>()
+                .ok()
+        };
+        wait_for(cx, "the line to type", &|cx| line(cx).is_some());
+        assert!(cx.read(|cx| line(cx).unwrap().read(cx).is_masked(cx)));
+        cx.simulate_input("s3cret");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "its answers", &|cx| {
+            let store = store.read(cx);
+            let code = store.code("Acme.many").unwrap();
+            let said = "picked alpha,gamma; none []; secret s3cret";
+            code.said.iter().any(|(_, text)| text == said)
+        });
     }
 
     #[gpui::test]
