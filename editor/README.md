@@ -165,6 +165,8 @@ inside another, and each reaches to where the next begins. The outline is
 found again a quarter of a second after the file last changed, and not at
 all while neither the panel nor the breadcrumbs are on screen. Up to 5000
 symbols of a file are kept.
+When a server starts later, its outline replaces the fallback without an
+edit or a cursor move; changes made through another view refresh it too.
 
 **The other places a symbol is used** are lit up once the cursor has rested
 in its name for a fifth of a second: the file's server is asked, and what

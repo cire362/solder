@@ -156,6 +156,10 @@ Never guess a signature.
   moment after the file changed (`Workspace::keep_outline`), never per
   key, and not at all while nothing on screen shows it. A new thing that
   shows symbols of the file in front reads it; it does not ask again.
+  A server becoming ready or the set of servers changing also refreshes
+  it (`LspStoreEvent::ServersChanged`), so an early fallback does not stay
+  after the server has started. Symbol siblings are sorted by position
+  before the tree becomes a list.
 - What servers report of files is kept twice: in the document, for a
   file that is open, where it moves with the text; and in
   `LspStore::problems`, for every file a server names, open or not, as

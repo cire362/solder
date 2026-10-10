@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import time
 
 docs = {}
 
@@ -130,6 +131,12 @@ while True:
     params = msg.get("params") or {}
     mid = msg.get("id")
     if method == "initialize":
+        # The test opens a file while the server is still starting, then
+        # lets it answer without changing the file or moving the cursor.
+        if "--initialize-gate" in sys.argv:
+            gate = sys.argv[sys.argv.index("--initialize-gate") + 1]
+            while not os.path.exists(gate):
+                time.sleep(0.01)
         note("initialize", params.get("initializationOptions"))
         send({"jsonrpc": "2.0", "id": mid, "result": {"capabilities": {
             "positionEncoding": "utf-16" if TAG else "utf-8",

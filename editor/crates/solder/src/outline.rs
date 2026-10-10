@@ -53,12 +53,15 @@ pub fn of_document(
         Some(number as i32)
     }
     fn walk(
-        symbols: Vec<lt::DocumentSymbol>,
+        mut symbols: Vec<lt::DocumentSymbol>,
         depth: usize,
         buffer: &Buffer,
         encoding: Encoding,
         nodes: &mut Vec<Node>,
     ) {
+        // Servers may return siblings in any order; hit testing and the
+        // trail of parents both need the order in the file.
+        symbols.sort_by_key(|symbol| (symbol.range.start.line, symbol.range.start.character));
         for symbol in symbols {
             if nodes.len() >= MOST {
                 return;
@@ -495,7 +498,7 @@ mod tests {
             None,
         );
         let nodes = of_document(
-            lt::DocumentSymbolResponse::Nested(vec![a, c]),
+            lt::DocumentSymbolResponse::Nested(vec![c, a]),
             &buffer,
             Encoding::Utf8,
         );

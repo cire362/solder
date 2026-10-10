@@ -356,6 +356,8 @@ pub enum LspStoreEvent {
     },
     /// What the servers report of the project's files changed.
     ProblemsChanged,
+    /// Documents joined or left a server, or a server became ready.
+    ServersChanged,
 }
 
 impl gpui::EventEmitter<LspStoreEvent> for LspStore {}
@@ -867,6 +869,7 @@ impl LspStore {
         for id in self.docs.keys().copied().collect::<Vec<_>>() {
             self.attach(id, cx);
         }
+        cx.emit(LspStoreEvent::ServersChanged);
     }
 
     /// Which VS Code extensions answer for which languages changed, or
@@ -1139,6 +1142,7 @@ impl LspStore {
         for id in waiting {
             self.open(id, &key, cx);
         }
+        cx.emit(LspStoreEvent::ServersChanged);
         cx.notify();
     }
 

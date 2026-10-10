@@ -42,7 +42,8 @@ something of its own unchecked or unmade adds it here.
       symbols and the outline of Rust, no real server's; and for the
       places a symbol is used and the places that implement it
 - [ ] On screen: the Structure panel, the breadcrumbs in the title bar
-      and the Problems panel. Tested in a headless window only
+      and the Problems panel, symbol highlights and implementation
+      navigation. Tested in a headless window only
 - [ ] The Problems panel with a server that reports on a whole project:
       it is tested with the mock server reporting on one file that is not
       open. How it reads with the thousands of reports of a real build

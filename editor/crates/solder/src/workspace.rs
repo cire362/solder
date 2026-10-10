@@ -779,13 +779,23 @@ impl Workspace {
         subscriptions.push(structure_events);
         subscriptions.push(problems_events);
         if let Some(store) = LspStore::global(cx) {
-            subscriptions.push(cx.subscribe(&store, |this, _, event, cx| match event {
-                crate::lsp_store::LspStoreEvent::ApplyEdit { edit, encoding } => {
-                    this.apply_workspace_edit(edit.clone(), *encoding, cx)
-                }
-                // The panel of them hears it itself.
-                crate::lsp_store::LspStoreEvent::ProblemsChanged => {}
-            }));
+            subscriptions.push(
+                cx.subscribe_in(&store, window, |this, _, event, window, cx| match event {
+                    crate::lsp_store::LspStoreEvent::ApplyEdit { edit, encoding } => {
+                        this.apply_workspace_edit(edit.clone(), *encoding, cx)
+                    }
+                    // The panel of them hears it itself.
+                    crate::lsp_store::LspStoreEvent::ProblemsChanged => {}
+                    crate::lsp_store::LspStoreEvent::ServersChanged => {
+                        this.outline_of = None;
+                        this.outline_wanted = None;
+                        this.keep_outline(window, cx);
+                        if let Some(editor) = this.active_editor().cloned() {
+                            editor.update(cx, |editor, cx| editor.occurrences_moved(cx));
+                        }
+                    }
+                }),
+            );
         }
         let this = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -950,6 +960,7 @@ impl Workspace {
                     cx.notify()
                 }
                 EditorEvent::Edited | EditorEvent::Saved => {
+                    this.keep_outline(window, cx);
                     if this.file_diff.as_ref().is_some_and(|view| {
                         view.read(cx).scope == DiffScope::Working
                             && editor.read(cx).path(cx) == Some(view.read(cx).path.as_path())
@@ -6932,6 +6943,47 @@ mod tests {
         cx.run_until_parked();
         wait_for(cx, "an empty list", &|cx| listed(cx).is_empty());
         assert!(crumbs(cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn the_outline_refreshes_when_a_server_becomes_ready(cx: &mut TestAppContext) {
+        let root = fixture("structure-starting");
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        let file = root.join("src/main.rs");
+        let text = "fn helper() {}\nfn other() {}\n";
+        std::fs::write(&file, text).unwrap();
+        let gate = root.join("ready");
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_lsp.py");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        cx.update(|_, cx| {
+            let mut settings = Settings::default();
+            settings.language_servers.insert(
+                "rust-analyzer".into(),
+                settings::ServerOverride {
+                    command: Some("python3".into()),
+                    args: Some(vec![
+                        script.display().to_string(),
+                        "--initialize-gate".into(),
+                        gate.display().to_string(),
+                    ]),
+                    ..Default::default()
+                },
+            );
+            cx.set_global(settings);
+        });
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(file), text, None, window, cx)
+        });
+        let panel = cx.read(|cx| ws.read(cx).structure_panel.clone());
+        cx.dispatch_action(ShowStructure);
+        wait_for(cx, "the outline while the server starts", &|cx| {
+            panel.read(cx).shown() == ["> helper (fn)", "other (fn)"]
+        });
+        std::fs::write(gate, "").unwrap();
+        wait_for(cx, "the server's outline without another edit", &|cx| {
+            panel.read(cx).shown() == ["crate", ">   helper", "  other"]
+        });
     }
 
     /// The Problems panel lists what the servers report of the project's
