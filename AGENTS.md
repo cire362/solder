@@ -234,8 +234,11 @@ Never guess a signature.
   A terminal of an extension is a terminal of the dock, kept by the
   workspace that made it (`extension_terminals`); a task is a command
   in such a terminal, and what `host/shell.js` knows of its end is what
-  the terminal's process ended with. Watching files is the host's own
-  work with Node: the editor is not asked.
+  the terminal's process ended with. A terminal the extension draws
+  itself has no program, so its terminal runs `host/relay.js`, which
+  carries between the terminal and the extension's object on a local
+  port, under a token: again nothing new in Rust. Watching files is the
+  host's own work with Node: the editor is not asked.
   A page of an extension (`webview.rs`) is the one browser view there
   is: the system's, through `wry`, a child of the window placed where
   GPUI laid out its tab. It is made when a page is first drawn, never

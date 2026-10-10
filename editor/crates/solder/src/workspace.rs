@@ -12961,6 +12961,17 @@ exports.activate = (context) => {
       terminal.show();
     }),
     vscode.commands.registerCommand('shell.close', () => terminal.dispose()),
+    // A terminal that is an object here, with no program behind it.
+    vscode.commands.registerCommand('shell.own', () => {
+      const write = new vscode.EventEmitter();
+      const own = vscode.window.createTerminal({ name: 'Own', pty: {
+        onDidWrite: write.event,
+        open: (size) => write.fire(`own-ready ${size.columns > 0}\r\n`),
+        close: () => console.log('own let go'),
+        handleInput: (data) => write.fire(`[${data.toUpperCase()}]`),
+      } });
+      own.show();
+    }),
   );
 };"#,
         );
@@ -13048,6 +13059,35 @@ exports.activate = (context) => {
         wait_for(cx, "its terminal to close", &|cx| {
             ws.read(cx).terminals.len() == 1 && said(cx, "closed Mine undefined")
         });
+
+        // A terminal the extension draws itself is a tab of the dock like
+        // the others: it is told the terminal's size, what it writes is
+        // shown, and what is typed reaches it key by key and is not shown
+        // by anyone but itself.
+        store.update(cx, |store, cx| {
+            store
+                .run_command("shell.own", serde_json::Value::Null, cx)
+                .detach()
+        });
+        wait_for(cx, "the terminal it draws", &|cx| {
+            shows(cx, 1, "own-ready true")
+        });
+        assert_eq!(
+            cx.read(|cx| ws.read(cx).terminals[1].0.read(cx).title()),
+            "Own"
+        );
+        let own = cx.read(|cx| ws.read(cx).terminals[1].0.clone());
+        own.update(cx, |terminal, _| terminal.write(b"ok".to_vec()));
+        wait_for(cx, "what was typed to reach it", &|cx| {
+            let terminal = ws.read(cx).terminals[1].0.read(cx);
+            let shown = terminal.visible_text().join("");
+            shown.contains("[O][K]") || shown.contains("[OK]")
+        });
+        // Its tab closed, the extension's object is let go.
+        ws.update_in(cx, |w, window, cx| w.remove_terminal(&own, window, cx));
+        // The terminal ends when nothing holds it, this test included.
+        drop(own);
+        wait_for(cx, "the object to be let go", &|cx| said(cx, "own let go"));
     }
 
     #[gpui::test]

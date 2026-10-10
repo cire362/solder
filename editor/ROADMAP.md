@@ -264,9 +264,10 @@ to build them.
       reached at a local port; a launch by name and adapters on named
       pipes are not there
 - [x] Tasks, terminals and file watching. Terminals are the dock's own; a
-      task is a command in one, listed by **Run extension task**. Not
-      there: terminals and tasks that are the extension's own code (`pty`,
-      `CustomExecution`), and problem matchers
+      task is a command in one, listed by **Run extension task**. A
+      terminal or a task that is the extension's own code (`pty`,
+      `CustomExecution`) runs a relay in such a terminal. Not there:
+      problem matchers
 - [x] Source control providers, views in the sidebar (trees), decorations and
       test controllers. **Show extension views** opens native lists in any
       dock: open branches lazily, run commands, edit source-control input,

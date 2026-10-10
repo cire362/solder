@@ -7,7 +7,9 @@
 // such a terminal. Watching files needs nothing of the editor: the code of
 // an extension reaches the disk itself, and Node says when it changes.
 
+const crypto = require('crypto');
 const fs = require('fs');
+const net = require('net');
 const path = require('path');
 const { classes, glob } = require('./types');
 
@@ -78,6 +80,103 @@ const shellEnums = {
   TerminalExitReason: { Unknown: 0, Shutdown: 1, Process: 2, User: 3, Extension: 4 },
 };
 
+// A terminal the extension draws itself: what is typed goes to an object
+// of the extension's, and what that object writes is shown. The terminal
+// of the dock runs `relay.js`, which carries both ways between it and
+// this, on a port of this machine and under a token made up for it.
+function ptyBridge(pty, say) {
+  const token = crypto.randomBytes(16).toString('hex');
+  const frame = (type, payload) => {
+    const body = Buffer.from(payload);
+    const head = Buffer.alloc(5);
+    head.write(type, 0, 'latin1');
+    head.writeUInt32BE(body.length, 1);
+    return Buffer.concat([head, body]);
+  };
+  let socket;
+  let opened = false;
+  // What it wrote, and whether it ended, before its terminal was there.
+  const early = [];
+  let ended;
+  const safely = (call) => {
+    try {
+      call();
+    } catch (error) {
+      say('error', [error && error.stack || error]);
+    }
+  };
+  const listening = [
+    pty.onDidWrite((text) => {
+      if (socket && opened) socket.write(frame('d', String(text)));
+      else early.push(String(text));
+    }),
+  ];
+  if (pty.onDidClose) {
+    listening.push(pty.onDidClose((code) => {
+      ended = typeof code === 'number' ? code : 0;
+      if (socket && opened) socket.write(frame('c', String(ended)));
+    }));
+  }
+  const server = net.createServer((incoming) => {
+    let pending = Buffer.alloc(0);
+    let known = false;
+    incoming.on('data', (chunk) => {
+      pending = Buffer.concat([pending, chunk]);
+      while (pending.length >= 5) {
+        const length = pending.readUInt32BE(1);
+        if (pending.length < 5 + length) return;
+        const type = String.fromCharCode(pending[0]);
+        const body = pending.subarray(5, 5 + length).toString();
+        pending = pending.subarray(5 + length);
+        if (!known) {
+          // Whoever does not say the token first is not its terminal.
+          if (type !== 't' || body !== token || socket) {
+            incoming.destroy();
+            return;
+          }
+          known = true;
+          socket = incoming;
+          server.close();
+        } else if (type === 'r') {
+          const dimensions = JSON.parse(body);
+          if (!opened) {
+            safely(() => pty.open(dimensions));
+            opened = true;
+            for (const text of early.splice(0)) incoming.write(frame('d', text));
+            if (ended !== undefined) incoming.write(frame('c', String(ended)));
+          } else if (pty.setDimensions) {
+            safely(() => pty.setDimensions(dimensions));
+          }
+        } else if (type === 'd' && pty.handleInput) {
+          safely(() => pty.handleInput(body));
+        }
+      }
+    });
+    incoming.on('error', () => incoming.destroy());
+    incoming.on('close', () => {
+      if (socket !== incoming) return;
+      socket = undefined;
+      // Its terminal is gone: the extension is told, once.
+      safely(() => pty.close());
+      listening.forEach((one) => one && one.dispose && one.dispose());
+    });
+  });
+  const ready = new Promise((resolve, reject) => {
+    server.on('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve(server.address().port));
+  });
+  return {
+    // What the dock's terminal runs.
+    command: () => ready.then((port) => ({
+      program: process.execPath,
+      args: [path.join(__dirname, 'relay.js'), String(port), token],
+    })),
+    input: (text) => pty.handleInput && safely(() => pty.handleInput(text)),
+    // Never shown: there is nobody to carry to.
+    drop: () => server.close(),
+  };
+}
+
 // One word of a command line, quoted where a shell would split it.
 function quoted(word) {
   const text = typeof word === 'string' ? word : word.value;
@@ -108,19 +207,25 @@ module.exports = function build(core) {
     let made = false;
     const cwd = options.cwd && typeof options.cwd === 'object' ? options.cwd.fsPath : options.cwd;
     const args = typeof options.shellArgs === 'string' ? [options.shellArgs] : options.shellArgs;
+    const bridge = options.pty ? ptyBridge(options.pty, core.say) : undefined;
+    // Made at once, or for one the extension draws, once its port is
+    // there. What is asked of it meanwhile goes after its making.
+    let making = Promise.resolve();
     const make = (show) => {
       if (made || terminal.exitStatus) return;
       made = true;
-      notify('terminal.create', {
+      const create = (program, programArgs) => notify('terminal.create', {
         id,
         name: options.name,
-        program: options.shellPath,
-        args: args || [],
+        program,
+        args: programArgs,
         cwd,
         env: options.env,
         keep: !!options._task,
         show,
       });
+      if (!bridge) create(options.shellPath, args || []);
+      else making = bridge.command().then((run) => create(run.program, run.args), (error) => core.say('error', [error.message]));
     };
     const terminal = {
       name: options.name || 'Terminal',
@@ -131,10 +236,12 @@ module.exports = function build(core) {
       shellIntegration: undefined,
       sendText(text, newline = true) {
         make(false);
-        notify('terminal.send', { id, text: String(text) + (newline ? '\n' : '') });
+        // To one the extension draws, text is what was typed into it.
+        if (bridge) bridge.input(String(text) + (newline ? '\r' : ''));
+        else notify('terminal.send', { id, text: String(text) + (newline ? '\n' : '') });
       },
       show() {
-        if (made) notify('terminal.show', { id });
+        if (made) making.then(() => notify('terminal.show', { id }));
         else make(true);
         if (active !== terminal) {
           active = terminal;
@@ -143,12 +250,14 @@ module.exports = function build(core) {
       },
       hide() {},
       dispose() {
-        if (made) notify('terminal.dispose', { id });
-        else end(id, undefined);
+        if (made) {
+          making.then(() => notify('terminal.dispose', { id }));
+        } else {
+          if (bridge) bridge.drop();
+          end(id, undefined);
+        }
       },
     };
-    // One the extension draws itself has no place in the dock yet.
-    if (options.pty) core.missing('window.createTerminal (pty)');
     terminals.set(id, terminal);
     opened.fire(terminal);
     return terminal;
@@ -224,19 +333,24 @@ module.exports = function build(core) {
       if (owner && owner.provider.resolveTask) resolved = (await owner.provider.resolveTask(task, token)) || task;
     }
     const execution = resolved.execution;
-    if (!execution || execution instanceof CustomExecution) {
-      core.missing('tasks (CustomExecution)');
-      throw new Error(`The task ${task.name} runs in the extension's own code, which is not here yet`);
+    if (!execution) throw new Error(`The task ${task.name} has nothing to run`);
+    let terminal;
+    if (execution instanceof CustomExecution) {
+      // A task that is the extension's own code: it gives the terminal it
+      // draws, and ends when that terminal does.
+      const pty = await execution.callback(resolved.definition);
+      terminal = createTerminal({ name: resolved.name, pty, _task: true });
+    } else {
+      const { program, args, options } = command(execution);
+      terminal = createTerminal({
+        name: resolved.name,
+        shellPath: program,
+        shellArgs: args,
+        cwd: options.cwd,
+        env: options.env,
+        _task: true,
+      });
     }
-    const { program, args, options } = command(execution);
-    const terminal = createTerminal({
-      name: resolved.name,
-      shellPath: program,
-      shellArgs: args,
-      cwd: options.cwd,
-      env: options.env,
-      _task: true,
-    });
     const run = { task: resolved, terminate: () => terminal.dispose() };
     running.set(terminal, run);
     terminal.show();

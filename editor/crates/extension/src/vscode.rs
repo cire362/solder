@@ -38,6 +38,7 @@ const HOST: &[(&str, &str)] = &[
     ("languages.js", include_str!("../host/languages.js")),
     ("debug.js", include_str!("../host/debug.js")),
     ("shell.js", include_str!("../host/shell.js")),
+    ("relay.js", include_str!("../host/relay.js")),
     ("views.js", include_str!("../host/views.js")),
     ("webviews.js", include_str!("../host/webviews.js")),
 ];
@@ -1287,6 +1288,154 @@ exports.activate = (context) => {
         std::fs::remove_file(project.join("a.txt")).unwrap();
         written(&said, "deleted a.txt");
         assert!(!output(&said).iter().any(|line| line.contains("c.md")));
+    }
+
+    #[test]
+    fn a_terminal_and_a_task_an_extension_draws_itself_run_in_a_terminal() {
+        use std::io::{Read, Write};
+        let code = r#"
+const vscode = require('vscode');
+// A terminal that is an object here: it says its size, shouts back what is
+// typed, and on Enter ends with what it was told to end with.
+function shouting(ending, said) {
+  const write = new vscode.EventEmitter();
+  const close = new vscode.EventEmitter();
+  return {
+    onDidWrite: write.event,
+    onDidClose: close.event,
+    open: (size) => write.fire(`open ${size.columns}x${size.rows}\r\n`),
+    close: () => said('let go'),
+    // Keys come one at a time from a keyboard and several at once from
+    // whatever pastes: each is looked at on its own.
+    handleInput(data) {
+      for (const key of data) {
+        if (key === '\r') {
+          write.fire('done\r\n');
+          close.fire(ending);
+        } else {
+          write.fire(key.toUpperCase());
+        }
+      }
+    },
+  };
+}
+exports.activate = (context) => {
+  const out = vscode.window.createOutputChannel('Pty');
+  const log = (...all) => out.appendLine(all.join(' '));
+  vscode.window.onDidCloseTerminal((closed) => log('closed', closed.name, closed.exitStatus.code));
+  vscode.tasks.onDidEndTaskProcess((e) => log('task ended', e.execution.task.name, e.exitCode));
+  vscode.tasks.registerTaskProvider('demo', {
+    provideTasks: () => [new vscode.Task({ type: 'demo' }, vscode.TaskScope.Workspace, 'own', 'demo',
+      new vscode.CustomExecution(async () => shouting(0, log)))],
+  });
+  context.subscriptions.push(vscode.commands.registerCommand('demo.pty', () => {
+    const terminal = vscode.window.createTerminal({ name: 'Mine', pty: shouting(3, log) });
+    terminal.show();
+  }));
+  log('ready');
+};
+"#;
+        let Some((host, told, _dir, log)) = hosted_logged("vscode-pty", code) else {
+            return;
+        };
+        let host = Arc::new(host);
+        let said = editor(&host, told, log, |method, _| {
+            Err(format!("no {method} here"))
+        });
+        host.notify("init", json!({}));
+        host.request("activate", json!({}), SOON).unwrap();
+        written(&said, "ready");
+        // What the dock's terminal is told to run, once it is said.
+        let made = |count: usize| -> Value {
+            let until = std::time::Instant::now() + SOON;
+            loop {
+                let all: Vec<Value> = lock(&said)
+                    .iter()
+                    .filter(|(method, _)| method == "terminal.create")
+                    .map(|(_, params)| params.clone())
+                    .collect();
+                if all.len() >= count {
+                    return all[count - 1].clone();
+                }
+                assert!(std::time::Instant::now() < until, "no terminal was made");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        // Plays the terminal: runs what it was told to, types `typed`, and
+        // gives what was shown and what the program ended with.
+        let terminal = |create: &Value, typed: &str| -> (String, Option<i32>) {
+            let args: Vec<&str> = create["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            let mut child = Command::new(create["program"].as_str().unwrap())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(typed.as_bytes())
+                .unwrap();
+            let mut shown = String::new();
+            child
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_string(&mut shown)
+                .unwrap();
+            (shown, child.wait().unwrap().code())
+        };
+
+        // A terminal the extension draws is a terminal of the dock that
+        // runs the relay. What is typed reaches the extension's object,
+        // what it writes is shown, and what it ends with is what the
+        // program in the terminal ends with.
+        host.request("executeCommand", json!({ "id": "demo.pty" }), SOON)
+            .unwrap();
+        let create = made(1);
+        assert_eq!(
+            (&create["name"], &create["show"]),
+            (&json!("Mine"), &json!(true))
+        );
+        assert!(create["args"][0].as_str().unwrap().ends_with("relay.js"));
+        let (shown, code) = terminal(&create, "hi\r");
+        assert_eq!(shown, "open 80x24\r\nHIdone\r\n");
+        assert_eq!(code, Some(3));
+        // Its terminal gone, the object is let go; and the extension hears
+        // of the end as of any terminal's.
+        written(&said, "let go");
+        host.notify("terminal.closed", json!({ "id": create["id"], "code": 3 }));
+        written(&said, "closed Mine 3");
+
+        // The port takes its own terminal and nobody else: without the
+        // token nothing is shown, and the one with it has gone already.
+        let mut stranger = create.clone();
+        stranger["args"][2] = json!("0000");
+        let (shown, _) = terminal(&stranger, "x");
+        assert_eq!(shown, "");
+
+        // A task that is the extension's own code runs the same way, in a
+        // terminal that keeps its tab, and ends when its terminal does.
+        let tasks = host.request("tasks.fetch", json!({}), SOON).unwrap();
+        assert_eq!(tasks[0]["name"], "own");
+        host.request("tasks.run", json!({ "index": 0 }), SOON)
+            .unwrap();
+        let create = made(2);
+        assert_eq!(
+            (&create["name"], &create["keep"]),
+            (&json!("own"), &json!(true))
+        );
+        let (shown, code) = terminal(&create, "go\r");
+        assert!(shown.ends_with("GOdone\r\n"), "{shown:?}");
+        assert_eq!(code, Some(0));
+        host.notify("terminal.closed", json!({ "id": create["id"], "code": 0 }));
+        written(&said, "task ended own 0");
     }
 
     #[test]
