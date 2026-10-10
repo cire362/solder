@@ -228,6 +228,16 @@ impl StructurePanel {
         cx.notify();
     }
 
+    /// A different file is in front: none of the old symbols belongs to
+    /// it, even while its new outline is on its way.
+    pub fn clear(&mut self, waiting: bool, cx: &mut Context<Self>) {
+        self.set(Arc::default(), false, cx);
+        self.current = None;
+        if waiting {
+            self.empty = "Reading structure".into();
+        }
+    }
+
     /// The symbol the cursor is in now. The list follows it while the
     /// keys are not in the list itself.
     pub fn set_current(&mut self, current: Option<usize>, window: &Window, cx: &mut Context<Self>) {

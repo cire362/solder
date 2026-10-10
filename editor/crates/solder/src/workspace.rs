@@ -3437,6 +3437,13 @@ impl Workspace {
             (document.entity_id(), document.read(cx).version())
         });
         if now != self.outline_of && now != self.outline_wanted {
+            if self.outline_of.map(|of| of.0) != now.map(|of| of.0) {
+                // Old symbols must not navigate in the newly opened file
+                // while its outline is still being found.
+                self.outline = Arc::default();
+                self.structure_panel
+                    .update(cx, |panel, cx| panel.clear(now.is_some(), cx));
+            }
             self.outline_wanted = now;
             self.outline_task = match front.clone() {
                 Some(editor) => Some(self.find_outline(editor, window, cx)),
@@ -6925,7 +6932,10 @@ mod tests {
         )
         .unwrap();
         ws.update_in(cx, |w, window, cx| {
-            w.open_path(other.clone(), None, window, cx)
+            let content = std::fs::read_to_string(&other).unwrap();
+            w.add_editor(Some(other.clone()), &content, None, window, cx);
+            assert!(w.outline.is_empty());
+            assert!(w.structure_panel.read(cx).shown().is_empty());
         });
         wait_for(cx, "the outline", &|cx| {
             listed(cx) == ["> helper (fn)", "Words (type)"]
