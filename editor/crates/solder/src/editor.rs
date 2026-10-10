@@ -65,6 +65,10 @@ actions!(
         Save,
         AddCursorAbove,
         AddCursorBelow,
+        ColumnSelectUp,
+        ColumnSelectDown,
+        ColumnSelectLeft,
+        ColumnSelectRight,
         SelectNextOccurrence,
         MoveLineUp,
         MoveLineDown,
@@ -147,6 +151,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-/", ToggleComment, full),
         KeyBinding::new("secondary-alt-up", AddCursorAbove, full),
         KeyBinding::new("secondary-alt-down", AddCursorBelow, full),
+        KeyBinding::new("secondary-alt-shift-up", ColumnSelectUp, full),
+        KeyBinding::new("secondary-alt-shift-down", ColumnSelectDown, full),
+        KeyBinding::new("secondary-alt-shift-left", ColumnSelectLeft, full),
+        KeyBinding::new("secondary-alt-shift-right", ColumnSelectRight, full),
     ]);
     let completions = Some("Editor && showing_completions");
     cx.bind_keys([
@@ -259,6 +267,17 @@ enum DragMode {
     Char,
     Word,
     Line,
+    /// A rectangle of cursors, from where it began to the pointer.
+    Column,
+}
+
+/// A selection by column: the two corners of a rectangle, each a line
+/// and a place in it counted in cells. A corner may be past the end of
+/// its line: the rectangle is of the screen, not of the text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Column {
+    anchor: (usize, usize),
+    head: (usize, usize),
 }
 
 struct Drag {
@@ -299,6 +318,9 @@ pub struct Editor {
     pub(crate) layout: Option<LayoutSnapshot>,
     pub(crate) marked_range: Option<Range<usize>>,
     drag: Option<Drag>,
+    /// The rectangle the selections are, while they are one: moving a
+    /// corner makes them again from it. Any other change of them ends it.
+    pub(crate) column: Option<Column>,
     /// Ranges painted as search results, sorted. Set by the find bar.
     pub(crate) search_matches: Arc<Vec<Range<usize>>>,
     pub(crate) active_match: Option<usize>,
@@ -373,6 +395,7 @@ impl Editor {
             layout: None,
             marked_range: None,
             drag: None,
+            column: None,
             search_matches: Arc::default(),
             active_match: None,
             completion: None,
@@ -618,6 +641,138 @@ impl Editor {
         }
         self.selections = merged;
         self.newest = newest.min(self.selections.len() - 1);
+        self.column = None;
+    }
+
+    /// Makes the selections a rectangle: on each of its lines, the part
+    /// between its left and right edge. A line that ends before the left
+    /// edge has no part in it, unless the rectangle has no width: then
+    /// every line has a cursor, at the edge or at its end.
+    fn select_column(&mut self, column: Column, cx: &mut Context<Self>) {
+        let buffer = self.buf(cx);
+        let last = buffer.line_count() - 1;
+        let (anchor, head) = (
+            (column.anchor.0.min(last), column.anchor.1),
+            (column.head.0.min(last), column.head.1),
+        );
+        let (left, right) = (anchor.1.min(head.1), anchor.1.max(head.1));
+        let mut selections = Vec::new();
+        for row in anchor.0.min(head.0)..=anchor.0.max(head.0) {
+            let end = text::Point::new(row, buffer.line_len(row));
+            if left > buffer.display_column(end) && left != right {
+                continue;
+            }
+            let at = |cells: usize| {
+                let column = buffer.column_for_display(row, cells);
+                buffer.point_to_offset(text::Point::new(row, column))
+            };
+            // The cursor of each line is at the head's edge.
+            selections.push(match head.1 < anchor.1 {
+                true => Selection::new(at(right), at(left)),
+                false => Selection::new(at(left), at(right)),
+            });
+        }
+        if selections.is_empty() {
+            let end = buffer.point_to_offset(text::Point::new(head.0, buffer.line_len(head.0)));
+            selections.push(Selection::new(end, end));
+        }
+        let newest = match head.0 < anchor.0 {
+            true => 0,
+            false => selections.len() - 1,
+        };
+        self.set_selections(selections, newest);
+        self.column = Some(Column { anchor, head });
+        self.selections_changed(cx);
+    }
+
+    /// The rectangle the selections are, or the one the newest of them
+    /// begins: from where it was anchored to its cursor.
+    fn column_now(&self, cx: &App) -> Column {
+        self.column.unwrap_or_else(|| {
+            let buffer = self.buf(cx);
+            let newest = self.newest_selection();
+            let cell = |offset: usize| {
+                let point = buffer.offset_to_point(offset);
+                (point.row, buffer.display_column(point))
+            };
+            Column {
+                anchor: cell(newest.anchor),
+                head: cell(newest.head),
+            }
+        })
+    }
+
+    /// Moves the free corner of the rectangle by lines and by cells.
+    fn column_select_by(&mut self, rows: isize, cells: isize, cx: &mut Context<Self>) {
+        if self.is_single_line() {
+            cx.propagate();
+            return;
+        }
+        Perf::input_started(cx);
+        let mut column = self.column_now(cx);
+        let last = self.buf(cx).line_count() - 1;
+        column.head.0 = column.head.0.saturating_add_signed(rows).min(last);
+        column.head.1 = column.head.1.saturating_add_signed(cells);
+        self.select_column(column, cx);
+    }
+
+    fn column_select_up(&mut self, _: &ColumnSelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.column_select_by(-1, 0, cx);
+    }
+
+    fn column_select_down(&mut self, _: &ColumnSelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.column_select_by(1, 0, cx);
+    }
+
+    fn column_select_left(&mut self, _: &ColumnSelectLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.column_select_by(0, -1, cx);
+    }
+
+    fn column_select_right(
+        &mut self,
+        _: &ColumnSelectRight,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.column_select_by(0, 1, cx);
+    }
+
+    /// The line and the cell under the pointer. The cell may be past the
+    /// end of the line.
+    fn cell_at(&self, position: Point<Pixels>, cx: &App) -> Option<(usize, usize)> {
+        let layout = self.layout.as_ref()?;
+        let row = layout.row_at(self.buf(cx), self.scroll, position.y);
+        let x = position.x - layout.text_left + self.scroll.x;
+        Some((row, (x / layout.em_width).round().max(0.) as usize))
+    }
+
+    /// The middle button down: a rectangle of cursors begins under it.
+    fn on_middle_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cell) = self
+            .cell_at(event.position, cx)
+            .filter(|_| !self.is_single_line())
+        else {
+            return;
+        };
+        window.focus(&self.focus_handle);
+        self.hide_popovers(cx);
+        self.document.update(cx, |d, _| d.seal_history());
+        self.select_column(
+            Column {
+                anchor: cell,
+                head: cell,
+            },
+            cx,
+        );
+        self.drag = Some(Drag {
+            mode: DragMode::Column,
+            origin: 0..0,
+        });
     }
 
     fn selections_changed(&mut self, cx: &mut Context<Self>) {
@@ -1818,6 +1973,21 @@ impl Editor {
         }
         Perf::input_started(cx);
         self.document.update(cx, |d, _| d.seal_history());
+        // Shift and alt together: a rectangle from the cursor to here,
+        // which the drag goes on with.
+        if event.modifiers.shift
+            && event.modifiers.alt
+            && !self.is_single_line()
+            && let Some(head) = self.cell_at(event.position, cx)
+        {
+            let anchor = self.column_now(cx).anchor;
+            self.select_column(Column { anchor, head }, cx);
+            self.drag = Some(Drag {
+                mode: DragMode::Column,
+                origin: 0..0,
+            });
+            return;
+        }
         let extra = self.doc(cx).word_characters_at(offset);
         let (mode, origin) = match event.click_count {
             1 => (DragMode::Char, offset..offset),
@@ -1848,6 +2018,23 @@ impl Editor {
             }
             return;
         };
+        if drag.mode == DragMode::Column {
+            let dragged = [MouseButton::Left, MouseButton::Middle];
+            let Some(anchor) = self.column.map(|column| column.anchor) else {
+                self.drag = None;
+                return;
+            };
+            match self.cell_at(event.position, cx) {
+                Some(head) if event.pressed_button.is_some_and(|b| dragged.contains(&b)) => {
+                    if self.column != Some(Column { anchor, head }) {
+                        Perf::input_started(cx);
+                        self.select_column(Column { anchor, head }, cx);
+                    }
+                }
+                _ => self.drag = None,
+            }
+            return;
+        }
         if event.pressed_button != Some(MouseButton::Left) {
             self.drag = None;
             return;
@@ -1856,6 +2043,8 @@ impl Editor {
             return;
         };
         let unit = match drag.mode {
+            // Handled above.
+            DragMode::Column => return,
             DragMode::Char => offset..offset,
             DragMode::Word => {
                 let extra = self.doc(cx).word_characters_at(offset);
@@ -2102,6 +2291,10 @@ impl Render for Editor {
             .on_action(cx.listener(Self::save_action))
             .on_action(cx.listener(Self::add_cursor_above))
             .on_action(cx.listener(Self::add_cursor_below))
+            .on_action(cx.listener(Self::column_select_up))
+            .on_action(cx.listener(Self::column_select_down))
+            .on_action(cx.listener(Self::column_select_left))
+            .on_action(cx.listener(Self::column_select_right))
             .on_action(cx.listener(Self::select_next_occurrence))
             .on_action(cx.listener(Self::move_line_up))
             .on_action(cx.listener(Self::move_line_down))
@@ -2132,6 +2325,9 @@ impl Render for Editor {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_down))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(EditorElement::new(cx.entity()))
@@ -2247,6 +2443,76 @@ mod tests {
         cx.simulate_keystrokes("end left enter");
         assert_eq!(text(&editor, cx), "if (a) {\n  \n}".replace("  ", "    "));
         assert_eq!(cursors(&editor, cx), vec![13..13]);
+    }
+
+    #[gpui::test]
+    fn a_rectangle_of_cursors_is_selected_by_column(cx: &mut TestAppContext) {
+        let lines = "let alpha = 1;\nlet b = 22;\n\nle\tgamma = 333;\n";
+        let (editor, cx) = setup(cx, "/tmp/columns.rs", lines);
+        let column = |cx: &mut VisualTestContext| cx.read(|cx| editor.read(cx).column);
+        // By the keys: from the cursor, a corner moved a line or a cell
+        // at a time. With no width yet, every line has a cursor, at the
+        // edge or at its end where it is shorter.
+        editor.update(cx, |editor, cx| editor.select_range(4..4, cx));
+        cx.simulate_keystrokes("secondary-alt-shift-down secondary-alt-shift-down");
+        assert_eq!(cursors(&editor, cx), [4..4, 19..19, 27..27]);
+        // With a width, a line that ends before the left edge has no
+        // part: the empty one here.
+        cx.simulate_keystrokes("secondary-alt-shift-down");
+        cx.simulate_keystrokes("secondary-alt-shift-right secondary-alt-shift-right");
+        assert_eq!(cursors(&editor, cx), [4..6, 19..21, 31..33]);
+        // Cells are counted on screen: the tab of the last line takes two,
+        // so the fourth cell is its third byte. What is typed goes to
+        // every line.
+        cx.simulate_input("X");
+        assert_eq!(
+            text(&editor, cx),
+            "let Xpha = 1;\nlet X= 22;\n\nle\tXmma = 333;\n"
+        );
+        assert_eq!(column(cx), None);
+
+        // By the mouse: shift and alt from the cursor to the pointer,
+        // and on as it is dragged.
+        editor.update(cx, |editor, cx| editor.select_range(0..0, cx));
+        cx.run_until_parked();
+        let at = |cx: &mut VisualTestContext, row: usize, cells: f32| {
+            cx.read(|cx| {
+                let layout = editor.read(cx).layout.as_ref().unwrap();
+                gpui::point(
+                    layout.text_left + layout.em_width * cells,
+                    layout.bounds.top() + layout.line_height * (row as f32 + 0.5),
+                )
+            })
+        };
+        let both = gpui::Modifiers {
+            shift: true,
+            alt: true,
+            ..Default::default()
+        };
+        let to = at(cx, 1, 3.);
+        cx.simulate_mouse_down(to, MouseButton::Left, both);
+        assert_eq!(cursors(&editor, cx), [0..3, 14..17]);
+        let to = at(cx, 0, 5.);
+        cx.simulate_mouse_move(to, MouseButton::Left, both);
+        assert_eq!(cursors(&editor, cx), vec![0..5]);
+        cx.simulate_mouse_up(to, MouseButton::Left, both);
+        // By the middle button: a rectangle from where it went down,
+        // here dragged up and to the left, so the cursors are at its left.
+        let from = at(cx, 1, 6.);
+        cx.simulate_mouse_down(from, MouseButton::Middle, gpui::Modifiers::default());
+        let to = at(cx, 0, 4.);
+        cx.simulate_mouse_move(to, MouseButton::Middle, gpui::Modifiers::default());
+        cx.simulate_mouse_up(to, MouseButton::Middle, gpui::Modifiers::default());
+        assert_eq!(cursors(&editor, cx), [4..6, 18..20]);
+        let heads: Vec<usize> = cx.read(|cx| {
+            let editor = editor.read(cx);
+            editor.selections.iter().map(|s| s.head).collect()
+        });
+        assert_eq!(heads, [4, 18]);
+        // A move of the pointer with no button down is no drag.
+        let away = at(cx, 3, 9.);
+        cx.simulate_mouse_move(away, None, gpui::Modifiers::default());
+        assert_eq!(cursors(&editor, cx), [4..6, 18..20]);
     }
 
     #[gpui::test]

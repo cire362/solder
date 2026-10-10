@@ -400,7 +400,8 @@ update. They come after phase 9, in this order unless one is needed sooner.
 
 ### The editor
 - [ ] Folding of blocks, indent guides, lines wrapped at the window's edge
-- [ ] Selection by column (a rectangle of cursors)
+- [x] Selection by column (a rectangle of cursors): `shift-alt` and the
+      mouse, the middle button, or `cmd-alt-shift` and the arrows
 - [x] Pinned tabs; the tab closed last opened again (`cmd-shift-t`). Tabs,
       split panes, cursors and scroll positions return per project, along
       with notebooks and pages whose extensions provide a serializer

@@ -51,6 +51,32 @@ scripts/bench.sh [file]
 
 The status bar shows live input latency, frame time, memory and startup time. Toggle it with `cmd-alt-p`.
 
+## Editing
+
+Several cursors: `alt`-click adds one, `cmd-alt-up` and `cmd-alt-down` add
+one on the line above or below, `cmd-d` selects the next place the selected
+word is.
+
+A **selection by column** is a rectangle of cursors, one on each line it
+crosses. With the mouse, hold `shift` and `alt` and click or drag: the
+rectangle goes from the cursor to the pointer. Or drag with the middle
+button, from where it went down. With the keys, `cmd-alt-shift` and an
+arrow moves the free corner a line or a cell at a time (`ctrl-alt-shift`
+on Linux and Windows). Cells are counted as they are on screen, so a tab
+takes as many as it is wide, and a corner may be past the end of its line.
+A line that ends before the left edge gets no cursor, unless the rectangle
+has no width yet.
+
+A tab can be **pinned** (`cmd-k shift-enter`, or **Workspace: Toggle pin
+tab** in the palette): it goes before the tabs that are not, shows a pin
+where they have their cross, and `cmd-w` and the middle button leave it
+open. A click on the pin lets it go. Pinned tabs are remembered with the
+rest of the project's tabs. `cmd-shift-t` opens again the file of the tab
+closed last, with its cursors and where it was scrolled to, then the one
+closed before it, up to 32 back; a file that is open already or gone from
+disk is passed over. Closed tabs are remembered while the window is open,
+not across a restart.
+
 ## Review changes
 
 Open the Git sidebar with `ctrl-shift-g` and click a file to compare both versions.
@@ -1019,15 +1045,6 @@ not allowed are not started for restoration. Missing files are skipped.
 Untitled text and terminal sessions are not restored, and this is not a
 backup of unsaved edits. State is written off the UI thread, in order, once
 per second when it changed and when the window closes.
-
-A tab can be **pinned** (`cmd-k shift-enter`, or **Workspace: Toggle pin
-tab** in the palette): it goes before the tabs that are not, shows a pin
-where they have their cross, and `cmd-w` and the middle button leave it
-open. A click on the pin lets it go. Pinned tabs are remembered with the
-rest. `cmd-shift-t` opens again the file of the tab closed last, with its
-cursors and where it was scrolled to, then the one closed before it, up to
-32 back; a file that is open already or gone from disk is passed over.
-Closed tabs are remembered while the window is open, not across a restart.
 
 Which extensions work is not claimed from the list above: it is found out.
 With each release the fifty most installed extensions of Open VSX are
