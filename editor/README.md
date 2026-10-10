@@ -1,6 +1,6 @@
 # Solder editor
 
-The native editor behind the website in `../src`. Rust, GPU-rendered UI, no Electron and no webview.
+The native editor behind the website in `../src`. Rust, GPU-rendered UI, no Electron and no webview: the one place a browser view is made is a page a VS Code extension opens, and only when it opens.
 
 ```
 crates/
@@ -906,6 +906,7 @@ What is in the module today is what every extension starts from:
 | Open terminals | A terminal of the dock, under the name the extension gives it, running what it names or your shell. It is made when the extension first shows it or types into it, so one only kept ready takes no room. A terminal the extension draws itself (`pty`) is not here yet |
 | Provide and run tasks | **Workspace: Run extension task** in the palette lists the tasks extensions provide and runs the one chosen in a terminal, whose tab stays when it ends. The extension hears what it ended with. A task that runs in the extension's own code is not here yet, and problem matchers are not read |
 | Watch files | `createFileSystemWatcher`, for the folders of the open windows: files made, changed and deleted, but for `.git` and `node_modules` |
+| Show pages (webviews) and editors of its own for kinds of files | A tab drawn by the system's browser; see below |
 | Give language features in code (`vscode.languages`) | Completions, hovers, definitions, references, rename, formatting, code actions, document and project symbols, signature help, inlay hints, semantic colors, and diagnostics from its collections. A code lens is offered among the code actions of its line (`cmd-.`), not drawn above it |
 
 **Show extension views** opens the **Views** panel. Trees an extension names
@@ -923,6 +924,30 @@ it, then groups of files and their commands. File-decoration providers are
 asked only for visible file-tree entries. Text decorations support hex and
 known theme background colors, whole-line backgrounds and text before or
 after a range. UTF-16 positions are converted and ranges follow edits.
+
+A **page** of an extension (a webview) is a tab next to the files' tabs: the
+extension writes its HTML, and the page and the extension send each other
+messages. It is drawn by the system's browser (WebKit on macOS, WebView2 on
+Windows, WebKitGTK on Linux under X11), put where the tab's content is; no
+browser exists until the first page opens, and none is made at startup. A
+view an extension draws as a page is listed in **Views** and opens in a tab
+when chosen. An editor an extension has for a kind of file (a picture, a
+diagram) is offered as **Open with** in the file tree's menu and the
+editor's, and opens the file as such a page.
+
+A page is shut in. It can go nowhere but itself: links, new windows,
+downloads and requests for the camera or the like are refused. Scripts run
+only if the extension turned them on. It reads files only through an
+address of its own, and only under the folders the extension named for it
+(its own folder and the project's, when it named none); what it posts
+reaches only the extension that made it. It gets the editor's colors and
+fonts as VS Code's variables (`--vscode-editor-background` and a dozen
+more, not every one VS Code has), and `vscode-dark` or `vscode-light` on
+its body. `cmd-w` closes it, and the keys of the command palette and the
+file finder work in it.
+
+Not there: notebooks, pages brought back after a restart, a page inside
+the sidebar itself, and pages under Wayland, where the tab says so.
 Disposing a decoration type or disabling the extension removes its marks
 without removing a language server's hints. Tree checkboxes, programmatic
 reveal, source-control quick diffs, test coverage and cancellation, and

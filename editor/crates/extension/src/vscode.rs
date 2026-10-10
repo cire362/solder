@@ -39,6 +39,7 @@ const HOST: &[(&str, &str)] = &[
     ("debug.js", include_str!("../host/debug.js")),
     ("shell.js", include_str!("../host/shell.js")),
     ("views.js", include_str!("../host/views.js")),
+    ("webviews.js", include_str!("../host/webviews.js")),
 ];
 
 /// Puts the host where Node can read it, under `dir`. A file is written
@@ -524,9 +525,10 @@ mod tests {
                     registered: true,
                 }
         });
-        heard(&told, |told| {
-            *told == Told::Missing("window.createWebviewPanel".into())
-        });
+        heard(
+            &told,
+            |told| matches!(told, Told::Said { method, .. } if method == "webview"),
+        );
         heard(
             &told,
             |told| matches!(told, Told::Log { text, .. } if text == "printed"),
@@ -1263,6 +1265,155 @@ exports.activate = (context) => {
         std::fs::remove_file(project.join("a.txt")).unwrap();
         written(&said, "deleted a.txt");
         assert!(!output(&said).iter().any(|line| line.contains("c.md")));
+    }
+
+    #[test]
+    fn an_extension_has_pages_views_that_are_pages_and_editors_of_its_own() {
+        let code = r#"
+const vscode = require('vscode');
+exports.activate = (context) => {
+  const out = vscode.window.createOutputChannel('Pages');
+  const log = (...all) => out.appendLine(all.map((one) => (typeof one === 'string' ? one : JSON.stringify(one))).join(' '));
+  let panel;
+  context.subscriptions.push(
+    vscode.commands.registerCommand('demo.page', () => {
+      panel = vscode.window.createWebviewPanel('demo.page', 'Demo page', vscode.ViewColumn.Two,
+        { enableScripts: true, localResourceRoots: [context.extensionUri] });
+      panel.webview.html = '<p>hello</p>';
+      panel.webview.onDidReceiveMessage((message) => log('got', message));
+      panel.onDidChangeViewState((e) => log('state', e.webviewPanel.visible, e.webviewPanel.active));
+      panel.onDidDispose(() => log('disposed'));
+      const picture = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'a b.png'));
+      log('uri', picture.toString().endsWith('/ext/media/a%20b.png'), picture.authority, panel.webview.cspSource);
+    }),
+    vscode.commands.registerCommand('demo.post', () => panel.webview.postMessage({ n: 1 })),
+    vscode.window.registerWebviewViewProvider('demo.side', {
+      resolveWebviewView(view) {
+        view.webview.html = '<b>side</b>';
+        log('resolved', view.viewType, view.title);
+      },
+    }),
+    vscode.window.registerCustomEditorProvider('demo.cat', {
+      resolveCustomTextEditor(document, page) {
+        page.webview.html = `<pre>${document.getText()}</pre>`;
+        log('editing', document.languageId, page.title);
+      },
+    }),
+    vscode.window.registerCustomEditorProvider('demo.bytes', {
+      openCustomDocument: (uri) => ({ uri, dispose: () => log('let go') }),
+      resolveCustomEditor(document, page) {
+        page.webview.html = document.uri.path.split('/').pop();
+        setTimeout(() => page.dispose(), 0);
+      },
+    }),
+  );
+  log('ready');
+};
+"#;
+        let Some((host, told, dir)) = hosted("vscode-pages", code) else {
+            return;
+        };
+        let host = Arc::new(host);
+        let said = editor(&host, told, |method, _| match method {
+            "webview.post" => Ok(json!(true)),
+            other => Err(format!("no {other} here")),
+        });
+        write_file(&dir.join("tom.txt"), "meow");
+        let file = format!("file://{}/tom.txt", dir.canonicalize().unwrap().display());
+        host.notify("init", json!({ "folders": [dir] }));
+        host.request("activate", json!({}), SOON).unwrap();
+        written(&said, "ready");
+        let pages = || -> Vec<Value> {
+            lock(&said)
+                .iter()
+                .filter(|(method, _)| method == "webview")
+                .map(|(_, params)| params.clone())
+                .collect()
+        };
+        // A view that is a page is listed as a view, and is no page yet.
+        let listed = lock(&said)
+            .iter()
+            .any(|(method, params)| method == "view" && params["kind"] == "webview");
+        assert!(listed && pages().is_empty());
+
+        // A page: what it is called, where it goes, what it may do, and
+        // then its text. What it may read is under a name of its own.
+        host.request("executeCommand", json!({ "id": "demo.page" }), SOON)
+            .unwrap();
+        written(&said, "uri true page1 solder-resource://page1");
+        let made = pages();
+        let folder = dir.join("ext").display().to_string();
+        assert_eq!(
+            made[0],
+            json!({
+                "id": "page1", "viewType": "demo.page", "title": "Demo page", "column": 2, "html": "",
+                "options": { "enableScripts": true, "localResourceRoots": [folder] },
+            })
+        );
+        assert_eq!(made[1]["html"], "<p>hello</p>");
+        // Messages both ways, what the editor says of it, and its end.
+        let posted = host.request("executeCommand", json!({ "id": "demo.post" }), SOON);
+        assert_eq!(posted, Ok(json!(true)));
+        let post = lock(&said)
+            .iter()
+            .find(|(method, _)| method == "webview.post")
+            .map(|(_, params)| params.clone());
+        assert_eq!(post, Some(json!({ "id": "page1", "message": { "n": 1 } })));
+        host.notify(
+            "webview.message",
+            json!({ "id": "page1", "message": { "hi": 1 } }),
+        );
+        written(&said, r#"got {"hi":1}"#);
+        host.notify(
+            "webview.state",
+            json!({ "id": "page1", "visible": false, "active": false }),
+        );
+        written(&said, "state false false");
+        host.notify("webview.closed", json!({ "id": "page1" }));
+        written(&said, "disposed");
+        assert_eq!(
+            pages().last(),
+            Some(&json!({ "id": "page1", "gone": true }))
+        );
+        // Gone, it takes no more messages.
+        let posted = host.request("executeCommand", json!({ "id": "demo.post" }), SOON);
+        assert_eq!(posted, Ok(json!(false)));
+
+        // The view that is a page is filled in when it is asked for, with
+        // scripts off unless it turns them on.
+        host.request("webview.resolve", json!({ "id": "demo.side" }), SOON)
+            .unwrap();
+        written(&said, "resolved demo.side demo.side");
+        let side = pages()
+            .into_iter()
+            .rfind(|page| page["id"] == "viewdemo.side")
+            .unwrap();
+        assert_eq!(
+            (&side["html"], &side["options"]["enableScripts"]),
+            (&json!("<b>side</b>"), &json!(false))
+        );
+
+        // An editor of its own for a file: one that edits text is given
+        // the text, and one that reads the file itself is given where it
+        // is and told when its page closed.
+        let open = |kind: &str| {
+            host.request(
+                "customEditor.open",
+                json!({ "viewType": kind, "uri": file }),
+                SOON,
+            )
+        };
+        open("demo.cat").unwrap();
+        written(&said, "editing plaintext tom.txt");
+        assert!(
+            pages()
+                .iter()
+                .any(|page| page["html"] == "<pre>meow</pre>" && page["title"] == "tom.txt")
+        );
+        open("demo.bytes").unwrap();
+        written(&said, "let go");
+        assert!(pages().iter().any(|page| page["html"] == "tom.txt"));
+        assert_eq!(open("demo.none"), Err("No editor demo.none".into()));
     }
 
     #[test]

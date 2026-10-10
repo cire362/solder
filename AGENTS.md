@@ -236,6 +236,14 @@ Never guess a signature.
   in such a terminal, and what `host/shell.js` knows of its end is what
   the terminal's process ended with. Watching files is the host's own
   work with Node: the editor is not asked.
+  A page of an extension (`webview.rs`) is the one browser view there
+  is: the system's, through `wry`, a child of the window placed where
+  GPUI laid out its tab. It is made when a page is first drawn, never
+  at startup and never in tests, whose windows have no handle to give.
+  A page is shut in, and each way out is closed where the browser is
+  built: navigation, new windows, downloads, permissions, and files
+  outside the folders the extension named. A new thing a page may do
+  is a new line there, with a test of what it refuses.
 
 ### Performance rules
 

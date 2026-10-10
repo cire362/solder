@@ -274,8 +274,14 @@ to build them.
       text backgrounds and words before/after ranges. Not there yet: tree
       checkboxes and programmatic reveal, source-control quick diffs, test
       coverage and cancellation, arbitrary CSS decoration styles
-- [ ] Webviews, custom editors and notebooks. They need a browser view inside
-      the window, which GPUI does not have; decided when the rest is done
+- [x] Webviews, custom editors and notebooks. They need a browser view inside
+      the window, which GPUI does not have: the system's, through `wry`
+      (and `gtk` on Linux; agreed on 2026-10-10). A page of an extension is
+      a tab, a view that is a page opens as one, and an editor of an
+      extension's for a kind of file is offered as **Open with**. The
+      browser is made when the first page opens. Not there: notebooks
+      (left out, as phase 10 says), pages kept across restarts, pages on
+      Wayland
 - [ ] A check that runs with each release: the most installed extensions of
       Open VSX are installed, activated and asked for their main feature, and
       the result is the list of what works

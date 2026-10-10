@@ -19,6 +19,7 @@ const buildLanguages = require('./languages');
 const buildDebug = require('./debug');
 const buildShell = require('./shell');
 const buildViews = require('./views');
+const buildWebviews = require('./webviews');
 
 const { Disposable, EventEmitter, Uri } = types.classes;
 
@@ -157,6 +158,9 @@ built.workspace.createFileSystemWatcher = shell.createFileSystemWatcher;
 // Trees in the sidebar, and the two things shown as trees there.
 const views = buildViews(core);
 Object.defineProperties(built.window, Object.getOwnPropertyDescriptors(views.windowMembers));
+const webviews = buildWebviews(core);
+Object.assign(built.told, webviews.told);
+Object.defineProperties(built.window, Object.getOwnPropertyDescriptors(webviews.windowMembers));
 // What is drawn over the text of a file. A kind of decoration is made
 // once and then put on ranges, file by file.
 let nextDecoration = 1;
@@ -355,7 +359,7 @@ const handlers = {
   },
 };
 
-Object.assign(handlers, debugging.asked, shell.asked, views.asked);
+Object.assign(handlers, debugging.asked, shell.asked, views.asked, webviews.asked);
 
 async function handle(message) {
   if (message.method === undefined) {

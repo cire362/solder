@@ -224,6 +224,8 @@ impl Pane {
 }
 
 pub struct Workspace {
+    web_pages: Vec<(Entity<crate::webview::Page>, Subscription)>,
+    web_front: Option<(Entity<crate::webview::Page>, usize)>,
     focus_handle: FocusHandle,
     project: Entity<Project>,
     project_panel: Entity<ProjectPanel>,
@@ -416,6 +418,7 @@ impl Workspace {
                 window,
                 |this, _, event, window, cx| match event {
                     crate::extension_api::ExtensionEvent::Asked => this.extension_asks(window, cx),
+                    crate::extension_api::ExtensionEvent::Webviews => this.sync_webviews(cx),
                     crate::extension_api::ExtensionEvent::Bar
                     | crate::extension_api::ExtensionEvent::Views
                     | crate::extension_api::ExtensionEvent::Files => cx.notify(),
@@ -739,6 +742,8 @@ impl Workspace {
             })
         });
         let mut this = Self {
+            web_pages: Vec::new(),
+            web_front: None,
             focus_handle: cx.focus_handle(),
             project,
             project_panel,
@@ -805,6 +810,9 @@ impl Workspace {
     }
 
     pub(crate) fn active_editor(&self) -> Option<&Entity<Editor>> {
+        if self.web_front.is_some() {
+            return None;
+        }
         self.panes
             .get(self.active_pane)
             .and_then(Pane::active_editor)
@@ -1001,6 +1009,7 @@ impl Workspace {
             return;
         };
         let editor = tab.editor.clone();
+        self.web_front = None;
         if self
             .inline_edit
             .as_ref()
@@ -1028,6 +1037,10 @@ impl Workspace {
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((page, _)) = self.web_front.clone() {
+            self.close_webview(&page, window, cx);
+            return;
+        }
         if self.file_diff.is_some() {
             self.close_file_diff(window, cx);
             return;
@@ -4067,6 +4080,7 @@ impl Workspace {
                 break;
             };
             match ask {
+                Ask::Webview { key } => self.open_webview(key, window, cx),
                 Ask::Pick { title, rows, reply } => {
                     self.toggle_modal(window, cx, move |window, cx| {
                         let pick = crate::extension_ask::AskPick::new(title, rows, reply);
@@ -4128,6 +4142,183 @@ impl Workspace {
                 }
             }
         }
+    }
+
+    fn sync_webviews(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = ExtensionStore::try_global(cx) else {
+            return;
+        };
+        let models = store.read(cx).api.webviews.clone();
+        self.web_pages.retain(|(page, _)| {
+            let key = page.read(cx).key.clone();
+            if let Some(model) = models.get(&key) {
+                page.update(cx, |page, cx| page.sync(model.clone(), cx));
+                true
+            } else {
+                page.update(cx, |page, _| page.show(false));
+                false
+            }
+        });
+        if self
+            .web_front
+            .as_ref()
+            .is_some_and(|(page, _)| !models.contains_key(&page.read(cx).key))
+        {
+            self.web_front = None;
+        }
+        for (page, _) in &self.web_pages {
+            let key = page.read(cx).key.clone();
+            let posts = store.update(cx, |store, _| store.api.web_posts.remove(&key));
+            for (message, reply) in posts.into_iter().flatten() {
+                let accepted = page.update(cx, |page, _| page.post(message));
+                reply.send(Ok(accepted.into()));
+            }
+        }
+        cx.notify();
+    }
+
+    fn open_webview(
+        &mut self,
+        key: crate::webview::Key,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = ExtensionStore::try_global(cx) else {
+            return;
+        };
+        let Some(model) = store.read(cx).api.webviews.get(&key).cloned() else {
+            return;
+        };
+        let page = self
+            .web_pages
+            .iter()
+            .find(|(page, _)| page.read(cx).key == key)
+            .map(|(page, _)| page.clone());
+        let page = page.unwrap_or_else(|| {
+            let page = cx.new(|cx| crate::webview::Page::new(key, model, cx));
+            let events = cx.subscribe_in(&page, window, |this, _, event, window, cx| match event {
+                crate::webview::PageEvent::Key(key) => match key.as_str() {
+                    "close" => this.close_tab(&CloseTab, window, cx),
+                    "commands" => {
+                        window.focus(&this.focus_handle);
+                        this.toggle_command_palette(&ToggleCommandPalette, window, cx);
+                    }
+                    "files" => {
+                        window.focus(&this.focus_handle);
+                        this.toggle_file_finder(&ToggleFileFinder, window, cx);
+                    }
+                    _ => {}
+                },
+            });
+            self.web_pages.push((page.clone(), events));
+            page
+        });
+        self.close_file_diff(window, cx);
+        self.web_front = Some((page, self.active_pane));
+        self.sync_webviews(cx);
+    }
+
+    fn close_webview(
+        &mut self,
+        page: &Entity<crate::webview::Page>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = page.read(cx).key.clone();
+        page.update(cx, |page, _| page.show(false));
+        self.web_front = None;
+        self.web_pages.retain(|(known, _)| known != page);
+        if let Some(store) = ExtensionStore::try_global(cx) {
+            store.update(cx, |store, cx| store.close_webview(&key, cx));
+        }
+        if let Some(editor) = self.active_editor() {
+            window.focus(&editor.focus_handle(cx));
+        } else {
+            window.focus(&self.focus_handle);
+        }
+        cx.notify();
+    }
+
+    fn webview_visibility(&mut self, cx: &mut Context<Self>) {
+        let obscured = self.modal.is_some()
+            || self.file_diff.is_some()
+            || self.structure.is_some()
+            || self.erd.is_some()
+            || self.bar_menu.is_some()
+            || self.dock_menu.is_some()
+            || self.editor_menu.is_some()
+            || self.dragging.is_some();
+        for (page, _) in &self.web_pages {
+            let selected = self
+                .web_front
+                .as_ref()
+                .is_some_and(|(active, _)| active == page);
+            page.update(cx, |page, _| page.show(selected && !obscured));
+        }
+    }
+
+    fn webview_tabs(&self, pane: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let theme = cx.theme().clone();
+        self.web_pages
+            .iter()
+            .enumerate()
+            .map(|(ix, (page, _))| {
+                let selected = self
+                    .web_front
+                    .as_ref()
+                    .is_some_and(|(active, _)| active == page);
+                let title = page.read(cx).model.title.clone();
+                let activate = page.clone();
+                let close = page.clone();
+                div()
+                    .id(("web-tab", ix))
+                    .debug_selector(move || format!("web-tab-{ix}"))
+                    .flex_none()
+                    .h(px(26.))
+                    .max_w(px(260.))
+                    .pl_3()
+                    .pr_1p5()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .rounded(theme.shape.control)
+                    .text_size(UI_FONT_SIZE)
+                    .text_color(if selected { theme.fg } else { theme.fg_subtle })
+                    .when(selected, |d| {
+                        d.bg(theme.bg_elev)
+                            .border(theme.shape.border)
+                            .border_color(theme.line)
+                    })
+                    .hover(|d| d.text_color(theme.fg))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.web_front = Some((activate.clone(), pane));
+                        // Keys go to the page that was chosen.
+                        activate.read(cx).focus();
+                        cx.notify();
+                    }))
+                    .child(crate::icons::draw("code"))
+                    .child(div().min_w_0().truncate().child(title))
+                    .child(
+                        div()
+                            .id(("web-close", ix))
+                            .debug_selector(move || format!("web-close-{ix}"))
+                            .flex_none()
+                            .size(px(16.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(theme.shape.token)
+                            .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                            .child(crate::icons::draw("x"))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.close_webview(&close, window, cx);
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect()
     }
 
     /// What an extension does with a terminal of its own, in the dock of
@@ -4445,7 +4636,7 @@ impl Workspace {
         let is_active_pane = p == self.active_pane;
         let search_visible =
             is_active_pane && self.search_bar.read(cx).visible && pane.active_editor().is_some();
-        let tabs: Vec<_> = pane
+        let mut tabs: Vec<AnyElement> = pane
             .tabs
             .iter()
             .enumerate()
@@ -4457,7 +4648,7 @@ impl Workspace {
                     .path()
                     .and_then(|path| crate::file_icons::file(path, cx));
                 let dirty = doc.is_dirty();
-                let active = pane.active == Some(ix);
+                let active = pane.active == Some(ix) && self.web_front.is_none();
                 let close_editor = editor.clone();
                 let middle_editor = editor.clone();
                 div()
@@ -4520,8 +4711,12 @@ impl Workspace {
                                 this.close(&close_editor, window, cx)
                             })),
                     )
+                    .into_any_element()
             })
             .collect();
+        if p == self.active_pane {
+            tabs.extend(self.webview_tabs(p, cx));
+        }
         let TabBar {
             height,
             place: tabs_at,
@@ -4576,9 +4771,17 @@ impl Workspace {
                             }),
                         )
                     })
-                    .map(|d| match pane.active_editor() {
-                        Some(editor) => d.child(editor.clone()),
-                        None => d.child(self.render_empty(window, cx)),
+                    .map(|d| {
+                        if let Some((page, page_pane)) = &self.web_front
+                            && *page_pane == p
+                        {
+                            d.child(page.clone())
+                        } else {
+                            match pane.active_editor() {
+                                Some(editor) => d.child(editor.clone()),
+                                None => d.child(self.render_empty(window, cx)),
+                            }
+                        }
                     }),
             )
             // Below the file, if that is where the layout puts them.
@@ -4747,6 +4950,9 @@ impl Workspace {
     /// What is in front, as the window's title says it: the file, or the
     /// view that took its place, or with neither the project's folder.
     fn front_title(&self, cx: &App) -> String {
+        if let Some((page, _)) = &self.web_front {
+            return page.read(cx).model.title.clone();
+        }
         self.structure
             .as_ref()
             .map(|(view, _)| format!("Structure of {}", view.read(cx).title(cx)))
@@ -5251,6 +5457,7 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        self.webview_visibility(cx);
         // A tab let go anywhere is no longer dragged.
         if self.dragging.is_some() && !cx.has_active_drag() {
             self.dragging = None;
@@ -12414,6 +12621,184 @@ exports.activate = async (context) => {
             store.set_off(Origin::VsCode, "Acme.api", true, cx)
         });
         assert!(cx.read(|cx| store.read(cx).bar().is_empty()));
+    }
+
+    #[gpui::test]
+    fn an_extension_shows_pages_in_tabs(cx: &mut TestAppContext) {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let (base, _) = serve(vec![
+            (
+                "/api/-/search",
+                Served::ok(br#"{"extensions":[]}"#.to_vec()),
+            ),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-pages", &base);
+        let root = cx.read(|cx| ws.read(cx).root(cx));
+        let folder = cx.read(|cx| store.read(cx).root.clone());
+        let dir = folder.join("vscode/acme.pages");
+        write_file(
+            &dir.join("package.json"),
+            r#"{ "name": "pages", "publisher": "Acme", "version": "1.0.0", "main": "main.js",
+  "activationEvents": ["onCommand:pages.open"],
+  "contributes": {
+    "views": { "explorer": [{ "id": "pages.side", "name": "Side page", "type": "webview" }] },
+    "customEditors": [{ "viewType": "pages.cat", "displayName": "Cat viewer", "selector": [{ "filenamePattern": "*.cat" }] }]
+  } }"#,
+        );
+        write_file(
+            &dir.join("main.js"),
+            r#"const vscode = require('vscode');
+exports.activate = (context) => {
+  let page;
+  context.subscriptions.push(
+    vscode.commands.registerCommand('pages.open', () => {
+      page = vscode.window.createWebviewPanel('pages.one', 'Page one', vscode.ViewColumn.One, { enableScripts: true });
+      page.webview.html = '<h1>One</h1>';
+      page.onDidDispose(() => console.log('page one closed'));
+    }),
+    vscode.commands.registerCommand('pages.post', () => page.webview.postMessage({ hello: 1 })),
+    vscode.window.registerWebviewViewProvider('pages.side', {
+      resolveWebviewView: (view) => { view.webview.html = '<b>side</b>'; },
+    }),
+    vscode.window.registerCustomEditorProvider('pages.cat', {
+      resolveCustomTextEditor: (document, panel) => { panel.webview.html = `<pre>${document.getText()}</pre>`; },
+    }),
+  );
+};"#,
+        );
+        std::fs::write(root.join("tom.cat"), "meow").unwrap();
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.scan(cx);
+        });
+        wait_for(cx, "the extension", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.pages").is_some()
+        });
+        store.update(cx, |store, cx| {
+            store.allow(Origin::VsCode, "Acme.pages", cx)
+        });
+        // The pages this window has, by their titles, and the one in front.
+        let pages = |cx: &App| -> (Vec<String>, Option<String>) {
+            let ws = ws.read(cx);
+            let titles = ws
+                .web_pages
+                .iter()
+                .map(|(page, _)| page.read(cx).model.title.clone());
+            let front = ws
+                .web_front
+                .as_ref()
+                .map(|(page, _)| page.read(cx).model.title.clone());
+            (titles.collect(), front)
+        };
+        let html = |cx: &App, title: &str| {
+            let ws = ws.read(cx);
+            let page = ws
+                .web_pages
+                .iter()
+                .find(|(page, _)| page.read(cx).model.title == title);
+            page.map(|(page, _)| page.read(cx).model.html.clone())
+        };
+        assert!(cx.read(|cx| pages(cx)).0.is_empty());
+        assert!(cx.read(|cx| ws.read(cx).active_editor().is_some()));
+
+        // A page an extension opens is a tab of the window, in front of
+        // the file that was there, and names the window.
+        let ran = |cx: &mut VisualTestContext, command: &str| {
+            let task = store.update(cx, |store, cx| {
+                store.run_command(command, serde_json::Value::Null, cx)
+            });
+            let answer = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let got = answer.clone();
+            cx.foreground_executor()
+                .spawn(async move { *got.borrow_mut() = Some(task.await) })
+                .detach();
+            for _ in 0..500 {
+                cx.run_until_parked();
+                if answer.borrow().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let answer = answer.borrow_mut().take();
+            answer.expect("the command did not answer")
+        };
+        ran(cx, "pages.open").unwrap();
+        wait_for(cx, "the page", &|cx| {
+            pages(cx) == (vec!["Page one".to_string()], Some("Page one".to_string()))
+                && html(cx, "Page one").as_deref() == Some("<h1>One</h1>")
+        });
+        assert!(cx.read(|cx| ws.read(cx).active_editor().is_none()));
+        assert_eq!(cx.read(|cx| ws.read(cx).front_title(cx)), "Page one");
+        // What the extension sends it is taken for the page.
+        assert_eq!(ran(cx, "pages.post"), Ok(serde_json::json!(true)));
+
+        // A file's tab chosen, the file is in front again and the page
+        // keeps its tab; closed by its own button, the extension hears.
+        let tab = bounds_soon(cx, "web-tab-0");
+        ws.update_in(cx, |w, window, cx| {
+            let pane = w.active_pane;
+            w.activate(pane, 0, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| pages(cx)).1, None);
+        assert!(cx.read(|cx| ws.read(cx).active_editor().is_some()));
+        cx.simulate_click(tab.center(), gpui::Modifiers::default());
+        assert_eq!(cx.read(|cx| pages(cx)).1.as_deref(), Some("Page one"));
+        let close = bounds_soon(cx, "web-close-0");
+        cx.simulate_click(close.center(), gpui::Modifiers::default());
+        wait_for(cx, "the extension to hear", &|cx| {
+            let store = store.read(cx);
+            let code = store.code("Acme.pages").unwrap();
+            code.said.iter().any(|(_, text)| text == "page one closed")
+        });
+        assert!(cx.read(|cx| pages(cx)).0.is_empty());
+        assert!(cx.read(|cx| ws.read(cx).active_editor().is_some()));
+
+        // An editor of the extension's is offered for a file its pattern
+        // names, in the tree's menu, and opens the file as a page.
+        let offered = |cx: &App, name: &str| {
+            let store = store.read(cx);
+            store.menu("explorer/context", &store.facts(), Some(&root.join(name)))
+        };
+        assert!(cx.read(|cx| offered(cx, "App.vue")).is_empty());
+        let with = cx.read(|cx| offered(cx, "tom.cat"));
+        assert_eq!(with.len(), 1);
+        assert_eq!(with[0].title, "Open with Cat viewer");
+        cx.dispatch_action(with[0].action.clone());
+        wait_for(cx, "the file as a page", &|cx| {
+            html(cx, "tom.cat").as_deref() == Some("<pre>meow</pre>")
+        });
+
+        // A view that is a page is in the list of views, and chosen there
+        // it opens in a tab.
+        cx.dispatch_action(ShowExtensionViews);
+        cx.run_until_parked();
+        let panel = cx.read(|cx| ws.read(cx).extension_views.clone());
+        wait_for(cx, "the view", &|cx| panel.read(cx).has("Side page"));
+        let side = cx.read(|cx| panel.read(cx).index("Side page").unwrap());
+        panel.update(cx, |panel, cx| panel.pick(side, cx));
+        wait_for(cx, "the view as a page", &|cx| {
+            html(cx, "Side page").as_deref() == Some("<b>side</b>")
+        });
+        assert_eq!(cx.read(|cx| pages(cx)).0, ["tom.cat", "Side page"]);
+
+        // Its code ended, its pages go with it.
+        store.update(cx, |store, cx| {
+            store.set_off(Origin::VsCode, "Acme.pages", true, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| pages(cx)), (Vec::new(), None));
     }
 
     #[gpui::test]

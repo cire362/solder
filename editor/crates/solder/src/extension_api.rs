@@ -101,6 +101,10 @@ pub struct RunExtensionCommand {
     pub when: Option<String>,
 }
 
+/// The command behind "Open with": Solder's own, given the extension, the
+/// kind of editor and the file.
+const OPEN_WITH: &str = "solder.openWith";
+
 /// A command of an extension as a list offers it: what it is called, and
 /// what choosing it does.
 #[derive(Clone, Debug, PartialEq)]
@@ -187,7 +191,10 @@ pub enum Ask {
         reply: Reply,
     },
     /// A file to save, or every changed one.
-    Save { path: Option<PathBuf>, reply: Reply },
+    Save {
+        path: Option<PathBuf>,
+        reply: Reply,
+    },
     /// Every changed file saved, with nobody waiting to hear of it.
     SaveAll,
     /// Something about a terminal of an extension's: by the extension and
@@ -198,7 +205,13 @@ pub enum Ask {
         what: TerminalAsk,
     },
     /// What an extension wrote to an output channel, to read.
-    Output { title: String, text: String },
+    Output {
+        title: String,
+        text: String,
+    },
+    Webview {
+        key: crate::webview::Key,
+    },
 }
 
 /// What an extension does with a terminal of its own.
@@ -246,6 +259,7 @@ pub enum ExtensionEvent {
     Bar,
     Views,
     Files,
+    Webviews,
 }
 
 impl EventEmitter<ExtensionEvent> for ExtensionStore {}
@@ -261,6 +275,8 @@ struct Followed {
 /// extensions put on screen.
 #[derive(Default)]
 pub struct Api {
+    pub(crate) webviews: BTreeMap<crate::webview::Key, crate::webview::Model>,
+    pub(crate) web_posts: BTreeMap<crate::webview::Key, VecDeque<(Value, Reply)>>,
     pub(crate) files: crate::extension_decorations::Files,
     pub(crate) views: BTreeMap<(String, String), crate::extension_views::View>,
     /// The windows' workspaces and their folders, the one in front first.
@@ -405,7 +421,7 @@ impl ExtensionStore {
         self.api.asks.remove(next)
     }
 
-    fn ask(&mut self, ask: Ask, cx: &mut Context<Self>) {
+    pub(crate) fn ask(&mut self, ask: Ask, cx: &mut Context<Self>) {
         self.api.asks.push_back(ask);
         cx.emit(ExtensionEvent::Asked);
     }
@@ -438,6 +454,25 @@ impl ExtensionStore {
                 };
                 let (at, reply) = (None, None);
                 self.ask(Ask::Show { path, at, reply }, cx);
+                Some(Ok(Value::Null))
+            }
+            // A file opened with an editor of an extension's: the code is
+            // started for it, and puts a page in a tab.
+            OPEN_WITH => {
+                let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+                let (owner, view_type) = (text(&args[0]), text(&args[1]));
+                let file = match &args[2]["$uri"] {
+                    Value::Null => args[2].clone(),
+                    uri => uri.clone(),
+                };
+                let params = json!({ "viewType": view_type, "uri": file });
+                let opening = self.ask_host(&owner, "customEditor.open", params, cx);
+                cx.spawn(async move |this, cx| {
+                    if let Err(error) = opening.await {
+                        this.update(cx, |this, cx| this.report(error, cx)).ok();
+                    }
+                })
+                .detach();
                 Some(Ok(Value::Null))
             }
             "workbench.action.files.saveAll" => {
@@ -767,6 +802,9 @@ impl ExtensionStore {
 
     /// Everything of an extension that was on screen goes with its code.
     pub(crate) fn clear_shown(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.api.webviews.retain(|(owner, _), _| owner != id);
+        self.api.web_posts.retain(|(owner, _), _| owner != id);
+        cx.emit(ExtensionEvent::Webviews);
         self.clear_extension_decorations(id, cx);
         self.api.views.retain(|(owner, _), _| owner != id);
         cx.emit(ExtensionEvent::Views);
@@ -883,6 +921,21 @@ impl ExtensionStore {
                         keyed: Self::keyed(extension, &item.command),
                     });
                 }
+            }
+            // Its editors for a file of this name, each a way to open it.
+            for editor in &extension.custom_editors {
+                let Some(path) = target.filter(|path| editor.opens(path)) else {
+                    continue;
+                };
+                offered.push(Offered {
+                    title: format!("Open with {}", editor.name),
+                    action: RunExtensionCommand {
+                        command: OPEN_WITH.into(),
+                        args: json!([extension.id, editor.view_type, { "$uri": uri(path) }]),
+                        when: None,
+                    },
+                    keyed: None,
+                });
             }
         }
         offered
@@ -1051,6 +1104,7 @@ impl ExtensionStore {
     pub(crate) fn said(&mut self, id: &str, method: &str, params: Value, cx: &mut Context<Self>) {
         let text = |value: &Value| value.as_str().map(str::to_string);
         match method {
+            "webview" | "webview.reveal" => self.webview_said(id, method, params, cx),
             "decorations" | "decorations.gone" | "files.provider" | "files.changed" => {
                 self.decoration_said(id, method, params, cx)
             }
@@ -1222,6 +1276,20 @@ impl ExtensionStore {
         };
         let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
         match method {
+            "webview.post" => {
+                let key = (id.to_string(), text(&params["id"]));
+                if self.api.webviews.contains_key(&key) {
+                    let posts = self.api.web_posts.entry(key).or_default();
+                    if posts.len() < 256 {
+                        posts.push_back((params["message"].clone(), reply));
+                        cx.emit(ExtensionEvent::Webviews);
+                    } else {
+                        reply.send(Ok(false.into()));
+                    }
+                } else {
+                    reply.send(Ok(false.into()));
+                }
+            }
             "executeCommand" => {
                 let command = text(&params["id"]);
                 let answer = self.command_from(Some(id), &command, params["args"].clone(), cx);

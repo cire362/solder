@@ -72,6 +72,7 @@ mod symbols;
 mod terminal;
 mod theme;
 mod ui;
+mod webview;
 mod workspace;
 
 use std::{

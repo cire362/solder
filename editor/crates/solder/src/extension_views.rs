@@ -37,7 +37,11 @@ impl ExtensionStore {
                     (extension.id.clone(), id.clone()),
                     View {
                         title: title.clone(),
-                        kind: "tree".into(),
+                        // One drawn as a page opens in a tab.
+                        kind: match extension.page_views.contains(id) {
+                            true => "webview".into(),
+                            false => "tree".into(),
+                        },
                         ..Default::default()
                     },
                 );
@@ -278,6 +282,14 @@ impl ExtensionViews {
         if self.loading.contains(&parent) || self.children.contains_key(&parent) {
             return;
         }
+        // A view that is a page has no nodes: the extension is asked to
+        // put it in a tab, and its code is started for that.
+        let page = self.views.get(&(owner.clone(), id.clone()));
+        if page.is_some_and(|view| view.kind == "webview") {
+            self.children.insert(None, Vec::new());
+            self.request("webview.resolve", json!({ "id": id }), cx);
+            return;
+        }
         self.loading.insert(parent.clone());
         let generation = self.generation;
         let task = self.store.update(cx, |store, cx| {
@@ -348,7 +360,9 @@ impl ExtensionViews {
             } else if self.loading.contains(&None) {
                 rows.push(Row::Note("Loading…".into()));
             }
-            if self.children.get(&None).is_some_and(Vec::is_empty) {
+            if view.kind == "webview" {
+                rows.push(Row::Note("Open in a tab".into()));
+            } else if self.children.get(&None).is_some_and(Vec::is_empty) {
                 rows.push(Row::Note("No items".into()));
             }
             if let Some(error) = &self.error {

@@ -167,6 +167,54 @@ pub struct Extension {
     /// The views it names for the sidebar, each by its id and its title:
     /// its code says what is in them.
     pub views: Vec<(String, String)>,
+    /// Which of those views are drawn as a page, by id.
+    pub page_views: Vec<String>,
+    /// The editors it has for kinds of files, which open them as a page.
+    pub custom_editors: Vec<CustomEditor>,
+}
+
+/// An editor of a VS Code extension's for a kind of file: its name for the
+/// user, and the patterns of file names it is for (`*.png`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CustomEditor {
+    pub view_type: String,
+    pub name: String,
+    pub patterns: Vec<String>,
+}
+
+impl CustomEditor {
+    /// Whether it is for a file of this name. A pattern is read by its
+    /// last part, where `*` is any run of characters.
+    pub fn opens(&self, file: &Path) -> bool {
+        let Some(name) = file
+            .file_name()
+            .map(|name| name.to_string_lossy().to_lowercase())
+        else {
+            return false;
+        };
+        self.patterns.iter().any(|pattern| {
+            let pattern = pattern.rsplit('/').next().unwrap_or(pattern).to_lowercase();
+            let mut parts = pattern.split('*');
+            let first = parts.next().unwrap_or_default();
+            let Some(mut rest) = name.strip_prefix(first) else {
+                return false;
+            };
+            let parts: Vec<&str> = parts.collect();
+            for (i, part) in parts.iter().enumerate() {
+                // The last part ends the name; one before it is found
+                // anywhere after what came before.
+                if i + 1 == parts.len() {
+                    return rest.ends_with(part);
+                }
+                match rest.find(part) {
+                    Some(at) => rest = &rest[at + part.len()..],
+                    None => return false,
+                }
+            }
+            // No `*` at all: the name itself.
+            rest.is_empty()
+        })
+    }
 }
 
 /// A command a VS Code extension's code has, as its manifest names it for
@@ -654,6 +702,8 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         menus: Vec::new(),
         keys: Vec::new(),
         views: Vec::new(),
+        page_views: Vec::new(),
+        custom_editors: Vec::new(),
     })
 }
 
@@ -1092,15 +1142,17 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
     // The views it names, wherever VS Code would put them: Solder has one
     // place for them all.
     let mut views: Vec<(String, String)> = Vec::new();
+    let mut page_views: Vec<String> = Vec::new();
     for (_, listed) in contributes["views"].as_object().into_iter().flatten() {
         for view in listed.as_array().into_iter().flatten() {
             let id = text(&view["id"]);
-            // One drawn as a web page is not a tree.
-            if id.is_empty()
-                || view["type"] == "webview"
-                || views.iter().any(|(known, _)| *known == id)
-            {
+            if id.is_empty() || views.iter().any(|(known, _)| *known == id) {
                 continue;
+            }
+            // One drawn as a page is listed with the trees and opens in
+            // a tab.
+            if view["type"] == "webview" {
+                page_views.push(id.clone());
             }
             let name = label(&text(&view["name"]));
             views.push((id.clone(), if name.is_empty() { id } else { name }));
@@ -1144,6 +1196,30 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         menus,
         keys,
         views,
+        page_views,
+        custom_editors: list("customEditors")
+            .iter()
+            .filter_map(|entry| {
+                let view_type = text(&entry["viewType"]);
+                let patterns: Vec<String> = entry["selector"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|selector| text(&selector["filenamePattern"]))
+                    .filter(|pattern| !pattern.is_empty())
+                    .collect();
+                let name = label(&text(&entry["displayName"]));
+                (!view_type.is_empty() && !patterns.is_empty()).then(|| CustomEditor {
+                    name: if name.is_empty() {
+                        view_type.clone()
+                    } else {
+                        name
+                    },
+                    view_type,
+                    patterns,
+                })
+            })
+            .collect(),
         servers: Vec::new(),
         debug_adapters: Vec::new(),
         context_servers: Vec::new(),
@@ -1205,3 +1281,30 @@ const EQUIVALENTS: &[(&str, &str)] = &[
     ("mrmlnc.vscode-scss", "scss"),
     ("syler.sass-indented", "scss"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_editor_of_an_extension_is_for_the_files_its_patterns_name() {
+        let opens = |patterns: &[&str], file: &str| {
+            let editor = CustomEditor {
+                patterns: patterns.iter().map(|p| p.to_string()).collect(),
+                ..Default::default()
+            };
+            editor.opens(Path::new(file))
+        };
+        assert!(opens(&["*.png"], "/a/b/Cat.PNG"));
+        assert!(!opens(&["*.png"], "/a/b/cat.jpg"));
+        // A pattern with folders in it is read by its last part.
+        assert!(opens(&["**/*.drawio.svg"], "/a/plan.drawio.svg"));
+        assert!(!opens(&["**/*.drawio.svg"], "/a/plan.svg"));
+        assert!(
+            opens(&["Makefile", "*.mk"], "/a/Makefile") && opens(&["Makefile", "*.mk"], "x.mk")
+        );
+        assert!(opens(&["data-*.v*.json"], "data-1.v22.json"));
+        assert!(!opens(&["data-*.v*.json"], "data-1.json"));
+        assert!(!opens(&["Makefile"], "/a/Makefile.bak") && !opens(&[], "a.png"));
+    }
+}
