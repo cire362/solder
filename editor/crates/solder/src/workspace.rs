@@ -17446,6 +17446,16 @@ exports.activate = (context) => {
             s.toggle(&app, 2, cx);
             s.start(configs[0].clone(), root.clone(), cx)
         });
+        // Compiling the real Ruby component can exceed five seconds on CI.
+        // Its preparation must not consume the protocol's pause deadline.
+        wait_for_with_timeout(
+            cx,
+            "the extension's debug adapter",
+            Duration::from_secs(30),
+            &|cx| !matches!(debug.read(cx).state, crate::debug::State::Starting(_)),
+        );
+        let state = cx.read(|cx| debug.read(cx).state.clone());
+        assert!(state.active(), "the debug adapter did not start: {state:?}");
         wait_for(cx, "the pause in app.rb", &|cx| {
             paused_line(&debug, cx) == Some(2)
         });
