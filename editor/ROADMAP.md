@@ -263,7 +263,10 @@ to build them.
       code, in the debugger. An adapter that is an object in the code is
       reached at a local port; a launch by name and adapters on named
       pipes are not there
-- [ ] Tasks, terminals and file watching
+- [x] Tasks, terminals and file watching. Terminals are the dock's own; a
+      task is a command in one, listed by **Run extension task**. Not
+      there: terminals and tasks that are the extension's own code (`pty`,
+      `CustomExecution`), and problem matchers
 - [ ] Source control providers, views in the sidebar (trees), decorations and
       test controllers
 - [ ] Webviews, custom editors and notebooks. They need a browser view inside

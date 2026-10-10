@@ -231,6 +231,11 @@ Never guess a signature.
   code if it does not run). An adapter that is an object in that code is
   put behind a local port by `host/debug.js`: no second way to talk to
   an adapter in Rust.
+  A terminal of an extension is a terminal of the dock, kept by the
+  workspace that made it (`extension_terminals`); a task is a command
+  in such a terminal, and what `host/shell.js` knows of its end is what
+  the terminal's process ended with. Watching files is the host's own
+  work with Node: the editor is not asked.
 
 ### Performance rules
 

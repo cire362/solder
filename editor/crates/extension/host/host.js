@@ -17,6 +17,7 @@ const { Documents } = require('./documents');
 const buildApi = require('./api');
 const buildLanguages = require('./languages');
 const buildDebug = require('./debug');
+const buildShell = require('./shell');
 
 const { Disposable, EventEmitter, Uri } = types.classes;
 
@@ -147,6 +148,11 @@ const languages = buildLanguages(core);
 built.told.lsp = (params) => void languages.lsp(params);
 const debugging = buildDebug(core);
 Object.assign(built.told, debugging.told);
+// Terminals are the window's and watching files the workspace's.
+const shell = buildShell(core);
+Object.assign(built.told, shell.told);
+Object.defineProperties(built.window, Object.getOwnPropertyDescriptors(shell.windowMembers));
+built.workspace.createFileSystemWatcher = shell.createFileSystemWatcher;
 
 const vscode = {
   // Extensions and their libraries refuse a VS Code older than they
@@ -155,10 +161,13 @@ const vscode = {
   ...types.classes,
   ...languages.classes,
   ...debugging.classes,
+  ...shell.classes,
   ...types.enums,
   ...debugging.enums,
+  ...shell.enums,
   languages: languages.languages,
   debug: debugging.debug,
+  tasks: shell.tasks,
   window: built.window,
   workspace: built.workspace,
   env: built.env,
@@ -318,7 +327,7 @@ const handlers = {
   },
 };
 
-Object.assign(handlers, debugging.asked);
+Object.assign(handlers, debugging.asked, shell.asked);
 
 async function handle(message) {
   if (message.method === undefined) {

@@ -80,6 +80,7 @@ actions!(
         OpenKeyLayout,
         ResetLayout,
         UseContextPrompt,
+        RunExtensionTask,
         GoToSymbol,
         GoToProjectSymbol,
         SplitRight,
@@ -283,6 +284,9 @@ pub struct Workspace {
     /// The menu of a dock: where it opened, the dock, and the panel whose
     /// tab was under the pointer, if one was.
     dock_menu: Option<(Point<Pixels>, Place, Option<Panel>)>,
+    /// The terminals extensions made in this window's dock, each by the
+    /// extension and the number it gave the terminal.
+    extension_terminals: Vec<((String, u64), Entity<Terminal>)>,
     /// What extensions offer for the file in front, where the right
     /// button was pressed in it.
     editor_menu: Option<(Point<Pixels>, Vec<crate::extension_api::Offered>)>,
@@ -745,6 +749,7 @@ impl Workspace {
             layout_selection: layout::selection(cx),
             resizing: None,
             dock_menu: None,
+            extension_terminals: Vec::new(),
             editor_menu: None,
             bar_menu: None,
             dragging: None,
@@ -1503,8 +1508,12 @@ impl Workspace {
             window,
             |this, terminal, event, window, cx| match event {
                 TerminalEvent::TitleChanged => cx.notify(),
-                // Services keep their tab so a crash's output stays readable.
-                TerminalEvent::Exited if terminal.read(cx).keep_on_exit => cx.notify(),
+                // Services keep their tab so a crash's output stays readable,
+                // and so do the tasks of extensions.
+                TerminalEvent::Exited if terminal.read(cx).keep_on_exit => {
+                    this.extension_terminal_gone(terminal, cx);
+                    cx.notify()
+                }
                 TerminalEvent::Exited => this.remove_terminal(terminal, window, cx),
             },
         );
@@ -3249,6 +3258,7 @@ impl Workspace {
         let Some(ix) = self.terminals.iter().position(|(t, _)| t == terminal) else {
             return;
         };
+        self.extension_terminal_gone(terminal, cx);
         let was_focused = terminal.focus_handle(cx).contains_focused(window, cx);
         drop(self.terminals.remove(ix));
         if self.terminals.is_empty() {
@@ -4083,6 +4093,11 @@ impl Workspace {
                         saving.detach();
                     }
                 }
+                Ask::Terminal {
+                    extension,
+                    terminal,
+                    what,
+                } => self.extension_terminal((extension, terminal), what, window, cx),
                 Ask::Output { title, text } => {
                     let document = cx.new(|cx| {
                         Document::virtual_file(title, PathBuf::from("output.log"), &text, cx)
@@ -4092,6 +4107,100 @@ impl Workspace {
                 }
             }
         }
+    }
+
+    /// What an extension does with a terminal of its own, in the dock of
+    /// this window.
+    fn extension_terminal(
+        &mut self,
+        key: (String, u64),
+        what: crate::extension_api::TerminalAsk,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::extension_api::TerminalAsk;
+        let known = self
+            .extension_terminals
+            .iter()
+            .find(|(of, _)| *of == key)
+            .map(|(_, terminal)| terminal.clone());
+        match (what, known) {
+            (
+                TerminalAsk::Create {
+                    name,
+                    program,
+                    args,
+                    cwd,
+                    env,
+                    keep,
+                    show,
+                },
+                None,
+            ) => {
+                let command = TerminalCommand {
+                    program,
+                    args,
+                    cwd: cwd.unwrap_or_else(|| self.root(cx)),
+                    env,
+                    title: name,
+                    keep_on_exit: keep,
+                };
+                match self.spawn_terminal_with(command, show, window, cx) {
+                    Some(terminal) => self.extension_terminals.push((key, terminal)),
+                    // It could not be started: to the extension it ended.
+                    None => {
+                        if let Some(store) = ExtensionStore::try_global(cx) {
+                            store.read(cx).terminal_closed(&key.0, key.1, None);
+                        }
+                    }
+                }
+            }
+            (TerminalAsk::Send(text), Some(terminal)) => terminal.read(cx).write(text.into_bytes()),
+            (TerminalAsk::Show, Some(terminal)) => {
+                if let Some(ix) = self.terminals.iter().position(|(t, _)| *t == terminal) {
+                    self.active_terminal = ix;
+                }
+                self.show_panel(Panel::Terminal, cx);
+                cx.notify();
+            }
+            (TerminalAsk::Dispose, Some(terminal)) => self.remove_terminal(&terminal, window, cx),
+            _ => {}
+        }
+    }
+
+    /// A terminal ended or its tab was closed. If an extension made it,
+    /// the extension hears of it, with what its program ended with.
+    fn extension_terminal_gone(&mut self, terminal: &Entity<Terminal>, cx: &mut Context<Self>) {
+        let made = self
+            .extension_terminals
+            .iter()
+            .position(|(_, known)| known == terminal);
+        let Some(ix) = made else {
+            return;
+        };
+        let ((extension, id), terminal) = self.extension_terminals.remove(ix);
+        let code = terminal.read(cx).exit_code;
+        if let Some(store) = ExtensionStore::try_global(cx) {
+            store.read(cx).terminal_closed(&extension, id, code);
+        }
+    }
+
+    /// The tasks extensions have, to run one in a terminal.
+    fn run_extension_task(
+        &mut self,
+        _: &RunExtensionTask,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = ExtensionStore::try_global(cx) else {
+            return;
+        };
+        let listing = store.update(cx, |store, cx| store.tasks(cx));
+        self.toggle_modal(window, cx, move |window, cx| {
+            let picker = Picker::new(crate::extension_ask::TaskPick::default(), window, cx);
+            crate::extension_ask::TaskPick::load(listing, window, cx);
+            picker
+        });
     }
 
     /// Saves the open file at `path`, or with none every open file that
@@ -5191,6 +5300,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_layout))
             .on_action(cx.listener(Self::switch_layout))
             .on_action(cx.listener(Self::run_extension_command))
+            .on_action(cx.listener(Self::run_extension_task))
             .on_action(cx.listener(Self::save_layout))
             .on_action(cx.listener(Self::switch_key_layout))
             .on_action(cx.listener(Self::save_key_layout))
@@ -12253,6 +12363,140 @@ exports.activate = async (context) => {
             store.set_off(Origin::VsCode, "Acme.api", true, cx)
         });
         assert!(cx.read(|cx| store.read(cx).bar().is_empty()));
+    }
+
+    #[gpui::test]
+    fn an_extension_runs_terminals_and_tasks_in_the_dock(cx: &mut TestAppContext) {
+        let node = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("node"))
+                .find(|node| node.is_file())
+        });
+        let Some(node) = node else {
+            eprintln!("skipped: no node to run an extension with");
+            return;
+        };
+        let (base, _) = serve(vec![
+            (
+                "/api/-/search",
+                Served::ok(br#"{"extensions":[]}"#.to_vec()),
+            ),
+            ("/extensions", Served::ok(br#"{"data":[]}"#.to_vec())),
+        ]);
+        let (_config, store, ws, cx) = extension_setup(cx, "ext-shell", &base);
+        let folder = cx.read(|cx| store.read(cx).root.clone());
+        let dir = folder.join("vscode/acme.shell");
+        write_file(
+            &dir.join("package.json"),
+            r#"{ "name": "shell", "publisher": "Acme", "version": "1.0.0", "main": "main.js",
+  "activationEvents": ["*"] }"#,
+        );
+        write_file(
+            &dir.join("main.js"),
+            r#"const vscode = require('vscode');
+exports.activate = (context) => {
+  const terminal = vscode.window.createTerminal({ name: 'Mine', shellPath: '/bin/sh' });
+  vscode.window.onDidCloseTerminal((closed) => console.log(`closed ${closed.name} ${closed.exitStatus.code}`));
+  vscode.tasks.registerTaskProvider('demo', {
+    provideTasks: () => [
+      new vscode.Task({ type: 'demo' }, vscode.TaskScope.Workspace, 'fail', 'demo',
+        new vscode.ShellExecution('echo task-$((1+1)); exit 3', { executable: '/bin/sh' })),
+    ],
+  });
+  vscode.tasks.onDidEndTaskProcess((e) => console.log(`task ${e.execution.task.name} ended with ${e.exitCode}`));
+  context.subscriptions.push(
+    vscode.commands.registerCommand('shell.type', () => {
+      terminal.sendText('echo solder-$((40+2))');
+      terminal.show();
+    }),
+    vscode.commands.registerCommand('shell.close', () => terminal.dispose()),
+  );
+};"#,
+        );
+        store.update(cx, |store, cx| {
+            store.world = Some(std::sync::Arc::new(NodeOnly(
+                node.to_string_lossy().into_owned(),
+            )));
+            store.scan(cx);
+        });
+        wait_for(cx, "the extension", &|cx| {
+            store.read(cx).find(Origin::VsCode, "Acme.shell").is_some()
+        });
+        store.update(cx, |store, cx| {
+            store.allow(Origin::VsCode, "Acme.shell", cx)
+        });
+        wait_for(cx, "its code", &|cx| {
+            store
+                .read(cx)
+                .code("Acme.shell")
+                .map(|code| code.state.clone())
+                == Some(CodeState::Running)
+        });
+        let said = |cx: &App, what: &str| {
+            let store = store.read(cx);
+            let code = store.code("Acme.shell").unwrap();
+            code.said.iter().any(|(_, text)| text == what)
+        };
+        let shows = |cx: &App, terminal: usize, line: &str| {
+            let terminals = &ws.read(cx).terminals;
+            let Some((terminal, _)) = terminals.get(terminal) else {
+                return false;
+            };
+            terminal.read(cx).visible_text().iter().any(|l| l == line)
+        };
+        // A terminal it only keeps ready takes no room in the dock.
+        assert!(cx.read(|cx| ws.read(cx).terminals.is_empty()));
+
+        // Typed into, it is a terminal of the dock, under its name, and
+        // what was typed ran in it.
+        store.update(cx, |store, cx| {
+            store
+                .run_command("shell.type", serde_json::Value::Null, cx)
+                .detach()
+        });
+        wait_for(cx, "what it typed to run", &|cx| shows(cx, 0, "solder-42"));
+        assert_eq!(
+            cx.read(|cx| ws.read(cx).terminals[0].0.read(cx).title()),
+            "Mine"
+        );
+        assert!(cx.read(|cx| ws.read(cx).bottom == Some(Panel::Terminal)));
+
+        // Its tasks are in the list of tasks, and one chosen runs in a
+        // terminal of its own. The extension hears what it ended with,
+        // and the tab stays, for what it wrote to be read.
+        cx.dispatch_action(RunExtensionTask);
+        wait_for(cx, "the tasks", &|cx| {
+            let Some(modal) = &ws.read(cx).modal else {
+                return false;
+            };
+            let picker = modal
+                .view
+                .clone()
+                .downcast::<Picker<crate::extension_ask::TaskPick>>();
+            picker.is_ok_and(|picker| !picker.read(cx).delegate.is_loading())
+        });
+        cx.simulate_input("fail");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the task to end", &|cx| {
+            said(cx, "task fail ended with 3")
+        });
+        assert!(cx.read(|cx| shows(cx, 1, "task-2")));
+        let ended = cx.read(|cx| {
+            let task = ws.read(cx).terminals[1].0.read(cx);
+            (task.title().to_string(), task.exited, task.exit_code)
+        });
+        assert_eq!(ended, ("fail".to_string(), true, Some(3)));
+
+        // Closed by the extension, its terminal leaves the dock, and it
+        // hears that too.
+        store.update(cx, |store, cx| {
+            store
+                .run_command("shell.close", serde_json::Value::Null, cx)
+                .detach()
+        });
+        wait_for(cx, "its terminal to close", &|cx| {
+            ws.read(cx).terminals.len() == 1 && said(cx, "closed Mine undefined")
+        });
     }
 
     #[gpui::test]

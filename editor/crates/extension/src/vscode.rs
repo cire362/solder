@@ -37,6 +37,7 @@ const HOST: &[(&str, &str)] = &[
     ("api.js", include_str!("../host/api.js")),
     ("languages.js", include_str!("../host/languages.js")),
     ("debug.js", include_str!("../host/debug.js")),
+    ("shell.js", include_str!("../host/shell.js")),
 ];
 
 /// Puts the host where Node can read it, under `dir`. A file is written
@@ -1118,6 +1119,143 @@ exports.activate = (context) => {
         assert!(lock(&said).iter().any(|(method, params)| {
             method == "missing" && params["name"] == "languages.registerFoldingRangeProvider"
         }));
+    }
+
+    #[test]
+    fn an_extension_has_terminals_tasks_and_hears_of_files_that_change() {
+        let code = r#"
+const vscode = require('vscode');
+exports.activate = (context) => {
+  const out = vscode.window.createOutputChannel('Shell');
+  const log = (...all) => out.appendLine(all.map((one) => (typeof one === 'string' ? one : JSON.stringify(one))).join(' '));
+  const name = (uri) => vscode.workspace.asRelativePath(uri);
+  const watcher = vscode.workspace.createFileSystemWatcher('**/*.txt');
+  watcher.onDidCreate((uri) => log('created', name(uri)));
+  watcher.onDidChange((uri) => log('changed', name(uri)));
+  watcher.onDidDelete((uri) => log('deleted', name(uri)));
+  const terminal = vscode.window.createTerminal({ name: 'Demo', shellPath: '/bin/sh', cwd: vscode.workspace.workspaceFolders[0].uri });
+  vscode.window.onDidCloseTerminal((closed) => log('closed', closed.name, closed.exitStatus.code, vscode.window.terminals.length));
+  vscode.tasks.registerTaskProvider('demo', {
+    provideTasks: () => [
+      new vscode.Task({ type: 'demo' }, vscode.TaskScope.Workspace, 'build', 'demo', new vscode.ShellExecution('echo', ['a b', 'c'])),
+      new vscode.Task({ type: 'demo' }, vscode.TaskScope.Workspace, 'list', 'demo', new vscode.ProcessExecution('ls', ['-la'], { cwd: '/tmp', env: { A: '1' } })),
+      new vscode.Task({ type: 'demo' }, 'line', 'demo', new vscode.ShellExecution('make all')),
+    ],
+  });
+  vscode.tasks.onDidStartTask((e) => log('task started', e.execution.task.name));
+  vscode.tasks.onDidEndTaskProcess((e) => log('task ended', e.execution.task.name, e.exitCode, vscode.tasks.taskExecutions.length));
+  context.subscriptions.push(watcher, vscode.commands.registerCommand('demo.type', () => {
+    terminal.sendText('echo hi');
+    terminal.show();
+    return vscode.window.terminals.length;
+  }));
+  log('ready');
+};
+"#;
+        let Some((host, told, dir)) = hosted("vscode-shell", code) else {
+            return;
+        };
+        let project = dir.join("project");
+        write_file(&project.join("old.txt"), "old");
+        let project = project.canonicalize().unwrap();
+        let host = Arc::new(host);
+        let said = editor(&host, told, |method, _| Err(format!("no {method} here")));
+        host.notify("init", json!({ "folders": [project] }));
+        host.request("activate", json!({}), SOON).unwrap();
+        written(&said, "ready");
+        let sent = |method: &str| -> Vec<Value> {
+            lock(&said)
+                .iter()
+                .filter(|(known, _)| known == method)
+                .map(|(_, params)| params.clone())
+                .collect()
+        };
+
+        // A terminal it only keeps ready is none in the editor. Typed
+        // into, it is made, with what it runs and where.
+        assert!(sent("terminal.create").is_empty());
+        let count = host.request("executeCommand", json!({ "id": "demo.type" }), SOON);
+        assert_eq!(count, Ok(json!(1)));
+        assert_eq!(
+            sent("terminal.create"),
+            [json!({
+                "id": 1, "name": "Demo", "program": "/bin/sh", "args": [],
+                "cwd": project, "keep": false, "show": false,
+            })]
+        );
+        assert_eq!(
+            sent("terminal.send"),
+            [json!({ "id": 1, "text": "echo hi\n" })]
+        );
+        assert_eq!(sent("terminal.show"), [json!({ "id": 1 })]);
+        host.notify("terminal.closed", json!({ "id": 1, "code": 0 }));
+        written(&said, "closed Demo 0 0");
+
+        // Its tasks, and one of them run: a command line for the shell,
+        // each word quoted where the shell would part it.
+        let tasks = host.request("tasks.fetch", json!({}), SOON).unwrap();
+        assert_eq!(
+            tasks,
+            json!([
+                { "name": "build", "source": "demo" },
+                { "name": "list", "source": "demo" },
+                { "name": "line", "source": "demo" },
+            ])
+        );
+        host.request("tasks.run", json!({ "index": 0 }), SOON)
+            .unwrap();
+        written(&said, "task started build");
+        let made = sent("terminal.create");
+        assert_eq!(made[1]["name"], "build");
+        assert_eq!(made[1]["args"], json!(["-c", "echo 'a b' c"]));
+        assert_eq!(
+            (&made[1]["keep"], &made[1]["show"]),
+            (&json!(true), &json!(true))
+        );
+        // It ends when what ran in its terminal does, with what that
+        // ended with.
+        host.notify("terminal.closed", json!({ "id": 2, "code": 3 }));
+        written(&said, "task ended build 3 0");
+        // A program with what it is given, and a line as it was written.
+        host.request("tasks.run", json!({ "index": 1 }), SOON)
+            .unwrap();
+        host.request("tasks.run", json!({ "index": 2 }), SOON)
+            .unwrap();
+        let made = sent("terminal.create");
+        assert_eq!(
+            (
+                &made[2]["program"],
+                &made[2]["args"],
+                &made[2]["cwd"],
+                &made[2]["env"]
+            ),
+            (
+                &json!("ls"),
+                &json!(["-la"]),
+                &json!("/tmp"),
+                &json!({ "A": "1" })
+            )
+        );
+        assert_eq!(made[3]["args"], json!(["-c", "make all"]));
+        assert!(
+            host.request("tasks.run", json!({ "index": 9 }), SOON)
+                .is_err()
+        );
+
+        // Files that change on disk: a new one, a changed one, one in a
+        // folder made after the watching began, and one that went. A file
+        // that was there is changed, not new; one of another ending is
+        // none of its business.
+        std::fs::write(project.join("a.txt"), "a").unwrap();
+        written(&said, "created a.txt");
+        std::fs::write(project.join("old.txt"), "older").unwrap();
+        written(&said, "changed old.txt");
+        std::fs::write(project.join("c.md"), "c").unwrap();
+        write_file(&project.join("sub/deep/b.txt"), "b");
+        written(&said, "created sub/deep/b.txt");
+        std::fs::remove_file(project.join("a.txt")).unwrap();
+        written(&said, "deleted a.txt");
+        assert!(!output(&said).iter().any(|line| line.contains("c.md")));
     }
 
     #[test]

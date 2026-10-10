@@ -190,8 +190,46 @@ pub enum Ask {
     Save { path: Option<PathBuf>, reply: Reply },
     /// Every changed file saved, with nobody waiting to hear of it.
     SaveAll,
+    /// Something about a terminal of an extension's: by the extension and
+    /// the number it gave the terminal.
+    Terminal {
+        extension: String,
+        terminal: u64,
+        what: TerminalAsk,
+    },
     /// What an extension wrote to an output channel, to read.
     Output { title: String, text: String },
+}
+
+/// What an extension does with a terminal of its own.
+pub enum TerminalAsk {
+    /// A terminal in the dock, running `program` (the user's shell where
+    /// it names none). `keep` leaves its tab when the program ends, for
+    /// the output of a task to be read.
+    Create {
+        name: Option<String>,
+        program: Option<String>,
+        args: Vec<String>,
+        cwd: Option<PathBuf>,
+        env: std::collections::HashMap<String, String>,
+        keep: bool,
+        show: bool,
+    },
+    /// Text typed into it.
+    Send(String),
+    Show,
+    Dispose,
+}
+
+/// A task of an extension's as a list offers it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OfferedTask {
+    pub extension: String,
+    /// Its place in what the extension last listed.
+    pub index: usize,
+    pub name: String,
+    /// What it is a task of, as the extension says: `npm`, `cargo`.
+    pub source: String,
 }
 
 impl Ask {
@@ -868,6 +906,67 @@ impl ExtensionStore {
         }
     }
 
+    /// The terminal an extension made ended: what ran in it did, or its
+    /// tab was closed. `code` is what the program ended with, if it ended.
+    pub fn terminal_closed(&self, extension: &str, terminal: u64, code: Option<i32>) {
+        if let Some(host) = self.code.get(extension).and_then(|code| code.host.as_ref()) {
+            host.notify("terminal.closed", json!({ "id": terminal, "code": code }));
+        }
+    }
+
+    /// The tasks of extensions: of every one whose code runs, and of the
+    /// ones that wait for their kind of task to be asked for, which are
+    /// started for this.
+    pub fn tasks(&mut self, cx: &mut Context<Self>) -> Task<Vec<OfferedTask>> {
+        let asking: Vec<String> = self
+            .installed
+            .iter()
+            .filter(|extension| self.may_run(extension))
+            .filter(|extension| {
+                let waits = |(_, wakes): (_, &[String])| {
+                    wakes.iter().any(|event| event.starts_with("onTaskType:"))
+                };
+                self.code.contains_key(&extension.id) || extension.node().is_some_and(waits)
+            })
+            .map(|extension| extension.id.clone())
+            .collect();
+        let asked: Vec<_> = asking
+            .into_iter()
+            .map(|id| {
+                let listing = self.ask_host(&id, "tasks.fetch", json!({}), cx);
+                (id, listing)
+            })
+            .collect();
+        cx.background_executor().spawn(async move {
+            let mut tasks = Vec::new();
+            for (extension, listing) in asked {
+                let Ok(Value::Array(listed)) = listing.await else {
+                    continue;
+                };
+                for (index, task) in listed.iter().enumerate() {
+                    let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+                    tasks.push(OfferedTask {
+                        extension: extension.clone(),
+                        index,
+                        name: text(&task["name"]),
+                        source: text(&task["source"]),
+                    });
+                }
+            }
+            tasks
+        })
+    }
+
+    /// Runs a task [`Self::tasks`] listed, in a terminal of the dock.
+    pub fn run_task(
+        &mut self,
+        task: &OfferedTask,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Value, String>> {
+        let params = json!({ "index": task.index });
+        self.ask_host(&task.extension, "tasks.run", params, cx)
+    }
+
     /// Says to the extensions whose code runs that a program began to be
     /// debugged, or that it ended.
     pub fn debug_session(&self, began: bool, session: Value) {
@@ -1033,6 +1132,42 @@ impl ExtensionStore {
                 if params["show"] == true {
                     self.show_output(id, &channel, cx);
                 }
+            }
+            // A terminal of its own: made, typed into, shown, closed.
+            "terminal.create" | "terminal.send" | "terminal.show" | "terminal.dispose" => {
+                let what = match method {
+                    "terminal.create" => TerminalAsk::Create {
+                        name: text(&params["name"]),
+                        program: text(&params["program"]),
+                        args: params["args"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(text)
+                            .collect(),
+                        cwd: text(&params["cwd"]).map(PathBuf::from),
+                        env: params["env"]
+                            .as_object()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|(name, value)| Some((name.clone(), text(value)?)))
+                            .collect(),
+                        keep: params["keep"] == true,
+                        show: params["show"] == true,
+                    },
+                    "terminal.send" => TerminalAsk::Send(text(&params["text"]).unwrap_or_default()),
+                    "terminal.show" => TerminalAsk::Show,
+                    _ => TerminalAsk::Dispose,
+                };
+                let terminal = params["id"].as_u64().unwrap_or_default();
+                self.ask(
+                    Ask::Terminal {
+                        extension: id.to_string(),
+                        terminal,
+                        what,
+                    },
+                    cx,
+                );
             }
             // The extension moved the selection or asks to see a place.
             "select" | "reveal" => {
