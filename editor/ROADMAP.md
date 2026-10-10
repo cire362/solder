@@ -21,6 +21,9 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] Commit-message suggestions from a real local or hosted model. The
+      staged-context policy and editable suggestion are checked with the
+      scripted model used by the chat tests
 - [ ] Fetch with SSH or a credential helper against a hosted remote. The
       stash and fetch tests use local repositories; Git runs without
       terminal credential prompts here
@@ -551,7 +554,7 @@ update. They come after phase 9, in this order unless one is needed sooner.
 - [x] The history as a graph, the history of one file, blame in the gutter
 - [x] Stash and fetch
 - [x] A check before a commit: keys and secrets in what is staged stop it
-- [ ] A commit message proposed by the model from what is staged
+- [x] A commit message proposed by the model from what is staged
 - [ ] The pull request of the branch and the state of its checks, through `gh`
 
 ### Tests and running

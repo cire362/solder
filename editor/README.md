@@ -242,6 +242,13 @@ staged files over 5 MB also stop the commit. This is a guard for recognizable
 keys, not a promise to find every password. It applies to editor commits;
 commands typed into a terminal use Git's own hooks.
 
+**Suggest message** asks the chat model selected in AI settings for a short
+commit subject. It uses staged changes, honors `.env` and `.solderignore`,
+checks for known keys before sending, and limits the diff to 60 KB (16 KB per
+file). Omitted files are named. The result fills the message field for editing;
+it creates no commit. If you edited the message or staged something else while
+waiting, your text is kept. **Cancel suggestion** stops waiting for the answer.
+
 ## Run the stack
 
 Open the Services tab with `cmd-shift-s` (`ctrl-shift-s` on Linux). Solder lists the

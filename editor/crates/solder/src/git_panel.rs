@@ -20,6 +20,7 @@ actions!(
     git,
     [
         Commit,
+        GenerateMessage,
         StageAll,
         UnstageAll,
         Push,
@@ -100,6 +101,9 @@ pub struct GitPanel {
     git: Entity<GitStore>,
     pub(crate) message: Entity<Editor>,
     amend: bool,
+    pub(crate) generating: bool,
+    generation_task: Option<Task<()>>,
+    pub(crate) generation_note: Option<SharedString>,
     pub(crate) history: Option<Entity<crate::git_history_panel::HistoryPanel>>,
     history_subscription: Option<Subscription>,
     pub(crate) stashes: Option<Vec<crate::git_stash::Stash>>,
@@ -120,6 +124,9 @@ impl GitPanel {
             git,
             message,
             amend: false,
+            generating: false,
+            generation_task: None,
+            generation_note: None,
             history: None,
             history_subscription: None,
             stashes: None,
@@ -339,6 +346,90 @@ impl GitPanel {
             );
         window.focus(&history.focus_handle(cx));
         self.history = Some(history);
+        cx.notify();
+    }
+
+    fn generate_message(&mut self, _: &GenerateMessage, _: &mut Window, cx: &mut Context<Self>) {
+        if self.generating {
+            self.generation_task = None;
+            self.generating = false;
+            self.generation_note = None;
+            cx.notify();
+            return;
+        }
+        let store = crate::ai_store::AiStore::try_global(cx);
+        let model = store
+            .as_ref()
+            .and_then(|s| s.read(cx).roles.get(&ai::Role::Chat).cloned());
+        let (Some(store), Some(model)) = (store, model) else {
+            self.generation_note = Some("Choose a chat model first.".into());
+            cx.notify();
+            return;
+        };
+        let Some(repo) = self.git.read(cx).repo().cloned() else {
+            return;
+        };
+        let root = self.root.clone();
+        let message_version = self.message.read(cx).version(cx);
+        self.generating = true;
+        self.generation_note = None;
+        self.generation_task = Some(cx.spawn(async move |this, cx| {
+            let snapshot_repo = repo.clone();
+            let result = async {
+                let staged = cx
+                    .background_executor()
+                    .spawn(async move { crate::ai_commit::staged(&snapshot_repo, &root) })
+                    .await?;
+                let endpoint = store
+                    .update(cx, |s, cx| s.endpoint(&model, cx))
+                    .map_err(|e| e.to_string())?
+                    .await?;
+                let name = if model.provider == crate::ai_providers::LOCAL {
+                    "local".into()
+                } else {
+                    model.model
+                };
+                let step = ai::spawn(ai::tools::step(
+                    endpoint,
+                    crate::ai_commit::request(name, staged.diff),
+                ))
+                .await?;
+                if step.stop == ai::tools::Stop::Length || !step.calls.is_empty() {
+                    return Err("The model gave no complete commit subject.".into());
+                }
+                let subject = crate::ai_commit::subject(&step.text)?;
+                let tree = cx
+                    .background_executor()
+                    .spawn(async move { repo.run(&["write-tree"]) })
+                    .await
+                    .map_err(|e| e.0)?;
+                if String::from_utf8_lossy(&tree).trim() != staged.tree {
+                    return Err("Staged changes moved. Generate the message again.".into());
+                }
+                Ok::<_, String>((subject, staged.skipped))
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                this.generating = false;
+                this.generation_task = None;
+                match result {
+                    Ok((subject, skipped)) => {
+                        if this.message.read(cx).version(cx) == message_version {
+                            this.message
+                                .update(cx, |e, cx| e.set_text(&subject, false, cx));
+                            this.generation_note = (!skipped.is_empty())
+                                .then(|| format!("Left out: {}", skipped.join(", ")).into());
+                        } else {
+                            this.generation_note =
+                                Some(format!("Your message was kept. Suggested: {subject}").into());
+                        }
+                    }
+                    Err(e) => this.generation_note = Some(e.into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
         cx.notify();
     }
 
@@ -932,6 +1023,7 @@ impl Render for GitPanel {
         div()
             .key_context("GitPanel")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::generate_message))
             .on_action(cx.listener(Self::commit))
             .on_action(cx.listener(Self::review_and_push))
             .on_action(cx.listener(Self::stash))
@@ -1065,6 +1157,25 @@ impl Render for GitPanel {
                             .child("Working...")
                     }))
                     .children(self.render_review(&theme, cx))
+                    .child(ui::button(
+                        "git-generate-message",
+                        if self.generating {
+                            "Cancel suggestion"
+                        } else {
+                            "Suggest message"
+                        },
+                        false,
+                        &theme,
+                        cx.listener(|this, _, window, cx| {
+                            this.generate_message(&GenerateMessage, window, cx)
+                        }),
+                    ))
+                    .children(self.generation_note.clone().map(|note| {
+                        div()
+                            .text_size(crate::theme::UI_FONT_SMALL)
+                            .text_color(theme.fg_muted)
+                            .child(note)
+                    }))
                     .child(
                         ui::text_field(self.message.clone(), message_focused, &theme)
                             .flex_none()

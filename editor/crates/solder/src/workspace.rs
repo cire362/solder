@@ -11978,6 +11978,74 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_commit_message_uses_staged_changes_and_stays_editable(cx: &mut TestAppContext) {
+        let step = serde_json::json!({"choices":[{"message":{"role":"assistant","content":"fix(math): guard division"},"finish_reason":"stop"}]});
+        let (root, _store, ws, seen, cx) = review_setup(cx, "commit-message", vec![step]);
+        let repo = crate::git::Repo::discover(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "fn staged() {}\n").unwrap();
+        repo.stage(&["a.rs"]).unwrap();
+        std::fs::write(root.join("a.rs"), "fn unstaged() {}\n").unwrap();
+        std::fs::write(root.join(".env"), "PRIVATE_FOR_TEST=value").unwrap();
+        repo.stage(&[".env"]).unwrap();
+        wait_for(cx, "repository", &|cx| {
+            ws.read(cx).git.read(cx).repo().is_some()
+        });
+        cx.dispatch_action(ShowGit);
+        cx.dispatch_action(git_panel::GenerateMessage);
+        let panel = cx.read(|cx| ws.read(cx).git_panel.clone());
+        wait_for(cx, "commit subject", &|cx| {
+            !panel.read(cx).generating
+                && panel
+                    .read(cx)
+                    .message
+                    .read(cx)
+                    .text(cx)
+                    .starts_with("fix(math)")
+        });
+        let request = seen.lock().unwrap().last().unwrap().clone();
+        let prompt = request["messages"].to_string();
+        assert!(prompt.contains("+fn staged()"));
+        assert!(!prompt.contains("fn unstaged()"));
+        assert!(!prompt.contains("PRIVATE_FOR_TEST"));
+        assert!(cx.read(|cx| {
+            panel
+                .read(cx)
+                .generation_note
+                .as_ref()
+                .is_some_and(|n| n.contains(".env"))
+        }));
+        assert!(repo.show("HEAD:a.rs").unwrap().contains("1 / 0"));
+        cx.simulate_input(" edited");
+        assert!(cx.read(|cx| panel.read(cx).message.read(cx).text(cx).contains("edited")));
+    }
+
+    #[gpui::test]
+    fn a_late_commit_suggestion_keeps_text_the_user_typed(cx: &mut TestAppContext) {
+        let step = serde_json::json!({"choices":[{"message":{"role":"assistant","content":"feat(core): generated"},"finish_reason":"stop"}]});
+        let (root, _store, ws, _seen, cx) = review_setup(cx, "commit-message-late", vec![step]);
+        let repo = crate::git::Repo::discover(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "fn staged() {}\n").unwrap();
+        repo.stage(&["a.rs"]).unwrap();
+        wait_for(cx, "repository", &|cx| {
+            ws.read(cx).git.read(cx).repo().is_some()
+        });
+        cx.dispatch_action(ShowGit);
+        cx.dispatch_action(git_panel::GenerateMessage);
+        let panel = cx.read(|cx| ws.read(cx).git_panel.clone());
+        let message = cx.read(|cx| panel.read(cx).message.clone());
+        message.update(cx, |e, cx| e.set_text("My own message", false, cx));
+        wait_for(cx, "late suggestion", &|cx| !panel.read(cx).generating);
+        assert_eq!(cx.read(|cx| message.read(cx).text(cx)), "My own message");
+        assert!(cx.read(|cx| {
+            panel
+                .read(cx)
+                .generation_note
+                .as_ref()
+                .is_some_and(|n| n.contains("Your message was kept"))
+        }));
+    }
+
+    #[gpui::test]
     fn push_waits_for_review_findings(cx: &mut TestAppContext) {
         let finding = tool_step(
             "r1",

@@ -1,6 +1,7 @@
 mod agent;
 mod agent_panel;
 mod agent_task;
+mod ai_commit;
 mod ai_context;
 mod ai_panel;
 mod ai_providers;
