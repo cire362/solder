@@ -305,6 +305,11 @@ doctests, custom harnesses, nested Go modules and Python pytest are not built-in
 runners here. Output keeps at most 1 MB per stream and displays its first 2,000
 lines. Extension test runners keep their own discovery and run profiles.
 
+A discovery whose output exceeds the limit is reported as incomplete rather
+than silently offering only part of the test list. In `unittest`, expected
+failures are marked skipped; unexpected successes are failed as the runner
+requires. Rust target groups include their package folder.
+
 ## Debugging
 
 Click a line number (or press `F9`) to set a breakpoint, then `F5`. The Debug

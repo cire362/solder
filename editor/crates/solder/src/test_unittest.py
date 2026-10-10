@@ -39,6 +39,14 @@ class Result(unittest.TextTestResult):
         super().addSkip(test, reason)
         send({"id": test.id(), "state": "skipped", "detail": reason})
 
+    def addExpectedFailure(self, test, err):
+        super().addExpectedFailure(test, err)
+        send({"id": test.id(), "state": "skipped", "detail": "Expected failure"})
+
+    def addUnexpectedSuccess(self, test):
+        super().addUnexpectedSuccess(test)
+        send({"id": test.id(), "state": "failed", "detail": "Unexpected success"})
+
 
 with contextlib.redirect_stdout(sys.stderr):
     loader = unittest.TestLoader()

@@ -80,6 +80,7 @@ struct Output {
     ok: bool,
     text: String,
     stdout: String,
+    limited: bool,
 }
 
 fn output(mut command: Command, cancel: &Cancel) -> Result<Output, String> {
@@ -111,6 +112,7 @@ fn output(mut command: Command, cancel: &Cancel) -> Result<Output, String> {
     .map(|mut stream| {
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
+            let mut limited = false;
             let mut buf = [0; 8192];
             while let Ok(n) = stream.read(&mut buf) {
                 if n == 0 {
@@ -118,8 +120,9 @@ fn output(mut command: Command, cancel: &Cancel) -> Result<Output, String> {
                 }
                 let keep = n.min((LIMIT / 2).saturating_sub(bytes.len()));
                 bytes.extend_from_slice(&buf[..keep]);
+                limited |= keep < n;
             }
-            bytes
+            (bytes, limited)
         })
     })
     .collect();
@@ -160,12 +163,29 @@ fn output(mut command: Command, cancel: &Cancel) -> Result<Output, String> {
         .into_iter()
         .map(|r| r.join().unwrap_or_default())
         .collect();
-    let stdout = String::from_utf8_lossy(&streams[0]).into_owned();
-    let mut text = format!("{stdout}\n{}", String::from_utf8_lossy(&streams[1]));
-    if streams.iter().any(|s| s.len() == LIMIT / 2) {
+    let stdout = String::from_utf8_lossy(&streams[0].0).into_owned();
+    let mut text = format!("{stdout}\n{}", String::from_utf8_lossy(&streams[1].0));
+    let limited = streams.iter().any(|s| s.1);
+    if limited {
         text.push_str("\nOutput limited to 1 MB per stream.\n");
     }
-    result.map(|ok| Output { ok, text, stdout })
+    result.map(|ok| Output {
+        ok,
+        text,
+        stdout,
+        limited,
+    })
+}
+
+fn discovery_output(command: Command, cancel: &Cancel) -> Result<Output, String> {
+    let out = output(command, cancel)?;
+    if out.limited {
+        return Err("Test discovery exceeded 1 MB per stream; its list is incomplete".into());
+    }
+    if !out.ok {
+        return Err(out.text);
+    }
+    Ok(out)
 }
 
 fn command(program: impl AsRef<std::ffi::OsStr>, root: &Path) -> Command {
@@ -207,7 +227,7 @@ pub fn discover(root: &Path, cancel: &Cancel) -> Discovery {
         let mut cmd = command("cargo", root);
         cmd.args(["test", "--workspace", "--no-run", "--message-format=json"]);
         let rust = (|| {
-            let built = output(cmd, cancel)?;
+            let built = discovery_output(cmd, cancel)?;
             if !built.ok {
                 return Err(built.text);
             }
@@ -226,7 +246,7 @@ pub fn discover(root: &Path, cancel: &Cancel) -> Discovery {
                 }
                 let mut cmd = command(exe, root);
                 cmd.args(["--list", "--format", "terse"]);
-                let listed = output(cmd, cancel)?;
+                let listed = discovery_output(cmd, cancel)?;
                 if !listed.ok {
                     return Err(listed.text);
                 }
@@ -240,6 +260,16 @@ pub fn discover(root: &Path, cancel: &Cancel) -> Discovery {
                     .to_string();
                 let manifest =
                     PathBuf::from(artifact["manifest_path"].as_str().unwrap_or("Cargo.toml"));
+                let folder = manifest
+                    .parent()
+                    .unwrap_or(root)
+                    .strip_prefix(root)
+                    .unwrap_or(root);
+                let group = if folder.as_os_str().is_empty() {
+                    format!("Rust · {target} ({kind})")
+                } else {
+                    format!("Rust · {} · {target} ({kind})", folder.display())
+                };
                 for name in listed
                     .stdout
                     .lines()
@@ -251,7 +281,7 @@ pub fn discover(root: &Path, cancel: &Cancel) -> Discovery {
                         manifest.parent().unwrap_or(root),
                     );
                     found.tests.push(Test {
-                        group: format!("Rust · {target} ({kind})"),
+                        group: group.clone(),
                         name: name.into(),
                         path,
                         line,
@@ -281,7 +311,7 @@ pub fn discover(root: &Path, cancel: &Cancel) -> Discovery {
         let program = python(root);
         let mut cmd = command(&program, root);
         cmd.args(["-c", PYTHON, "list"]);
-        match output(cmd, cancel) {
+        match discovery_output(cmd, cancel) {
             Ok(out) if out.ok => {
                 for row in lines(&out.stdout, "solder-test:") {
                     let Some(name) = row["id"].as_str() else {
@@ -306,7 +336,7 @@ pub fn discover(root: &Path, cancel: &Cancel) -> Discovery {
         let mut cmd = command("go", root);
         cmd.args(["list", "-f", "{{.ImportPath}}|{{.Dir}}", "./..."]);
         let go = (|| {
-            let packages = output(cmd, cancel)?;
+            let packages = discovery_output(cmd, cancel)?;
             if !packages.ok {
                 return Err(packages.text);
             }
@@ -317,7 +347,7 @@ pub fn discover(root: &Path, cancel: &Cancel) -> Discovery {
                 };
                 let mut cmd = command("go", root);
                 cmd.args(["test", "-list", ".", package]);
-                let listed = output(cmd, cancel)?;
+                let listed = discovery_output(cmd, cancel)?;
                 if !listed.ok {
                     return Err(listed.text);
                 }
@@ -559,16 +589,33 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(3));
     }
     #[test]
+    fn an_oversized_discovery_never_looks_like_a_complete_test_list() {
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let root = db::testing::dir("test-list-limit");
+        let mut cmd = command("python3", &root);
+        cmd.args(["-c", "import sys; sys.stdout.write('x' * 1100000)"]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(
+            discovery_output(cmd, &cancel)
+                .err()
+                .unwrap()
+                .contains("list is incomplete")
+        );
+    }
+
+    #[test]
     fn unittest_lists_locations_and_runs_exactly_one_test() {
         if Command::new("python3").arg("--version").output().is_err() {
             return;
         }
         let root = db::testing::dir("test-runner").canonicalize().unwrap();
-        std::fs::write(root.join("test_example.py"), "import unittest\nclass Tests(unittest.TestCase):\n    def test_pass(self): self.assertEqual(2, 2)\n    def test_fail(self): self.assertEqual(1, 2)\n    @unittest.skip('later')\n    def test_skip(self): pass\n").unwrap();
+        std::fs::write(root.join("test_example.py"), "import unittest\nclass Tests(unittest.TestCase):\n    def test_pass(self): self.assertEqual(2, 2)\n    def test_fail(self): self.assertEqual(1, 2)\n    @unittest.skip('later')\n    def test_skip(self): pass\n    @unittest.expectedFailure\n    def test_expected(self): self.fail('known')\n    @unittest.expectedFailure\n    def test_unexpected(self): pass\n").unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let found = discover(&root, &cancel);
         assert!(found.errors.is_empty(), "{:?}", found.errors);
-        assert_eq!(found.tests.len(), 3);
+        assert_eq!(found.tests.len(), 5);
         let test = |name: &str| found.tests.iter().find(|t| t.name.ends_with(name)).unwrap();
         assert_eq!(test("test_pass").line, 3);
         assert_eq!(test("test_pass").path, Some(root.join("test_example.py")));
@@ -578,6 +625,13 @@ mod tests {
         assert!(failed.output.contains("AssertionError: 1 != 2"));
         assert!(!failed.output.contains("test_pass"));
         assert_eq!(run(&root, test("test_skip"), &cancel).state, State::Skipped);
+        assert_eq!(
+            run(&root, test("test_expected"), &cancel).state,
+            State::Skipped
+        );
+        let unexpected = run(&root, test("test_unexpected"), &cancel);
+        assert_eq!(unexpected.state, State::Failed);
+        assert!(unexpected.output.contains("Unexpected success"));
         cancel.store(true, Ordering::Relaxed);
         assert_eq!(
             run(&root, test("test_pass"), &cancel).state,
