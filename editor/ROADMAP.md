@@ -283,10 +283,11 @@ to build them.
       browser is made when the first page opens. A notebook is not a
       page: a tab of cells drawn by Solder, each cell an editor, with the
       words and pictures its run put out under it; the extension reads,
-      runs and writes it. Pages return through their serializer. Not there: pages on
-      Wayland, outputs of a notebook that are pages of their own (HTML,
-      widgets), running Jupyter kernels. Format 4 `.ipynb` files are read and saved by
-      the editor, with metadata, attachments and outputs preserved
+      runs and writes it. Pages return through their serializer. HTML output
+      and allowed notebook renderer modules open on demand in a separate tab.
+      Not there: pages on Wayland, Jupyter kernels and the ipywidgets protocol.
+      Format 4 `.ipynb` files are read and saved by the editor, with metadata,
+      attachments and outputs preserved
 - [x] A check that runs with each release: the most installed extensions of
       Open VSX are installed, activated and asked for their main feature, and
       the result is the list of what works. `extension-census`, run by the

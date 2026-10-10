@@ -174,7 +174,19 @@ pub struct Extension {
     /// The kinds of notebook it reads: files it opens as a list of cells.
     /// `view_type` is the kind's name.
     pub notebooks: Vec<CustomEditor>,
+    pub notebook_renderers: Vec<NotebookRenderer>,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NotebookRenderer {
+    pub id: String,
+    pub name: String,
+    pub entrypoint: PathBuf,
+    pub mimes: Vec<String>,
+    pub messaging: bool,
+}
+
+pub const RENDERER_CODE: &str = "Draw notebook outputs with browser code";
 
 /// An editor of a VS Code extension's for a kind of file: its name for the
 /// user, and the patterns of file names it is for (`*.png`).
@@ -306,7 +318,14 @@ impl Extension {
     /// not run.
     pub fn outside(&self) -> Vec<String> {
         if self.node().is_some() {
-            return vec![NODE_CODE.to_string()];
+            let mut outside = vec![NODE_CODE.to_string()];
+            if !self.notebook_renderers.is_empty() {
+                outside.push(RENDERER_CODE.to_string());
+            }
+            return outside;
+        }
+        if !self.notebook_renderers.is_empty() {
+            return vec![RENDERER_CODE.to_string()];
         }
         if !self.runs_code() {
             return Vec::new();
@@ -708,6 +727,7 @@ fn read_zed(dir: &Path) -> Result<Extension, String> {
         page_views: Vec::new(),
         custom_editors: Vec::new(),
         notebooks: Vec::new(),
+        notebook_renderers: Vec::new(),
     })
 }
 
@@ -1234,6 +1254,27 @@ fn read_vscode(dir: &Path) -> Result<Extension, String> {
         page_views,
         custom_editors: editors("customEditors", "viewType"),
         notebooks: editors("notebooks", "type"),
+        notebook_renderers: list("notebookRenderer")
+            .iter()
+            .filter_map(|entry| {
+                let script = entry["entrypoint"]
+                    .as_str()
+                    .or(entry["entrypoint"]["path"].as_str())?;
+                let entrypoint = inside(dir, script)?;
+                let id = text(&entry["id"]);
+                let mimes = strings(&entry["mimeTypes"]);
+                if id.is_empty() || mimes.is_empty() {
+                    return None;
+                }
+                Some(NotebookRenderer {
+                    name: label(&text(&entry["displayName"])),
+                    id,
+                    entrypoint,
+                    mimes,
+                    messaging: entry["requiresMessaging"] == "always",
+                })
+            })
+            .collect(),
         servers: Vec::new(),
         debug_adapters: Vec::new(),
         context_servers: Vec::new(),
@@ -1320,6 +1361,27 @@ mod tests {
         assert!(opens(&["data-*.v*.json"], "data-1.v22.json"));
         assert!(!opens(&["data-*.v*.json"], "data-1.json"));
         assert!(!opens(&["Makefile"], "/a/Makefile.bak") && !opens(&[], "a.png"));
+    }
+
+    #[test]
+    fn notebook_renderers_are_named_and_their_scripts_stay_in_the_extension() {
+        let dir = crate::testing::scratch("renderer-manifest");
+        crate::testing::write(
+            &dir.join("package.json"),
+            r#"{
+            "name":"render","publisher":"Test","version":"1",
+            "contributes":{"notebookRenderer":[
+                {"id":"inside","displayName":"Widget","entrypoint":"./widget.js","mimeTypes":["application/x-widget"]},
+                {"id":"outside","entrypoint":"../private.js","mimeTypes":["text/html"]}
+            ]}}"#,
+        );
+        let extension = read(&dir).unwrap();
+        assert_eq!(extension.notebook_renderers.len(), 1);
+        assert_eq!(
+            extension.notebook_renderers[0].entrypoint,
+            dir.join("widget.js")
+        );
+        assert_eq!(extension.outside(), [RENDERER_CODE]);
     }
 
     #[test]

@@ -5,8 +5,8 @@
 //! writes them back, and it runs the code (`host/notebooks.js`). What is
 //! on screen is here: a tab with the cells one under another, each an
 //! editor as tall as its text, and under a cell what its last run put
-//! out. Words and pictures are drawn. An output that is a page of its own
-//! (HTML, a widget) is named and not drawn.
+//! out. Words and pictures are drawn inline; HTML and an allowed renderer
+//! are opened on demand in a separate page tab.
 
 use crate::{
     document::{Document, DocumentEvent},
@@ -69,6 +69,7 @@ pub(crate) enum Output {
     Picture(Arc<Image>),
     /// A form that is not drawn here: what it is called.
     Unknown(SharedString),
+    Rich(Arc<Value>, Option<SharedString>),
 }
 
 struct Cell {
@@ -95,6 +96,12 @@ enum State {
 pub enum NotebookEvent {
     /// Its name in the tab is to be drawn again: it has changes, or none.
     Changed,
+    Output {
+        title: String,
+        uri: String,
+        items: Arc<Value>,
+        renderer: Option<Box<(String, PathBuf, extension::NotebookRenderer)>>,
+    },
 }
 
 pub struct Notebook {
@@ -658,7 +665,7 @@ impl Notebook {
                 .bg(theme.bg_sunken)
                 .font_family(font)
                 .text_size(size)
-                .children(cell.outputs.iter().map(|output| {
+                .children(cell.outputs.iter().enumerate().map(|(output_ix, output)| {
                     match output {
                         Output::Words(words) => {
                             div().text_color(theme.fg_muted).child(words.clone())
@@ -673,6 +680,93 @@ impl Notebook {
                                 .max_h(px(480.))
                                 .object_fit(ObjectFit::ScaleDown),
                         ),
+                        Output::Rich(items, fallback) => {
+                            let renderer = ExtensionStore::try_global(cx).and_then(|store| {
+                                let store = store.read(cx);
+                                store
+                                    .installed
+                                    .iter()
+                                    .filter(|extension| store.may_render(extension))
+                                    .find_map(|extension| {
+                                        extension
+                                            .notebook_renderers
+                                            .iter()
+                                            .find(|renderer| {
+                                                (!renderer.messaging || extension.node().is_some())
+                                                    && items.as_array().into_iter().flatten().any(
+                                                        |item| {
+                                                            renderer.mimes.iter().any(|mime| {
+                                                                item["mime"] == mime.as_str()
+                                                            })
+                                                        },
+                                                    )
+                                            })
+                                            .map(|renderer| {
+                                                (
+                                                    extension.id.clone(),
+                                                    extension.dir.clone(),
+                                                    renderer.clone(),
+                                                )
+                                            })
+                                    })
+                            });
+                            let html = items
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .any(|item| item["mime"] == "text/html");
+                            let mut result = div().children(
+                                fallback
+                                    .clone()
+                                    .map(|words| div().text_color(theme.fg_muted).child(words)),
+                            );
+                            if renderer.is_some() || html {
+                                let items = items.clone();
+                                let label = renderer
+                                    .as_ref()
+                                    .map(|(_, _, renderer)| {
+                                        format!(
+                                            "View with {}",
+                                            if renderer.name.is_empty() {
+                                                &renderer.id
+                                            } else {
+                                                &renderer.name
+                                            }
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "View HTML output".into());
+                                result = result.child(
+                                    crate::ui::button(
+                                        ("rich-output", handle * 1000 + output_ix),
+                                        label,
+                                        false,
+                                        &theme,
+                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            cx.emit(NotebookEvent::Output {
+                                                title: format!(
+                                                    "{}: output {}",
+                                                    this.title(),
+                                                    ix + 1
+                                                ),
+                                                uri: this.uri.clone(),
+                                                items: items.clone(),
+                                                renderer: renderer.clone().map(Box::new),
+                                            });
+                                        }),
+                                    )
+                                    .debug_selector(
+                                        move || format!("notebook-output-{ix}-{output_ix}"),
+                                    ),
+                                );
+                            } else {
+                                result = result.child(
+                                    div()
+                                        .text_color(theme.fg_subtle)
+                                        .child("No renderer is allowed for this output"),
+                                );
+                            }
+                            result
+                        }
                     }
                 }))
         });
@@ -735,6 +829,10 @@ impl Notebook {
                     Output::Error(words) => format!(" => ! {}", first(words)),
                     Output::Picture(_) => " => a picture".to_string(),
                     Output::Unknown(what) => format!(" => ? {what}"),
+                    Output::Rich(_, fallback) => fallback
+                        .as_ref()
+                        .map(|words| format!(" => {}", first(words)))
+                        .unwrap_or_else(|| " => an interactive output".into()),
                 });
             }
             line
@@ -944,6 +1042,21 @@ pub(crate) fn outputs(said: &Value) -> Vec<Output> {
         if let Some(picture) = picture {
             return Some(Output::Picture(picture));
         }
+        let rich = items.iter().any(|item| {
+            let mime = item["mime"].as_str().unwrap_or_default();
+            (mime == "text/html"
+                || (!mime.starts_with("text/")
+                    && !matches!(mime, "application/json" | STDOUT | STDERR | ERROR)))
+                && (item["text"].is_string() || item["data"].is_string())
+        });
+        if rich {
+            return Some(Output::Rich(
+                Arc::new(Value::Array(
+                    items.iter().map(|item| (*item).clone()).collect(),
+                )),
+                of("text/plain").and_then(words),
+            ));
+        }
         // Plain words before words in a form of their own, and a page
         // (HTML) never as its source.
         let plain = of(STDOUT).or(of("text/plain")).or_else(|| {
@@ -1046,15 +1159,16 @@ mod tests {
                 Output::Error(words) => format!("error {words}"),
                 Output::Picture(picture) => format!("picture {:?}", picture.bytes()),
                 Output::Unknown(what) => format!("unknown {what}"),
+                Output::Rich(_, _) => "rich output".into(),
             })
             .collect();
         assert_eq!(
             drawn,
             [
-                "words 3",
+                "rich output",
                 "picture [137, 80, 78, 71]",
                 "error Error: no",
-                "unknown text/html, 2.0 KB: not drawn here",
+                "rich output",
                 "words # A",
             ]
         );

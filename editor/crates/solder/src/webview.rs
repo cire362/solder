@@ -39,6 +39,8 @@ pub struct Model {
     pub view_type: String,
     pub document_uri: Option<String>,
     pub initial_state: Value,
+    pub renderer: Option<String>,
+    pub notebook_uri: Option<String>,
     pub title: String,
     pub html: String,
     pub column: i32,
@@ -212,14 +214,24 @@ impl Page {
             match input {
                 Input::Ready => {
                     self.ready = true;
+                    if let Some(renderer) = &self.model.renderer {
+                        self.tell("notebook.renderer.open", json!({"id":self.key.1,"renderer":renderer,"uri":self.model.notebook_uri}), cx);
+                    }
                     self.flush();
                 }
                 Input::State { value } => self.source.lock().unwrap().state = value,
-                Input::Message { value } => self.tell(
-                    "webview.message",
-                    json!({"id":self.key.1,"message":value}),
-                    cx,
-                ),
+                Input::Message { value } => match &self.model.renderer {
+                    Some(renderer) => self.tell(
+                        "notebook.renderer.message",
+                        json!({"renderer":renderer,"uri":self.model.notebook_uri,"message":value}),
+                        cx,
+                    ),
+                    None => self.tell(
+                        "webview.message",
+                        json!({"id":self.key.1,"message":value}),
+                        cx,
+                    ),
+                },
                 Input::Key { key } => cx.emit(PageEvent::Key(key)),
             }
         }
@@ -367,7 +379,15 @@ impl Page {
                         .options
                         .local_resource_roots
                         .clone();
-                    responder.respond(resource(&id, &roots, &request));
+                    let mut response = resource(&id, &roots, &request);
+                    // Renderer ES modules are served from the resource
+                    // origin. The handler still limits every file to this
+                    // page's approved roots and refuses other page ids.
+                    response.headers_mut().insert(
+                        "Access-Control-Allow-Origin",
+                        wry::http::HeaderValue::from_static("*"),
+                    );
+                    responder.respond(response);
                 });
             },
         );
@@ -587,6 +607,77 @@ fn theme_values(cx: &App) -> Value {
         "textLink-foreground":css(theme.accent),"editor-selectionBackground":css(theme.selection)}})
 }
 
+/// Rich notebook outputs are opened as a page on demand, so a notebook
+/// with thousands of cells does not create thousands of native browsers.
+pub(crate) fn notebook_output(
+    (title, uri, id): (&str, &str, &str),
+    items: &Value,
+    renderer: Option<(&std::path::Path, &extension::NotebookRenderer)>,
+    cx: &App,
+) -> Option<Model> {
+    let theme = theme_values(cx);
+    let mut style = String::from(":root{");
+    for (name, value) in theme["colors"].as_object()? {
+        style.push_str(&format!("--vscode-{name}:{};", value.as_str()?));
+    }
+    style.push_str(&format!(
+        "--vscode-font-family:{};--vscode-font-size:{}px;}}",
+        theme["font"].as_str()?.replace('<', "\\3c "),
+        theme["size"]
+    ));
+    style.push_str("body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size);color:var(--vscode-editor-foreground);background:var(--vscode-editor-background);margin:16px;}img{max-width:100%;}table{border-collapse:collapse;}td,th{padding:4px 8px;}");
+    let forms = items.as_array()?;
+    let (html, scripts, roots, renderer_id) = if let Some((root, renderer)) = renderer {
+        let item = forms.iter().find(|item| {
+            renderer
+                .mimes
+                .iter()
+                .any(|mime| item["mime"] == mime.as_str())
+        })?;
+        let origin = if cfg!(target_os = "windows") {
+            format!("http://solder-resource.{id}")
+        } else {
+            format!("solder-resource://{id}")
+        };
+        let mut encoded = String::new();
+        for byte in renderer.entrypoint.to_string_lossy().bytes() {
+            match byte {
+                b'/' | b'-' | b'_' | b'.' | b'~' | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => {
+                    encoded.push(byte as char)
+                }
+                _ => encoded.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        let data = json!({"id":id,"item":item,"module":format!("{origin}{encoded}")});
+        let loader = include_str!("notebook_renderer.js")
+            .replace("__SOLDER_OUTPUT__", &escape_config(&data));
+        (
+            format!(
+                "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'nonce-solder-loader' {origin}; style-src 'unsafe-inline'; img-src data: blob: {origin}; connect-src {origin}; font-src {origin};\"><style>{style}</style></head><body><div id=\"output\"></div><script type=\"module\" nonce=\"solder-loader\">{loader}</script></body></html>"
+            ),
+            true,
+            vec![root.to_path_buf()],
+            Some(renderer.id.clone()),
+        )
+    } else {
+        let html = forms.iter().find(|item| item["mime"] == "text/html")?["text"].as_str()?;
+        // Even malformed HTML cannot turn scripts on: the browser itself
+        // has JavaScript disabled, besides the restrictive page CSP.
+        (
+            format!(
+                "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:;\"><style>{style}</style></head><body>{html}</body></html>"
+            ),
+            false,
+            Vec::new(),
+            None,
+        )
+    };
+    Model::read(
+        json!({"title":title,"html":html,"column":1,"renderer":renderer_id,"notebookUri":uri,
+        "options":{"enableScripts":scripts,"localResourceRoots":roots}}),
+    )
+}
+
 impl ExtensionStore {
     pub(crate) fn webview_said(
         &mut self,
@@ -628,7 +719,14 @@ impl ExtensionStore {
     }
 
     pub(crate) fn close_webview(&mut self, key: &Key, cx: &mut Context<Self>) {
-        self.api.webviews.remove(key);
+        if self
+            .api
+            .webviews
+            .remove(key)
+            .is_some_and(|model| model.renderer.is_some())
+        {
+            self.webview_tell(&key.0, "notebook.renderer.closed", json!({"id":key.1}));
+        }
         self.api.web_posts.remove(key);
         self.webview_tell(&key.0, "webview.closed", json!({"id":key.1}));
         cx.emit(crate::extension_api::ExtensionEvent::Webviews);
@@ -696,6 +794,42 @@ mod tests {
         assert_eq!(decode_path("/a%20b/%D0%B4"), Some("/a b/\u{434}".into()));
         assert_eq!(decode_path("/a%2"), None);
         assert_eq!(decode_path("/a%00b"), None);
+    }
+
+    #[gpui::test]
+    fn notebook_output_pages_confine_html_and_renderer_modules(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(crate::theme::Theme::dark());
+            cx.set_global(Settings::default());
+            let items =
+                json!([{"mime":"text/html","text":"<script>bad()</script><table></table>"}]);
+            let html =
+                notebook_output(("Result", "file:///book", "output1"), &items, None, cx).unwrap();
+            assert!(!html.options.enable_scripts);
+            assert!(html.options.local_resource_roots.is_empty());
+            assert!(html.html.contains("default-src 'none'"));
+            let renderer = extension::NotebookRenderer {
+                id: "widget".into(),
+                name: "Widget".into(),
+                entrypoint: PathBuf::from("/ext/widget module.js"),
+                mimes: vec!["application/x-widget".into()],
+                messaging: false,
+            };
+            let items =
+                json!([{"mime":"application/x-widget","text":"</script><script>bad()</script>"}]);
+            let page = notebook_output(
+                ("Result", "file:///book", "output2"),
+                &items,
+                Some((std::path::Path::new("/ext"), &renderer)),
+                cx,
+            )
+            .unwrap();
+            assert!(page.options.enable_scripts);
+            assert_eq!(page.options.local_resource_roots, [PathBuf::from("/ext")]);
+            assert!(page.html.contains("widget%20module.js"));
+            assert!(!page.html.contains("</script><script>bad()"));
+            assert!(page.html.contains("connect-src solder-resource://output2"));
+        });
     }
 
     #[test]

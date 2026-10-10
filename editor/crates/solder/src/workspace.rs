@@ -4278,6 +4278,7 @@ impl Workspace {
         self.close_file_diff(window, cx);
         self.leave_notebook(cx);
         self.web_front = Some((page, self.active_pane));
+        window.focus(&self.focus_handle);
         self.sync_webviews(cx);
     }
 
@@ -4298,7 +4299,69 @@ impl Workspace {
             .cloned();
         let notebook = known.unwrap_or_else(|| {
             let notebook = cx.new(|cx| Notebook::open(path, extension, kind, cx));
-            let events = cx.subscribe(&notebook, |_, _, _: &NotebookEvent, cx| cx.notify());
+            let events = cx.subscribe_in(
+                &notebook,
+                window,
+                |this, _, event, window, cx| match event {
+                    NotebookEvent::Changed => cx.notify(),
+                    NotebookEvent::Output {
+                        title,
+                        uri,
+                        items,
+                        renderer,
+                    } => {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static NEXT: AtomicU64 = AtomicU64::new(0);
+                        let owner = renderer
+                            .as_ref()
+                            .map(|renderer| renderer.0.as_str())
+                            .unwrap_or("solder.notebook");
+                        let key = (
+                            owner.to_string(),
+                            format!("output{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+                        );
+                        let model = crate::webview::notebook_output(
+                            (title, uri, &key.1),
+                            items,
+                            renderer
+                                .as_ref()
+                                .map(|renderer| (renderer.1.as_path(), &renderer.2)),
+                            cx,
+                        );
+                        if let (Some(model), Some(store)) = (model, ExtensionStore::try_global(cx))
+                        {
+                            let activate = store.update(cx, |store, cx| {
+                                store.api.webviews.insert(key.clone(), model);
+                                (renderer.is_some()
+                                    && store
+                                        .find(extension::Origin::VsCode, owner)
+                                        .is_some_and(|extension| extension.node().is_some()))
+                                .then(|| {
+                                    store.ask_host(
+                                        owner,
+                                        "notebook.renderer.activate",
+                                        serde_json::json!({}),
+                                        cx,
+                                    )
+                                })
+                            });
+                            if let Some(activate) = activate {
+                                // The page can send its first message immediately.
+                                // Its extension must be listening before it is drawn.
+                                cx.spawn_in(window, async move |this, cx| {
+                                    let _ = activate.await;
+                                    let _ = this.update_in(cx, |this, window, cx| {
+                                        this.open_webview(key, window, cx)
+                                    });
+                                })
+                                .detach();
+                            } else {
+                                this.open_webview(key, window, cx);
+                            }
+                        }
+                    }
+                },
+            );
             self.notebooks.push((notebook.clone(), events));
             notebook
         });
@@ -4454,13 +4517,22 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let key = page.read(cx).key.clone();
+        let notebook_uri = page.read(cx).model.notebook_uri.clone();
         page.update(cx, |page, _| page.show(false));
         self.web_front = None;
         self.web_pages.retain(|(known, _)| known != page);
         if let Some(store) = ExtensionStore::try_global(cx) {
             store.update(cx, |store, cx| store.close_webview(&key, cx));
         }
-        if let Some(editor) = self.active_editor() {
+        let notebook = notebook_uri.and_then(|uri| {
+            self.notebooks
+                .iter()
+                .find(|(book, _)| crate::extension_api::uri(&book.read(cx).path) == uri)
+                .map(|(book, _)| book.clone())
+        });
+        if let Some(notebook) = notebook {
+            self.show_notebook(notebook, self.active_pane, window, cx);
+        } else if let Some(editor) = self.active_editor() {
             window.focus(&editor.focus_handle(cx));
         } else {
             window.focus(&self.focus_handle);
@@ -13350,7 +13422,7 @@ exports.activate = (context) => {
         let original = serde_json::json!({"nbformat":4,"nbformat_minor":5,
             "metadata":{"custom":42},"cells":[{"cell_type":"code","id":"first",
             "source":["print(1)"],"metadata":{"tags":["keep"]},"execution_count":1,
-            "outputs":[{"output_type":"stream","name":"stdout","text":["1\n"]}]}]});
+            "outputs":[{"output_type":"stream","name":"stdout","text":["1\n"]},{"output_type":"display_data","data":{"text/html":"<table><tr><td>Result</td></tr></table>"},"metadata":{}}]}]});
         std::fs::write(&file, serde_json::to_vec(&original).unwrap()).unwrap();
         cx.executor().allow_parking();
         let (ws, cx) = setup(cx, root);
@@ -13361,8 +13433,14 @@ exports.activate = (context) => {
         wait_for(cx, "the native cells", &|cx| notebook.read(cx).is_ready());
         assert_eq!(
             cx.read(|cx| notebook.read(cx).seen(cx)),
-            ["code python [1]: print(1) => 1"]
+            ["code python [1]: print(1) => 1 => an interactive output"]
         );
+        click(cx, "notebook-output-0-1");
+        let page = cx.read(|cx| ws.read(cx).web_front.as_ref().unwrap().0.clone());
+        assert!(cx.read(|cx| page.read(cx).model.html.contains("<td>Result</td>")));
+        assert!(cx.read(|cx| page.read(cx).options()["enableScripts"] == false));
+        cx.dispatch_action(CloseTab);
+        assert!(cx.read(|cx| ws.read(cx).notebook_front.is_some()));
         notebook.update_in(cx, |notebook, window, cx| notebook.focus(window, cx));
         cx.simulate_input("# edited\n");
         assert!(cx.read(|cx| notebook.read(cx).is_dirty()));

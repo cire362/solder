@@ -1891,6 +1891,10 @@ impl ExtensionStore {
             && self.state.asks(extension).is_empty()
     }
 
+    pub(crate) fn may_render(&self, extension: &Extension) -> bool {
+        !self.is_off(extension.origin, &extension.id) && self.state.asks(extension).is_empty()
+    }
+
     /// The code of the VS Code extension `id`, if it was started.
     pub fn code(&self, id: &str) -> Option<&NodeCode> {
         self.code.get(id)

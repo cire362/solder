@@ -82,7 +82,7 @@ const notebookEnums = {
 
 // What an output is to the editor, which draws words and pictures: each
 // of its forms with the text it has, or with the picture as it is. Of a
-// form that is neither, only what it is and how large.
+// rich form, the bounded bytes that a declared renderer can draw.
 const PICTURES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 const PICTURE_LIMIT = 8 << 20;
 function wordsOf(item) {
@@ -108,6 +108,7 @@ function plainOutputs(outputs) {
         size,
         text: wordsOf(item),
         picture: picture ? Buffer.from(item.data).toString('base64') : undefined,
+        data: size <= PICTURE_LIMIT && !picture && wordsOf(item) === undefined ? Buffer.from(item.data || []).toString('base64') : undefined,
       };
     }),
   }));
@@ -115,6 +116,8 @@ function plainOutputs(outputs) {
 
 module.exports = function buildNotebooks(core) {
   const serializers = new Map();
+  const messaging = new Map();
+  const rendererPages = new Map();
   const controllers = [];
   // The notebooks the editor has open, by where their file is.
   const open = new Map();
@@ -307,6 +310,22 @@ module.exports = function buildNotebooks(core) {
   }
 
   const notebooks = core.namespace('notebooks', {
+    createRendererMessaging(id) {
+      if (messaging.has(id)) return messaging.get(id);
+      const received = new EventEmitter();
+      const channel = {
+        onDidReceiveMessage: received.event,
+        _received: received,
+        async postMessage(message, editor) {
+          const targets = [...rendererPages].filter(([, page]) => page.renderer === id
+            && (!editor || page.uri === editor.notebook.uri.toString()));
+          const sent = await Promise.all(targets.map(([id]) => core.request('webview.post', { id, message: core.plain(message) })));
+          return sent.some(Boolean);
+        },
+      };
+      messaging.set(id, channel);
+      return channel;
+    },
     createNotebookController(id, notebookType, label, handler) {
       const selected = new EventEmitter();
       const received = new EventEmitter();
@@ -373,6 +392,7 @@ module.exports = function buildNotebooks(core) {
   };
 
   const asked = {
+    'notebook.renderer.activate': async () => true,
     // A file read into cells by the extension that knows its kind.
     'notebook.open': async ({ type, uri }) => {
       const serializer = serializers.get(type);
@@ -419,6 +439,14 @@ module.exports = function buildNotebooks(core) {
   };
 
   const told = {
+    'notebook.renderer.open'({ id, renderer, uri }) {
+      rendererPages.set(id, { renderer, uri });
+    },
+    'notebook.renderer.message'({ renderer, uri, message }) {
+      const notebook = open.get(key(uri));
+      messaging.get(renderer)?._received.fire({ editor: notebook ? editorOf(notebook) : undefined, message });
+    },
+    'notebook.renderer.closed'({ id }) { rendererPages.delete(id); },
     // The text of a cell as it is now.
     'notebook.cell'({ uri, handle, value }) {
       const notebook = open.get(key(uri));

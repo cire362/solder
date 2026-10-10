@@ -268,8 +268,10 @@ Never guess a signature.
   only the rows its place in the window leaves to be seen, and asks the
   list it is in to show the cursor. Cells are a `list`, so only the ones
   on screen are laid out. What a run puts out is words or a picture
-  (`notebook::outputs`); a form that is neither is named, never drawn as
-  a page.
+  (`notebook::outputs`). HTML and a permitted extension's renderer module
+  open on demand in a separate page tab (`webview::notebook_output`), with
+  remote requests blocked and only the extension's files available. Raw
+  HTML has scripts disabled. These result tabs are transient.
   Whether published extensions work is found by `extension::census`,
   which installs and starts them. It runs their code, so it belongs to
   the workflow that runs it on a runner with no secrets: do not run it

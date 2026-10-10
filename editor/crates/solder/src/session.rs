@@ -138,6 +138,7 @@ impl Workspace {
         let pages = self
             .web_pages
             .iter()
+            .filter(|(page, _)| !page.read(cx).model.view_type.is_empty())
             .map(|(page, _)| {
                 let page = page.read(cx);
                 Page {
@@ -180,10 +181,12 @@ impl Workspace {
                 .notebook_front
                 .as_ref()
                 .and_then(|(book, _)| self.notebooks.iter().position(|(known, _)| known == book)),
-            front_page: self
-                .web_front
-                .as_ref()
-                .and_then(|(page, _)| self.web_pages.iter().position(|(known, _)| known == page)),
+            front_page: self.web_front.as_ref().and_then(|(page, _)| {
+                self.web_pages
+                    .iter()
+                    .filter(|(page, _)| !page.read(cx).model.view_type.is_empty())
+                    .position(|(known, _)| known == page)
+            }),
         }
     }
 

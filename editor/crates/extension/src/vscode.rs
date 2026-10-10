@@ -1656,6 +1656,57 @@ exports.activate = (context) => {
         assert_eq!(open("demo.none"), Err("No editor demo.none".into()));
     }
 
+    #[test]
+    fn notebook_renderers_send_messages_only_to_their_open_pages() {
+        let code = r#"
+const v = require('vscode');
+exports.activate = () => {
+  const messages = v.notebooks.createRendererMessaging('counter');
+  const received = [];
+  messages.onDidReceiveMessage(event => received.push(event.message));
+  v.commands.registerCommand('counter.send', message => messages.postMessage(message));
+  v.commands.registerCommand('counter.received', () => received);
+};
+"#;
+        let Some((host, told, _, log)) = hosted_logged("renderer-messages", code) else {
+            return;
+        };
+        let host = Arc::new(host);
+        let said = editor(&host, told, log, |method, _| match method {
+            "webview.post" => Ok(json!(true)),
+            _ => Err(format!("no {method}")),
+        });
+        host.request("activate", json!({}), SOON).unwrap();
+        host.notify(
+            "notebook.renderer.open",
+            json!({"id":"one", "renderer":"counter", "uri":"file:///counter.book"}),
+        );
+        host.notify(
+            "notebook.renderer.open",
+            json!({"id":"other", "renderer":"plot", "uri":"file:///counter.book"}),
+        );
+        let run = |command: &str, args: Value| {
+            host.request("executeCommand", json!({"id":command,"args":args}), SOON)
+                .unwrap()
+        };
+        assert_eq!(run("counter.send", json!([{"count":1}])), json!(true));
+        let all = lock(&said);
+        let posts: Vec<_> = all
+            .iter()
+            .filter(|(method, _)| method == "webview.post")
+            .map(|(_, params)| params.clone())
+            .collect();
+        assert_eq!(posts, [json!({"id":"one","message":{"count":1}})]);
+        drop(all);
+        host.notify(
+            "notebook.renderer.message",
+            json!({"renderer":"counter","uri":"file:///counter.book","message":{"count":2}}),
+        );
+        assert_eq!(run("counter.received", json!([])), json!([{"count":2}]));
+        host.notify("notebook.renderer.closed", json!({"id":"one"}));
+        assert_eq!(run("counter.send", json!([{"count":3}])), json!(false));
+    }
+
     /// A notebook is read and written by its extension, which also runs
     /// its cells and says what came out.
     #[test]
@@ -1840,7 +1891,7 @@ exports.activate = (context) => {
             json!([stdout, { "items": [
                 { "mime": "text/plain", "size": 11, "text": "HELLO THERE" },
                 { "mime": "image/png", "size": 4, "picture": "iVBORw==" },
-                { "mime": "application/x-thing", "size": 3 },
+                { "mime": "application/x-thing", "size": 3, "data": "AQID" },
             ] }])
         );
 

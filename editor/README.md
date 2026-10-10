@@ -947,8 +947,8 @@ more, not every one VS Code has), and `vscode-dark` or `vscode-light` on
 its body. `cmd-w` closes it, and the keys of the command palette and the
 file finder work in it.
 
-Not there: pages brought back after a restart, a page inside the sidebar
-itself, and pages under Wayland, where the tab says so.
+Not there: a page inside the sidebar itself, and pages under Wayland,
+where the tab says so. Pages return through their serializer after a restart.
 
 A **notebook** is a file an extension reads as a list of cells: text, and
 code it can run. A file whose name an extension's kind of notebook is for
@@ -972,23 +972,30 @@ them back (`registerNotebookSerializer`), and it runs the code
 Of what a run puts out, Solder draws words (plain text, what was written to
 standard output and to standard error, an error with its trace, Markdown
 and JSON as their source) and pictures (PNG, JPEG, GIF, WebP, up to 8 MB).
-An output of more than 200 lines or 64 KB is cut, and says so. An output
-that is a page of its own (HTML, a widget, a plot drawn by a script) is
-named with its size and not drawn, unless the run also put it out as words
-or as a picture, which is then what is shown. Closing a notebook with
+An output of more than 200 lines or 64 KB is cut, and says so. HTML output has a **View HTML output** button, which opens it in a separate
+tab with scripts disabled. A matching `contributes.notebookRenderer` module
+can draw an interactive output in that tab after the extension is allowed.
+It receives the output's MIME data and can exchange messages through
+`createRendererMessaging`. Only files inside that extension are served;
+remote requests, navigation and downloads are blocked. Text and pictures
+stay inline; browser views are created only when a result is opened.
+Closing the result returns to its notebook. Closing a notebook with
 changes asks, as closing a file does.
 
 Not there for notebooks: language features inside a cell (completions and
 the like), text cells shown as formatted text and not as their Markdown, a
 choice between several things that can run a kind of notebook (the first
-the extension made is used), renderers of outputs
-(`contributes.notebookRenderer`), cell status bar items, edits an extension
+the extension made is used), dependencies between renderer modules
+(`getRenderer`, `extends`), cell status bar items, edits an extension
 makes to the cells itself (`NotebookEdit`), and a notebook opened by an
 extension's code (`openNotebookDocument`, `showNotebookDocument`). Jupyter `.ipynb` files (format 4) open directly, without an extension. The
 built-in reader preserves cell ids, metadata, attachments, outputs and
 unknown fields when editing and saving. It does not start a kernel: reading
 and saving a Jupyter file is independent of running its cells. A file over
-64 MB is refused with a reason.
+64 MB is refused with a reason. Jupyter kernels and the ipywidgets protocol
+are not built in: a generic renderer module does not make every Jupyter
+widget or the Jupyter extension compatible. Outputs opened in a separate
+tab are transient and are reopened from the notebook, not restored as pages.
 
 Files, split panes, cursors, scroll positions and notebook tabs are remembered
 per project in `sessions/` beside the settings. Pages of extensions return
