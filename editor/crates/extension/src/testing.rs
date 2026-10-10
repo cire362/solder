@@ -147,7 +147,7 @@ exports.activate = async (context) => {
     vscode.commands.registerCommand('demo.spin', () => { for (;;) {} }),
     vscode.commands.registerCommand('demo.quit', () => process.exit(7)),
   );
-  vscode.notebooks.createNotebookController('demo', 'demo', 'Demo');
+  vscode.comments.createCommentController('demo', 'Demo');
 };
 "#;
 

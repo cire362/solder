@@ -228,6 +228,15 @@ impl Document {
         doc
     }
 
+    /// The text of a cell of a notebook: no file of its own, and written
+    /// in the language `language_path` would be.
+    pub fn cell(language_path: PathBuf, content: &str, cx: &mut Context<Self>) -> Self {
+        let mut doc = Self::new(None, content, cx);
+        doc.language_path = Some(language_path);
+        doc.initial_parse(cx);
+        doc
+    }
+
     pub fn is_read_only(&self) -> bool {
         self.read_only
     }

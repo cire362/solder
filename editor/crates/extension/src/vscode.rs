@@ -41,6 +41,7 @@ const HOST: &[(&str, &str)] = &[
     ("relay.js", include_str!("../host/relay.js")),
     ("views.js", include_str!("../host/views.js")),
     ("webviews.js", include_str!("../host/webviews.js")),
+    ("notebooks.js", include_str!("../host/notebooks.js")),
 ];
 
 /// Puts the host where Node can read it, under `dir`. A file is written
@@ -1630,6 +1631,237 @@ exports.activate = (context) => {
         written(&said, "let go");
         assert!(pages().iter().any(|page| page["html"] == "tom.txt"));
         assert_eq!(open("demo.none"), Err("No editor demo.none".into()));
+    }
+
+    /// A notebook is read and written by its extension, which also runs
+    /// its cells and says what came out.
+    #[test]
+    fn an_extension_reads_runs_and_writes_a_notebook() {
+        let code = r#"
+const vscode = require('vscode');
+// A file of cells set apart by a line of dashes, each begun by what it is.
+const reader = {
+  deserializeNotebook(bytes) {
+    const cells = Buffer.from(bytes).toString().split('\n---\n').filter(Boolean).map((part) => {
+      const [head, ...rest] = part.split('\n');
+      const code = head.startsWith('code:');
+      return new vscode.NotebookCellData(code ? vscode.NotebookCellKind.Code : vscode.NotebookCellKind.Markup, rest.join('\n'), code ? head.slice(5) : 'markdown');
+    });
+    return new vscode.NotebookData(cells);
+  },
+  serializeNotebook(data) {
+    const parts = data.cells.map((cell) => `${cell.kind === vscode.NotebookCellKind.Code ? 'code:' + cell.languageId : 'text'}\n${cell.value}`);
+    return Buffer.from(parts.join('\n---\n'));
+  },
+};
+exports.activate = (context) => {
+  let runs = 0;
+  const changes = [];
+  const controller = vscode.notebooks.createNotebookController('demo.runner', 'demo-book', 'Demo runner', async (cells, notebook, controller) => {
+    for (const cell of cells) {
+      const run = controller.createNotebookCellExecution(cell);
+      run.executionOrder = ++runs;
+      run.start();
+      const text = cell.document.getText();
+      if (text === 'wait') {
+        await new Promise((resolve) => run.token.onCancellationRequested(resolve));
+        run.end(false);
+        continue;
+      }
+      await run.replaceOutput(new vscode.NotebookCellOutput([vscode.NotebookCellOutputItem.stdout('running\n')]));
+      if (text.includes('boom')) {
+        await run.appendOutput(new vscode.NotebookCellOutput([vscode.NotebookCellOutputItem.error(new RangeError('boom'))]));
+        run.end(false);
+        continue;
+      }
+      await run.appendOutput(new vscode.NotebookCellOutput([
+        vscode.NotebookCellOutputItem.text(text.toUpperCase()),
+        new vscode.NotebookCellOutputItem(Uint8Array.from([137, 80, 78, 71]), 'image/png'),
+        new vscode.NotebookCellOutputItem(Uint8Array.from([1, 2, 3]), 'application/x-thing'),
+      ]));
+      run.end(true);
+    }
+  });
+  context.subscriptions.push(
+    controller,
+    vscode.workspace.registerNotebookSerializer('demo-book', reader),
+    vscode.workspace.onDidChangeNotebookDocument((event) => changes.push(event)),
+    vscode.commands.registerCommand('demo.books', () => ({
+      open: vscode.workspace.notebookDocuments.map((notebook) => `${notebook.notebookType} ${notebook.cellCount} ${notebook.isDirty}`),
+      cells: vscode.workspace.textDocuments.filter((document) => document.uri.scheme === 'vscode-notebook-cell').map((document) => `${document.languageId}:${document.getText()}`),
+      front: vscode.window.activeNotebookEditor && vscode.window.activeNotebookEditor.selection.start,
+      changes: changes.length,
+      moved: changes.filter((event) => event.contentChanges.length).map((event) => event.contentChanges.map((change) => [change.range.start, change.range.end, change.removedCells.length, change.addedCells.length])),
+    })),
+  );
+};
+"#;
+        let Some((host, told, dir, log)) = hosted_logged("vscode-notebook", code) else {
+            return;
+        };
+        let host = Arc::new(host);
+        let said = editor(&host, told, log, |method, _| {
+            Err(format!("no {method} here"))
+        });
+        let file = dir.join("first.book");
+        std::fs::write(&file, "text\n# Title\n---\ncode:javascript\nhello").unwrap();
+        let uri = format!("file://{}", file.display());
+        // Nothing reads a kind of notebook before its extension says it does.
+        let early = host.request(
+            "notebook.open",
+            json!({ "type": "demo-book", "uri": uri }),
+            SOON,
+        );
+        assert!(early.unwrap_err().contains("reads no notebooks"));
+        host.request("activate", json!({}), SOON).unwrap();
+        let heard = |method: &str| -> Vec<Value> {
+            let all = lock(&said);
+            let of = all.iter().filter(|(said, _)| said == method);
+            of.map(|(_, params)| params.clone()).collect()
+        };
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let until = std::time::Instant::now() + SOON;
+            while !done() {
+                assert!(std::time::Instant::now() < until, "no {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        until("runner", &|| !heard("notebook.runners").is_empty());
+        assert_eq!(
+            heard("notebook.runners")[0],
+            json!({ "runners": [{ "type": "demo-book", "label": "Demo runner" }] })
+        );
+
+        // Opened: the cells as the extension read them, and what runs them.
+        let opened = host
+            .request(
+                "notebook.open",
+                json!({ "type": "demo-book", "uri": uri }),
+                SOON,
+            )
+            .unwrap();
+        assert_eq!(
+            opened,
+            json!({ "runner": "Demo runner", "cells": [
+                { "handle": 0, "code": false, "language": "markdown", "value": "# Title", "outputs": [] },
+                { "handle": 1, "code": true, "language": "javascript", "value": "hello", "outputs": [] },
+            ] })
+        );
+        // The editor says what is typed into a cell, and which cells there
+        // are after one was added before the others.
+        host.notify(
+            "notebook.cell",
+            json!({ "uri": uri, "handle": 1, "value": "hello there" }),
+        );
+        host.notify(
+            "notebook.cells",
+            json!({ "uri": uri, "cells": [
+                { "handle": 2, "code": true, "language": "javascript", "value": "boom" },
+                { "handle": 0 }, { "handle": 1 },
+            ] }),
+        );
+        host.notify("notebook.front", json!({ "uri": uri, "selected": 2 }));
+        let books = || {
+            host.request("executeCommand", json!({ "id": "demo.books" }), SOON)
+                .unwrap()
+        };
+        assert_eq!(
+            books(),
+            json!({
+                "open": ["demo-book 3 true"],
+                "cells": ["markdown:# Title", "javascript:hello there", "javascript:boom"],
+                "front": 2,
+                "changes": 2,
+                "moved": [[[0, 0, 0, 1]]],
+            })
+        );
+
+        // Run: each cell says it runs, what it puts out as it comes, and
+        // how it ended. A picture goes as it is, and of a form the editor
+        // draws nothing of, what it is and how large.
+        let ran = host.request(
+            "notebook.execute",
+            json!({ "uri": uri, "handles": [1, 2, 0] }),
+            SOON,
+        );
+        assert_eq!(ran, Ok(json!(true)));
+        until("the runs to end", &|| heard("notebook.run").len() == 4);
+        assert_eq!(
+            heard("notebook.run"),
+            [
+                json!({ "uri": uri, "handle": 2, "running": true }),
+                json!({ "uri": uri, "handle": 2, "running": false, "failed": true, "order": 1 }),
+                json!({ "uri": uri, "handle": 1, "running": true }),
+                json!({ "uri": uri, "handle": 1, "running": false, "failed": false, "order": 2 }),
+            ]
+        );
+        let outputs = heard("notebook.outputs");
+        let last = |handle: u64| {
+            let of = outputs.iter().rev().find(|said| said["handle"] == handle);
+            of.unwrap()["outputs"].clone()
+        };
+        let stdout = json!({ "items": [{ "mime": "application/vnd.code.notebook.stdout", "size": 8, "text": "running\n" }] });
+        let failed = last(2);
+        assert_eq!(failed[0], stdout);
+        let error = &failed[1]["items"][0];
+        assert_eq!(error["mime"], "application/vnd.code.notebook.error");
+        assert!(
+            error["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("RangeError: boom"),
+            "{error}"
+        );
+        assert_eq!(
+            last(1),
+            json!([stdout, { "items": [
+                { "mime": "text/plain", "size": 11, "text": "HELLO THERE" },
+                { "mime": "image/png", "size": 4, "picture": "iVBORw==" },
+                { "mime": "application/x-thing", "size": 3 },
+            ] }])
+        );
+
+        // Saved by the extension, from the cells as they are now.
+        assert_eq!(
+            host.request("notebook.save", json!({ "uri": uri }), SOON),
+            Ok(json!(true))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "code:javascript\nboom\n---\ntext\n# Title\n---\ncode:javascript\nhello there"
+        );
+        assert_eq!(books()["open"], json!(["demo-book 3 false"]));
+
+        // A run that does not end by itself is told to stop.
+        host.notify(
+            "notebook.cell",
+            json!({ "uri": uri, "handle": 1, "value": "wait" }),
+        );
+        let waiting = {
+            let (host, uri) = (host.clone(), uri.clone());
+            std::thread::spawn(move || {
+                host.request(
+                    "notebook.execute",
+                    json!({ "uri": uri, "handles": [1] }),
+                    SOON,
+                )
+            })
+        };
+        until("the run to start", &|| heard("notebook.run").len() == 5);
+        assert_eq!(
+            host.request("notebook.interrupt", json!({ "uri": uri }), SOON),
+            Ok(json!(true))
+        );
+        assert_eq!(waiting.join().unwrap(), Ok(json!(true)));
+        assert_eq!(heard("notebook.run")[5]["failed"], true);
+
+        // Closed, it and the text of its cells are gone for the extension.
+        host.notify("notebook.close", json!({ "uri": uri }));
+        let after = books();
+        assert_eq!(
+            (&after["open"], &after["cells"], &after["front"]),
+            (&json!([]), &json!([]), &Value::Null)
+        );
     }
 
     #[test]

@@ -280,9 +280,12 @@ to build them.
       (and `gtk` on Linux; agreed on 2026-10-10). A page of an extension is
       a tab, a view that is a page opens as one, and an editor of an
       extension's for a kind of file is offered as **Open with**. The
-      browser is made when the first page opens. Not there: notebooks
-      (left out, as phase 10 says), pages kept across restarts, pages on
-      Wayland
+      browser is made when the first page opens. A notebook is not a
+      page: a tab of cells drawn by Solder, each cell an editor, with the
+      words and pictures its run put out under it; the extension reads,
+      runs and writes it. Not there: pages kept across restarts, pages on
+      Wayland, outputs of a notebook that are pages of their own (HTML,
+      widgets), and Jupyter's `.ipynb`, which no extension reads by itself
 - [x] A check that runs with each release: the most installed extensions of
       Open VSX are installed, activated and asked for their main feature, and
       the result is the list of what works. `extension-census`, run by the
@@ -443,7 +446,7 @@ update. They come after phase 9, in this order unless one is needed sooner.
 - [ ] Dev containers: `devcontainer.json`, with terminals, services and the
       agent inside
 
-Left out on purpose: notebooks, a list of servers and deploys (far from an
+Left out on purpose: a list of servers and deploys (far from an
 editor for what they cost), settings synced through a folder (they are files
 already), and moving data over from an Electron version (there is none).
 Accessibility through the system's own tree and installers with updates

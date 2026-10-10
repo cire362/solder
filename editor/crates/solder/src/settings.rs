@@ -555,6 +555,8 @@ pub fn bind_defaults(cx: &mut App) {
     crate::agent_panel::bind_keys(cx);
     crate::debug_panel::bind_keys(cx);
     crate::inline_edit::bind_keys(cx);
+    // After the editor's: in a cell, two of its keys run the cell.
+    crate::notebook::bind_keys(cx);
 }
 
 fn read(path: &Path) -> String {

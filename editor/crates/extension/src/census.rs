@@ -538,7 +538,7 @@ exports.activate = () => {
             panic!("{:?}", rows[0].code);
         };
         assert_eq!(demo.commands, 3);
-        assert_eq!(demo.missing, ["notebooks.createNotebookController"]);
+        assert_eq!(demo.missing, ["comments.createCommentController"]);
         assert!(demo.languages.is_empty() && demo.asked.is_empty());
 
         // The one with language features: what it can do, and what it
@@ -568,7 +568,7 @@ exports.activate = () => {
             page.contains("hovers, formatting for python; hovers answered; formatting answered")
         );
         assert!(page.contains("its start failed: no license"));
-        assert!(page.contains("| notebooks.createNotebookController |"));
+        assert!(page.contains("| comments.createCommentController |"));
         // One the catalog lists and does not have is said, and the rest go on.
         let gone = Row {
             id: "Acme.gone".into(),

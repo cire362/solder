@@ -272,8 +272,16 @@ pub(crate) struct HighlightCache {
     pub spans: Arc<Vec<(Range<usize>, HighlightKind)>>,
 }
 
+/// Told where the row of the cursor is in the window (its top and its
+/// bottom), when that row is to be brought into view.
+pub(crate) type Reveal = std::rc::Rc<dyn Fn(Pixels, Pixels, &mut App)>;
+
 pub struct Editor {
     pub(crate) mode: EditorMode,
+    /// Set for an editor that is as tall as its text and inside something
+    /// that scrolls (a cell of a notebook): it never scrolls up or down
+    /// itself, and asks what it is in to show the cursor.
+    pub(crate) fit: Option<Reveal>,
     pub(crate) placeholder: Option<SharedString>,
     /// Draws the text as stars; for secrets typed into a field.
     pub(crate) masked: bool,
@@ -350,6 +358,7 @@ impl Editor {
         });
         Self {
             mode: EditorMode::Full,
+            fit: None,
             placeholder: None,
             masked: false,
             focus_handle: cx.focus_handle(),
@@ -375,6 +384,18 @@ impl Editor {
             signature_task: None,
             _document_subscription: subscription,
         }
+    }
+
+    /// An editor as tall as its text, for a document shown inside
+    /// something that scrolls.
+    pub(crate) fn fitted(
+        document: Entity<Document>,
+        reveal: Reveal,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut editor = Self::for_document(document, cx);
+        editor.fit = Some(reveal);
+        editor
     }
 
     pub fn single_line(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
@@ -1860,6 +1881,10 @@ impl Editor {
     fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
         let line_height = self.layout.as_ref().map_or(px(20.), |l| l.line_height);
         let delta = event.delta.pixel_delta(line_height);
+        // Up and down is for what an editor as tall as its text is in.
+        if self.fit.is_some() && delta.x == px(0.) {
+            return;
+        }
         self.scroll = point(self.scroll.x - delta.x, self.scroll.y - delta.y);
         if self.hover.is_some() {
             self.hover = None;
@@ -2022,7 +2047,12 @@ impl Render for Editor {
                 d.w_full()
                     .h(crate::settings::Settings::get(cx).line_height())
             })
-            .when(!single_line, |d| d.size_full().bg(cx.theme().bg))
+            .when(!single_line, |d| d.bg(cx.theme().bg))
+            .map(|d| match (single_line, self.fit.is_some()) {
+                (true, _) => d,
+                (false, true) => d.w_full(),
+                (false, false) => d.size_full(),
+            })
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::accept_ghost))
             .on_action(cx.listener(Self::toggle_breakpoint))

@@ -249,6 +249,18 @@ Never guess a signature.
   built: navigation, new windows, downloads, permissions, and files
   outside the folders the extension named. A new thing a page may do
   is a new line there, with a test of what it refuses.
+  A notebook (`notebook.rs`) is no page: a tab of cells the editor draws
+  itself, kept by the workspace next to the pages' tabs. The extension
+  reads the file, runs the cells and writes it back (`host/notebooks.js`,
+  which also reads and writes the file: no bytes of it cross to the
+  editor); the editor says what is typed and which cells there are, a
+  cell by a number that stays its own. A cell is an `Editor` as tall as
+  its text (`Editor::fitted`): it never scrolls up or down itself, draws
+  only the rows its place in the window leaves to be seen, and asks the
+  list it is in to show the cursor. Cells are a `list`, so only the ones
+  on screen are laid out. What a run puts out is words or a picture
+  (`notebook::outputs`); a form that is neither is named, never drawn as
+  a page.
   Whether published extensions work is found by `extension::census`,
   which installs and starts them. It runs their code, so it belongs to
   the workflow that runs it on a runner with no secrets: do not run it

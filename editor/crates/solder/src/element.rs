@@ -256,6 +256,9 @@ pub struct PrepaintState {
     ghost: Vec<(ShapedLine, Point<Pixels>)>,
     ghost_background: Vec<PaintQuad>,
     gutter: Vec<(ShapedLine, Point<Pixels>)>,
+    /// Where the row of the cursor is, when an editor as tall as its text
+    /// wants it in view.
+    reveal: Option<(Pixels, Pixels)>,
 }
 
 impl IntoElement for EditorElement {
@@ -288,8 +291,13 @@ impl Element for EditorElement {
         let single_line = self.editor.read(cx).mode == EditorMode::SingleLine;
         let mut style = Style::default();
         style.size.width = relative(1.).into();
+        let editor = self.editor.read(cx);
         style.size.height = if single_line {
             Settings::get(cx).line_height().into()
+        } else if editor.fit.is_some() {
+            // As tall as its text.
+            let lines = editor.doc(cx).text().line_count();
+            (Settings::get(cx).line_height() * lines as f32).into()
         } else {
             relative(1.).into()
         };
@@ -313,6 +321,13 @@ impl Element for EditorElement {
             layout(editor, bounds, focused, &theme, &settings, window, cx)
         });
         state.started = started;
+        // What the editor is in is asked to show the cursor once this
+        // frame is done with: it may be in the middle of its own.
+        if let Some((top, bottom)) = state.reveal.take()
+            && let Some(reveal) = self.editor.read(cx).fit.clone()
+        {
+            cx.defer(move |cx| reveal(top, bottom, cx));
+        }
         state
     }
 
@@ -452,8 +467,23 @@ fn layout(
     let max_y = lh * line_count.saturating_sub(1) as f32;
     scroll.y = clamp(scroll.y, px(0.), max_y);
 
-    let first_row = ((scroll.y / lh).floor() as usize).min(line_count - 1);
-    let end_row = (((scroll.y + height) / lh).ceil() as usize + 1).min(line_count);
+    let mut first_row = ((scroll.y / lh).floor() as usize).min(line_count - 1);
+    let mut end_row = (((scroll.y + height) / lh).ceil() as usize + 1).min(line_count);
+    let mut reveal = None;
+    if editor.fit.is_some() {
+        // As tall as its text, it does not scroll: the rows to draw are
+        // the ones its place in the window leaves to be seen.
+        scroll.y = px(0.);
+        let seen = window.content_mask().bounds;
+        let from = (seen.top() - bounds.top()).max(px(0.));
+        let to = (seen.bottom() - bounds.top()).max(px(0.));
+        first_row = ((from / lh).floor() as usize).min(line_count - 1);
+        end_row = ((to / lh).ceil() as usize + 1).clamp(first_row + 1, line_count);
+        if editor.autoscroll {
+            let top = bounds.top() + lh * cursor_row as f32;
+            reveal = Some((top, top + lh));
+        }
+    }
     let visible = buffer.line_start(first_row)..if end_row < line_count {
         buffer.line_start(end_row)
     } else {
@@ -652,7 +682,9 @@ fn layout(
                     theme.accent,
                 ));
             }
-            if s.is_empty() && !single_line {
+            // One of many on a page (a cell of a notebook) marks the row
+            // of its cursor only while the keys are its own.
+            if s.is_empty() && !single_line && (focused || editor.fit.is_none()) {
                 background.push(fill(
                     Bounds::new(
                         point(bounds.left(), row_y(head.row)),
@@ -985,6 +1017,7 @@ fn layout(
         ghost,
         ghost_background,
         gutter,
+        reveal,
     }
 }
 

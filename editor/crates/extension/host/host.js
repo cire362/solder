@@ -20,6 +20,7 @@ const buildDebug = require('./debug');
 const buildShell = require('./shell');
 const buildViews = require('./views');
 const buildWebviews = require('./webviews');
+const buildNotebooks = require('./notebooks');
 
 const { Disposable, EventEmitter, Uri } = types.classes;
 
@@ -161,6 +162,11 @@ Object.defineProperties(built.window, Object.getOwnPropertyDescriptors(views.win
 const webviews = buildWebviews(core);
 Object.assign(built.told, webviews.told);
 Object.defineProperties(built.window, Object.getOwnPropertyDescriptors(webviews.windowMembers));
+// Notebooks: the window has the one in front, the workspace the open ones.
+const notebooks = buildNotebooks(core);
+Object.assign(built.told, notebooks.told);
+Object.defineProperties(built.window, Object.getOwnPropertyDescriptors(notebooks.windowMembers));
+Object.defineProperties(built.workspace, Object.getOwnPropertyDescriptors(notebooks.workspaceMembers));
 // What is drawn over the text of a file. A kind of decoration is made
 // once and then put on ranges, file by file.
 let nextDecoration = 1;
@@ -191,12 +197,15 @@ const vscode = {
   ...debugging.classes,
   ...shell.classes,
   ...views.classes,
+  ...notebooks.classes,
+  ...notebooks.enums,
   ...types.enums,
   ...debugging.enums,
   ...shell.enums,
   ...views.enums,
   scm: views.scm,
   tests: views.tests,
+  notebooks: notebooks.notebooks,
   languages: languages.languages,
   debug: debugging.debug,
   tasks: shell.tasks,
@@ -359,7 +368,7 @@ const handlers = {
   },
 };
 
-Object.assign(handlers, debugging.asked, shell.asked, views.asked, webviews.asked);
+Object.assign(handlers, debugging.asked, shell.asked, views.asked, webviews.asked, notebooks.asked);
 
 async function handle(message) {
   if (message.method === undefined) {

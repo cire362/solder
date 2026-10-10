@@ -907,6 +907,7 @@ What is in the module today is what every extension starts from:
 | Provide and run tasks | **Workspace: Run extension task** in the palette lists the tasks extensions provide and runs the one chosen in a terminal, whose tab stays when it ends. The extension hears what it ended with. A task that is the extension's own code (`CustomExecution`) runs in a terminal it draws. Problem matchers are not read |
 | Watch files | `createFileSystemWatcher`, for the folders of the open windows: files made, changed and deleted, but for `.git` and `node_modules` |
 | Show pages (webviews) and editors of its own for kinds of files | A tab drawn by the system's browser; see below |
+| Read, run and write notebooks | A tab of cells, drawn by Solder: the extension reads the file, runs the cells and writes it back; see below |
 | Give language features in code (`vscode.languages`) | Completions, hovers, definitions, references, rename, formatting, code actions, document and project symbols, signature help, inlay hints, semantic colors, and diagnostics from its collections. A code lens is at the end of its line, where a click runs it, and among the code actions of the line (`cmd-.`) |
 
 **Show extension views** opens the **Views** panel. Trees an extension names
@@ -946,8 +947,48 @@ more, not every one VS Code has), and `vscode-dark` or `vscode-light` on
 its body. `cmd-w` closes it, and the keys of the command palette and the
 file finder work in it.
 
-Not there: notebooks, pages brought back after a restart, a page inside
-the sidebar itself, and pages under Wayland, where the tab says so.
+Not there: pages brought back after a restart, a page inside the sidebar
+itself, and pages under Wayland, where the tab says so.
+
+A **notebook** is a file an extension reads as a list of cells: text, and
+code it can run. A file whose name an extension's kind of notebook is for
+is offered as **Open with** in the file tree's menu and the editor's, and
+opens as a tab of cells next to the files' tabs. Nothing of it is a browser
+view: each cell is an editor of Solder's, as tall as its text and colored
+for its language, and under a code cell is what its last run put out.
+
+| | |
+|---|---|
+| `cmd-enter` | Run the cell the cursor is in |
+| `shift-enter` | Run it and go to the next cell; after the last, a new one is made |
+| `cmd-s` | Save: the extension writes the file from the cells as they are |
+| **Run all**, **Stop** | Every code cell, in order; stop what runs |
+| **Add code**, **Add text** | A cell under the one the cursor is in; code in the language of the code above it |
+| The arrows and the bin in a cell's head | Move the cell up or down, remove it |
+
+The extension does three things: it reads the file into cells and writes
+them back (`registerNotebookSerializer`), and it runs the code
+(`createNotebookController`), saying what each run put out as it comes.
+Of what a run puts out, Solder draws words (plain text, what was written to
+standard output and to standard error, an error with its trace, Markdown
+and JSON as their source) and pictures (PNG, JPEG, GIF, WebP, up to 8 MB).
+An output of more than 200 lines or 64 KB is cut, and says so. An output
+that is a page of its own (HTML, a widget, a plot drawn by a script) is
+named with its size and not drawn, unless the run also put it out as words
+or as a picture, which is then what is shown. Closing a notebook with
+changes asks, as closing a file does.
+
+Not there for notebooks: language features inside a cell (completions and
+the like), text cells shown as formatted text and not as their Markdown, a
+choice between several things that can run a kind of notebook (the first
+the extension made is used), renderers of outputs
+(`contributes.notebookRenderer`), cell status bar items, edits an extension
+makes to the cells itself (`NotebookEdit`), and a notebook opened by an
+extension's code (`openNotebookDocument`, `showNotebookDocument`). No
+extension reads Jupyter's `.ipynb` here by itself: in VS Code that reader
+is built into the editor, and the Jupyter extension that runs such
+notebooks needs far more of VS Code than is here. This was made for the
+smaller notebooks that bring both their reader and their runner.
 
 Which extensions work is not claimed from the list above: it is found out.
 With each release the fifty most installed extensions of Open VSX are
