@@ -82,6 +82,8 @@ mod settings;
 mod structure;
 mod symbols;
 mod terminal;
+mod test_runner;
+mod tests_panel;
 mod theme;
 mod ui;
 mod webview;

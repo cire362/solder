@@ -283,6 +283,28 @@ Containers are listed below the services when a Docker runtime is running: Docke
 Desktop, OrbStack or Colima. Solder uses the `docker` CLI and its current context,
 and finds OrbStack's CLI in `~/.orbstack/bin` even without the `/usr/local/bin` links.
 
+## Tests
+
+**Show Tests** in the command palette opens the Tests panel, which can move
+between docks through `layout.json` like any other panel. **Project** lists
+built-in runners; **Extensions** shows only the test controllers registered by
+allowed extensions. Nothing discovers or runs tests at startup.
+
+Choose **Discover** to compile and list Cargo tests, list Go tests in the root
+module, or collect Python `unittest` tests. Python uses `.venv` or `venv` when
+present, otherwise Python on PATH. Discovery runs the project's tools and code.
+A group folds its tests; select a test and **Run** (`cmd-enter`) to run only that
+one, select a group to run it, or choose **Run all**. Enter or a click opens its
+source. Results distinguish passing, failed and skipped tests, and the selected
+test's output stays under the tree. **Stop** or Escape cancels the command and
+its process group. Commands have a ten-minute deadline.
+
+Source lookup for Rust and Go accepts only an unambiguous function in its
+package; generated tests and repeated names may have no source jump. Cargo
+doctests, custom harnesses, nested Go modules and Python pytest are not built-in
+runners here. Output keeps at most 1 MB per stream and displays its first 2,000
+lines. Extension test runners keep their own discovery and run profiles.
+
 ## Debugging
 
 Click a line number (or press `F9`) to set a breakpoint, then `F5`. The Debug

@@ -122,6 +122,7 @@ pub fn bind_keys(cx: &mut App) {
 
 pub struct ExtensionViews {
     store: Entity<ExtensionStore>,
+    tests_only: bool,
     views: BTreeMap<Key, View>,
     active: Option<Key>,
     visible: bool,
@@ -140,6 +141,14 @@ pub struct ExtensionViews {
 }
 
 impl ExtensionViews {
+    pub fn tests(store: Entity<ExtensionStore>, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::new(store, cx);
+        this.tests_only = true;
+        this.views.retain(|_, view| view.kind == "tests");
+        this.rebuild();
+        this
+    }
+
     pub fn new(store: Entity<ExtensionStore>, cx: &mut Context<Self>) -> Self {
         let watch = cx.observe(&store, |this, _, cx| this.sync(cx));
         let events = cx.subscribe(&store, |this, _, event, cx| {
@@ -150,6 +159,7 @@ impl ExtensionViews {
         let mut this = Self {
             views: store.read(cx).views(),
             store,
+            tests_only: false,
             active: None,
             visible: false,
             children: HashMap::new(),
@@ -202,7 +212,10 @@ impl ExtensionViews {
     }
 
     fn sync(&mut self, cx: &mut Context<Self>) {
-        let now = self.store.read(cx).views();
+        let mut now = self.store.read(cx).views();
+        if self.tests_only {
+            now.retain(|_, view| view.kind == "tests");
+        }
         if now == self.views {
             return;
         }
@@ -525,7 +538,7 @@ impl Render for ExtensionViews {
             .child(
                 div().px_2().py_1().flex().items_center().justify_between()
                     .text_size(UI_FONT_SIZE).text_color(theme.fg_muted)
-                    .child("Extension views")
+                    .child(if self.tests_only { "Extension tests" } else { "Extension views" })
                     .when(self.active.is_some(), |d| d.child(ui::button(
                         "refresh-views", "Refresh", false, &theme,
                         cx.listener(|this, _, _, cx| this.refresh_provider(cx)),
@@ -533,7 +546,7 @@ impl Render for ExtensionViews {
             )
             .when(self.views.is_empty(), |d| d.child(
                 div().p_3().text_size(UI_FONT_SIZE).text_color(theme.fg_muted)
-                    .child("Views appear here when an enabled extension provides a tree, source control or tests."),
+                    .child(if self.tests_only { "Tests appear here when an enabled extension provides a controller." } else { "Views appear here when an enabled extension provides a tree, source control or tests." }),
             ))
             .child(
                 uniform_list("extension-views", self.rows.len(), cx.processor(

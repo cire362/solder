@@ -21,6 +21,10 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] The Tests panel in a real window and with published test extensions.
+      Real Cargo, Go and unittest processes and headless window input are
+      covered by fixtures; large projects and Windows process cancellation
+      have not been checked
 - [ ] The Git PR panel against an authenticated GitHub account. Its CLI
       process, errors, both kinds of check data and manual refresh are
       tested with an executable fixture; no live PR was changed in a test
@@ -83,6 +87,12 @@ something of its own unchecked or unmade adds it here.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] Built-in test discovery has no Cargo doctests or custom harness support,
+      no nested Go modules and no pytest. Rust/Go source jumps require a
+      unique matching function in the package; generated or repeated names
+      can have no source jump. Output is limited to 1 MB per stream and its
+      first 2,000 lines are shown. Runs are sequential and results are not
+      kept across a restart; extension controllers keep their own limits
 - [ ] The commit guard recognizes private-key PEM headers and known AWS,
       GitHub, GitLab, Slack, API-key and connection-password forms, plus long
       literal credential assignments (UTF-8 and marked UTF-16 included). It
@@ -569,7 +579,8 @@ update. They come after phase 9, in this order unless one is needed sooner.
 - [x] The pull request of the branch and the state of its checks, through `gh`
 
 ### Tests and running
-- [ ] A tree of the project's tests: run one, see what failed, go to its line
+- [x] A tree of the project's tests: run one, see what failed, go to its line
+      (Cargo, Go and Python unittest, plus permitted extensions' controllers)
 - [ ] Breakpoints with a condition, and ones that only write to the console
 - [ ] Python under the debugger (debugpy), now that an adapter is only
       something to start

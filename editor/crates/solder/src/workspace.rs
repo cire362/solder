@@ -104,6 +104,7 @@ actions!(
         ShowExtensionViews,
         ShowStructure,
         ShowProblems,
+        ShowTests,
         ImportSettings,
         ToggleChat,
         ShowAgent,
@@ -270,6 +271,7 @@ pub struct Workspace {
     extension_views: Entity<crate::extension_views::ExtensionViews>,
     structure_panel: Entity<crate::outline::StructurePanel>,
     problems_panel: Entity<crate::problems_panel::ProblemsPanel>,
+    tests_panel: Entity<crate::tests_panel::TestsPanel>,
     /// The outline of the file in front, for the Structure panel and
     /// the breadcrumbs: found only while one of them is on screen.
     outline: Arc<Vec<crate::outline::Node>>,
@@ -474,6 +476,20 @@ impl Workspace {
             );
         let extension_views =
             cx.new(|cx| crate::extension_views::ExtensionViews::new(extensions.clone(), cx));
+        let tests_panel =
+            cx.new(|cx| crate::tests_panel::TestsPanel::new(root.clone(), extensions.clone(), cx));
+        let tests_events = cx.subscribe_in(&tests_panel, window, |this, _, event, window, cx| {
+            let crate::tests_panel::TestsEvent::Open(path, line) = event;
+            this.open_path(
+                path.clone(),
+                Some(Jump::Point {
+                    row: line.saturating_sub(1) as usize,
+                    column: 0,
+                }),
+                window,
+                cx,
+            );
+        });
         let structure_panel = cx.new(crate::outline::StructurePanel::new);
         let problems_panel = {
             let root = project.read(cx).root().to_path_buf();
@@ -790,6 +806,7 @@ impl Workspace {
         let mut subscriptions = subscriptions;
         subscriptions.push(structure_events);
         subscriptions.push(problems_events);
+        subscriptions.push(tests_events);
         if let Some(store) = LspStore::global(cx) {
             subscriptions.push(
                 cx.subscribe_in(&store, window, |this, _, event, window, cx| match event {
@@ -884,6 +901,7 @@ impl Workspace {
             ai_panel,
             extensions_panel,
             extension_views,
+            tests_panel,
             structure_panel,
             problems_panel,
             outline: Arc::default(),
@@ -1980,6 +1998,7 @@ impl Workspace {
             Panel::ExtensionViews => self.extension_views.focus_handle(cx),
             Panel::Structure => self.structure_panel.focus_handle(cx),
             Panel::Problems => self.problems_panel.focus_handle(cx),
+            Panel::Tests => self.tests_panel.focus_handle(cx),
             Panel::Chat => self.chat.focus_handle(cx),
             Panel::Agent => self.agent.focus_handle(cx),
             Panel::Debug => self.debug_panel.focus_handle(cx),
@@ -2540,6 +2559,9 @@ impl Workspace {
     fn tell_panels(&mut self, now: Option<Panel>, cx: &mut Context<Self>) {
         let visible = self.shown(Panel::ExtensionViews);
         self.extension_views
+            .update(cx, |p, cx| p.set_visible(visible, cx));
+        let visible = self.shown(Panel::Tests);
+        self.tests_panel
             .update(cx, |p, cx| p.set_visible(visible, cx));
         let visible = self.shown(Panel::Problems);
         self.problems_panel
@@ -3475,6 +3497,11 @@ impl Workspace {
         self.toggle_modal(window, cx, move |_, cx| {
             crate::plugins_view::PluginsView::new(store, cx)
         });
+    }
+
+    fn show_tests(&mut self, _: &ShowTests, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_panel(Panel::Tests, cx);
+        window.focus(&self.tests_panel.focus_handle(cx));
     }
 
     fn show_problems(&mut self, _: &ShowProblems, window: &mut Window, cx: &mut Context<Self>) {
@@ -5641,6 +5668,7 @@ impl Workspace {
                             }
                             Panel::Structure => this.show_structure(&ShowStructure, window, cx),
                             Panel::Problems => this.show_problems(&ShowProblems, window, cx),
+                            Panel::Tests => this.show_tests(&ShowTests, window, cx),
                             Panel::Chat => this.show_right(false, window, cx),
                             Panel::Agent => this.show_right(true, window, cx),
                             _ => {}
@@ -5724,6 +5752,7 @@ impl Workspace {
                     Panel::ExtensionViews => d.child(self.extension_views.clone()),
                     Panel::Structure => d.child(self.structure_panel.clone()),
                     Panel::Problems => d.child(self.problems_panel.clone()),
+                    Panel::Tests => d.child(self.tests_panel.clone()),
                     Panel::Chat => d.pt_1().child(self.chat.clone()),
                     Panel::Agent => d.pt_1().child(self.agent.clone()),
                     Panel::Debug => d.child(self.debug_panel.clone()),
@@ -6433,6 +6462,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_extension_views))
             .on_action(cx.listener(Self::show_structure))
             .on_action(cx.listener(Self::show_problems))
+            .on_action(cx.listener(Self::show_tests))
             .on_action(cx.listener(Self::import_settings))
             .on_action(cx.listener(Self::debug_start))
             .on_action(cx.listener(Self::debug_pick))
@@ -6601,6 +6631,71 @@ mod tests {
                 .active_editor()
                 .and_then(|e| e.read(cx).path(cx).map(Path::to_path_buf))
         })
+    }
+
+    #[gpui::test]
+    fn project_tests_discover_run_show_failures_and_open_their_source(cx: &mut TestAppContext) {
+        let root = fixture("project-tests");
+        let path = root.join("test_sample.py");
+        std::fs::write(&path, "import unittest\nclass Tests(unittest.TestCase):\n    def test_good(self): self.assertTrue(True)\n    def test_bad(self): self.fail('a clear failure')\n").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        cx.dispatch_action(ShowTests);
+        let panel = cx.read(|cx| ws.read(cx).tests_panel.clone());
+        assert!(cx.read(|cx| panel.read(cx).index("test_bad").is_none()));
+        bounds_soon(cx, "tests-discover");
+        click(cx, "tests-discover");
+        wait_for(cx, "the project's tests", &|cx| {
+            panel.read(cx).index("test_bad").is_some()
+        });
+        let bad = cx.read(|cx| panel.read(cx).index("test_bad").unwrap());
+        assert_eq!(bad, 1);
+        bounds_soon(cx, "project-test-1");
+        click(cx, "project-test-1");
+        wait_for(cx, "the test's file", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|e| e.read(cx).path(cx) == Some(path.as_path()))
+        });
+        assert_eq!(
+            cx.read(|cx| ws
+                .read(cx)
+                .active_editor()
+                .unwrap()
+                .read(cx)
+                .cursor_position(cx)
+                .0),
+            4
+        );
+        bounds_soon(cx, "tests-run");
+        click(cx, "tests-run");
+        wait_for(cx, "the failed test", &|cx| {
+            panel
+                .read(cx)
+                .result("test_bad")
+                .is_some_and(|(state, _)| *state == crate::test_runner::State::Failed)
+        });
+        assert!(cx.read(|cx| {
+            panel
+                .read(cx)
+                .result("test_bad")
+                .unwrap()
+                .1
+                .contains("a clear failure")
+        }));
+        assert!(
+            cx.read(|cx| *panel.read(cx).result("test_good").unwrap().0
+                == crate::test_runner::State::Ready)
+        );
+        cx.dispatch_action(ShowTests);
+        bounds_soon(cx, "tests-all");
+        click(cx, "tests-all");
+        wait_for(cx, "the passing test", &|cx| {
+            panel
+                .read(cx)
+                .result("test_good")
+                .is_some_and(|(state, _)| *state == crate::test_runner::State::Passed)
+        });
     }
 
     #[gpui::test]
@@ -18238,6 +18333,7 @@ exports.activate = (context) => {
                 Ai,
                 Extensions,
                 ExtensionViews,
+                Tests,
                 Structure
             ]
         );
@@ -18933,6 +19029,24 @@ exports.activate = (context) => {
         panel.update(cx, |panel, cx| panel.pick(all, cx));
         wait_for(cx, "the test to pass", &|cx| {
             panel.read(cx).has_mark("Passed")
+        });
+        cx.dispatch_action(ShowTests);
+        cx.run_until_parked();
+        bounds_soon(cx, "tests-extensions");
+        click(cx, "tests-extensions");
+        let only_tests = cx.read(|cx| ws.read(cx).tests_panel.read(cx).extension_view());
+        wait_for(cx, "the dedicated test controller", &|cx| {
+            only_tests.read(cx).has("Tests")
+        });
+        assert!(
+            !cx.read(
+                |cx| only_tests.read(cx).has("Demo tree") || only_tests.read(cx).has("Changes")
+            )
+        );
+        let controller = cx.read(|cx| only_tests.read(cx).index("Tests").unwrap());
+        only_tests.update(cx, |p, cx| p.pick(controller, cx));
+        wait_for(cx, "the dedicated test result", &|cx| {
+            only_tests.read(cx).has_mark("Passed")
         });
         let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
         wait_for(cx, "the text annotation", &|cx| {

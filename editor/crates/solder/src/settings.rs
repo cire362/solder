@@ -552,6 +552,7 @@ pub fn bind_defaults(cx: &mut App) {
     crate::extension_views::bind_keys(cx);
     crate::outline::bind_keys(cx);
     crate::problems_panel::bind_keys(cx);
+    crate::tests_panel::bind_keys(cx);
     crate::terminal::bind_keys(cx);
     crate::git_panel::bind_keys(cx);
     crate::file_diff::bind_keys(cx);

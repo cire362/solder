@@ -343,7 +343,7 @@ fn macos_profile(writable: &[PathBuf], network: bool) -> String {
 
 /// `PATH` with the usual install folders: an app started from the Dock gets
 /// a minimal one.
-fn search_path() -> String {
+pub(crate) fn search_path() -> String {
     let home = dirs::home_dir().unwrap_or_default();
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
