@@ -1,5 +1,6 @@
 //! Integrated terminal: Alacritty's emulator and PTY, drawn on the GPU by
 //! Solder's own element. Only the visible grid is shaped each frame.
+mod search;
 
 use std::{borrow::Cow, collections::HashMap, ops::Range, path::PathBuf, sync::Arc};
 
@@ -20,13 +21,13 @@ use gpui::{
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, FontWeight, GlobalElementId,
     Hsla, InspectorElementId, IntoElement, KeyBinding, KeyDownEvent, Keystroke, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, PaintQuad, Pixels, Point, Render,
-    ScrollWheelEvent, ShapedLine, SharedString, Style, Task, TextRun, UTF16Selection, Window,
-    actions, div, fill, point, prelude::*, px, relative, rgb, size,
+    ScrollWheelEvent, ShapedLine, SharedString, Style, Subscription, Task, TextRun, UTF16Selection,
+    Window, actions, div, fill, point, prelude::*, px, relative, rgb, size,
 };
 
 use crate::{settings::Settings, theme::ActiveTheme};
 
-actions!(terminal, [Copy, Paste, Clear]);
+actions!(terminal, [Copy, Paste, Clear, Find]);
 
 pub fn bind_keys(cx: &mut App) {
     let ctx = Some("Terminal");
@@ -34,11 +35,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-c", Copy, ctx),
         KeyBinding::new("secondary-v", Paste, ctx),
         KeyBinding::new("secondary-k", Clear, ctx),
+        KeyBinding::new("secondary-f", Find, ctx),
     ]);
+    search::bind_keys(cx);
 }
 
 pub enum TerminalEvent {
     TitleChanged,
+    Focused,
     OpenFile(crate::terminal_output::FileLink),
     /// The shell exited; the tab can close.
     Exited,
@@ -102,6 +106,8 @@ pub struct Terminal {
     cell: (Pixels, Pixels),
     last_bounds: Option<Bounds<Pixels>>,
     selecting: bool,
+    search: Entity<search::Search>,
+    _focus: Subscription,
     _events: Task<()>,
 }
 
@@ -174,7 +180,7 @@ impl Terminal {
         })
     }
 
-    pub fn new(started: StartedTerminal, cx: &mut Context<Self>) -> Self {
+    pub fn new(started: StartedTerminal, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let StartedTerminal {
             term,
             sender,
@@ -184,6 +190,13 @@ impl Terminal {
             keep_on_exit,
             cwd,
         } = started;
+        let parent = cx.entity().downgrade();
+        let search = cx.new(|child| search::Search::new(parent, term.clone(), child));
+        cx.observe(&search, |_, _, cx| cx.notify()).detach();
+        let focus_handle = cx.focus_handle();
+        let focus = cx.on_focus_in(&focus_handle, window, |_, _, cx| {
+            cx.emit(TerminalEvent::Focused)
+        });
         let events = cx.spawn(async move |this, cx| {
             while let Some(first) = rx.next().await {
                 let mut batch = vec![first];
@@ -207,7 +220,7 @@ impl Terminal {
         Self {
             term,
             sender,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             title: title.into(),
             fixed_title,
             keep_on_exit,
@@ -218,6 +231,8 @@ impl Terminal {
             cell: (px(8.), px(16.)),
             last_bounds: None,
             selecting: false,
+            search,
+            _focus: focus,
             _events: events,
         }
     }
@@ -253,6 +268,11 @@ impl Terminal {
     }
 
     #[cfg(test)]
+    pub fn bounds(&self) -> Option<Bounds<Pixels>> {
+        self.last_bounds
+    }
+
+    #[cfg(test)]
     pub fn text_position(&self, wanted: &str) -> Option<Point<Pixels>> {
         let bounds = self.last_bounds?;
         let term = self.term.lock();
@@ -273,6 +293,7 @@ impl Terminal {
 
     fn handle_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
         match event {
+            TermEvent::Wakeup => self.search.update(cx, |s, cx| s.refresh(false, cx)),
             TermEvent::Title(title) if !self.fixed_title => {
                 self.title = title.into();
                 cx.emit(TerminalEvent::TitleChanged);
@@ -315,7 +336,13 @@ impl Terminal {
         }
     }
 
-    fn resize(&mut self, columns: usize, lines: usize, cell: (Pixels, Pixels)) {
+    fn resize(
+        &mut self,
+        columns: usize,
+        lines: usize,
+        cell: (Pixels, Pixels),
+        cx: &mut Context<Self>,
+    ) {
         if (columns, lines) == self.grid && cell == self.cell {
             return;
         }
@@ -323,6 +350,7 @@ impl Terminal {
         self.cell = cell;
         self.term.lock().resize(GridSize { columns, lines });
         let _ = self.sender.send(Msg::Resize(self.window_size()));
+        self.search.update(cx, |s, cx| s.refresh(false, cx));
     }
 
     fn mode(&self) -> TermMode {
@@ -331,7 +359,12 @@ impl Terminal {
 
     // ------------------------------------------------------------ input
 
-    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus_handle.is_focused(window)
+            || (event.keystroke.modifiers.secondary() && event.keystroke.key == "f")
+        {
+            return;
+        }
         let mode = self.mode();
         if let Some(bytes) = escape_sequence(&event.keystroke, mode.contains(TermMode::APP_CURSOR))
         {
@@ -371,8 +404,21 @@ impl Terminal {
         cx.notify();
     }
 
+    fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        self.search.update(cx, |s, cx| s.deploy(window, cx));
+    }
+
+    #[cfg(test)]
+    pub fn search_state(&self, cx: &App) -> (bool, usize, Option<usize>) {
+        let search = self.search.read(cx);
+        (search.visible, search.found.matches.len(), search.active)
+    }
+
     fn cell_at(&self, position: Point<Pixels>) -> Option<(GridPoint, Side)> {
         let bounds = self.last_bounds?;
+        if !bounds.contains(&position) {
+            return None;
+        }
         let x = (position.x - bounds.left()).max(px(0.));
         let y = (position.y - bounds.top()).max(px(0.));
         let col = ((x / self.cell.0) as usize).min(self.grid.0.saturating_sub(1));
@@ -387,10 +433,10 @@ impl Terminal {
     }
 
     fn mouse_down(&mut self, e: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus_handle);
         let Some((point, side)) = self.cell_at(e.position) else {
             return;
         };
+        window.focus(&self.focus_handle);
         if e.modifiers.platform || e.modifiers.control {
             let found =
                 crate::terminal_output::read_line(&*self.term.lock(), point.line).link_at(point);
@@ -633,19 +679,29 @@ impl Render for Terminal {
             .key_context("Terminal")
             .track_focus(&self.focus_handle)
             .size_full()
-            .px_2()
-            .py_1()
+            .flex()
+            .flex_col()
             .bg(cx.theme().bg)
             .on_key_down(cx.listener(Self::key_down))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::clear))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-            .on_mouse_move(cx.listener(Self::mouse_move))
-            .on_scroll_wheel(cx.listener(Self::scroll))
-            .child(TerminalElement {
-                terminal: cx.entity(),
-            })
+            .on_action(cx.listener(Self::find))
+            .children(self.search.read(cx).visible.then(|| self.search.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+                    .on_mouse_move(cx.listener(Self::mouse_move))
+                    .on_scroll_wheel(cx.listener(Self::scroll))
+                    .child(TerminalElement {
+                        terminal: cx.entity(),
+                    }),
+            )
     }
 }
 
@@ -782,12 +838,13 @@ impl Element for TerminalElement {
         let columns = ((bounds.size.width / cell_width) as usize).max(2);
         let lines = ((bounds.size.height / cell_height) as usize).max(1);
 
-        self.terminal.update(cx, |t, _| {
+        self.terminal.update(cx, |t, cx| {
             t.last_bounds = Some(bounds);
-            t.resize(columns, lines, (cell_width, cell_height));
+            t.resize(columns, lines, (cell_width, cell_height), cx);
         });
 
         let terminal = self.terminal.read(cx);
+        let search = terminal.search.read(cx);
         let term = terminal.term.lock();
         let content = term.renderable_content();
         let offset = content.display_offset as i32;
@@ -857,6 +914,31 @@ impl Element for TerminalElement {
                 }
             }
             // Selection highlight.
+            for (_, _, _, flags, col) in cells {
+                if let Some(active) =
+                    search.highlight(GridPoint::new(Line(row as i32 - offset), *col))
+                {
+                    backgrounds.push(fill(
+                        Bounds::new(
+                            point(origin.x + cell_width * col.0 as f32, y),
+                            size(
+                                cell_width
+                                    * if flags.contains(Flags::WIDE_CHAR) {
+                                        2.
+                                    } else {
+                                        1.
+                                    },
+                                cell_height,
+                            ),
+                        ),
+                        if active {
+                            theme.accent_soft
+                        } else {
+                            theme.search_match
+                        },
+                    ));
+                }
+            }
             if let Some(sel) = selection {
                 let line = Line(row as i32 - offset);
                 if sel.start.line <= line && line <= sel.end.line {

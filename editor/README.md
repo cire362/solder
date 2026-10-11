@@ -293,6 +293,23 @@ Colors and soft wraps do not become part of a path. Ordinary clicks still
 select text. URLs are not opened by this gesture, and changing directory
 inside a shell does not update the base for relative paths.
 
+Ctrl/Cmd-F in a terminal searches its retained history as literal, case-sensitive
+text. Enter and Shift-Enter move between matches; Escape returns to the shell.
+Soft wraps belong to one line. Search runs in the background after a pause and
+is limited to 8 MB and 20,000 matches, shown by `+` in the count. The emulator
+retains at most 10,000 history rows. A logical line is limited to 129 rows or
+32 KB; search does not cross a hard line break.
+
+**Split Terminal** (or **Split** beside the tabs) shows two sessions in the
+same dock. It uses another existing session or starts a new shell. Clicking a
+pane gives it the keyboard; selecting another tab replaces the focused pane
+without ending its old process. **Unsplit Terminal** keeps both sessions alive.
+Closing a visible session returns to one pane. The divider changes their
+proportion, saved in the selected `layout.json` as
+`"terminal": { "axis": "horizontal", "ratio": 0.5 }`; `vertical` stacks them.
+The ratio is fitted between 0.1 and 0.9. The pair itself is not restored after
+restart. Both panes move with the Terminal panel between docks.
+
 ## Tests
 
 **Show Tests** in the command palette opens the Tests panel, which can move

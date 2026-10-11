@@ -22,11 +22,12 @@ pub struct FileLink {
 pub struct TextLine {
     pub text: String,
     pub cells: Vec<(Range<usize>, Point)>,
+    pub last_row: Line,
+    pub limited: bool,
 }
 
 pub fn read_line<T: EventListener>(term: &Term<T>, row: Line) -> TextLine {
     let top = term.topmost_line().0;
-    let bottom = term.bottommost_line().0;
     let last = Column(term.columns() - 1);
     let mut start = row.0;
     while start > top
@@ -37,11 +38,21 @@ pub fn read_line<T: EventListener>(term: &Term<T>, row: Line) -> TextLine {
     {
         start -= 1;
     }
+    read_from(term, Line(start))
+}
+
+pub fn read_from<T: EventListener>(term: &Term<T>, row: Line) -> TextLine {
+    let start = row.0;
+    let bottom = term.bottommost_line().0;
+    let last = Column(term.columns() - 1);
     let mut out = TextLine {
         text: String::new(),
         cells: Vec::new(),
+        last_row: row,
+        limited: false,
     };
     for line in start..=bottom.min(start + 128) {
+        out.last_row = Line(line);
         let grid_row = &term.grid()[Line(line)];
         let wrapped = grid_row[last].flags.contains(Flags::WRAPLINE);
         let end = if wrapped {
@@ -62,13 +73,18 @@ pub fn read_line<T: EventListener>(term: &Term<T>, row: Line) -> TextLine {
                 continue;
             }
             let begin = out.text.len();
-            out.text.push(cell.c);
-            for c in cell.zerowidth().into_iter().flatten() {
-                out.text.push(*c);
+            if cell.flags.contains(Flags::HIDDEN) {
+                out.text.push(' ');
+            } else {
+                out.text.push(cell.c);
+                for c in cell.zerowidth().into_iter().flatten() {
+                    out.text.push(*c);
+                }
             }
             out.cells
                 .push((begin..out.text.len(), Point::new(Line(line), Column(col))));
         }
+        out.limited = wrapped;
         if !wrapped || out.text.len() >= 32_768 {
             break;
         }

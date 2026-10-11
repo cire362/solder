@@ -21,6 +21,9 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] Terminal search and split panes in a real window and on Windows.
+      Retained history, soft wraps, match navigation, keyboard routing, two
+      PTYs, switching panes and resizing are checked headlessly
 - [ ] A real paused Python session in a window, other Python versions and
       Windows interpreter/process behavior. CI of PR #51 passed with the
       approved debugpy 1.8.22 wheel in Python 3.12, checking conditions,
@@ -105,6 +108,12 @@ something of its own unchecked or unmade adds it here.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] Terminal search is literal and case-sensitive, across soft wraps but
+      not hard line breaks. It scans at most 8 MB and keeps 20,000 matches;
+      logical lines have the same 129-row/32-KB limit as links. Only the
+      emulator's retained 10,000 history rows can be searched. The split
+      has two panes, no nested splits; sessions and their pair are not
+      restored after a restart
 - [ ] Terminal relative file links use the starting directory, not later
       shell `cd` commands. URLs, `file://` URIs and traceback-only positions
       without colon numbers are not handled. A logical line is inspected
@@ -618,7 +627,7 @@ update. They come after phase 9, in this order unless one is needed sooner.
 ### The terminal
 - [x] `file:line:column` in the output opens in the editor
       (Ctrl/Cmd-click, relative to the terminal's starting directory)
-- [ ] Search in what scrolled by; the dock split in two
+- [x] Search in what scrolled by; the dock split in two
 - [ ] A command that failed offered to the model to fix
 
 ### Windows and the way in
