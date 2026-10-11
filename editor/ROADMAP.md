@@ -21,22 +21,17 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
-- [ ] Why two tests of the terminal fail on Linux in some runs and never
-      on macOS: an extension's terminal that is typed into as it starts,
-      and a program that fails at once. Two runs of three were red with
-      them. Since the terminal block a process starts off the thread that
-      draws, and a start that fails, or a process that ends before it is
-      looked at, may be what a test then waits for in vain. A wait that
-      gives up says what each terminal did; no red run has said it yet
-- [ ] The set of windows across a real quit with several of them open
-      (the key, the Dock, a shutdown), on a second display and with one
-      unplugged, fullscreen or maximized, and on Windows and Linux. Seen
-      live on macOS: the way in, two windows put back, a move written.
-      The rest is checked headlessly
-- [ ] A clone from a real server, and one that needs a password or a key
-      with a passphrase. Checked against a repository on this disk. The
-      system's folder dialogs (Open a folder, Clone here) are not driven
-      by any test
+- [ ] Why a test of the terminal fails on Linux in some runs and never on
+      macOS: a program that fails at once
+      (`terminal_failure_is_an_editable_draft_until_sent`). Two runs of
+      three were red with it. Since the terminal block a process starts off
+      the thread that draws, so it may have ended before it is looked at. A
+      wait that gives up says what each terminal did; no red run has said
+      it yet. The other test that failed with it has a likely cause, read
+      from the code and not seen on Linux: what an extension types into a
+      terminal as it starts may reach the shell before its prompt, and
+      dash then prints the answer after the prompt, on a line the test did
+      not expect. The test now takes that line too
 - [ ] The question about a crash in a real window, and a panic on Windows
       and Linux. The hook is checked in a process of its own on the machine
       that runs the tests, the question and the report's tab headlessly. A

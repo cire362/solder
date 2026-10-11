@@ -16844,7 +16844,17 @@ exports.activate = (context) => {
             let Some((terminal, _)) = terminals.get(terminal) else {
                 return false;
             };
-            terminal.read(cx).visible_text().iter().any(|l| l == line)
+            // What is typed before the shell asks for it is run all the
+            // same, and a shell that does not draw its line again (dash,
+            // which is `sh` on Linux) then prints the answer right after
+            // its prompt: `$ solder-42`. Which comes first, the prompt
+            // or the typing, is a race the editor does not decide.
+            let after_prompt = format!(" {line}");
+            terminal
+                .read(cx)
+                .visible_text()
+                .iter()
+                .any(|l| l == line || l.ends_with(&after_prompt))
         };
         // A terminal it only keeps ready takes no room in the dock.
         assert!(cx.read(|cx| ws.read(cx).terminals.is_empty()));
