@@ -79,6 +79,18 @@ pub(super) struct Session {
     pages: Vec<Page>,
     front_book: Option<usize>,
     front_page: Option<usize>,
+    /// The pictures and previews of each pane.
+    #[serde(default)]
+    viewers: Vec<Vec<Shown>>,
+}
+
+/// A picture, or the preview of a file: its path, and whether it is what
+/// its pane shows.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct Shown {
+    path: PathBuf,
+    preview: bool,
+    front: bool,
 }
 
 pub(super) struct Writer(mpsc::Sender<(Session, futures::channel::oneshot::Sender<bool>)>);
@@ -137,8 +149,10 @@ fn read(path: &Path, root: &Path) -> Option<Session> {
         && session.panes.len() <= 8
         && session.panes.iter().all(|pane| pane.len() <= 256)
         && session.books.len() <= 128
-        && session.pages.len() <= 128)
-        .then_some(session)
+        && session.pages.len() <= 128
+        && session.viewers.len() <= 8
+        && session.viewers.iter().all(|pane| pane.len() <= 64))
+    .then_some(session)
 }
 
 impl Workspace {
@@ -183,8 +197,27 @@ impl Workspace {
                 }
             })
             .collect();
+        let viewers = self
+            .panes
+            .iter()
+            .map(|pane| {
+                pane.viewers
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, (viewer, _))| {
+                        let viewer = viewer.read(cx);
+                        Shown {
+                            path: viewer.path.clone(),
+                            preview: viewer.is_preview(),
+                            front: pane.shown == Some(ix),
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
         Session {
             version: 1,
+            viewers,
             root: self.root(cx),
             panes,
             active: self
@@ -287,9 +320,13 @@ impl Workspace {
                 let files = saved.panes.iter().map(|pane| pane.iter().map(|file| {
                     crate::document::load(&file.path).ok()
                 }).collect::<Vec<_>>()).collect::<Vec<_>>();
-                Some((saved, files))
+                // A picture whose file is gone is skipped, like a file.
+                let pictures = saved.viewers.iter().map(|pane| pane.iter().map(|shown| {
+                    shown.preview || shown.path.is_file()
+                }).collect::<Vec<_>>()).collect::<Vec<_>>();
+                Some((saved, files, pictures))
             }).await;
-            let Some((saved, files)) = read else {
+            let Some((saved, files, pictures)) = read else {
                 this.update(cx, |this, _| this.restoring = false).ok();
                 return;
             };
@@ -324,8 +361,28 @@ impl Workspace {
                     }
                     if let Some(active) = active { this.activate(pane, active, window, cx); }
                 }
+                // Pictures and previews come after the files: a preview is
+                // of a file that has a tab again.
+                for (pane, (shown, there)) in saved.viewers.iter().zip(pictures).enumerate() {
+                    while this.panes.len() <= pane { this.panes.push(Pane::default()); }
+                    let mut front = None;
+                    for (shown, there) in shown.iter().zip(there) {
+                        let viewer = match shown.preview {
+                            true => this.document_for_path(&shown.path, cx)
+                                .filter(|_| crate::viewer::has_preview(&shown.path))
+                                .map(|document| cx.new(|cx| Viewer::preview(document, cx))),
+                            false => (there && crate::viewer::is_picture(&shown.path))
+                                .then(|| cx.new(|cx| Viewer::picture(shown.path.clone(), cx))),
+                        };
+                        let Some(viewer) = viewer else { continue; };
+                        this.add_viewer(viewer, pane, false, window, cx);
+                        if shown.front { front = Some(this.panes[pane].viewers.len() - 1); }
+                    }
+                    this.panes[pane].shown = front;
+                }
+                for pane in (0..this.panes.len()).rev() { this.drop_empty_pane(pane); }
                 this.active_pane = saved.active_pane.min(this.panes.len() - 1);
-                if let Some(active) = this.panes[this.active_pane].active { this.activate(this.active_pane, active, window, cx); }
+                this.front_of_pane(this.active_pane, window, cx);
                 for book in &saved.books { this.open_notebook(book.path.clone(), book.extension.clone(), book.kind.clone(), window, cx); }
                 if let Some(book) = saved.front_book.and_then(|at| this.notebooks.get(at)).map(|(book, _)| book.clone()) {
                     this.show_notebook(book, this.active_pane, window, cx);
@@ -365,8 +422,8 @@ impl Workspace {
                     this.open_webview(key, window, cx);
                 } else if let Some(book) = saved.front_book.and_then(|at| this.notebooks.get(at)).map(|(book, _)| book.clone()) {
                     this.show_notebook(book, this.active_pane, window, cx);
-                } else if let Some(active) = this.panes[this.active_pane].active {
-                    this.activate(this.active_pane, active, window, cx);
+                } else {
+                    this.front_of_pane(this.active_pane, window, cx);
                 }
                 this.restoring = false;
             }).ok();

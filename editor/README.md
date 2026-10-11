@@ -177,6 +177,24 @@ closed before it, up to 32 back; a file that is open already or gone from
 disk is passed over. Closed tabs are remembered while the window is open,
 not across a restart.
 
+## Pictures and previews
+
+A PNG, JPEG, GIF, WebP, BMP or TIFF file opens as the picture it is, in a
+tab next to the tabs of files, with its size, its format and how many bytes
+it has under it. It is read again when the file changes.
+
+**Workspace: Open preview** (`cmd-shift-v`) shows what the Markdown file in
+front reads as, in the pane to its right: headings, lists with tasks, quotes,
+tables, rules, code in the colors of its language, links and pictures. The
+file keeps the keys, and the preview follows what is typed, saved or not. A
+link to a file of the project opens the file; any other opens where the
+system opens addresses. A picture that is a file of this machine is drawn. One
+that is on a server is shown by its name: nothing is fetched.
+
+An SVG opens as text, and the same command draws it next to its source.
+
+Pictures and previews come back with the tabs at the next start.
+
 ## Structure and breadcrumbs
 
 **Show structure** (in the palette, or the **Structure** tab of the left

@@ -63,6 +63,7 @@ mod layout;
 mod layout_picker;
 mod locations;
 mod lsp_store;
+mod markdown;
 mod mcp_store;
 mod notebook;
 mod outline;
@@ -92,6 +93,7 @@ mod test_runner;
 mod tests_panel;
 mod theme;
 mod ui;
+mod viewer;
 mod way_in;
 mod webview;
 mod windows;
@@ -138,7 +140,8 @@ fn main() {
         // Read the file before the window exists, so the first frame is
         // already an editable file rather than an empty workspace.
         let initial = file.and_then(|path| {
-            if path.extension().is_some_and(|ext| ext == "ipynb") {
+            // A notebook and a picture are not read as text.
+            if !opens_as_text(&path) {
                 let nothing = document::Loaded::of(&[]);
                 return Some((path, nothing));
             }
@@ -212,6 +215,12 @@ fn main() {
         });
 }
 
+/// Whether a file named on the command line is read here, before the
+/// window, to be its first tab of text.
+fn opens_as_text(path: &std::path::Path) -> bool {
+    !(path.extension().is_some_and(|ext| ext == "ipynb") || viewer::is_picture(path))
+}
+
 /// The theme of the settings, for the first window that asks.
 pub fn ensure_theme(window: &Window, cx: &mut App) {
     if !cx.has_global::<Theme>() {
@@ -250,7 +259,7 @@ pub fn open_workspace_window(
                     let workspace = cx.new(|cx| Workspace::new(root, window, cx));
                     if let Some((path, loaded)) = initial {
                         workspace.update(cx, |w, cx| {
-                            if path.extension().is_some_and(|ext| ext == "ipynb") {
+                            if !opens_as_text(&path) {
                                 w.open_path(path, None, window, cx);
                             } else {
                                 w.add_loaded(path, &loaded, None, window, cx);

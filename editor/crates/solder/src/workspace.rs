@@ -48,6 +48,7 @@ use crate::{
     settings::{self, Settings},
     terminal::{Terminal, TerminalCommand, TerminalEvent},
     theme::{ActiveTheme, UI_FONT_SIZE},
+    viewer::Viewer,
 };
 
 actions!(
@@ -74,6 +75,7 @@ actions!(
         OpenFolder,
         OpenProject,
         NewWindow,
+        OpenPreview,
         ShowErrorLog,
         OpenSettings,
         OpenKeymap,
@@ -158,6 +160,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-o", OpenFolder, None),
         KeyBinding::new("secondary-alt-o", OpenProject, None),
         KeyBinding::new("secondary-shift-n", NewWindow, None),
+        KeyBinding::new("secondary-shift-v", OpenPreview, None),
         KeyBinding::new("secondary-,", OpenSettings, None),
         KeyBinding::new("secondary-\\", SplitRight, None),
         KeyBinding::new("secondary-k secondary-right", FocusNextPane, None),
@@ -253,13 +256,29 @@ mod recovery;
 struct Pane {
     tabs: Vec<Tab>,
     active: Option<usize>,
+    /// The pictures and previews open here, each a tab after the files.
+    viewers: Vec<(Entity<Viewer>, Subscription)>,
+    /// The one of them shown in place of the pane's file, if one is.
+    shown: Option<usize>,
 }
 
 impl Pane {
+    /// The file this pane shows. None while it shows a picture or a
+    /// preview: what a command does to "the file in front" is not done to
+    /// a file behind one.
     fn active_editor(&self) -> Option<&Entity<Editor>> {
+        if self.shown.is_some() {
+            return None;
+        }
         self.active
             .and_then(|i| self.tabs.get(i))
             .map(|t| &t.editor)
+    }
+
+    fn shown_viewer(&self) -> Option<&Entity<Viewer>> {
+        self.shown
+            .and_then(|ix| self.viewers.get(ix))
+            .map(|(viewer, _)| viewer)
     }
 }
 
@@ -1140,6 +1159,10 @@ impl Workspace {
             self.open_notebook(path, String::new(), "jupyter-notebook".into(), window, cx);
             return;
         }
+        if crate::viewer::is_picture(&path) {
+            self.open_picture(path, window, cx);
+            return;
+        }
         self.close_file_diff(window, cx);
         let pane = &self.panes[self.active_pane];
         if let Some(ix) = pane
@@ -1201,6 +1224,7 @@ impl Workspace {
         self.close_file_diff(window, cx);
         self.active_pane = pane;
         self.panes[pane].active = Some(ix);
+        self.panes[pane].shown = None;
         if let Some(path) = editor.read(cx).path(cx).map(Path::to_path_buf) {
             self.project_panel
                 .update(cx, |p, cx| p.select_path(&path, cx));
@@ -1229,6 +1253,10 @@ impl Workspace {
         }
         if self.file_diff.is_some() {
             self.close_file_diff(window, cx);
+            return;
+        }
+        if let Some(viewer) = self.panes[self.active_pane].shown_viewer().cloned() {
+            self.close_viewer(&viewer, window, cx);
             return;
         }
         if let Some(editor) = self.active_editor().cloned() {
@@ -1298,15 +1326,47 @@ impl Workspace {
             let over = self.closed_tabs.len().saturating_sub(CLOSED_TABS);
             self.closed_tabs.drain(..over);
         }
-        if self.panes[p].tabs.is_empty() && self.panes.len() > 1 {
-            // An empty split closes; focus moves to its neighbour.
-            self.panes.remove(p);
-            let next = p.min(self.panes.len() - 1);
-            let tab = self.panes[next].active.unwrap_or(0);
-            self.activate(next, tab, window, cx);
+        // A preview has nothing to follow once its file has no tab.
+        let document = closed.editor.read(cx).document().clone();
+        if self.view_count(document.entity_id(), cx) == 0 {
+            for pane in &mut self.panes {
+                let shown = pane.shown_viewer().cloned();
+                pane.viewers
+                    .retain(|(viewer, _)| !viewer.read(cx).is_preview_of(&document));
+                pane.shown = shown
+                    .and_then(|shown| pane.viewers.iter().position(|(viewer, _)| *viewer == shown));
+            }
+        }
+        // Panes left with nothing close: the one the tab was in, and one
+        // that held only such a preview.
+        let mut here = Some(p);
+        for q in (0..self.panes.len()).rev() {
+            if self.drop_empty_pane(q).is_none() {
+                here = match here {
+                    Some(here) if here == q => None,
+                    Some(here) if here > q => Some(here - 1),
+                    here => here,
+                };
+            }
+        }
+        let Some(p) = here else {
+            let next = self.active_pane;
+            self.front_of_pane(next, window, cx);
+            return;
+        };
+        let pane = &mut self.panes[p];
+        if pane.shown.is_some() {
+            // The picture in front stays in front: only which file is
+            // behind it changed.
+            pane.active = match pane.active {
+                _ if pane.tabs.is_empty() => None,
+                Some(a) if a > ix => Some(a - 1),
+                Some(a) => Some(a.min(pane.tabs.len() - 1)),
+                None => None,
+            };
+            cx.notify();
             return;
         }
-        let pane = &mut self.panes[p];
         if pane.tabs.is_empty() {
             pane.active = None;
             self.search_bar
@@ -4425,6 +4485,10 @@ impl Workspace {
     fn focus_pane(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         let len = self.panes.len() as isize;
         let next = (self.active_pane as isize + delta).rem_euclid(len) as usize;
+        if let Some(shown) = self.panes[next].shown {
+            self.show_viewer(next, shown, true, window, cx);
+            return;
+        }
         match self.panes[next].active {
             Some(tab) => self.activate(next, tab, window, cx),
             None => {
@@ -4860,6 +4924,11 @@ impl Workspace {
 
     /// Files changed on disk: reload clean documents, refresh the tree.
     fn files_changed(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        for (viewer, _) in self.panes.iter().flat_map(|pane| &pane.viewers) {
+            if paths.contains(&viewer.read(cx).path) {
+                viewer.update(cx, |viewer, cx| viewer.reload(cx));
+            }
+        }
         for document in self.documents(cx) {
             let (path, dirty) = {
                 let d = document.read(cx);
@@ -5302,6 +5371,234 @@ impl Workspace {
         }
         self.notebooks.retain(|(known, _)| known != notebook);
         cx.notify();
+    }
+
+    /// Takes away pane `p` if nothing is left in it and it is not the only
+    /// one, and says where the pane is now: nowhere, if it went.
+    fn drop_empty_pane(&mut self, p: usize) -> Option<usize> {
+        let pane = &self.panes[p];
+        if !pane.tabs.is_empty() || !pane.viewers.is_empty() || self.panes.len() == 1 {
+            return Some(p);
+        }
+        // An empty split closes; focus moves to its neighbour.
+        self.panes.remove(p);
+        if self.active_pane > p || self.active_pane == self.panes.len() {
+            self.active_pane -= 1;
+        }
+        None
+    }
+
+    /// Puts what pane `p` shows in front of the window: its picture or
+    /// preview, else its file, else nothing.
+    fn front_of_pane(&mut self, p: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = &self.panes[p];
+        if let Some(shown) = pane.shown {
+            self.show_viewer(p, shown, true, window, cx);
+        } else if !pane.tabs.is_empty() {
+            let tab = pane.active.unwrap_or(0).min(pane.tabs.len() - 1);
+            self.activate(p, tab, window, cx);
+        } else {
+            self.active_pane = p;
+            self.search_bar
+                .update(cx, |bar, cx| bar.set_editor(None, cx));
+            window.focus(&self.focus_handle);
+            self.keep_outline(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Adds a picture or a preview to pane `p` as a tab, and shows it.
+    fn add_viewer(
+        &mut self,
+        viewer: Entity<Viewer>,
+        p: usize,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let events = cx.subscribe_in(&viewer, window, |this, _, event, window, cx| match event {
+            crate::viewer::ViewerEvent::Open(path) => {
+                this.open_path(path.clone(), None, window, cx)
+            }
+            crate::viewer::ViewerEvent::Changed => cx.notify(),
+        });
+        self.panes[p].viewers.push((viewer, events));
+        let ix = self.panes[p].viewers.len() - 1;
+        self.show_viewer(p, ix, focus, window, cx);
+    }
+
+    fn show_viewer(
+        &mut self,
+        p: usize,
+        ix: usize,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((viewer, _)) = self.panes.get(p).and_then(|pane| pane.viewers.get(ix)) else {
+            return;
+        };
+        let viewer = viewer.clone();
+        self.panes[p].shown = Some(ix);
+        if focus {
+            self.close_file_diff(window, cx);
+            self.leave_notebook(cx);
+            self.web_front = None;
+            self.discard_inline_edit(cx);
+            self.active_pane = p;
+            self.search_bar
+                .update(cx, |bar, cx| bar.set_editor(None, cx));
+            window.focus(&viewer.focus_handle(cx));
+            self.keep_outline(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Where a picture or a preview is: its pane and its place among the
+    /// pane's.
+    fn locate_viewer(&self, viewer: &Entity<Viewer>) -> Option<(usize, usize)> {
+        self.panes.iter().enumerate().find_map(|(p, pane)| {
+            let ix = pane.viewers.iter().position(|(known, _)| known == viewer)?;
+            Some((p, ix))
+        })
+    }
+
+    fn close_viewer(
+        &mut self,
+        viewer: &Entity<Viewer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((p, ix)) = self.locate_viewer(viewer) else {
+            return;
+        };
+        let pane = &mut self.panes[p];
+        drop(pane.viewers.remove(ix));
+        pane.shown = match pane.shown {
+            Some(shown) if shown == ix => None,
+            Some(shown) if shown > ix => Some(shown - 1),
+            shown => shown,
+        };
+        let was_active = self.active_pane == p;
+        match self.drop_empty_pane(p) {
+            Some(p) if was_active => self.front_of_pane(p, window, cx),
+            None if was_active => self.front_of_pane(self.active_pane, window, cx),
+            _ => cx.notify(),
+        }
+    }
+
+    /// A picture file, as a tab of the pane in front. Asked for again, it
+    /// is the tab it has.
+    fn open_picture(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let known = self.panes.iter().enumerate().find_map(|(p, pane)| {
+            let ix = pane.viewers.iter().position(|(viewer, _)| {
+                let viewer = viewer.read(cx);
+                !viewer.is_preview() && viewer.path == path
+            })?;
+            Some((p, ix))
+        });
+        if let Some((p, ix)) = known {
+            self.show_viewer(p, ix, true, window, cx);
+            return;
+        }
+        self.project_panel
+            .update(cx, |panel, cx| panel.select_path(&path, cx));
+        let viewer = cx.new(|cx| Viewer::picture(path, cx));
+        self.add_viewer(viewer, self.active_pane, true, window, cx);
+    }
+
+    /// Shows what the file in front reads as, next to it: Markdown laid
+    /// out, an SVG drawn. The file keeps the keys.
+    fn open_preview(&mut self, _: &OpenPreview, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor() else {
+            return;
+        };
+        let document = editor.read(cx).document().clone();
+        if !document
+            .read(cx)
+            .path()
+            .is_some_and(crate::viewer::has_preview)
+        {
+            return;
+        }
+        let known = self.panes.iter().enumerate().find_map(|(p, pane)| {
+            let ix = pane
+                .viewers
+                .iter()
+                .position(|(viewer, _)| viewer.read(cx).is_preview_of(&document))?;
+            Some((p, ix))
+        });
+        if let Some((p, ix)) = known {
+            self.show_viewer(p, ix, false, window, cx);
+            return;
+        }
+        // In the pane to the right, which is made if there is none.
+        let at = self.active_pane + 1;
+        if at == self.panes.len() {
+            self.panes.push(Pane::default());
+        }
+        let viewer = cx.new(|cx| Viewer::preview(document, cx));
+        self.add_viewer(viewer, at, false, window, cx);
+    }
+
+    fn viewer_tabs(&self, p: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let theme = cx.theme().clone();
+        let pane = &self.panes[p];
+        let front = self.web_front.is_none() && self.notebook_front.is_none();
+        pane.viewers
+            .iter()
+            .enumerate()
+            .map(|(ix, (viewer, _))| {
+                let selected = pane.shown == Some(ix) && front;
+                let title = viewer.read(cx).title();
+                let icon = crate::file_icons::file(&viewer.read(cx).path, cx);
+                let close = viewer.clone();
+                div()
+                    .id(("viewer-tab", p * 10_000 + ix))
+                    .debug_selector(move || format!("viewer-tab-{p}-{ix}"))
+                    .flex_none()
+                    .h(px(26.))
+                    .max_w(px(260.))
+                    .pl_3()
+                    .pr_1p5()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .rounded(theme.shape.control)
+                    .text_size(UI_FONT_SIZE)
+                    .text_color(if selected { theme.fg } else { theme.fg_subtle })
+                    .when(selected, |d| {
+                        d.bg(theme.bg_elev)
+                            .border(theme.shape.border)
+                            .border_color(theme.line)
+                    })
+                    .hover(|d| d.text_color(theme.fg))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.show_viewer(p, ix, true, window, cx);
+                    }))
+                    .children(icon)
+                    .child(div().min_w_0().truncate().child(title))
+                    .child(
+                        div()
+                            .id(("viewer-close", p * 10_000 + ix))
+                            .debug_selector(move || format!("viewer-close-{p}-{ix}"))
+                            .flex_none()
+                            .size(px(16.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(theme.shape.token)
+                            .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                            .child("×")
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.close_viewer(&close, window, cx);
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect()
     }
 
     fn notebook_tabs(&self, pane: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -5808,6 +6105,7 @@ impl Workspace {
                 let pinned = tab.pinned;
                 let pin_editor = editor.clone();
                 let active = pane.active == Some(ix)
+                    && pane.shown.is_none()
                     && self.web_front.is_none()
                     && self.notebook_front.is_none();
                 let close_editor = editor.clone();
@@ -5887,6 +6185,7 @@ impl Workspace {
                     .into_any_element()
             })
             .collect();
+        tabs.extend(self.viewer_tabs(p, cx));
         if p == self.active_pane {
             tabs.extend(self.webview_tabs(p, cx));
             tabs.extend(self.notebook_tabs(p, cx));
@@ -5954,6 +6253,8 @@ impl Workspace {
                             && *pane == p
                         {
                             d.child(notebook.clone())
+                        } else if let Some(viewer) = pane.shown_viewer() {
+                            d.child(viewer.clone())
                         } else {
                             match pane.active_editor() {
                                 // What is to be said of the file above
@@ -6812,6 +7113,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_untitled))
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::open_project))
+            .on_action(cx.listener(Self::open_preview))
             .on_action(cx.listener(Self::new_window))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::show_error_log))
@@ -20402,5 +20704,250 @@ exports.activate = (context) => {
                 .is_none()
         });
         assert_eq!(cx.read(project_windows).len(), 2);
+    }
+    /// The first bytes of a PNG that say it is `width` by `height`.
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend(width.to_be_bytes());
+        bytes.extend(height.to_be_bytes());
+        bytes.extend([8, 6, 0, 0, 0]);
+        bytes
+    }
+
+    #[gpui::test]
+    async fn a_picture_opens_as_a_picture_in_a_tab_of_its_own(cx: &mut TestAppContext) {
+        let root = fixture("picture");
+        let shot = root.join("shot.png");
+        std::fs::write(&shot, png(640, 480)).unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(root.join("src/main.rs"), None, window, cx)
+        });
+        wait_for(cx, "the file", &|cx| ws.read(cx).active_editor().is_some());
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(shot.clone(), None, window, cx)
+        });
+        let viewer = cx.read(|cx| ws.read(cx).panes[0].shown_viewer().cloned().unwrap());
+        // It is no file to type into: nothing is "the file in front".
+        assert!(cx.read(|cx| ws.read(cx).active_editor().is_none()));
+        assert_eq!(cx.read(|cx| viewer.read(cx).title()), "shot.png");
+        wait_for(cx, "the picture to be read", &|cx| {
+            viewer.read(cx).picture_state() == Some((Some((640, 480)), 29, None))
+        });
+        // Asked for again, it is the tab it has.
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(shot.clone(), None, window, cx)
+        });
+        assert_eq!(cx.read(|cx| ws.read(cx).panes[0].viewers.len()), 1);
+        // The file changed on disk: the picture is read again.
+        std::fs::write(&shot, png(32, 16)).unwrap();
+        ws.update(cx, |ws, cx| ws.files_changed(vec![shot.clone()], cx));
+        wait_for(cx, "the picture to be read again", &|cx| {
+            viewer.read(cx).picture_state() == Some((Some((32, 16)), 29, None))
+        });
+        // The file behind it comes back when its tab is chosen, and the
+        // picture when its own is.
+        ws.update_in(cx, |ws, window, cx| ws.activate(0, 0, window, cx));
+        assert!(cx.read(|cx| ws.read(cx).panes[0].shown.is_none()));
+        assert_eq!(active_path(&ws, cx), Some(root.join("src/main.rs")));
+        ws.update_in(cx, |ws, window, cx| ws.show_viewer(0, 0, true, window, cx));
+        cx.simulate_keystrokes("secondary-w");
+        assert!(cx.read(|cx| ws.read(cx).panes[0].viewers.is_empty()));
+        assert_eq!(active_path(&ws, cx), Some(root.join("src/main.rs")));
+
+        // A file that is gone says so instead of a picture.
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(root.join("missing.png"), None, window, cx)
+        });
+        let missing = cx.read(|cx| ws.read(cx).panes[0].shown_viewer().cloned().unwrap());
+        wait_for(cx, "why there is no picture", &|cx| {
+            missing
+                .read(cx)
+                .picture_state()
+                .is_some_and(|(_, _, failed)| failed.is_some())
+        });
+    }
+
+    #[gpui::test]
+    async fn markdown_is_shown_next_to_its_source_and_follows_what_is_typed(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::markdown::{Block, Inline};
+        let root = fixture("preview");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        // A file that reads as nothing else has no preview.
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(root.join("src/main.rs"), None, window, cx)
+        });
+        wait_for(cx, "the file", &|cx| ws.read(cx).active_editor().is_some());
+        cx.simulate_keystrokes("secondary-shift-v");
+        assert_eq!(cx.read(|cx| ws.read(cx).panes.len()), 1);
+
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(root.join("README.md"), None, window, cx)
+        });
+        wait_for(cx, "the Markdown file", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|editor| editor.read(cx).path(cx) == Some(&root.join("README.md")))
+        });
+        cx.simulate_keystrokes("secondary-shift-v");
+        let viewer = cx.read(|cx| {
+            let ws = ws.read(cx);
+            assert_eq!(ws.panes.len(), 2);
+            ws.panes[1].shown_viewer().cloned().unwrap()
+        });
+        assert_eq!(cx.read(|cx| viewer.read(cx).title()), "Preview README.md");
+        // The source keeps the keys: it is still the file in front.
+        assert_eq!(active_path(&ws, cx), Some(root.join("README.md")));
+        let words = |words: &str| Block::Paragraph(vec![Inline::Text(words.into())]);
+        wait_for(cx, "the preview", &|cx| {
+            viewer.read(cx).blocks() == [words("A needle in the docs.")]
+        });
+        // Asked for again, it is the same preview.
+        cx.simulate_keystrokes("secondary-shift-v");
+        assert_eq!(cx.read(|cx| ws.read(cx).panes[1].viewers.len()), 1);
+
+        cx.simulate_keystrokes("ctrl-home");
+        cx.simulate_input("# Title");
+        cx.simulate_keystrokes("enter enter");
+        wait_for(cx, "the preview of what was typed", &|cx| {
+            viewer.read(cx).blocks()
+                == [
+                    Block::Heading {
+                        level: 1,
+                        text: vec![Inline::Text("Title".into())],
+                    },
+                    words("A needle in the docs."),
+                ]
+        });
+        // Nothing of it is on disk: the preview is of the document.
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "A needle in the docs.\n"
+        );
+
+        // A link to a file of the project opens the file.
+        viewer.update(cx, |viewer, cx| {
+            viewer.follow_link("src/util/strings.rs#L2", cx)
+        });
+        wait_for(cx, "the linked file", &|cx| {
+            ws.read(cx).active_editor().is_some_and(|editor| {
+                editor.read(cx).path(cx) == Some(&root.join("src/util/strings.rs"))
+            })
+        });
+
+        // With the last tab of its file gone, the preview goes, and the
+        // pane that held nothing else with it.
+        let readme = cx.read(|cx| {
+            let ws = ws.read(cx);
+            ws.all_editors()
+                .find(|editor| editor.read(cx).path(cx) == Some(&root.join("README.md")))
+                .cloned()
+                .unwrap()
+        });
+        ws.update_in(cx, |ws, window, cx| ws.remove_tab(&readme, window, cx));
+        cx.read(|cx| {
+            let ws = ws.read(cx);
+            assert_eq!(ws.panes.len(), 1);
+            assert!(ws.panes[0].viewers.is_empty());
+        });
+        assert_eq!(active_path(&ws, cx), Some(root.join("src/util/strings.rs")));
+    }
+
+    #[gpui::test]
+    async fn an_svg_is_drawn_from_what_is_typed(cx: &mut TestAppContext) {
+        let root = fixture("svg-preview");
+        let logo = root.join("logo.svg");
+        let source = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\"/>\n";
+        std::fs::write(&logo, source).unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(logo.clone(), None, window, cx)
+        });
+        // It opens as text: it is written by hand.
+        wait_for(cx, "the source", &|cx| {
+            ws.read(cx).active_editor().is_some()
+        });
+        assert_eq!(active_text(&ws, cx), source);
+        cx.simulate_keystrokes("secondary-shift-v");
+        let viewer = cx.read(|cx| ws.read(cx).panes[1].shown_viewer().cloned().unwrap());
+        wait_for(cx, "the drawing", &|cx| {
+            viewer.read(cx).picture_state() == Some((None, source.len(), None))
+        });
+        cx.simulate_keystrokes("ctrl-end");
+        cx.simulate_input("<!-- more -->");
+        wait_for(cx, "the drawing of what was typed", &|cx| {
+            viewer.read(cx).picture_state() == Some((None, source.len() + 13, None))
+        });
+    }
+    #[gpui::test]
+    async fn pictures_and_previews_come_back_with_the_tabs(cx: &mut TestAppContext) {
+        let root = fixture("session-viewers");
+        let saved = db::testing::dir("session-viewers-state").join("session.json");
+        let (shot, gone) = (root.join("shot.png"), root.join("gone.png"));
+        std::fs::write(&shot, png(8, 8)).unwrap();
+        std::fs::write(&gone, png(8, 8)).unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(root.join("README.md"), None, window, cx)
+        });
+        wait_for(cx, "the Markdown file", &|cx| {
+            ws.read(cx).active_editor().is_some()
+        });
+        cx.simulate_keystrokes("secondary-shift-v");
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(gone.clone(), None, window, cx);
+            ws.open_path(shot.clone(), None, window, cx);
+        });
+        let snapshot = cx.read(|cx| ws.read(cx).snapshot(cx));
+        std::fs::write(&saved, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        ws.update_in(cx, |ws, window, cx| {
+            ws.panes = vec![Pane::default()];
+            ws.active_pane = 0;
+            ws.restore_session(saved.clone(), window, cx);
+        });
+        wait_for(cx, "the tabs to be put back", &|cx| !ws.read(cx).restoring);
+        cx.read(|cx| {
+            let ws = ws.read(cx);
+            let titles = |pane: &Pane| -> Vec<String> {
+                let viewers = pane.viewers.iter();
+                viewers.map(|(viewer, _)| viewer.read(cx).title()).collect()
+            };
+            assert_eq!(ws.panes.len(), 2);
+            // The picture whose file went is not put back; the one that
+            // was in front is in front.
+            assert_eq!(titles(&ws.panes[0]), ["shot.png"]);
+            assert_eq!(ws.panes[0].shown, Some(0));
+            assert_eq!(ws.panes[0].tabs.len(), 1);
+            assert_eq!(titles(&ws.panes[1]), ["Preview README.md"]);
+            assert_eq!(ws.panes[1].shown, Some(0));
+        });
+        let preview = cx.read(|cx| ws.read(cx).panes[1].shown_viewer().cloned().unwrap());
+        wait_for(cx, "the preview to be made again", &|cx| {
+            !preview.read(cx).blocks().is_empty()
+        });
+
+        // What an older build kept has no pictures, and still opens.
+        let mut value = serde_json::to_value(&snapshot).unwrap();
+        value.as_object_mut().unwrap().remove("viewers");
+        std::fs::write(&saved, serde_json::to_vec(&value).unwrap()).unwrap();
+        ws.update_in(cx, |ws, window, cx| {
+            ws.panes = vec![Pane::default()];
+            ws.active_pane = 0;
+            ws.restore_session(saved.clone(), window, cx);
+        });
+        wait_for(cx, "the tabs alone", &|cx| !ws.read(cx).restoring);
+        cx.read(|cx| {
+            let ws = ws.read(cx);
+            assert_eq!(ws.panes.len(), 1);
+            assert_eq!(ws.panes[0].tabs.len(), 1);
+            assert!(ws.panes[0].viewers.is_empty());
+        });
     }
 }

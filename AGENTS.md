@@ -137,6 +137,15 @@ Never guess a signature.
   the system says it is gone: at the end of a run every window goes and
   none was closed. The way in (`way_in.rs`) is one list, drawn as the
   first window or over a project.
+- A pane holds tabs of files and, after them, viewers (`viewer.rs`):
+  pictures, and previews of Markdown and SVG. While a pane shows one,
+  `Pane::active_editor` is none: a command for "the file in front" must
+  not reach a file behind a picture. A preview follows its `Document`,
+  not the disk, and is made off the UI thread a moment after the last
+  key (`markdown::parse`, in-house: no crate was added for it). Its rows
+  are a `list`, and only the blocks that changed are measured again, so
+  it stays where it was scrolled to. The list cannot be asked for its
+  size while it lays out a row. A picture on a server is never fetched.
 - An error nobody is shown is said with `journal::error`, never
   `eprintln!`: it goes to `logs/solder.log` of the settings folder, which
   `journal.rs` rotates. A panic leaves a report there through the hook

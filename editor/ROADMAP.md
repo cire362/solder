@@ -32,7 +32,14 @@ something of its own unchecked or unmade adds it here.
       by any test
 - [ ] The question about a crash in a real window, and a panic on Windows
       and Linux. The hook is checked in a process of its own on the machine
-      that runs the tests, the question and the report's tab headlessly
+      that runs the tests, the question and the report's tab headlessly. A
+      real crash of a real run on macOS left its report and its line
+- [ ] A picture's tab, an SVG's preview, a click on a link of a preview and
+      a preview scrolled while its source is typed into, in a real window.
+      Seen live on macOS once: a page with headings, emphasis, lists, tasks,
+      a quote, a table, colored code, a picture of the project and one that
+      is elsewhere. How pictures are sized was changed after that and not
+      looked at again. Whether a GIF moves was not looked at
 - [ ] Failed-command explanations from a real local or hosted model.
       The editable draft, no request before Send, metadata, plain output
       and removing the attachment are checked with the chat fixture
@@ -128,6 +135,14 @@ something of its own unchecked or unmade adds it here.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] A preview does not scroll with its source, and the source does not
+      follow a click in it. HTML inside Markdown is shown as written.
+      Footnotes, definition lists, formulas and emoji by name are plain
+      text. A picture that is not a file of this machine is named, not
+      fetched: the editor asks the network for nothing by itself
+- [ ] A picture has no zoom and cannot be moved about; one larger than
+      64 MB is not shown; ICO, AVIF and HEIC open as text. The keys that go
+      to the next and the previous tab pass over pictures and previews
 - [ ] A second `solder` started while one runs is a second process, not a
       window of the first. Nothing is done when the Dock icon is clicked
       with no window, or a folder is dropped on it. There is no menu bar,
@@ -682,7 +697,7 @@ update. They come after phase 9, in this order unless one is needed sooner.
 ### Windows and the way in
 - [x] A first window with the projects opened last, open a folder, clone
 - [x] Several windows, a project in each, the set restored
-- [ ] Markdown shown next to its source; pictures shown as pictures
+- [x] Markdown shown next to its source; pictures shown as pictures
 - [x] A log of errors with rotation, and a report of a crash at the next start
 - [ ] The interface in Russian as well as English
 
