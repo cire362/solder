@@ -21,6 +21,13 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] Why two tests of the terminal fail on Linux in some runs and never
+      on macOS: an extension's terminal that is typed into as it starts,
+      and a program that fails at once. Two runs of three were red with
+      them. Since the terminal block a process starts off the thread that
+      draws, and a start that fails, or a process that ends before it is
+      looked at, may be what a test then waits for in vain. A wait that
+      gives up says what each terminal did; no red run has said it yet
 - [ ] The set of windows across a real quit with several of them open
       (the key, the Dock, a shutdown), on a second display and with one
       unplugged, fullscreen or maximized, and on Windows and Linux. Seen
