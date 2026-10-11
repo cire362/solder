@@ -1,0 +1,9 @@
+if [[ $_solder_zdotdir_set == 1 ]]; then
+    ZDOTDIR=$_solder_zdotdir
+else
+    unset ZDOTDIR
+fi
+[[ ! -r ${ZDOTDIR-$HOME}/.zprofile ]] || builtin source "${ZDOTDIR-$HOME}/.zprofile"
+_solder_zdotdir=${ZDOTDIR-}
+_solder_zdotdir_set=${+ZDOTDIR}
+ZDOTDIR=$_solder_dir

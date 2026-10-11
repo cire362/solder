@@ -310,6 +310,30 @@ proportion, saved in the selected `layout.json` as
 The ratio is fitted between 0.1 and 0.9. The pair itself is not restored after
 restart. Both panes move with the Terminal panel between docks.
 
+For interactive Bash and Zsh, the last failed command also offers **Help fix**
+while the shell stays open. The starting directory and status come from a shell
+hook. Startup files and existing prompt hooks are preserved without changing
+them on disk. Bash uses history: disabled, ignored, duplicate or stale history
+is skipped rather than attributing an error to an older command. Commands are
+limited to 8 KB, the working-directory name to 4 KB and the report to 16 KB.
+Other shells and Windows have no interactive-command hook; explicit programs
+can still offer their process failures. Hooks installed later can replace ours.
+Login Bash uses a temporary HOME for global `/etc/profile`, restoring it before
+user profiles. On macOS, hooked shells keep login startup but bypass
+`/usr/bin/login` accounting and messages. Missing SHELL leaves the normal shell
+without integration. Shell startup and hook files are prepared in the background.
+
+A program that exits with a nonzero code keeps its tab and offers **Help fix**. It opens a chat draft
+with the program and its arguments, working directory, exit code and plain
+output. **Inspect** shows the attachment, **Remove** drops it; edit the question
+and press **Send** when it is ready. Attaching sends no model request, and file
+and project context are initially off for this draft. Existing chat history is
+still included. Output is the recent tail, at most 200 rows and 8 KB, and may
+contain adjacent commands. Escape sequences and hidden terminal cells are
+excluded, but ordinary printed text can still contain sensitive information.
+Environment variables are not attached. A signal or startup error has no
+known exit code; it offers no draft. A suggested fix is not run automatically.
+
 ## Tests
 
 **Show Tests** in the command palette opens the Tests panel, which can move

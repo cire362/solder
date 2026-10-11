@@ -21,9 +21,14 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
-- [ ] Terminal search and split panes in a real window and on Windows.
-      Retained history, soft wraps, match navigation, keyboard routing, two
-      PTYs, switching panes and resizing are checked headlessly
+- [ ] Failed-command explanations from a real local or hosted model.
+      The editable draft, no request before Send, metadata, plain output
+      and removing the attachment are checked with the chat fixture
+- [ ] Terminal search, split panes and failure-draft controls in a real
+      window and on Windows. Retained history, soft wraps, match navigation,
+      keyboard routing, two PTYs, switching panes and resizing are checked
+      headlessly. A macOS window was opened, but its automation did not
+      reliably apply the feature controls, so live input remains unverified
 - [ ] A real paused Python session in a window, other Python versions and
       Windows interpreter/process behavior. CI of PR #51 passed with the
       approved debugpy 1.8.22 wheel in Python 3.12, checking conditions,
@@ -108,6 +113,22 @@ something of its own unchecked or unmade adds it here.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] Interactive failure reports are for Bash and Zsh only. Bash skips
+      disabled, ignored, duplicate or stale history; rewritten history or
+      later prompt hooks can defeat attribution. Commands above 8 KB,
+      working-directory names above 4 KB and reports above 16 KB are ignored.
+      Global startup overrides can bypass integration. Login Bash exposes
+      temporary HOME to `/etc/profile`; hooked macOS shells bypass
+      `/usr/bin/login` accounting/messages. Missing SHELL opts out. Other
+      shells and Windows offer only explicit programs' process failures
+      Private temporary hook files are removed asynchronously; forcibly
+      ending the editor can leave them behind
+- [ ] Terminal failure context is the last 200 rows and at most 8 KB of
+      recent output, so it can contain adjacent commands. It does not
+      include environment variables; text a program printed is still
+      included. Non-UTF-8 directory names are displayed with replacement
+      characters in model context. Signal termination and startup errors have no exit code
+      and do not offer a model draft. No fix is executed automatically
 - [ ] Terminal search is literal and case-sensitive, across soft wraps but
       not hard line breaks. It scans at most 8 MB and keeps 20,000 matches;
       logical lines have the same 129-row/32-KB limit as links. Only the
@@ -628,7 +649,7 @@ update. They come after phase 9, in this order unless one is needed sooner.
 - [x] `file:line:column` in the output opens in the editor
       (Ctrl/Cmd-click, relative to the terminal's starting directory)
 - [x] Search in what scrolled by; the dock split in two
-- [ ] A command that failed offered to the model to fix
+- [x] A command that failed offered to the model to fix (an editable chat draft)
 
 ### Windows and the way in
 - [ ] A first window with the projects opened last, open a folder, clone

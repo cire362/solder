@@ -1886,19 +1886,17 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<Terminal>> {
-        let started = match Terminal::start(command) {
-            Ok(t) => t,
-            Err(err) => {
-                eprintln!("could not start a terminal: {err}");
-                return None;
-            }
-        };
-        let terminal = cx.new(|cx| Terminal::new(started, window, cx));
+        let terminal = cx.new(|cx| Terminal::new(command, window, cx));
         let subscription = cx.subscribe_in(
             &terminal,
             window,
             |this, terminal, event, window, cx| match event {
                 TerminalEvent::TitleChanged => cx.notify(),
+                TerminalEvent::Help(failure) => {
+                    this.chat
+                        .update(cx, |chat, cx| chat.attach_terminal(failure.clone(), cx));
+                    this.show_right(false, window, cx);
+                }
                 TerminalEvent::Focused => {
                     if let Some(ix) = this.terminals.iter().position(|(t, _)| t == terminal) {
                         this.active_terminal = ix;
@@ -1916,7 +1914,9 @@ impl Workspace {
                 ),
                 // Services keep their tab so a crash's output stays readable,
                 // and so do the tasks of extensions.
-                TerminalEvent::Exited if terminal.read(cx).keep_on_exit => {
+                TerminalEvent::Exited
+                    if terminal.read(cx).keep_on_exit || terminal.read(cx).has_failure() =>
+                {
                     this.extension_terminal_gone(terminal, cx);
                     cx.notify()
                 }
@@ -8217,6 +8217,198 @@ mod tests {
         assert_eq!(cx.read(|cx| ws.read(cx).terminals.len()), 2);
         assert!(!cx.read(|cx| first.read(cx).exited));
         assert!(!cx.read(|cx| second.read(cx).exited));
+    }
+
+    #[gpui::test]
+    fn terminal_failure_is_an_editable_draft_until_sent(cx: &mut TestAppContext) {
+        let (api, seen) = fake_api_reply(Some("Use a valid option."), Duration::ZERO, true);
+        let urls = crate::ai_providers::Urls {
+            lm_studio: api,
+            ..down_urls()
+        };
+        let (root, store, ws, cx) = ai_setup(cx, "terminal-failure", urls);
+        let terminal = ws
+            .update_in(cx, |w, window, cx| {
+                w.spawn_terminal(
+                    TerminalCommand {
+                        program: Some("/bin/sh".into()),
+                        args: vec![
+                            "-c".into(),
+                            "printf '\\033[31mfailed-output\\033[0m\\n'; exit 7".into(),
+                        ],
+                        cwd: root.clone(),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        wait_for(cx, "the failed command", &|cx| {
+            terminal.read(cx).has_failure()
+                && terminal.read(cx).text_position("failed-output").is_some()
+        });
+        // Failed processes keep their output even without keep_on_exit.
+        assert_eq!(cx.read(|cx| ws.read(cx).terminals.len()), 1);
+        click(cx, "terminal-help");
+        let chat = cx.read(|cx| ws.read(cx).chat.clone());
+        wait_for(cx, "the failure draft", &|cx| {
+            chat.read(cx).terminal_draft().is_some()
+        });
+        wait_for(cx, "the chat model", &|cx| {
+            store
+                .read(cx)
+                .provider("lmstudio")
+                .is_some_and(|p| p.models() == ["model-a"])
+        });
+        store.update(cx, |s, cx| {
+            s.choose(
+                ai::Role::Chat,
+                crate::ai_providers::ModelRef {
+                    provider: "lmstudio".into(),
+                    model: "model-a".into(),
+                },
+                cx,
+            )
+        });
+        assert!(seen.lock().unwrap().iter().all(|r| !r.starts_with("POST ")));
+        assert!(cx.read(|cx| chat.read(cx).messages.is_empty()));
+        cx.read(|cx| {
+            let draft = chat.read(cx).terminal_draft().unwrap();
+            assert_eq!(draft.status, 7);
+            assert_eq!(draft.cwd, root);
+            assert!(draft.output.contains("failed-output") && !draft.output.contains('\x1b'));
+            assert!(!chat.read(cx).include_file && !chat.read(cx).include_project);
+        });
+        let input = cx.read(|cx| chat.read(cx).input());
+        input.update(cx, |input, cx| {
+            input.set_text("Explain the bad option, please.", false, cx)
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(chat_answer(&ws, cx), "Use a valid option.");
+        let requests = seen.lock().unwrap();
+        let sent = requests
+            .iter()
+            .filter(|r| r.starts_with("POST "))
+            .collect::<Vec<_>>();
+        assert_eq!(sent.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_str(sent[0].split_once('\n').unwrap().1).unwrap();
+        let prompt = body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(prompt.ends_with("Explain the bad option, please."));
+        let json = prompt.lines().nth(1).unwrap();
+        let data: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(data["status"], 7);
+        assert_eq!(data["command"]["program"], "/bin/sh");
+        assert!(data["output"].as_str().unwrap().contains("failed-output"));
+        assert!(data.get("env").is_none());
+        drop(requests);
+        assert!(cx.read(|cx| chat.read(cx).terminal_draft().is_none()));
+        click(cx, "terminal-help");
+        wait_for(cx, "another draft", &|cx| {
+            chat.read(cx).terminal_draft().is_some()
+        });
+        click(cx, "chat-terminal-remove");
+        assert!(cx.read(|cx| chat.read(cx).terminal_draft().is_none()));
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.starts_with("POST "))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    fn terminal_interactive_failure_names_the_command_and_its_starting_directory(
+        cx: &mut TestAppContext,
+    ) {
+        let root = fixture("terminal-interactive-failure");
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join(".bashrc"), "PS1='hook$ '\nPROMPT_COMMAND=':'\n").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let terminal = ws
+            .update_in(cx, |w, window, cx| {
+                w.spawn_terminal(
+                    TerminalCommand {
+                        program: Some("/bin/bash".into()),
+                        cwd: root.clone(),
+                        env: [("HOME".into(), root.to_string_lossy().into_owned())]
+                            .into_iter()
+                            .collect(),
+                        title: Some("interactive test".into()),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        wait_for(cx, "the shell prompt", &|cx| {
+            terminal
+                .read(cx)
+                .visible_text()
+                .iter()
+                .any(|line| line.contains("hook$"))
+        });
+        cx.simulate_input("cd sub; printf 'directory-ready\\n'");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the changed shell directory", &|cx| {
+            terminal
+                .read(cx)
+                .visible_text()
+                .iter()
+                .any(|line| line == "directory-ready")
+        });
+        cx.simulate_input("printf 'interactive-failure\\n'; false");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the failed command inside a running shell", &|cx| {
+            terminal.read(cx).has_failure()
+        });
+        assert!(!cx.read(|cx| terminal.read(cx).exited));
+        assert_eq!(cx.read(|cx| terminal.read(cx).title()), "interactive test");
+        click(cx, "terminal-help");
+        let chat = cx.read(|cx| ws.read(cx).chat.clone());
+        wait_for(cx, "the interactive failure draft", &|cx| {
+            chat.read(cx).terminal_draft().is_some()
+        });
+        cx.read(|cx| {
+            let failure = chat.read(cx).terminal_draft().unwrap();
+            assert_eq!(failure.cwd, root.join("sub")); assert_eq!(failure.status, 1);
+            assert!(matches!(&failure.command, crate::terminal::failure::Command::Shell {text} if text == "printf 'interactive-failure\\n'; false"));
+            assert!(failure.output.contains("interactive-failure"));
+            assert!(chat.read(cx).messages.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn a_terminal_startup_error_stays_readable_and_can_be_closed(cx: &mut TestAppContext) {
+        let root = fixture("terminal-startup");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let terminal = ws
+            .update_in(cx, |w, window, cx| {
+                w.spawn_terminal(
+                    TerminalCommand {
+                        program: Some(root.join("absent-program").to_string_lossy().into_owned()),
+                        cwd: root,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        wait_for(cx, "the startup error", &|cx| terminal.read(cx).exited);
+        assert!(cx.read(|cx| terminal.read(cx).keep_on_exit));
+        assert!(!cx.read(|cx| terminal.read(cx).has_failure()));
+        ws.update_in(cx, |w, window, cx| w.remove_terminal(&terminal, window, cx));
+        assert!(cx.read(|cx| ws.read(cx).terminals.is_empty()));
     }
 
     #[gpui::test]

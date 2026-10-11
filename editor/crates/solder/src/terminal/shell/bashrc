@@ -1,0 +1,16 @@
+# Login startup uses a temporary HOME to select this wrapper. Restore it before
+# any user file, including a profile that itself sources .bashrc.
+if [[ -n ${SOLDER_SHELL_HOME+x} ]]; then
+    HOME=$SOLDER_SHELL_HOME
+    export HOME
+    if [[ -r $HOME/.bash_profile ]]; then
+        builtin source "$HOME/.bash_profile"
+    elif [[ -r $HOME/.bash_login ]]; then
+        builtin source "$HOME/.bash_login"
+    elif [[ -r $HOME/.profile ]]; then
+        builtin source "$HOME/.profile"
+    fi
+elif [[ -r $HOME/.bashrc ]]; then
+    builtin source "$HOME/.bashrc"
+fi
+builtin source "$SOLDER_SHELL_DIR/bash.sh"

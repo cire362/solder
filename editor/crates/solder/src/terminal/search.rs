@@ -87,6 +87,11 @@ impl Search {
         }
     }
 
+    pub fn set_term(&mut self, term: Arc<FairMutex<Term<Listener>>>, cx: &mut Context<Self>) {
+        self.term = term;
+        self.refresh(false, cx);
+    }
+
     pub fn deploy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = true;
         window.focus(&self.query.focus_handle(cx));
