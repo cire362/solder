@@ -63,7 +63,9 @@ impl Recovery {
                             .map_err(|e| e.to_string())
                             .and_then(|bytes| crate::ipynb::write_atomic(&file, &bytes));
                         if let Err(error) = written {
-                            eprintln!("could not keep unsaved text: {error}");
+                            crate::journal::error(format_args!(
+                                "could not keep unsaved text: {error}"
+                            ));
                         }
                     }
                     Op::Forget(file) => {

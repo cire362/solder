@@ -499,9 +499,176 @@ pub fn pull_request_url(remote: &str, branch: &str) -> Option<String> {
     }
 }
 
+/// Whether what was typed is the address of a repository and not the
+/// name of a project: something `git clone` would be given.
+pub fn is_address(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() || text.contains(char::is_whitespace) {
+        return false;
+    }
+    // `git@host:owner/name`, the short way to write an SSH address.
+    let short = text.split_once(':').is_some_and(|(host, path)| {
+        host.contains('@') && !host.contains('/') && !path.is_empty() && !path.starts_with("//")
+    });
+    text.contains("://") || short || text.ends_with(".git")
+}
+
+/// The folder a clone of `address` gets: `solder` for
+/// `https://example.com/cire362/solder.git`.
+pub fn clone_name(address: &str) -> Option<String> {
+    let address = address.trim().trim_end_matches('/');
+    let address = address.strip_suffix(".git").unwrap_or(address);
+    let name = address.rsplit(['/', ':', '\\']).next()?;
+    (!name.is_empty() && name != "." && name != ".." && !name.contains('@'))
+        .then(|| name.to_string())
+}
+
+/// Clones `address` into `into`, saying what git says of how far it is.
+/// Stopped through `stop`, it ends git and leaves what git leaves.
+pub fn clone(
+    address: &str,
+    into: &Path,
+    stop: &std::sync::atomic::AtomicBool,
+    mut said: impl FnMut(String),
+) -> Result<()> {
+    use std::io::Read;
+    use std::sync::atomic::Ordering;
+    let mut child = Command::new("git")
+        // Never wait for a name or a password nobody can type.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["clone", "--progress", "--"])
+        .arg(address)
+        .arg(into)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| GitError(format!("git: {e}")))?;
+    // Progress is one line written over and over: a part ends at either
+    // kind of line end.
+    let (send, lines) = std::sync::mpsc::channel::<String>();
+    let reader = child.stderr.take().map(|mut errors| {
+        std::thread::spawn(move || {
+            let (mut chunk, mut line) = ([0u8; 4096], Vec::new());
+            while let Ok(read @ 1..) = errors.read(&mut chunk) {
+                for byte in &chunk[..read] {
+                    if !matches!(byte, b'\r' | b'\n') {
+                        line.push(*byte);
+                        continue;
+                    }
+                    let text = String::from_utf8_lossy(&line).trim().to_string();
+                    line.clear();
+                    if !text.is_empty() && send.send(text).is_err() {
+                        return;
+                    }
+                }
+            }
+            let text = String::from_utf8_lossy(&line).trim().to_string();
+            if !text.is_empty() {
+                let _ = send.send(text);
+            }
+        })
+    });
+    let mut reason = None;
+    let mut hear = |line: String, said: &mut dyn FnMut(String)| {
+        let cause = line
+            .strip_prefix("fatal: ")
+            .or_else(|| line.strip_prefix("error: "));
+        match cause {
+            // The first is the cause; what follows is what came of it.
+            Some(cause) => drop(reason.get_or_insert_with(|| cause.to_string())),
+            None => said(line),
+        }
+    };
+    let status = loop {
+        for line in lines.try_iter() {
+            hear(line, &mut said);
+        }
+        if stop.load(Ordering::Relaxed) {
+            // Asked to end, git takes away what it had made so far.
+            #[cfg(unix)]
+            let _ = Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            #[cfg(not(unix))]
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(GitError("Stopped".into()));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(30)),
+            Err(e) => return Err(GitError(e.to_string())),
+        }
+    };
+    if let Some(reader) = reader {
+        let _ = reader.join();
+    }
+    for line in lines.try_iter() {
+        hear(line, &mut said);
+    }
+    match status.success() {
+        true => Ok(()),
+        false => Err(GitError(reason.unwrap_or_else(|| "git failed".into()))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_address_is_told_from_a_name() {
+        for address in [
+            "https://example.com/cire362/solder.git",
+            "https://example.com/cire362/solder",
+            "git@example.com:cire362/solder.git",
+            "ssh://git@example.com/cire362/solder",
+            "file:///tmp/origin",
+            "../origin.git",
+        ] {
+            assert!(is_address(address), "{address}");
+        }
+        for name in ["solder", "my project", "", "src/main.rs", "a:b", "C:/code"] {
+            assert!(!is_address(name), "{name}");
+        }
+        let name = |address| clone_name(address).unwrap();
+        assert_eq!(name("https://example.com/cire362/solder.git"), "solder");
+        assert_eq!(name("https://example.com/cire362/solder/"), "solder");
+        assert_eq!(name("git@example.com:solder.git"), "solder");
+        assert_eq!(name("file:///tmp/origin"), "origin");
+        assert_eq!(clone_name("https://example.com/.."), None);
+        assert_eq!(clone_name("git@example.com"), None);
+    }
+
+    #[test]
+    fn a_clone_brings_the_files_and_says_why_it_could_not() {
+        let origin = diff_repo("clone-origin");
+        std::fs::write(origin.workdir.join("README.md"), "hello\n").unwrap();
+        origin.run(&["add", "."]).unwrap();
+        origin.run(&["commit", "-q", "-m", "first"]).unwrap();
+        let home = db::testing::dir("clone-into");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let address = format!("file://{}", origin.workdir.display());
+        clone(&address, &home.join("copy"), &stop, |_| {}).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.join("copy/README.md")).unwrap(),
+            "hello\n"
+        );
+        // The same place again: git says why not, and that is the error.
+        let again = clone(&address, &home.join("copy"), &stop, |_| {}).unwrap_err();
+        assert!(again.0.contains("already exists"), "{}", again.0);
+        let missing = format!("file://{}", home.join("nothing").display());
+        let none = clone(&missing, &home.join("other"), &stop, |_| {}).unwrap_err();
+        assert!(none.0.contains("nothing"), "{}", none.0);
+        assert!(!home.join("other").exists());
+        // Asked to stop before it began, it makes nothing.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let stopped = clone(&address, &home.join("third"), &stop, |_| {}).unwrap_err();
+        assert_eq!(stopped.0, "Stopped");
+    }
 
     #[test]
     fn parses_porcelain_v2() {

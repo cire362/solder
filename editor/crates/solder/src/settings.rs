@@ -68,6 +68,8 @@ pub struct Settings {
     pub ui_font_size: f32,
     /// How tall the rows of lists are: `compact`, `default`, `comfortable`.
     pub ui_density: Density,
+    /// What the interface reads in: `en` or `ru`.
+    pub language: crate::lang::Language,
     /// Default, VS Code, JetBrains, or a file in `keymaps`.
     pub key_layout: String,
     /// Indent width for files whose indentation cannot be detected.
@@ -297,6 +299,7 @@ impl Default for Settings {
             ui_font_family: UI_FONT.to_string(),
             ui_font_size: UI_FONT_PX,
             ui_density: Density::Standard,
+            language: crate::lang::Language::English,
             key_layout: crate::key_layout::DEFAULT.into(),
             indent_size: 4,
             show_performance_hud: true,
@@ -646,6 +649,7 @@ pub fn reload_from(dir: &Path, cx: &mut App) {
     errors.extend(settings.theme_overrides.mistakes());
     cx.global_mut::<crate::perf::Perf>().hud_visible = settings.show_performance_hud;
     let key_layout = settings.key_layout.clone();
+    crate::lang::set(settings.language);
     cx.set_global(settings);
 
     // An explicit choice wins over an older import. Personal bindings
@@ -662,7 +666,7 @@ pub fn reload_from(dir: &Path, cx: &mut App) {
     errors.extend(keymap_errors);
     errors.extend(crate::layout::reload_from(dir, cx));
     for e in &errors {
-        eprintln!("{e}");
+        crate::journal::error(format_args!("{e}"));
     }
     cx.set_global(ConfigErrors(errors));
     cx.refresh_windows();

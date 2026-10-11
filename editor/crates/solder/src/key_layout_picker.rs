@@ -1,5 +1,6 @@
 //! Choose or copy a set of keys. Personal overrides stay in keymap.json.
 
+use crate::lang::{t, tf};
 use gpui::{
     Action, AnyElement, Context, DismissEvent, SharedString, Task, Window, div, prelude::*,
 };
@@ -90,9 +91,9 @@ impl KeyLayoutPicker {
 impl PickerDelegate for KeyLayoutPicker {
     fn placeholder(&self) -> SharedString {
         if self.save {
-            "Name for this key layout"
+            t("Name for this key layout")
         } else {
-            "Switch key layout"
+            t("Switch key layout")
         }
         .into()
     }
@@ -161,7 +162,7 @@ impl PickerDelegate for KeyLayoutPicker {
         let label = if self.save {
             div()
                 .debug_selector(|| "key-layout-save".into())
-                .child(format!("Save as {}", self.query))
+                .child(tf("Save as {}", &[&self.query]))
         } else {
             let (index, positions) = &self.matches[ix];
             let name = &self.names[*index];
@@ -169,7 +170,7 @@ impl PickerDelegate for KeyLayoutPicker {
             div()
                 .debug_selector(|| format!("key-layout-choice-{ix}"))
                 .child(highlighted_text(name, positions, theme.fg, theme.accent))
-                .when(name == current, |d| d.child(" (in use)"))
+                .when(name == current, |d| d.child(t(" (in use)")))
         };
         label
             .text_size(UI_FONT_SIZE)
@@ -178,15 +179,15 @@ impl PickerDelegate for KeyLayoutPicker {
     }
     fn empty_text(&self) -> SharedString {
         if !self.loaded {
-            "Loading key layouts"
+            t("Loading key layouts")
         } else if self.save && self.query.is_empty() {
-            "Type a name"
+            t("Type a name")
         } else if self.save && self.names.contains(&self.query) {
-            "A key layout with this name exists"
+            t("A key layout with this name exists")
         } else if self.save {
-            "Use letters, numbers, spaces, - or _"
+            t("Use letters, numbers, spaces, - or _")
         } else {
-            "No matches"
+            t("No matches")
         }
         .into()
     }

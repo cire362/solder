@@ -1,6 +1,7 @@
 //! Search across the project (`cmd-shift-f`), using ripgrep's own crates:
 //! parallel walk honoring `.gitignore`, SIMD literal search, binary skipping.
 
+use crate::lang::t;
 use std::{
     collections::HashSet,
     ops::Range,
@@ -97,7 +98,7 @@ pub struct ProjectSearch {
 
 impl ProjectSearch {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let query = cx.new(|cx| Editor::single_line("Search files", cx));
+        let query = cx.new(|cx| Editor::single_line(t("Search files"), cx));
         // Search as you type, after a short pause.
         let subscription = cx.subscribe_in(&query, window, |this, _, e, _, cx| {
             if let EditorEvent::Edited = e {
@@ -248,13 +249,13 @@ impl ProjectSearch {
             return Some(err.clone());
         }
         if self.searching {
-            return Some("Searching...".into());
+            return Some(t("Searching...").into());
         }
         if self.searched_query.trim().is_empty() {
             return None;
         }
         Some(match (self.total, self.results.len()) {
-            (0, _) => "No results".into(),
+            (0, _) => t("No results").into(),
             (m, f) => format!(
                 "{m}{} {} in {f} {}",
                 if self.limit_hit { "+" } else { "" },
@@ -398,7 +399,7 @@ impl Render for ProjectSearch {
                             .child(ui::toggle(
                                 "ps-case",
                                 "Aa",
-                                "Match case",
+                                t("Match case"),
                                 options.case_sensitive,
                                 &theme,
                                 toggle(|o| o.case_sensitive = !o.case_sensitive),
@@ -406,7 +407,7 @@ impl Render for ProjectSearch {
                             .child(ui::toggle(
                                 "ps-word",
                                 "ab",
-                                "Whole word",
+                                t("Whole word"),
                                 options.whole_word,
                                 &theme,
                                 toggle(|o| o.whole_word = !o.whole_word),
@@ -414,7 +415,7 @@ impl Render for ProjectSearch {
                             .child(ui::toggle(
                                 "ps-regex",
                                 ".*",
-                                "Regular expression",
+                                t("Regular expression"),
                                 options.regex,
                                 &theme,
                                 toggle(|o| o.regex = !o.regex),

@@ -1,3 +1,4 @@
+use crate::lang::{t, tf};
 use std::{
     any::TypeId,
     collections::{HashMap, HashSet, VecDeque},
@@ -48,6 +49,7 @@ use crate::{
     settings::{self, Settings},
     terminal::{Terminal, TerminalCommand, TerminalEvent},
     theme::{ActiveTheme, UI_FONT_SIZE},
+    viewer::Viewer,
 };
 
 actions!(
@@ -72,6 +74,10 @@ actions!(
         NewFile,
         SaveAs,
         OpenFolder,
+        OpenProject,
+        NewWindow,
+        OpenPreview,
+        ShowErrorLog,
         OpenSettings,
         OpenKeymap,
         OpenLayout,
@@ -153,6 +159,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-n", NewFile, None),
         KeyBinding::new("secondary-alt-s", SaveAs, None),
         KeyBinding::new("secondary-o", OpenFolder, None),
+        KeyBinding::new("secondary-alt-o", OpenProject, None),
+        KeyBinding::new("secondary-shift-n", NewWindow, None),
+        KeyBinding::new("secondary-shift-v", OpenPreview, None),
         KeyBinding::new("secondary-,", OpenSettings, None),
         KeyBinding::new("secondary-\\", SplitRight, None),
         KeyBinding::new("secondary-k secondary-right", FocusNextPane, None),
@@ -188,7 +197,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-g", FindNext, None),
         KeyBinding::new("cmd-shift-g", FindPrev, None),
     ]);
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &Quit, cx| {
+        // Before the windows start to close: they are not being closed.
+        crate::windows::quitting(cx);
+        cx.quit()
+    });
 }
 
 const RECENT_LIMIT: usize = 20;
@@ -244,13 +257,29 @@ mod recovery;
 struct Pane {
     tabs: Vec<Tab>,
     active: Option<usize>,
+    /// The pictures and previews open here, each a tab after the files.
+    viewers: Vec<(Entity<Viewer>, Subscription)>,
+    /// The one of them shown in place of the pane's file, if one is.
+    shown: Option<usize>,
 }
 
 impl Pane {
+    /// The file this pane shows. None while it shows a picture or a
+    /// preview: what a command does to "the file in front" is not done to
+    /// a file behind one.
     fn active_editor(&self) -> Option<&Entity<Editor>> {
+        if self.shown.is_some() {
+            return None;
+        }
         self.active
             .and_then(|i| self.tabs.get(i))
             .map(|t| &t.editor)
+    }
+
+    fn shown_viewer(&self) -> Option<&Entity<Viewer>> {
+        self.shown
+            .and_then(|ix| self.viewers.get(ix))
+            .map(|(viewer, _)| viewer)
     }
 }
 
@@ -1131,6 +1160,10 @@ impl Workspace {
             self.open_notebook(path, String::new(), "jupyter-notebook".into(), window, cx);
             return;
         }
+        if crate::viewer::is_picture(&path) {
+            self.open_picture(path, window, cx);
+            return;
+        }
         self.close_file_diff(window, cx);
         let pane = &self.panes[self.active_pane];
         if let Some(ix) = pane
@@ -1163,7 +1196,7 @@ impl Workspace {
             let loaded = match loaded {
                 Ok(loaded) => loaded,
                 Err(err) => {
-                    eprintln!("could not open {}: {err}", path.display());
+                    crate::journal::error(format_args!("could not open {}: {err}", path.display()));
                     return;
                 }
             };
@@ -1192,6 +1225,7 @@ impl Workspace {
         self.close_file_diff(window, cx);
         self.active_pane = pane;
         self.panes[pane].active = Some(ix);
+        self.panes[pane].shown = None;
         if let Some(path) = editor.read(cx).path(cx).map(Path::to_path_buf) {
             self.project_panel
                 .update(cx, |p, cx| p.select_path(&path, cx));
@@ -1222,6 +1256,10 @@ impl Workspace {
             self.close_file_diff(window, cx);
             return;
         }
+        if let Some(viewer) = self.panes[self.active_pane].shown_viewer().cloned() {
+            self.close_viewer(&viewer, window, cx);
+            return;
+        }
         if let Some(editor) = self.active_editor().cloned() {
             // A pinned tab is let go first, by its pin.
             let pinned = self
@@ -1245,9 +1283,9 @@ impl Workspace {
         let name = document.read(cx).title();
         let answer = window.prompt(
             PromptLevel::Warning,
-            &format!("Save changes to {name}?"),
-            Some("Your changes will be lost if you don't save them."),
-            &["Save", "Don't Save", "Cancel"],
+            &tf("Save changes to {}?", &[&name]),
+            Some(t("Your changes will be lost if you don't save them.")),
+            &[t("Save"), t("Don't Save"), t("Cancel")],
             cx,
         );
         let editor = editor.clone();
@@ -1289,15 +1327,47 @@ impl Workspace {
             let over = self.closed_tabs.len().saturating_sub(CLOSED_TABS);
             self.closed_tabs.drain(..over);
         }
-        if self.panes[p].tabs.is_empty() && self.panes.len() > 1 {
-            // An empty split closes; focus moves to its neighbour.
-            self.panes.remove(p);
-            let next = p.min(self.panes.len() - 1);
-            let tab = self.panes[next].active.unwrap_or(0);
-            self.activate(next, tab, window, cx);
+        // A preview has nothing to follow once its file has no tab.
+        let document = closed.editor.read(cx).document().clone();
+        if self.view_count(document.entity_id(), cx) == 0 {
+            for pane in &mut self.panes {
+                let shown = pane.shown_viewer().cloned();
+                pane.viewers
+                    .retain(|(viewer, _)| !viewer.read(cx).is_preview_of(&document));
+                pane.shown = shown
+                    .and_then(|shown| pane.viewers.iter().position(|(viewer, _)| *viewer == shown));
+            }
+        }
+        // Panes left with nothing close: the one the tab was in, and one
+        // that held only such a preview.
+        let mut here = Some(p);
+        for q in (0..self.panes.len()).rev() {
+            if self.drop_empty_pane(q).is_none() {
+                here = match here {
+                    Some(here) if here == q => None,
+                    Some(here) if here > q => Some(here - 1),
+                    here => here,
+                };
+            }
+        }
+        let Some(p) = here else {
+            let next = self.active_pane;
+            self.front_of_pane(next, window, cx);
+            return;
+        };
+        let pane = &mut self.panes[p];
+        if pane.shown.is_some() {
+            // The picture in front stays in front: only which file is
+            // behind it changed.
+            pane.active = match pane.active {
+                _ if pane.tabs.is_empty() => None,
+                Some(a) if a > ix => Some(a - 1),
+                Some(a) => Some(a.min(pane.tabs.len() - 1)),
+                None => None,
+            };
+            cx.notify();
             return;
         }
-        let pane = &mut self.panes[p];
         if pane.tabs.is_empty() {
             pane.active = None;
             self.search_bar
@@ -1429,6 +1499,7 @@ impl Workspace {
             .cloned()
             .collect();
         if dirty.is_empty() && books.is_empty() {
+            crate::windows::closed(window.window_handle().window_id(), cx);
             if self.session_writer.is_some() {
                 let saved = self.keep_session(cx);
                 cx.spawn_in(window, async move |_, cx| {
@@ -1441,15 +1512,15 @@ impl Workspace {
             return true;
         }
         let message = match (dirty.as_slice(), books.as_slice()) {
-            ([one], []) => format!("Save changes to {}?", one.read(cx).title()),
-            ([], [one]) => format!("Save changes to {}?", one.read(cx).title()),
-            _ => format!("Save changes to {} files?", dirty.len() + books.len()),
+            ([one], []) => tf("Save changes to {}?", &[&one.read(cx).title()]),
+            ([], [one]) => tf("Save changes to {}?", &[&one.read(cx).title()]),
+            _ => tf("Save changes to {} files?", &[&(dirty.len() + books.len())]),
         };
         let answer = window.prompt(
             PromptLevel::Warning,
             &message,
-            Some("Your changes will be lost if you don't save them."),
-            &["Save All", "Don't Save", "Cancel"],
+            Some(t("Your changes will be lost if you don't save them.")),
+            &[t("Save All"), t("Don't Save"), t("Cancel")],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
@@ -1497,6 +1568,7 @@ impl Workspace {
                 this.update_in(cx, |this, window, cx| {
                     // Nothing left to ask about; close for real.
                     this.panes = vec![Pane::default()];
+                    crate::windows::closed(window.window_handle().window_id(), cx);
                     window.remove_window();
                     cx.notify();
                 })
@@ -1603,7 +1675,7 @@ impl Workspace {
             view.update(cx, |view, cx| {
                 view.set_result(
                     Err(crate::git::GitError(
-                        "Open a file inside a Git repository.".into(),
+                        t("Open a file inside a Git repository.").into(),
                     )),
                     cx,
                 )
@@ -1616,7 +1688,7 @@ impl Workspace {
             view.update(cx, |view, cx| {
                 view.set_result(
                     Err(crate::git::GitError(
-                        "This file is outside the Git repository.".into(),
+                        t("This file is outside the Git repository.").into(),
                     )),
                     cx,
                 )
@@ -1806,7 +1878,8 @@ impl Workspace {
                 None => {
                     this.update(cx, |this, cx| {
                         this.git.update(cx, |g, cx| {
-                            g.last_error = Some("No GitHub or GitLab remote named origin".into());
+                            g.last_error =
+                                Some(t("No GitHub or GitLab remote named origin").into());
                             cx.notify();
                         })
                     })
@@ -1846,8 +1919,8 @@ impl Workspace {
                     cx.new(|cx| Editor::for_document(doc, cx))
                 };
                 // Ours to the left of the current pane, theirs to the right.
-                let ours_editor = side(format!("{name} (ours)"), &ours, cx);
-                let theirs_editor = side(format!("{name} (theirs)"), &theirs, cx);
+                let ours_editor = side(tf("{} (ours)", &[&name]), &ours, cx);
+                let theirs_editor = side(tf("{} (theirs)", &[&name]), &theirs, cx);
                 let at = this.active_pane;
                 this.panes.insert(at, Pane::default());
                 this.active_pane = at;
@@ -2360,7 +2433,7 @@ impl Workspace {
             if layout.place(panel).is_some() {
                 items.push(item(
                     "menu-hide".into(),
-                    format!("Hide {}", panel.label()),
+                    tf("Hide {}", &[&panel.label()]),
                     cx,
                     Box::new(move |this, window, cx| this.hide_panel(panel, window, cx)),
                 ));
@@ -2369,7 +2442,7 @@ impl Workspace {
                 if layout.place(panel) != Some(to) {
                     items.push(item(
                         format!("menu-move-{}", to.id()),
-                        format!("Move to {} dock", to.id()),
+                        tf("Move to {} dock", &[&to.id()]),
                         cx,
                         Box::new(move |this, window, cx| {
                             this.put_panel(panel, to, None, window, cx)
@@ -2382,7 +2455,7 @@ impl Workspace {
         for hidden in layout.hidden.iter().copied() {
             items.push(item(
                 format!("menu-show-{}", hidden.id()),
-                format!("Show {}", hidden.label()),
+                tf("Show {}", &[&hidden.label()]),
                 cx,
                 Box::new(move |this, window, cx| this.put_panel(hidden, place, None, window, cx)),
             ));
@@ -2392,7 +2465,7 @@ impl Workspace {
         }
         items.push(item(
             "menu-reset".into(),
-            "Reset layout".into(),
+            t("Reset layout").into(),
             cx,
             Box::new(|this, window, cx| this.reset_layout(&ResetLayout, window, cx)),
         ));
@@ -2415,9 +2488,9 @@ impl Workspace {
             let hidden = item.clone();
             items.push(Self::menu_item(
                 "bar-menu-hide".into(),
-                format!(
+                tf(
                     "Hide {}",
-                    layout.style(&item).label.as_deref().unwrap_or(item.label())
+                    &[&layout.style(&item).label.as_deref().unwrap_or(item.label())],
                 ),
                 Box::new(move |_, _, cx| {
                     layout::put(Layout::get(cx).clone().hiding_item(hidden.clone()), cx);
@@ -2429,7 +2502,7 @@ impl Workspace {
                     let item = item.clone();
                     items.push(Self::menu_item(
                         format!("bar-menu-move-{}", to.id()),
-                        format!("Move to {}", to.label()),
+                        tf("Move to {}", &[&to.label()]),
                         Box::new(move |_, _, cx| {
                             layout::put(
                                 Layout::get(cx).clone().moved_item(item.clone(), to, None),
@@ -2442,9 +2515,9 @@ impl Workspace {
             }
             items.push(separator());
             for (display, id, label) in [
-                (Display::Text, "text", "Text"),
-                (Display::Icon, "icon", "Icon"),
-                (Display::Both, "both", "Text and icon"),
+                (Display::Text, "text", t("Text")),
+                (Display::Icon, "icon", t("Icon")),
+                (Display::Both, "both", t("Text and icon")),
             ] {
                 let item = item.clone();
                 items.push(Self::menu_item(
@@ -2458,7 +2531,7 @@ impl Workspace {
             }
             items.push(Self::menu_item(
                 "bar-menu-edit".into(),
-                "Edit icon or command".into(),
+                t("Edit icon or command").into(),
                 Box::new(|this, window, cx| {
                     this.open_layout(&OpenLayout, window, cx);
                 }),
@@ -2468,7 +2541,7 @@ impl Workspace {
                 let button = button.clone();
                 items.push(Self::menu_item(
                     "bar-menu-remove".into(),
-                    "Remove button".into(),
+                    t("Remove button").into(),
                     Box::new(move |_, _, cx| {
                         layout::put(Layout::get(cx).clone().without_button(&button), cx);
                     }),
@@ -2481,13 +2554,13 @@ impl Workspace {
             if layout.item_place(&hidden).is_none() {
                 items.push(Self::menu_item(
                     format!("bar-menu-show-{}", hidden.id()),
-                    format!(
+                    tf(
                         "Show {}",
-                        layout
+                        &[&layout
                             .style(&hidden)
                             .label
                             .as_deref()
-                            .unwrap_or(hidden.label())
+                            .unwrap_or(hidden.label())],
                     ),
                     Box::new(move |_, _, cx| {
                         layout::put(
@@ -2504,7 +2577,7 @@ impl Workspace {
         items.push(separator());
         items.push(Self::menu_item(
             "bar-menu-add".into(),
-            "Add command button".into(),
+            t("Add command button").into(),
             Box::new(move |this, window, cx| {
                 let commands =
                     crate::bar_commands::Commands::new(end, this.plugins.clone(), window, cx);
@@ -2516,7 +2589,7 @@ impl Workspace {
         ));
         items.push(Self::menu_item(
             "bar-menu-reset".into(),
-            "Reset layout".into(),
+            t("Reset layout").into(),
             Box::new(|this, window, cx| this.reset_layout(&ResetLayout, window, cx)),
             cx,
         ));
@@ -2859,7 +2932,7 @@ impl Workspace {
                 })
                 .await;
             if let Err(e) = created {
-                eprintln!("could not create the scratch file: {e}");
+                crate::journal::error(format_args!("could not create the scratch file: {e}"));
                 return;
             }
             this.update_in(cx, |this, window, cx| {
@@ -3423,7 +3496,7 @@ impl Workspace {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Import".into()),
+            prompt: Some(t("Import").into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = answer.await else {
@@ -3793,7 +3866,7 @@ impl Workspace {
                 d.child(div().size(px(6.)).rounded(px(3.)).bg(theme.warning))
             })
             .child(crate::icons::draw(crate::icons::panel(Panel::Debug)))
-            .child("Debug")
+            .child(t("Debug"))
             .child(
                 div()
                     .id("debug-close")
@@ -3974,9 +4047,9 @@ impl Workspace {
                         let t = terminal.read(cx);
                         match (t.exited, t.exit_code) {
                             (false, _) => t.title().to_string(),
-                            (true, Some(0)) => format!("{} (exited)", t.title()),
-                            (true, Some(code)) => format!("{} (exited {code})", t.title()),
-                            (true, None) => format!("{} (killed)", t.title()),
+                            (true, Some(0)) => tf("{} (exited)", &[&t.title()]),
+                            (true, Some(code)) => tf("{} (exited {})", &[&t.title(), &code]),
+                            (true, None) => tf("{} (killed)", &[&t.title()]),
                         }
                     })
                     .child(
@@ -4019,9 +4092,9 @@ impl Workspace {
             crate::ui::button(
                 "terminal-split",
                 if self.terminal_pair.is_some() {
-                    "Unsplit"
+                    t("Unsplit")
                 } else {
-                    "Split"
+                    t("Split")
                 },
                 false,
                 &theme,
@@ -4200,7 +4273,7 @@ impl Workspace {
                 cx.notify();
             }))
             .child(crate::icons::draw(crate::icons::panel(Panel::Results)))
-            .child("Results")
+            .child(t("Results"))
             .child(
                 div()
                     .id("results-close")
@@ -4243,7 +4316,7 @@ impl Workspace {
                 cx.notify();
             }))
             .child(crate::icons::draw(crate::icons::panel(Panel::Response)))
-            .child("Response")
+            .child(t("Response"))
             .child(
                 div()
                     .id("response-close")
@@ -4367,7 +4440,10 @@ impl Workspace {
                         return;
                     };
                     if loaded.read_only.is_some() {
-                        eprintln!("not edited, it cannot be: {}", path.display());
+                        crate::journal::error(format_args!(
+                            "not edited, it cannot be: {}",
+                            path.display()
+                        ));
                         return;
                     }
                     let mut buffer = text::Buffer::new(&loaded.text);
@@ -4382,7 +4458,10 @@ impl Workspace {
                         })
                         .and_then(|bytes| std::fs::write(&path, bytes).map_err(|e| e.to_string()));
                     if let Err(err) = written {
-                        eprintln!("could not write {}: {err}", path.display());
+                        crate::journal::error(format_args!(
+                            "could not write {}: {err}",
+                            path.display()
+                        ));
                     }
                 })
                 .detach();
@@ -4408,6 +4487,10 @@ impl Workspace {
     fn focus_pane(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         let len = self.panes.len() as isize;
         let next = (self.active_pane as isize + delta).rem_euclid(len) as usize;
+        if let Some(shown) = self.panes[next].shown {
+            self.show_viewer(next, shown, true, window, cx);
+            return;
+        }
         match self.panes[next].active {
             Some(tab) => self.activate(next, tab, window, cx),
             None => {
@@ -4509,7 +4592,7 @@ impl Workspace {
                 let _ = std::fs::create_dir_all(dir);
             }
             if let Err(err) = std::fs::write(&path, default) {
-                eprintln!("could not create {}: {err}", path.display());
+                crate::journal::error(format_args!("could not create {}: {err}", path.display()));
                 return;
             }
         }
@@ -4524,6 +4607,95 @@ impl Workspace {
     fn open_keymap(&mut self, _: &OpenKeymap, window: &mut Window, cx: &mut Context<Self>) {
         let default = settings::DEFAULT_KEYMAP.to_string();
         self.open_config_file(settings::keymap_path(), default, window, cx);
+    }
+
+    fn show_error_log(&mut self, _: &ShowErrorLog, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_log(crate::journal::dir(), window, cx);
+    }
+
+    /// Opens the log of errors kept in `dir`, or says there is none yet.
+    pub(crate) fn show_log(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let log = crate::journal::path(&dir);
+        if log.is_file() {
+            self.open_path(log, None, window, cx);
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Info,
+            t("No errors have been written"),
+            Some(&tf("They would be in {}.", &[&log.display()])),
+            &[t("OK")],
+            cx,
+        );
+        cx.background_executor()
+            .spawn(async move {
+                answer.await.ok();
+            })
+            .detach();
+    }
+
+    /// The first window of a run says what the run before left. A
+    /// benchmark is asked nothing: it types into the window.
+    pub(crate) fn offer_crash_once(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if ASKED.swap(true, std::sync::atomic::Ordering::Relaxed)
+            || std::env::vars_os()
+                .any(|(name, _)| name.to_string_lossy().starts_with("SOLDER_BENCH"))
+        {
+            return;
+        }
+        self.offer_crash(crate::journal::dir(), window, cx);
+    }
+
+    /// Says once that a run before this one ended in a crash, if it left
+    /// a report in `dir`. Asked or not, a report is said one time.
+    pub(crate) fn offer_crash(
+        &mut self,
+        dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move { crate::journal::crashes(&dir) })
+                .await;
+            if found.is_empty() {
+                return;
+            }
+            let Ok(answer) = cx.update(|window, cx| {
+                window.prompt(
+                    PromptLevel::Warning,
+                    t("Solder closed unexpectedly last time"),
+                    Some(t(
+                        "A report was kept on this machine. It is not sent anywhere.",
+                    )),
+                    &[t("Show report"), t("Dismiss")],
+                    cx,
+                )
+            }) else {
+                return;
+            };
+            let show = answer.await == Ok(0);
+            let last = cx
+                .background_executor()
+                .spawn(async move {
+                    // Every one of them, and the newest is the one shown.
+                    let kept: Vec<PathBuf> = found
+                        .iter()
+                        .filter_map(|report| crate::journal::seen(report))
+                        .collect();
+                    kept.into_iter().next_back()
+                })
+                .await;
+            if let Some(report) = last.filter(|_| show) {
+                this.update_in(cx, |this, window, cx| {
+                    this.open_path(report, None, window, cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// The borders that can be dragged: a strip over each, as long as the
@@ -4727,21 +4899,40 @@ impl Workspace {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Open".into()),
+            prompt: Some(t("Open").into()),
         });
         cx.spawn(async move |_, cx| {
             if let Ok(Ok(Some(paths))) = answer.await
                 && let Some(root) = paths.into_iter().next()
             {
-                cx.update(|cx| crate::open_workspace_window(root, None, cx))
-                    .ok();
+                cx.update(|cx| crate::windows::open(root, cx)).ok();
             }
         })
         .detach();
     }
 
+    /// The projects opened before, a folder, an address to clone: what
+    /// is chosen gets a window of its own.
+    fn open_project(&mut self, _: &OpenProject, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_modal(window, cx, |window, cx| {
+            Picker::new(crate::way_in::WayIn::new(false, cx), window, cx)
+        });
+    }
+
+    fn new_window(&mut self, _: &NewWindow, _: &mut Window, cx: &mut Context<Self>) {
+        // Not in the middle of this window's key.
+        cx.defer(|cx| {
+            crate::way_in::open_window(cx);
+        });
+    }
+
     /// Files changed on disk: reload clean documents, refresh the tree.
     fn files_changed(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        for (viewer, _) in self.panes.iter().flat_map(|pane| &pane.viewers) {
+            if paths.contains(&viewer.read(cx).path) {
+                viewer.update(cx, |viewer, cx| viewer.reload(cx));
+            }
+        }
         for document in self.documents(cx) {
             let (path, dirty) = {
                 let d = document.read(cx);
@@ -4794,6 +4985,12 @@ impl Workspace {
     }
 
     // ------------------------------------------------------------ modals
+
+    /// The list or the box over the window, if it is a `V`.
+    #[cfg(test)]
+    pub(crate) fn modal_view<V: 'static>(&self) -> Option<Entity<V>> {
+        self.modal.as_ref()?.view.clone().downcast::<V>().ok()
+    }
 
     fn toggle_modal<V: ManagedView>(
         &mut self,
@@ -5135,9 +5332,9 @@ impl Workspace {
         let name = notebook.read(cx).title();
         let answer = window.prompt(
             PromptLevel::Warning,
-            &format!("Save changes to {name}?"),
-            Some("Your changes will be lost if you don't save them."),
-            &["Save", "Don't Save", "Cancel"],
+            &tf("Save changes to {}?", &[&name]),
+            Some(t("Your changes will be lost if you don't save them.")),
+            &[t("Save"), t("Don't Save"), t("Cancel")],
             cx,
         );
         let notebook = notebook.clone();
@@ -5178,6 +5375,234 @@ impl Workspace {
         }
         self.notebooks.retain(|(known, _)| known != notebook);
         cx.notify();
+    }
+
+    /// Takes away pane `p` if nothing is left in it and it is not the only
+    /// one, and says where the pane is now: nowhere, if it went.
+    fn drop_empty_pane(&mut self, p: usize) -> Option<usize> {
+        let pane = &self.panes[p];
+        if !pane.tabs.is_empty() || !pane.viewers.is_empty() || self.panes.len() == 1 {
+            return Some(p);
+        }
+        // An empty split closes; focus moves to its neighbour.
+        self.panes.remove(p);
+        if self.active_pane > p || self.active_pane == self.panes.len() {
+            self.active_pane -= 1;
+        }
+        None
+    }
+
+    /// Puts what pane `p` shows in front of the window: its picture or
+    /// preview, else its file, else nothing.
+    fn front_of_pane(&mut self, p: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = &self.panes[p];
+        if let Some(shown) = pane.shown {
+            self.show_viewer(p, shown, true, window, cx);
+        } else if !pane.tabs.is_empty() {
+            let tab = pane.active.unwrap_or(0).min(pane.tabs.len() - 1);
+            self.activate(p, tab, window, cx);
+        } else {
+            self.active_pane = p;
+            self.search_bar
+                .update(cx, |bar, cx| bar.set_editor(None, cx));
+            window.focus(&self.focus_handle);
+            self.keep_outline(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Adds a picture or a preview to pane `p` as a tab, and shows it.
+    fn add_viewer(
+        &mut self,
+        viewer: Entity<Viewer>,
+        p: usize,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let events = cx.subscribe_in(&viewer, window, |this, _, event, window, cx| match event {
+            crate::viewer::ViewerEvent::Open(path) => {
+                this.open_path(path.clone(), None, window, cx)
+            }
+            crate::viewer::ViewerEvent::Changed => cx.notify(),
+        });
+        self.panes[p].viewers.push((viewer, events));
+        let ix = self.panes[p].viewers.len() - 1;
+        self.show_viewer(p, ix, focus, window, cx);
+    }
+
+    fn show_viewer(
+        &mut self,
+        p: usize,
+        ix: usize,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((viewer, _)) = self.panes.get(p).and_then(|pane| pane.viewers.get(ix)) else {
+            return;
+        };
+        let viewer = viewer.clone();
+        self.panes[p].shown = Some(ix);
+        if focus {
+            self.close_file_diff(window, cx);
+            self.leave_notebook(cx);
+            self.web_front = None;
+            self.discard_inline_edit(cx);
+            self.active_pane = p;
+            self.search_bar
+                .update(cx, |bar, cx| bar.set_editor(None, cx));
+            window.focus(&viewer.focus_handle(cx));
+            self.keep_outline(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Where a picture or a preview is: its pane and its place among the
+    /// pane's.
+    fn locate_viewer(&self, viewer: &Entity<Viewer>) -> Option<(usize, usize)> {
+        self.panes.iter().enumerate().find_map(|(p, pane)| {
+            let ix = pane.viewers.iter().position(|(known, _)| known == viewer)?;
+            Some((p, ix))
+        })
+    }
+
+    fn close_viewer(
+        &mut self,
+        viewer: &Entity<Viewer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((p, ix)) = self.locate_viewer(viewer) else {
+            return;
+        };
+        let pane = &mut self.panes[p];
+        drop(pane.viewers.remove(ix));
+        pane.shown = match pane.shown {
+            Some(shown) if shown == ix => None,
+            Some(shown) if shown > ix => Some(shown - 1),
+            shown => shown,
+        };
+        let was_active = self.active_pane == p;
+        match self.drop_empty_pane(p) {
+            Some(p) if was_active => self.front_of_pane(p, window, cx),
+            None if was_active => self.front_of_pane(self.active_pane, window, cx),
+            _ => cx.notify(),
+        }
+    }
+
+    /// A picture file, as a tab of the pane in front. Asked for again, it
+    /// is the tab it has.
+    fn open_picture(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let known = self.panes.iter().enumerate().find_map(|(p, pane)| {
+            let ix = pane.viewers.iter().position(|(viewer, _)| {
+                let viewer = viewer.read(cx);
+                !viewer.is_preview() && viewer.path == path
+            })?;
+            Some((p, ix))
+        });
+        if let Some((p, ix)) = known {
+            self.show_viewer(p, ix, true, window, cx);
+            return;
+        }
+        self.project_panel
+            .update(cx, |panel, cx| panel.select_path(&path, cx));
+        let viewer = cx.new(|cx| Viewer::picture(path, cx));
+        self.add_viewer(viewer, self.active_pane, true, window, cx);
+    }
+
+    /// Shows what the file in front reads as, next to it: Markdown laid
+    /// out, an SVG drawn. The file keeps the keys.
+    fn open_preview(&mut self, _: &OpenPreview, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor() else {
+            return;
+        };
+        let document = editor.read(cx).document().clone();
+        if !document
+            .read(cx)
+            .path()
+            .is_some_and(crate::viewer::has_preview)
+        {
+            return;
+        }
+        let known = self.panes.iter().enumerate().find_map(|(p, pane)| {
+            let ix = pane
+                .viewers
+                .iter()
+                .position(|(viewer, _)| viewer.read(cx).is_preview_of(&document))?;
+            Some((p, ix))
+        });
+        if let Some((p, ix)) = known {
+            self.show_viewer(p, ix, false, window, cx);
+            return;
+        }
+        // In the pane to the right, which is made if there is none.
+        let at = self.active_pane + 1;
+        if at == self.panes.len() {
+            self.panes.push(Pane::default());
+        }
+        let viewer = cx.new(|cx| Viewer::preview(document, cx));
+        self.add_viewer(viewer, at, false, window, cx);
+    }
+
+    fn viewer_tabs(&self, p: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let theme = cx.theme().clone();
+        let pane = &self.panes[p];
+        let front = self.web_front.is_none() && self.notebook_front.is_none();
+        pane.viewers
+            .iter()
+            .enumerate()
+            .map(|(ix, (viewer, _))| {
+                let selected = pane.shown == Some(ix) && front;
+                let title = viewer.read(cx).title();
+                let icon = crate::file_icons::file(&viewer.read(cx).path, cx);
+                let close = viewer.clone();
+                div()
+                    .id(("viewer-tab", p * 10_000 + ix))
+                    .debug_selector(move || format!("viewer-tab-{p}-{ix}"))
+                    .flex_none()
+                    .h(px(26.))
+                    .max_w(px(260.))
+                    .pl_3()
+                    .pr_1p5()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .rounded(theme.shape.control)
+                    .text_size(UI_FONT_SIZE)
+                    .text_color(if selected { theme.fg } else { theme.fg_subtle })
+                    .when(selected, |d| {
+                        d.bg(theme.bg_elev)
+                            .border(theme.shape.border)
+                            .border_color(theme.line)
+                    })
+                    .hover(|d| d.text_color(theme.fg))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.show_viewer(p, ix, true, window, cx);
+                    }))
+                    .children(icon)
+                    .child(div().min_w_0().truncate().child(title))
+                    .child(
+                        div()
+                            .id(("viewer-close", p * 10_000 + ix))
+                            .debug_selector(move || format!("viewer-close-{p}-{ix}"))
+                            .flex_none()
+                            .size(px(16.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(theme.shape.token)
+                            .hover(|d| d.bg(theme.line).text_color(theme.fg))
+                            .child("×")
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.close_viewer(&close, window, cx);
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect()
     }
 
     fn notebook_tabs(&self, pane: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -5684,6 +6109,7 @@ impl Workspace {
                 let pinned = tab.pinned;
                 let pin_editor = editor.clone();
                 let active = pane.active == Some(ix)
+                    && pane.shown.is_none()
                     && self.web_front.is_none()
                     && self.notebook_front.is_none();
                 let close_editor = editor.clone();
@@ -5763,6 +6189,7 @@ impl Workspace {
                     .into_any_element()
             })
             .collect();
+        tabs.extend(self.viewer_tabs(p, cx));
         if p == self.active_pane {
             tabs.extend(self.webview_tabs(p, cx));
             tabs.extend(self.notebook_tabs(p, cx));
@@ -5830,6 +6257,8 @@ impl Workspace {
                             && *pane == p
                         {
                             d.child(notebook.clone())
+                        } else if let Some(viewer) = pane.shown_viewer() {
+                            d.child(viewer.clone())
                         } else {
                             match pane.active_editor() {
                                 // What is to be said of the file above
@@ -6032,11 +6461,11 @@ impl Workspace {
         }
         self.structure
             .as_ref()
-            .map(|(view, _)| format!("Structure of {}", view.read(cx).title(cx)))
+            .map(|(view, _)| tf("Structure of {}", &[&view.read(cx).title(cx)]))
             .or_else(|| {
                 self.erd
                     .as_ref()
-                    .map(|(view, _)| format!("Diagram of {}", view.read(cx).connection))
+                    .map(|(view, _)| tf("Diagram of {}", &[&view.read(cx).connection]))
             })
             .or_else(|| {
                 self.file_diff
@@ -6159,19 +6588,19 @@ impl Workspace {
             }
             Item::Position => {
                 if self.file_diff.is_some() {
-                    return vec![says("Git diff".into()), says("Read-only".into())];
+                    return vec![says(t("Git diff").into()), says(t("Read-only").into())];
                 }
                 let Some(editor) = editor else {
                     return Vec::new();
                 };
                 let e = editor.read(cx);
                 let (line, col, cursors) = e.cursor_position(cx);
-                let mut parts = vec![says(format!("Ln {line}, Col {col}"))];
+                let mut parts = vec![says(tf("Ln {}, Col {}", &[&line, &col]))];
                 if cursors > 1 {
-                    parts.push(says(format!("{cursors} cursors")));
+                    parts.push(says(tf("{} cursors", &[&cursors])));
                 }
                 if e.doc(cx).is_read_only() {
-                    parts.push(says("Read-only".into()));
+                    parts.push(says(t("Read-only").into()));
                 }
                 parts
             }
@@ -6202,7 +6631,7 @@ impl Workspace {
             Item::Language => editor
                 .map(|e| {
                     let name = e.read(cx).doc(cx).language_name();
-                    says(name.unwrap_or("Plain text").to_string())
+                    says(name.unwrap_or(t("Plain text")).to_string())
                 })
                 .into_iter()
                 .collect(),
@@ -6231,7 +6660,7 @@ impl Workspace {
                     parts.push(says(status.to_string()));
                 }
                 if self.project.read(cx).is_scanning() {
-                    parts.push(says("Indexing files...".into()));
+                    parts.push(says(t("Indexing files...").into()));
                 }
                 // An extension's grammar that stopped answering: its
                 // files are plain text until the editor starts again.
@@ -6251,9 +6680,8 @@ impl Workspace {
                     let store = self.database.read(cx);
                     match store.binding(path) {
                         Some(name) => Some(name.to_string()),
-                        None => {
-                            database::query_file_engines(path).map(|_| "No connection".to_string())
-                        }
+                        None => database::query_file_engines(path)
+                            .map(|_| t("No connection").to_string()),
                     }
                 });
                 connection
@@ -6312,8 +6740,8 @@ impl Workspace {
                     .collect();
                 match plugins.slow().as_slice() {
                     [] => {}
-                    [name] => items.push((format!("Slow plugin: {name}"), true)),
-                    names => items.push((format!("{} slow plugins", names.len()), true)),
+                    [name] => items.push((tf("Slow plugin: {}", &[&name]), true)),
+                    names => items.push((tf("{} slow plugins", &[&names.len()]), true)),
                 }
                 items
                     .into_iter()
@@ -6329,20 +6757,19 @@ impl Workspace {
                 let mut parts = Vec::new();
                 if perf.hud_visible {
                     if let Some((p50, p99)) = perf.input_p50_p99() {
-                        parts.push(says(format!(
+                        parts.push(says(tf(
                             "input {} ms, p99 {}",
-                            perf::ms(p50),
-                            perf::ms(p99)
+                            &[&perf::ms(p50), &perf::ms(p99)],
                         )));
                     }
                     if let Some((p50, _)) = perf.frame_p50_p99() {
-                        parts.push(says(format!("frame {} ms", perf::ms(p50))));
+                        parts.push(says(tf("frame {} ms", &[&perf::ms(p50)])));
                     }
                     if let Some(bytes) = perf::resident_memory() {
                         parts.push(says(format!("{} MB", bytes / (1024 * 1024))));
                     }
                     if let Some(start) = perf.first_frame {
-                        parts.push(says(format!("start {} ms", perf::ms(start))));
+                        parts.push(says(tf("start {} ms", &[&perf::ms(start)])));
                     }
                 }
                 parts
@@ -6545,11 +6972,12 @@ impl Workspace {
             .justify_center()
             .gap_2p5()
             .bg(theme.bg)
-            .child(hint("Go to file", &ToggleFileFinder))
-            .child(hint("Run a command", &ToggleCommandPalette))
-            .child(hint("Search in project", &ShowSearch))
-            .child(hint("New file", &NewFile))
-            .child(hint("Open folder", &OpenFolder))
+            .child(hint(t("Go to file"), &ToggleFileFinder))
+            .child(hint(t("Run a command"), &ToggleCommandPalette))
+            .child(hint(t("Search in project"), &ShowSearch))
+            .child(hint(t("New file"), &NewFile))
+            .child(hint(t("Open folder"), &OpenFolder))
+            .child(hint(t("Open project"), &OpenProject))
     }
 }
 
@@ -6686,7 +7114,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_as))
             .on_action(cx.listener(Self::save_untitled))
             .on_action(cx.listener(Self::open_folder))
+            .on_action(cx.listener(Self::open_project))
+            .on_action(cx.listener(Self::open_preview))
+            .on_action(cx.listener(Self::new_window))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::show_error_log))
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::open_layout))
             .on_action(cx.listener(Self::switch_layout))
@@ -19429,7 +19861,9 @@ exports.activate = (context) => {
         // Every open window follows a switch and remembers it for its
         // project. A window removed before another switch is left alone.
         let second_root = db::testing::dir("ws-named-second").canonicalize().unwrap();
-        let second = cx.update(|_, cx| crate::open_workspace_window(second_root.clone(), None, cx));
+        let second = cx.update(|_, cx| {
+            crate::open_workspace_window(crate::windows::Place::of(second_root.clone()), None, cx)
+        });
         cx.dispatch_action(SwitchLayout {
             name: Some("Review".into()),
         });
@@ -19448,8 +19882,9 @@ exports.activate = (context) => {
             name: Some(layout::DEFAULT_NAME.into()),
         });
         wait(cx, None);
-        let reopened =
-            cx.update(|_, cx| crate::open_workspace_window(second_root.clone(), None, cx));
+        let reopened = cx.update(|_, cx| {
+            crate::open_workspace_window(crate::windows::Place::of(second_root.clone()), None, cx)
+        });
         wait(cx, Some("Review"));
         assert_eq!(
             reopened.read_with(cx, |w, _| w.right).unwrap(),
@@ -20026,5 +20461,586 @@ exports.activate = (context) => {
         });
         assert!(cx.read(|cx| store.read(cx).file_marks(&file).is_empty()));
         assert!(cx.read(|cx| editor.read(cx).doc(cx).inlays().is_empty()));
+    }
+    #[gpui::test]
+    async fn a_crash_of_the_last_run_is_said_once_and_its_report_shown(cx: &mut TestAppContext) {
+        let root = fixture("crash-report");
+        let logs = db::testing::dir("ws-crash-logs");
+        std::fs::write(logs.join("crash-1-1-000000000.txt"), "an older one\n").unwrap();
+        std::fs::write(logs.join("crash-2-1-000000000.txt"), "the reason\n").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |ws, window, cx| {
+            ws.offer_crash(logs.clone(), window, cx)
+        });
+        for _ in 0..crate::patience::LOOKS {
+            cx.run_until_parked();
+            if cx.has_pending_prompt() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cx.simulate_prompt_answer("Show report");
+        wait_for(cx, "the report in a tab", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|editor| editor.read(cx).text(cx) == "the reason\n")
+        });
+        // Both were said, the one shown and the one before it.
+        assert!(crate::journal::crashes(&logs).is_empty());
+        assert_eq!(crate::journal::crashes(&logs.join("seen")).len(), 2);
+
+        // Nothing is asked when nothing was left.
+        ws.update_in(cx, |ws, window, cx| {
+            ws.offer_crash(logs.clone(), window, cx)
+        });
+        for _ in 0..20 {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!cx.has_pending_prompt());
+
+        // The log is a file like another, shown when there is one.
+        ws.update_in(cx, |ws, window, cx| ws.show_log(logs.clone(), window, cx));
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Ok");
+        std::fs::write(
+            crate::journal::path(&logs),
+            "2026-10-11 09:30:00Z error: it\n",
+        )
+        .unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.show_log(logs.clone(), window, cx));
+        wait_for(cx, "the log in a tab", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|editor| editor.read(cx).text(cx).ends_with("error: it\n"))
+        });
+    }
+    /// The globals a window needs, and windows remembered in `kept_in`
+    /// with `recent` as the projects opened before.
+    fn windows_setup(cx: &mut TestAppContext, kept_in: Option<PathBuf>, recent: &[PathBuf]) {
+        cx.update(|cx| {
+            cx.set_global(Perf::new(Instant::now()));
+            cx.set_global(crate::theme::Theme::dark());
+            cx.set_global(Settings::default());
+            settings::bind_defaults(cx);
+            crate::lsp_store::init(cx);
+            crate::windows::init(kept_in, cx);
+            let kept = crate::windows::Kept {
+                recent: recent.to_vec(),
+                ..Default::default()
+            };
+            crate::windows::learn(&kept, cx);
+        });
+    }
+
+    fn soon(cx: &mut TestAppContext, what: &str, f: &dyn Fn(&App) -> bool) {
+        for _ in 0..crate::patience::LOOKS {
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+            if cx.read(|cx| f(cx)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// The projects that have a window, as the windows themselves say.
+    fn project_windows(cx: &App) -> Vec<PathBuf> {
+        cx.windows()
+            .into_iter()
+            .filter_map(|window| window.downcast::<Workspace>())
+            .filter_map(|window| window.read(cx).ok().map(|workspace| workspace.root(cx)))
+            .collect()
+    }
+
+    #[gpui::test]
+    async fn the_windows_of_a_run_are_kept_and_the_last_to_close_comes_back(
+        cx: &mut TestAppContext,
+    ) {
+        let (a, b) = (fixture("windows-a"), fixture("windows-b"));
+        let kept_in = db::testing::dir("windows-kept").join("sessions/windows.json");
+        cx.executor().allow_parking();
+        windows_setup(cx, Some(kept_in.clone()), &[]);
+        let first = cx.update(|cx| crate::windows::open(a.clone(), cx));
+        let second = cx.update(|cx| crate::windows::open(b.clone(), cx));
+        // A project has one window: asked for again, it is the same one.
+        let again = cx.update(|cx| crate::windows::open(a.clone(), cx));
+        assert_eq!(first, again);
+        assert_eq!(cx.windows().len(), 2);
+        let roots = |kept: &crate::windows::Kept| -> Vec<PathBuf> {
+            kept.open.iter().map(|place| place.root.clone()).collect()
+        };
+        soon(cx, "both windows in the file", &|_| {
+            roots(&kept_read(&kept_in)) == [a.clone(), b.clone()]
+        });
+        assert_eq!(kept_read(&kept_in).recent, [b.clone(), a.clone()]);
+        let place = &kept_read(&kept_in).open[0];
+        assert!(
+            place
+                .bounds
+                .is_some_and(|[_, _, width, height]| width > 0. && height > 0.)
+        );
+
+        // Closed while another is open, a window is out of the set.
+        assert!(VisualTestContext::from_window(second.into(), cx).simulate_close());
+        second
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        soon(cx, "one window in the file", &|_| {
+            roots(&kept_read(&kept_in)) == [a.clone()]
+        });
+        // The last one ends the run, and is what the next one starts with.
+        assert!(VisualTestContext::from_window(first.into(), cx).simulate_close());
+        first
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        for _ in 0..20 {
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(cx.windows().is_empty());
+        let left = kept_read(&kept_in);
+        assert_eq!(roots(&left), std::slice::from_ref(&a));
+        assert_eq!(left.recent, [b.clone(), a.clone()]);
+
+        // The next start: what was open and is still a folder.
+        let mut left = left;
+        left.open.push(crate::windows::Place::of(b.join("gone")));
+        left.open.push(crate::windows::Place::of(a.clone()));
+        assert_eq!(cx.update(|cx| crate::windows::restore(&left, cx)), 1);
+        assert_eq!(cx.read(project_windows), std::slice::from_ref(&a));
+        assert_eq!(
+            cx.read(crate::windows::open_roots),
+            std::slice::from_ref(&a)
+        );
+
+        // Windows that go because the run ends were not closed by anybody.
+        cx.update(|cx| crate::windows::open(b.clone(), cx));
+        soon(cx, "both windows in the file again", &|_| {
+            roots(&kept_read(&kept_in)) == [a.clone(), b.clone()]
+        });
+        for window in cx.windows() {
+            window
+                .update(cx, |_, window, _| window.remove_window())
+                .unwrap();
+        }
+        for _ in 0..20 {
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(roots(&kept_read(&kept_in)), [a, b]);
+        // The end of a test waits for no thread.
+        cx.update(crate::windows::stop);
+    }
+
+    fn kept_read(path: &Path) -> crate::windows::Kept {
+        crate::windows::Kept::read(path)
+    }
+
+    #[gpui::test]
+    async fn the_way_in_lists_projects_opened_before_and_opens_one(cx: &mut TestAppContext) {
+        let (a, b) = (fixture("way-in-a"), fixture("way-in-b"));
+        let gone = b.join("gone");
+        cx.executor().allow_parking();
+        windows_setup(cx, None, &[a.clone(), gone.clone(), b.clone()]);
+        let way_in = cx.update(crate::way_in::open_window);
+        let list = way_in
+            .read_with(cx, |way_in, _| way_in.list().clone())
+            .unwrap();
+        let listed = |cx: &App| list.read(cx).delegate.listed();
+        let path = |path: &Path| path.display().to_string();
+        assert_eq!(
+            cx.read(listed),
+            ["Open a folder".to_string(), path(&a), path(&gone), path(&b)]
+        );
+        let cx = &mut VisualTestContext::from_window(way_in.into(), cx);
+        // What is typed narrows the list; a folder can always be opened.
+        // The folder the tests are in has a name of its own on every
+        // machine, and some of its letters may match too: what is typed
+        // comes first, and that is all that is said of the rest.
+        cx.simulate_input("gone");
+        let narrowed = cx.read(listed);
+        assert_eq!(narrowed[0], path(&gone));
+        assert_eq!(narrowed.last().unwrap(), "Open a folder");
+        // A project whose folder is gone says so and leaves the list.
+        cx.simulate_keystrokes("enter");
+        assert!(cx.read(|cx| {
+            list.read(cx)
+                .delegate
+                .failure()
+                .is_some_and(|said| said.ends_with("is not there any more"))
+        }));
+        assert!(!cx.read(listed).contains(&path(&gone)));
+        assert_eq!(cx.read(crate::windows::recent), [a.clone(), b.clone()]);
+        // An address is something to clone, not a name to look for.
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("https://example.com/cire362/solder.git");
+        assert_eq!(
+            cx.read(listed),
+            ["Clone https://example.com/cire362/solder.git"]
+        );
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("way-in-b");
+        cx.simulate_keystrokes("enter");
+        // The project takes the place of the window that led to it.
+        wait_for(cx, "the project's window alone", &|cx| {
+            cx.windows().len() == 1 && project_windows(cx) == [b.clone()]
+        });
+        assert_eq!(cx.read(crate::windows::recent), [b, a]);
+    }
+
+    #[gpui::test]
+    async fn an_address_is_cloned_into_a_folder_and_opened(cx: &mut TestAppContext) {
+        let origin = git_fixture("way-in-origin");
+        let parent = db::testing::dir("way-in-clones").canonicalize().unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, fixture("way-in-from"));
+        cx.update(|_, cx| {
+            crate::windows::init(None, cx);
+            crate::windows::learn(&Default::default(), cx);
+        });
+        cx.simulate_keystrokes("secondary-alt-o");
+        let list = cx
+            .read(|cx| ws.read(cx).modal_view::<Picker<crate::way_in::WayIn>>())
+            .expect("the way in over the window");
+        let clone = |address: String, cx: &mut VisualTestContext| {
+            let parent = parent.clone();
+            list.update_in(cx, |list, window, cx| {
+                list.delegate.clone_into(address, parent, window, cx)
+            });
+        };
+        // What git says of a failure is what the list says.
+        // Not inside the folder it would be cloned into: that would be
+        // a clone of itself.
+        clone(format!("file://{}", origin.join("nothing").display()), cx);
+        assert!(cx.read(|cx| list.read(cx).delegate.is_cloning()));
+        wait_for(cx, "git to say no", &|cx| {
+            list.read(cx).delegate.failure().is_some()
+        });
+        assert!(cx.read(|cx| {
+            let said = list.read(cx).delegate.failure().unwrap().to_string();
+            said.contains("nothing") && !list.read(cx).delegate.is_cloning()
+        }));
+        assert_eq!(cx.read(project_windows).len(), 1);
+
+        clone(format!("file://{}", origin.display()), cx);
+        let cloned = parent.join(origin.file_name().unwrap());
+        wait_for(cx, "the clone in a window of its own", &|cx| {
+            project_windows(cx).contains(&cloned)
+        });
+        assert_eq!(
+            std::fs::read_to_string(cloned.join("a.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+        // The window it was asked from stays, without the list.
+        wait_for(cx, "the list to go", &|cx| {
+            ws.read(cx)
+                .modal_view::<Picker<crate::way_in::WayIn>>()
+                .is_none()
+        });
+        assert_eq!(cx.read(project_windows).len(), 2);
+    }
+    /// The first bytes of a PNG that say it is `width` by `height`.
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend(width.to_be_bytes());
+        bytes.extend(height.to_be_bytes());
+        bytes.extend([8, 6, 0, 0, 0]);
+        bytes
+    }
+
+    #[gpui::test]
+    async fn a_picture_opens_as_a_picture_in_a_tab_of_its_own(cx: &mut TestAppContext) {
+        let root = fixture("picture");
+        let shot = root.join("shot.png");
+        std::fs::write(&shot, png(640, 480)).unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(root.join("src/main.rs"), None, window, cx)
+        });
+        wait_for(cx, "the file", &|cx| ws.read(cx).active_editor().is_some());
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(shot.clone(), None, window, cx)
+        });
+        let viewer = cx.read(|cx| ws.read(cx).panes[0].shown_viewer().cloned().unwrap());
+        // It is no file to type into: nothing is "the file in front".
+        assert!(cx.read(|cx| ws.read(cx).active_editor().is_none()));
+        assert_eq!(cx.read(|cx| viewer.read(cx).title()), "shot.png");
+        wait_for(cx, "the picture to be read", &|cx| {
+            viewer.read(cx).picture_state() == Some((Some((640, 480)), 29, None))
+        });
+        // Asked for again, it is the tab it has.
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(shot.clone(), None, window, cx)
+        });
+        assert_eq!(cx.read(|cx| ws.read(cx).panes[0].viewers.len()), 1);
+        // The file changed on disk: the picture is read again.
+        std::fs::write(&shot, png(32, 16)).unwrap();
+        ws.update(cx, |ws, cx| ws.files_changed(vec![shot.clone()], cx));
+        wait_for(cx, "the picture to be read again", &|cx| {
+            viewer.read(cx).picture_state() == Some((Some((32, 16)), 29, None))
+        });
+        // The file behind it comes back when its tab is chosen, and the
+        // picture when its own is.
+        ws.update_in(cx, |ws, window, cx| ws.activate(0, 0, window, cx));
+        assert!(cx.read(|cx| ws.read(cx).panes[0].shown.is_none()));
+        assert_eq!(active_path(&ws, cx), Some(root.join("src/main.rs")));
+        ws.update_in(cx, |ws, window, cx| ws.show_viewer(0, 0, true, window, cx));
+        cx.simulate_keystrokes("secondary-w");
+        assert!(cx.read(|cx| ws.read(cx).panes[0].viewers.is_empty()));
+        assert_eq!(active_path(&ws, cx), Some(root.join("src/main.rs")));
+
+        // A file that is gone says so instead of a picture.
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(root.join("missing.png"), None, window, cx)
+        });
+        let missing = cx.read(|cx| ws.read(cx).panes[0].shown_viewer().cloned().unwrap());
+        wait_for(cx, "why there is no picture", &|cx| {
+            missing
+                .read(cx)
+                .picture_state()
+                .is_some_and(|(_, _, failed)| failed.is_some())
+        });
+    }
+
+    #[gpui::test]
+    async fn markdown_is_shown_next_to_its_source_and_follows_what_is_typed(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::markdown::{Block, Inline};
+        let root = fixture("preview");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        // A file that reads as nothing else has no preview.
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(root.join("src/main.rs"), None, window, cx)
+        });
+        wait_for(cx, "the file", &|cx| ws.read(cx).active_editor().is_some());
+        cx.simulate_keystrokes("secondary-shift-v");
+        assert_eq!(cx.read(|cx| ws.read(cx).panes.len()), 1);
+
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(root.join("README.md"), None, window, cx)
+        });
+        wait_for(cx, "the Markdown file", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|editor| editor.read(cx).path(cx) == Some(&root.join("README.md")))
+        });
+        cx.simulate_keystrokes("secondary-shift-v");
+        let viewer = cx.read(|cx| {
+            let ws = ws.read(cx);
+            assert_eq!(ws.panes.len(), 2);
+            ws.panes[1].shown_viewer().cloned().unwrap()
+        });
+        assert_eq!(cx.read(|cx| viewer.read(cx).title()), "Preview README.md");
+        // The source keeps the keys: it is still the file in front.
+        assert_eq!(active_path(&ws, cx), Some(root.join("README.md")));
+        let words = |words: &str| Block::Paragraph(vec![Inline::Text(words.into())]);
+        wait_for(cx, "the preview", &|cx| {
+            viewer.read(cx).blocks() == [words("A needle in the docs.")]
+        });
+        // Asked for again, it is the same preview.
+        cx.simulate_keystrokes("secondary-shift-v");
+        assert_eq!(cx.read(|cx| ws.read(cx).panes[1].viewers.len()), 1);
+
+        cx.simulate_keystrokes("ctrl-home");
+        cx.simulate_input("# Title");
+        cx.simulate_keystrokes("enter enter");
+        wait_for(cx, "the preview of what was typed", &|cx| {
+            viewer.read(cx).blocks()
+                == [
+                    Block::Heading {
+                        level: 1,
+                        text: vec![Inline::Text("Title".into())],
+                    },
+                    words("A needle in the docs."),
+                ]
+        });
+        // Nothing of it is on disk: the preview is of the document.
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "A needle in the docs.\n"
+        );
+
+        // A link to a file of the project opens the file.
+        viewer.update(cx, |viewer, cx| {
+            viewer.follow_link("src/util/strings.rs#L2", cx)
+        });
+        wait_for(cx, "the linked file", &|cx| {
+            ws.read(cx).active_editor().is_some_and(|editor| {
+                editor.read(cx).path(cx) == Some(&root.join("src/util/strings.rs"))
+            })
+        });
+
+        // With the last tab of its file gone, the preview goes, and the
+        // pane that held nothing else with it.
+        let readme = cx.read(|cx| {
+            let ws = ws.read(cx);
+            ws.all_editors()
+                .find(|editor| editor.read(cx).path(cx) == Some(&root.join("README.md")))
+                .cloned()
+                .unwrap()
+        });
+        ws.update_in(cx, |ws, window, cx| ws.remove_tab(&readme, window, cx));
+        cx.read(|cx| {
+            let ws = ws.read(cx);
+            assert_eq!(ws.panes.len(), 1);
+            assert!(ws.panes[0].viewers.is_empty());
+        });
+        assert_eq!(active_path(&ws, cx), Some(root.join("src/util/strings.rs")));
+    }
+
+    #[gpui::test]
+    async fn an_svg_is_drawn_from_what_is_typed(cx: &mut TestAppContext) {
+        let root = fixture("svg-preview");
+        let logo = root.join("logo.svg");
+        let source = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\"/>\n";
+        std::fs::write(&logo, source).unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(logo.clone(), None, window, cx)
+        });
+        // It opens as text: it is written by hand.
+        wait_for(cx, "the source", &|cx| {
+            ws.read(cx).active_editor().is_some()
+        });
+        assert_eq!(active_text(&ws, cx), source);
+        cx.simulate_keystrokes("secondary-shift-v");
+        let viewer = cx.read(|cx| ws.read(cx).panes[1].shown_viewer().cloned().unwrap());
+        wait_for(cx, "the drawing", &|cx| {
+            viewer.read(cx).picture_state() == Some((None, source.len(), None))
+        });
+        cx.simulate_keystrokes("ctrl-end");
+        cx.simulate_input("<!-- more -->");
+        wait_for(cx, "the drawing of what was typed", &|cx| {
+            viewer.read(cx).picture_state() == Some((None, source.len() + 13, None))
+        });
+    }
+    #[gpui::test]
+    async fn pictures_and_previews_come_back_with_the_tabs(cx: &mut TestAppContext) {
+        let root = fixture("session-viewers");
+        let saved = db::testing::dir("session-viewers-state").join("session.json");
+        let (shot, gone) = (root.join("shot.png"), root.join("gone.png"));
+        std::fs::write(&shot, png(8, 8)).unwrap();
+        std::fs::write(&gone, png(8, 8)).unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(root.join("README.md"), None, window, cx)
+        });
+        wait_for(cx, "the Markdown file", &|cx| {
+            ws.read(cx).active_editor().is_some()
+        });
+        cx.simulate_keystrokes("secondary-shift-v");
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_path(gone.clone(), None, window, cx);
+            ws.open_path(shot.clone(), None, window, cx);
+        });
+        let snapshot = cx.read(|cx| ws.read(cx).snapshot(cx));
+        std::fs::write(&saved, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        ws.update_in(cx, |ws, window, cx| {
+            ws.panes = vec![Pane::default()];
+            ws.active_pane = 0;
+            ws.restore_session(saved.clone(), window, cx);
+        });
+        wait_for(cx, "the tabs to be put back", &|cx| !ws.read(cx).restoring);
+        cx.read(|cx| {
+            let ws = ws.read(cx);
+            let titles = |pane: &Pane| -> Vec<String> {
+                let viewers = pane.viewers.iter();
+                viewers.map(|(viewer, _)| viewer.read(cx).title()).collect()
+            };
+            assert_eq!(ws.panes.len(), 2);
+            // The picture whose file went is not put back; the one that
+            // was in front is in front.
+            assert_eq!(titles(&ws.panes[0]), ["shot.png"]);
+            assert_eq!(ws.panes[0].shown, Some(0));
+            assert_eq!(ws.panes[0].tabs.len(), 1);
+            assert_eq!(titles(&ws.panes[1]), ["Preview README.md"]);
+            assert_eq!(ws.panes[1].shown, Some(0));
+        });
+        let preview = cx.read(|cx| ws.read(cx).panes[1].shown_viewer().cloned().unwrap());
+        wait_for(cx, "the preview to be made again", &|cx| {
+            !preview.read(cx).blocks().is_empty()
+        });
+
+        // What an older build kept has no pictures, and still opens.
+        let mut value = serde_json::to_value(&snapshot).unwrap();
+        value.as_object_mut().unwrap().remove("viewers");
+        std::fs::write(&saved, serde_json::to_vec(&value).unwrap()).unwrap();
+        ws.update_in(cx, |ws, window, cx| {
+            ws.panes = vec![Pane::default()];
+            ws.active_pane = 0;
+            ws.restore_session(saved.clone(), window, cx);
+        });
+        wait_for(cx, "the tabs alone", &|cx| !ws.read(cx).restoring);
+        cx.read(|cx| {
+            let ws = ws.read(cx);
+            assert_eq!(ws.panes.len(), 1);
+            assert_eq!(ws.panes[0].tabs.len(), 1);
+            assert!(ws.panes[0].viewers.is_empty());
+        });
+    }
+    #[gpui::test]
+    async fn the_interface_reads_in_russian_when_the_settings_say_so(cx: &mut TestAppContext) {
+        use crate::command_palette::CommandPalette;
+        use crate::lang::{self, Language};
+        let root = fixture("russian");
+        let config = db::testing::dir("russian-config");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        let commands = |cx: &mut VisualTestContext| -> Vec<String> {
+            cx.simulate_keystrokes("secondary-shift-p");
+            let palette = cx
+                .read(|cx| ws.read(cx).modal_view::<Picker<CommandPalette>>())
+                .expect("the palette");
+            let names = cx.read(|cx| palette.read(cx).delegate.names());
+            cx.simulate_keystrokes("escape");
+            names
+        };
+        assert!(commands(cx).contains(&"Workspace: Open folder".to_string()));
+        assert_eq!(Panel::Files.label(), "Files");
+
+        std::fs::write(config.join("settings.json"), r#"{ "language": "ru" }"#).unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert_eq!(lang::current(), Language::Russian);
+        let russian = commands(cx);
+        assert!(
+            russian.contains(&"Окно: открыть папку".to_string()),
+            "{russian:?}"
+        );
+        assert!(!russian.iter().any(|name| name.starts_with("Workspace: ")));
+        assert_eq!(Panel::Files.label(), "Файлы");
+        // A command is found by its Russian name and runs as it did.
+        cx.simulate_keystrokes("secondary-shift-p");
+        cx.simulate_input("новый файл");
+        cx.simulate_keystrokes("enter");
+        assert!(cx.read(|cx| ws.read(cx).active_editor().is_some()));
+        cx.simulate_input("x");
+        cx.simulate_keystrokes("secondary-w");
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Не сохранять");
+        wait_for(cx, "the tab to close", &|cx| {
+            ws.read(cx).active_editor().is_none()
+        });
+
+        // A language the settings do not know leaves the one in use, and
+        // says so; without the setting it is English again.
+        std::fs::write(config.join("settings.json"), r#"{ "language": "tlh" }"#).unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert_eq!(lang::current(), Language::Russian);
+        assert!(cx.read(|cx| !cx.global::<settings::ConfigErrors>().0.is_empty()));
+        std::fs::write(config.join("settings.json"), "{}").unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert_eq!(lang::current(), Language::English);
+        assert!(commands(cx).contains(&"Workspace: Open folder".to_string()));
     }
 }

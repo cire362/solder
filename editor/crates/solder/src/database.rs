@@ -358,7 +358,7 @@ impl DatabaseStore {
             .spawn(async move { add_to_file(&path, &root, &name, &url) });
         cx.spawn(async move |this, cx| {
             if let Err(e) = task.await {
-                eprintln!("could not save the connection: {e}");
+                crate::journal::error(format_args!("could not save the connection: {e}"));
             }
             this.update(cx, |this, cx| this.redetect(cx)).ok();
         })

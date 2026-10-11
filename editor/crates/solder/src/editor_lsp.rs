@@ -1111,7 +1111,7 @@ impl Editor {
             this.update(cx, |_, cx| match result {
                 Ok(Some(edit)) => cx.emit(EditorEvent::ApplyWorkspaceEdit { edit, encoding }),
                 Ok(None) => {}
-                Err(err) => eprintln!("rename failed: {err}"),
+                Err(err) => crate::journal::error(format_args!("rename failed: {err}")),
             })
             .ok();
         })

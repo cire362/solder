@@ -1,3 +1,4 @@
+use crate::lang::{t, tf};
 use gpui::{
     AnyElement, Context, DismissEvent, Entity, SharedString, Task, Window, div, prelude::*,
 };
@@ -39,7 +40,7 @@ pub fn parse_target(query: &str) -> Option<(usize, usize)> {
 
 impl PickerDelegate for GoToLine {
     fn placeholder(&self) -> SharedString {
-        format!("Line number, 1 to {}", self.line_count).into()
+        tf("Line number, 1 to {}", &[&self.line_count]).into()
     }
 
     fn match_count(&self) -> usize {
@@ -78,9 +79,9 @@ impl PickerDelegate for GoToLine {
     ) -> AnyElement {
         let (row, col) = self.target.unwrap_or_default();
         let label = if col > 0 {
-            format!("Go to line {}, column {}", row + 1, col + 1)
+            tf("Go to line {}, column {}", &[&(row + 1), &(col + 1)])
         } else {
-            format!("Go to line {}", row + 1)
+            tf("Go to line {}", &[&(row + 1)])
         };
         div()
             .text_size(UI_FONT_SIZE)
@@ -90,7 +91,7 @@ impl PickerDelegate for GoToLine {
     }
 
     fn empty_text(&self) -> SharedString {
-        "Type a line number, or line:column".into()
+        t("Type a line number, or line:column").into()
     }
 
     fn width(&self) -> gpui::Pixels {

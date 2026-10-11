@@ -29,6 +29,16 @@ something of its own unchecked or unmade adds it here.
       what a program prints as it ends can be lost (under "Not finished").
       The tests no longer depend on either; a wait that gives up says what
       each terminal did, should it be something else
+- [ ] The question about a crash in a real window, and a panic on Windows
+      and Linux. The hook is checked in a process of its own on the machine
+      that runs the tests, the question and the report's tab headlessly. A
+      real crash of a real run on macOS left its report and its line
+- [ ] A picture's tab, an SVG's preview, a click on a link of a preview and
+      a preview scrolled while its source is typed into, in a real window.
+      Seen live on macOS once: a page with headings, emphasis, lists, tasks,
+      a quote, a table, colored code, a picture of the project and one that
+      is elsewhere. How pictures are sized was changed after that and not
+      looked at again. Whether a GIF moves was not looked at
 - [ ] Failed-command explanations from a real local or hosted model.
       The editable draft, no request before Send, metadata, plain output
       and removing the attachment are checked with the chat fixture
@@ -118,6 +128,10 @@ something of its own unchecked or unmade adds it here.
       (`benchmarks/tests-running.md` measures these features inactive);
       busy terminal output, retained-history search, two visible terminal
       panes and model inference (`benchmarks/terminal-workflow.md` measures
+      these features inactive);
+      a start that puts several windows back or shows the way in, typing
+      with a preview open, a long Markdown file, a large picture, the
+      interface in Russian (`benchmarks/windows-and-way-in.md` measures
       these features inactive)
 - [ ] The numbers on the website (`src/components/performance.tsx`) are
       placeholders, marked so. The measurements in `benchmarks/` are local
@@ -137,6 +151,36 @@ something of its own unchecked or unmade adds it here.
       it had (`EventLoop::pty_read`). macOS does not report the closed end
       that way. Not fixed: it needs a patched copy of that crate or a
       terminal kept open by the editor itself, and that is to be decided
+- [ ] In Russian, the inside of these still reads in English: Git and its
+      history, databases with their tables and diagrams, HTTP, models, chat
+      and the agent, extensions and plugins, services, the debugger, tests,
+      the terminal's own controls, notebooks, Structure, Problems, the
+      import of settings, menus of the editor, and every error a store
+      reports. Nothing checks that a string shown is one given to `lang::t`:
+      the test holds the table to the strings that are. The language of the
+      system is not followed: `language` is set by hand. Numbers have one
+      form ("Курсоров: 3"), dates are not written anywhere yet, and none of
+      it was read in a real window or by a second reader
+- [ ] A preview does not scroll with its source, and the source does not
+      follow a click in it. HTML inside Markdown is shown as written.
+      Footnotes, definition lists, formulas and emoji by name are plain
+      text. A picture that is not a file of this machine is named, not
+      fetched: the editor asks the network for nothing by itself
+- [ ] A picture has no zoom and cannot be moved about; one larger than
+      64 MB is not shown; ICO, AVIF and HEIC open as text. The keys that go
+      to the next and the previous tab pass over pictures and previews
+- [ ] A second `solder` started while one runs is a second process, not a
+      window of the first. Nothing is done when the Dock icon is clicked
+      with no window, or a folder is dropped on it. There is no menu bar,
+      so no Open Recent in one
+- [ ] A clone takes the default branch whole: no branch, depth or
+      submodules to choose, and a clone into a folder inside the
+      repository being cloned is not refused. A project leaves the list of
+      those opened before only when its folder is gone
+- [ ] A crash that is no panic leaves no report: a signal, an abort in
+      native code, memory that ran out. Only the editor's own errors reach
+      `solder.log`: what the `syntax` and `extension` crates print, what
+      GPUI logs and what a language server writes to its error stream do not
 - [ ] Interactive failure reports are for Bash and Zsh only. Bash skips
       disabled, ignored, duplicate or stale history; rewritten history or
       later prompt hooks can defeat attribution. Commands above 8 KB,
@@ -677,11 +721,15 @@ update. They come after phase 9, in this order unless one is needed sooner.
 - [x] A command that failed offered to the model to fix (an editable chat draft)
 
 ### Windows and the way in
-- [ ] A first window with the projects opened last, open a folder, clone
-- [ ] Several windows, a project in each, the set restored
-- [ ] Markdown shown next to its source; pictures shown as pictures
-- [ ] A log of errors with rotation, and a report of a crash at the next start
-- [ ] The interface in Russian as well as English
+- [x] A first window with the projects opened last, open a folder, clone
+- [x] Several windows, a project in each, the set restored
+- [x] Markdown shown next to its source; pictures shown as pictures
+- [x] A log of errors with rotation, and a report of a crash at the next start
+- [ ] The interface in Russian as well as English. There so far: the
+      setting, every command of the palette, the docks' and bars' names,
+      the questions, the lists over the window, find and replace, the tree
+      of files, the way in, pictures and previews. The inside of each tool
+      panel is still English only (see "Not finished")
 
 ### Projects that are somewhere else
 - [ ] A project on a server over SSH: files, terminal, Git, search and

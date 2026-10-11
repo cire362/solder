@@ -127,6 +127,30 @@ Never guess a signature.
   changed, by one thread and in order, let go when the file is saved, its
   tab closed or the window closed with an answer, and put back at the
   next start only after the tabs are. It never writes to the file itself.
+- A project has one window. A window for a project is asked of
+  `windows::open`, which brings forward the one it has, never of
+  `cx.open_window`. `windows.rs` keeps the set and the projects opened
+  before in `sessions/windows.json`: one thread writes, once the set has
+  been still for a moment, and nothing is written before what an earlier
+  run kept was read. A window leaves the set where it agrees to close
+  (`windows::closed`, from `Workspace::confirm_window_close`), not when
+  the system says it is gone: at the end of a run every window goes and
+  none was closed. The way in (`way_in.rs`) is one list, drawn as the
+  first window or over a project.
+- A pane holds tabs of files and, after them, viewers (`viewer.rs`):
+  pictures, and previews of Markdown and SVG. While a pane shows one,
+  `Pane::active_editor` is none: a command for "the file in front" must
+  not reach a file behind a picture. A preview follows its `Document`,
+  not the disk, and is made off the UI thread a moment after the last
+  key (`markdown::parse`, in-house: no crate was added for it). Its rows
+  are a `list`, and only the blocks that changed are measured again, so
+  it stays where it was scrolled to. The list cannot be asked for its
+  size while it lays out a row. A picture on a server is never fetched.
+- An error nobody is shown is said with `journal::error`, never
+  `eprintln!`: it goes to `logs/solder.log` of the settings folder, which
+  `journal.rs` rotates. A panic leaves a report there through the hook
+  `journal::start` sets, and the next start says so once
+  (`Workspace::offer_crash`). Nothing in tests writes to that folder.
 - Language-server requests triggered by typing must run after the current
   effect cycle (`cx.defer`), so the `didChange` for what was just typed
   reaches the server first. See `Editor::after_typing`.
@@ -381,6 +405,13 @@ pattern for new widgets instead of calling `cx.propagate()` everywhere.
   which follows `ui_density`. Code is sized by `buffer_font_size` alone.
 - Comments explain why, not what. Match the density of the surrounding code.
 - User-facing strings are short and plain, with no em dashes.
+- A string the user reads is given to `lang::t` where it is used, or to
+  `lang::tf` with what is put into its `{}`, and has its Russian in
+  `lang_ru.rs` in the same commit: a test fails for one that has none and
+  for an entry of a string that is gone. A new command needs its name in
+  `COMMANDS` there. The English is the key, so write it once and the same
+  everywhere. What is not for the user to read is not translated: what
+  goes to a model, a log, a file, a program.
 
 ## Website (Next.js)
 

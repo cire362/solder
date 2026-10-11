@@ -1701,7 +1701,9 @@ impl ExtensionStore {
         cx.background_executor()
             .spawn(async move {
                 if let Err(error) = state.save(&root) {
-                    eprintln!("extensions: could not save state.json: {error}");
+                    crate::journal::error(format_args!(
+                        "extensions: could not save state.json: {error}"
+                    ));
                 }
             })
             .detach();

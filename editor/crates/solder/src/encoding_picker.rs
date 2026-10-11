@@ -1,6 +1,7 @@
 //! Choose what a file is written in: to read it again as that, or to
 //! save it as that from now on.
 
+use crate::lang::t;
 use gpui::{
     AnyElement, Context, DismissEvent, Entity, SharedString, Task, Window, div, prelude::*,
 };
@@ -36,8 +37,8 @@ impl EncodingPicker {
 impl PickerDelegate for EncodingPicker {
     fn placeholder(&self) -> SharedString {
         match self.reopen {
-            true => "Read the file again as written in",
-            false => "Save the file as written in",
+            true => t("Read the file again as written in"),
+            false => t("Save the file as written in"),
         }
         .into()
     }
@@ -126,10 +127,10 @@ impl PickerDelegate for EncodingPicker {
                 theme.fg,
                 theme.accent,
             ))
-            .when(current, |d| d.child(" (as it is now)"))
+            .when(current, |d| d.child(t(" (as it is now)")))
             .into_any_element()
     }
     fn empty_text(&self) -> SharedString {
-        "No encoding of that name".into()
+        t("No encoding of that name").into()
     }
 }

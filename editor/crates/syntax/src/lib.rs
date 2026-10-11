@@ -633,9 +633,9 @@ pub fn language_for_path(path: &Path) -> Option<Arc<Language>> {
         .cloned()
 }
 
-/// The language an injection calls `name`: built-in ones first, then those
-/// of extensions.
-fn language_named(name: &str) -> Option<Arc<Language>> {
+/// The language an injection or a fenced block calls `name`: built-in
+/// ones first, then those of extensions.
+pub fn language_named(name: &str) -> Option<Arc<Language>> {
     let name = name.trim().to_lowercase();
     registry()
         .iter()

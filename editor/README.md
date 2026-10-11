@@ -51,6 +51,35 @@ scripts/bench.sh [file]
 
 The status bar shows live input latency, frame time, memory and startup time. Toggle it with `cmd-alt-p`.
 
+## Windows and projects
+
+A project is a folder, and it has one window. `solder path/to/folder` opens
+it; `solder path/to/file` opens the file in a window on its folder. Started
+with nothing named, Solder puts back the windows the last run was left with:
+each project where its window was and as large, on the display it was on if
+that is still there.
+
+A window closed while others are open leaves that set. The last one to close
+ends the run, and is what the next start begins with.
+
+With no window to put back, the start shows the way in: the projects opened
+before, **Open a folder**, and cloning. Type to narrow the list. Paste the
+address of a repository (`https://...`, `git@host:owner/name`, anything
+ending in `.git`) and the list offers **Clone**: choose the folder to clone
+into, and the project opens when git is done. What git says of its progress,
+or of why it could not, is in the row. Git is given no terminal to ask for a
+password on, so a repository that needs one clones only when a credential
+helper or an SSH agent already has it.
+
+Inside a project, **Workspace: Open project** (`cmd-alt-o`) shows the same
+list over the window. What is chosen gets a window of its own, and a project
+that has one already, marked `open`, is brought to the front.
+**Workspace: New window** (`cmd-shift-n`) shows the way in as a window, and
+**Workspace: Open folder** (`cmd-o`) asks for a folder at once.
+
+The set is kept in `~/.config/solder/sessions/windows.json`, with the last
+thirty projects.
+
 ## Editing
 
 Several cursors: `alt`-click adds one, `cmd-alt-up` and `cmd-alt-down` add
@@ -147,6 +176,24 @@ closed last, with its cursors and where it was scrolled to, then the one
 closed before it, up to 32 back; a file that is open already or gone from
 disk is passed over. Closed tabs are remembered while the window is open,
 not across a restart.
+
+## Pictures and previews
+
+A PNG, JPEG, GIF, WebP, BMP or TIFF file opens as the picture it is, in a
+tab next to the tabs of files, with its size, its format and how many bytes
+it has under it. It is read again when the file changes.
+
+**Workspace: Open preview** (`cmd-shift-v`) shows what the Markdown file in
+front reads as, in the pane to its right: headings, lists with tasks, quotes,
+tables, rules, code in the colors of its language, links and pictures. The
+file keeps the keys, and the preview follows what is typed, saved or not. A
+link to a file of the project opens the file; any other opens where the
+system opens addresses. A picture that is a file of this machine is drawn. One
+that is on a server is shown by its name: nothing is fetched.
+
+An SVG opens as text, and the same command draws it next to its source.
+
+Pictures and previews come back with the tabs at the next start.
 
 ## Structure and breadcrumbs
 
@@ -1750,6 +1797,36 @@ text grows and shrinks with it, and the rows of lists grow with larger text so
 that a line always fits. `ui_density` is how tall those rows are: `compact`,
 `default` or `comfortable`. The bars keep the heights `layout.json` gives
 them.
+
+## The interface in Russian
+
+`"language": "ru"` in the settings puts the interface in Russian, and `"en"`,
+which it is without the setting, in English. It applies as soon as the file
+is saved.
+
+In Russian so far: every command of the palette, which is then found by its
+Russian name, the names of the docks' tabs and of what the bars say, the
+questions about unsaved files, the lists over the window, find and replace,
+the tree of files, the window a start shows, pictures and previews. The inside
+of the tool panels (Git, databases, HTTP, models, the agent, extensions,
+the debugger, tests and the rest) still reads in English.
+
+## When something goes wrong
+
+An error Solder meets on its own (a file it could not write, a tab it could
+not restore, a setting it could not read) is a line of
+`~/.config/solder/logs/solder.log`, with the time in UTC. **Workspace: Show
+error log** opens it. At a megabyte the log is put aside as `solder.1.log`,
+and three old ones are kept.
+
+A panic writes a report before the process ends: the version, the system,
+the thread, the place, the message and the stack, in
+`logs/crash-<time>-<pid>-<nanos>.txt`. The first window of the next start
+says so once, with **Show report** and **Dismiss**. Either way the report
+moves to `logs/seen`, where the last five stay. Nothing leaves the machine.
+
+A crash that is no panic (a signal, an abort in native code) leaves no
+report. What a language server or an extension prints is not in the log.
 
 ## Settings from another editor
 
