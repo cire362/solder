@@ -129,6 +129,10 @@ something of its own unchecked or unmade adds it here.
       (`benchmarks/tests-running.md` measures these features inactive);
       busy terminal output, retained-history search, two visible terminal
       panes and model inference (`benchmarks/terminal-workflow.md` measures
+      these features inactive);
+      a start that puts several windows back or shows the way in, typing
+      with a preview open, a long Markdown file, a large picture, the
+      interface in Russian (`benchmarks/windows-and-way-in.md` measures
       these features inactive)
 - [ ] The numbers on the website (`src/components/performance.tsx`) are
       placeholders, marked so. The measurements in `benchmarks/` are local
