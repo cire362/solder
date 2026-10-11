@@ -268,6 +268,19 @@ impl Terminal {
     }
 
     #[cfg(test)]
+    pub fn search_match_visible(&self, cx: &App) -> bool {
+        let search = self.search.read(cx);
+        let term = self.term.lock();
+        search
+            .active
+            .and_then(|i| search.found.matches.get(i))
+            .is_some_and(|m| {
+                let row = m.start.line.0 + term.grid().display_offset() as i32;
+                row >= 0 && row < term.screen_lines() as i32
+            })
+    }
+
+    #[cfg(test)]
     pub fn bounds(&self) -> Option<Bounds<Pixels>> {
         self.last_bounds
     }

@@ -53,6 +53,8 @@ pub(super) struct Search {
     term: Arc<FairMutex<Term<Listener>>>,
     generation: Arc<AtomicU64>,
     pending: bool,
+    dirty: bool,
+    reveal_pending: bool,
     task: Option<Task<()>>,
     _query: Subscription,
 }
@@ -78,6 +80,8 @@ impl Search {
             term,
             generation: Arc::new(AtomicU64::new(0)),
             pending: false,
+            dirty: false,
+            reveal_pending: false,
             task: None,
             _query: subscription,
         }
@@ -90,17 +94,27 @@ impl Search {
     }
 
     pub fn refresh(&mut self, reveal: bool, cx: &mut Context<Self>) {
-        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        self.task = None;
         if !self.visible {
             return;
         }
+        self.reveal_pending |= reveal;
+        // Output is throttled, not debounced: a busy process must not keep
+        // postponing its search. A changed query still cancels old work.
+        if !reveal && self.task.is_some() {
+            self.dirty = true;
+            return;
+        }
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.task = None;
+        self.dirty = false;
         let query = self.query.read(cx).text(cx);
         let old = self
             .active
             .and_then(|i| self.found.matches.get(i).map(|m| m.start));
-        self.found = Found::default();
-        self.active = None;
+        if reveal || query.is_empty() {
+            self.found = Found::default();
+            self.active = None;
+        }
         self.pending = !query.is_empty();
         if query.is_empty() {
             cx.notify();
@@ -112,6 +126,9 @@ impl Search {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(150))
                 .await;
+            if this.update(cx, |this, _| this.dirty = false).is_err() {
+                return;
+            }
             let found = cx
                 .background_executor()
                 .spawn(async move { find(&term, &query, &counter, generation) })
@@ -120,6 +137,7 @@ impl Search {
                 if this.generation.load(Ordering::Relaxed) != generation || !this.visible {
                     return;
                 }
+                this.task = None;
                 this.found = found;
                 this.pending = false;
                 this.active = if this.found.matches.is_empty() {
@@ -130,8 +148,12 @@ impl Search {
                             .unwrap_or(0),
                     )
                 };
-                if reveal {
+                if this.reveal_pending {
                     this.reveal();
+                    this.reveal_pending = false;
+                }
+                if this.dirty {
+                    this.refresh(false, cx);
                 }
                 cx.notify();
             })
@@ -169,6 +191,7 @@ impl Search {
     }
     fn close(&mut self, _: &Close, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = false;
+        self.reveal_pending = false;
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.task = None;
         self.found = Found::default();
@@ -218,17 +241,24 @@ fn find(
         bytes += line.text.len();
         found.limited |= line.limited;
         for (byte, text) in line.text.match_indices(query) {
+            if counter.load(Ordering::Relaxed) != generation {
+                return Found::default();
+            }
+            let first = line.cells.partition_point(|(range, _)| range.end <= byte);
+            let last_byte = byte + text.len() - 1;
+            let last = line
+                .cells
+                .partition_point(|(range, _)| range.start <= last_byte)
+                .checked_sub(1);
             let start = line
                 .cells
-                .iter()
-                .find(|(r, _)| r.contains(&byte))
-                .map(|(_, p)| *p);
-            let end = line
-                .cells
-                .iter()
-                .rev()
-                .find(|(r, _)| r.contains(&(byte + text.len() - 1)))
-                .map(|(_, p)| *p);
+                .get(first)
+                .filter(|(range, _)| range.contains(&byte))
+                .map(|(_, point)| *point);
+            let end = last
+                .and_then(|i| line.cells.get(i))
+                .filter(|(range, _)| range.contains(&last_byte))
+                .map(|(_, point)| *point);
             if let (Some(start), Some(end)) = (start, end) {
                 found.matches.push(Match { start, end });
             }
@@ -251,7 +281,7 @@ impl Render for Search {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let focused = self.query.focus_handle(cx).is_focused(window);
-        let status: String = if self.pending {
+        let status: String = if self.pending && self.found.matches.is_empty() {
             "Searching...".into()
         } else {
             format!(
@@ -310,6 +340,34 @@ impl Drop for Search {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_search_caps_matches_and_does_not_search_hidden_text() {
+        let (tx, _) = futures::channel::mpsc::unbounded();
+        let mut term = Term::new(
+            Default::default(),
+            &super::super::GridSize {
+                columns: 80,
+                lines: 3,
+            },
+            Listener(tx),
+        );
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        // A dense wrapped line exercises lookup inside one logical line,
+        // rather than only cancellation between hard line breaks.
+        parser.advance(&mut term, "x".repeat(10_000).as_bytes());
+        parser.advance(&mut term, b"\r\n");
+        for _ in 0..600 {
+            parser.advance(&mut term, format!("{}\r\n", "x".repeat(80)).as_bytes());
+        }
+        parser.advance(&mut term, b"\x1b[8mhidden-needle\x1b[0m\r\n");
+        let term = Arc::new(FairMutex::new(term));
+        let counter = AtomicU64::new(0);
+        let found = find(&term, "x", &counter, 0);
+        assert_eq!(found.matches.len(), 20_000);
+        assert!(found.limited);
+        assert!(find(&term, "hidden-needle", &counter, 0).matches.is_empty());
+    }
 
     #[test]
     fn search_reads_history_and_soft_wraps_and_can_be_cancelled() {

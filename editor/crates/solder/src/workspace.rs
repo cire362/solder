@@ -8083,6 +8083,13 @@ mod tests {
         assert_eq!(cx.read(|cx| terminal.read(cx).search_state(cx).2), before.2);
         cx.simulate_keystrokes("escape");
         assert!(!cx.read(|cx| terminal.read(cx).search_state(cx).0));
+        cx.simulate_input(" "); // Input returns to the bottom of the terminal.
+        assert!(!cx.read(|cx| terminal.read(cx).search_match_visible(cx)));
+        cx.simulate_keystrokes("secondary-f");
+        wait_for(cx, "the reopened match to be revealed", &|cx| {
+            terminal.read(cx).search_match_visible(cx)
+        });
+        cx.simulate_keystrokes("escape");
         cx.simulate_input("echo still-running");
         cx.simulate_keystrokes("enter");
         wait_for(cx, "the shell after search", &|cx| {
@@ -8095,10 +8102,34 @@ mod tests {
     }
 
     #[gpui::test]
+    fn terminal_search_finishes_while_output_keeps_arriving(cx: &mut TestAppContext) {
+        let root = fixture("terminal-busy-search");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let terminal = ws.update_in(cx, |w,window,cx| w.spawn_terminal(TerminalCommand {
+            program: Some("/bin/sh".into()), args: vec!["-c".into(), "printf 'busy-needle\\n'; i=0; while [ $i -lt 100 ]; do echo tick-$i; i=$((i+1)); sleep 0.05; done".into()], cwd: root, keep_on_exit: true, ..Default::default()
+        }, window,cx)).unwrap();
+        wait_for(cx, "the busy process", &|cx| {
+            terminal.read(cx).text_position("busy-needle").is_some()
+        });
+        cx.simulate_keystrokes("secondary-f");
+        cx.simulate_input("busy-needle");
+        wait_for(cx, "search during output", &|cx| {
+            terminal.read(cx).search_state(cx).1 == 1
+        });
+        assert!(!cx.read(|cx| terminal.read(cx).exited));
+        cx.simulate_keystrokes("enter");
+        assert!(cx.read(|cx| terminal.read(cx).search_match_visible(cx)));
+    }
+
+    #[gpui::test]
     fn terminal_split_keeps_two_processes_focus_and_layout(cx: &mut TestAppContext) {
         let root = fixture("terminal-split");
         cx.executor().allow_parking();
         let (ws, cx) = setup(cx, root.clone());
+        let config = db::testing::dir("terminal-split-config");
+        std::fs::write(config.join("layout.json"), "// split preference\n{}\n").unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
         let spawn = |cx: &mut VisualTestContext| {
             ws.update_in(cx, |w, window, cx| {
                 w.spawn_terminal(
@@ -8152,6 +8183,14 @@ mod tests {
             ..Default::default()
         });
         assert!(cx.read(|cx| Layout::get(cx).terminal.ratio) > 0.5);
+        wait_for(cx, "the saved terminal proportion", &|_| {
+            std::fs::read_to_string(config.join("layout.json"))
+                .ok()
+                .is_some_and(|text| {
+                    text.contains("// split preference")
+                        && layout::parse(&text).is_ok_and(|layout| layout.terminal.ratio > 0.5)
+                })
+        });
         cx.update(|_, cx| {
             let mut layout = Layout::get(cx).clone();
             layout.terminal.axis = layout::TerminalAxis::Vertical;
