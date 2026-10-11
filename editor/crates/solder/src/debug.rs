@@ -157,6 +157,11 @@ pub struct DebugStore {
     /// Which line each breakpoint the adapter numbered stands for, so a
     /// later `breakpoint` event can mark it verified.
     breakpoint_ids: HashMap<(usize, i64), (PathBuf, u32)>,
+    /// What an adapter said of a breakpoint by a number it had not yet
+    /// been heard to give. The answer that numbers a breakpoint and the
+    /// event that verifies it come by two ways, and the event may be
+    /// taken in first: it is kept for the answer.
+    breakpoint_early: HashMap<(usize, i64), bool>,
     breakpoint_options: BTreeMap<PathBuf, BTreeMap<u32, BreakpointOptions>>,
     breakpoint_revisions: HashMap<(usize, PathBuf), u64>,
     pub timeline: Vec<crate::debug_timeline::Entry>,
@@ -206,6 +211,7 @@ impl DebugStore {
             run: 0,
             pending_browser: None,
             breakpoint_ids: HashMap::new(),
+            breakpoint_early: HashMap::new(),
             breakpoint_options: BTreeMap::new(),
             breakpoint_revisions: HashMap::new(),
             timeline: Vec::new(),
@@ -386,12 +392,25 @@ impl DebugStore {
                     .iter()
                     .zip(body["breakpoints"].as_array().into_iter().flatten())
                 {
-                    if let Some(slot) = lines.get_mut(asked) {
-                        *slot = got["verified"].as_bool().unwrap_or(false);
+                    // The line was marked unverified when this was asked. An
+                    // answer that it is not verified here leaves it as it
+                    // is: another session, the one that runs the program,
+                    // may have verified it meanwhile.
+                    if let Some(slot) = lines.get_mut(asked)
+                        && got["verified"].as_bool().unwrap_or(false)
+                    {
+                        *slot = true;
                     }
                     if let Some(bp) = got["id"].as_i64() {
                         this.breakpoint_ids
                             .insert((session, bp), (path.clone(), *asked));
+                        // Said of this number before the number was known.
+                        if let (Some(early), Some(slot)) = (
+                            this.breakpoint_early.remove(&(session, bp)),
+                            lines.get_mut(asked),
+                        ) {
+                            *slot = early;
+                        }
                     }
                 }
                 cx.notify();
@@ -912,16 +931,19 @@ impl DebugStore {
                 }
                 "breakpoint" => {
                     let bp = &body["breakpoint"];
-                    let found = bp["id"]
-                        .as_i64()
-                        .and_then(|bp| self.breakpoint_ids.get(&(id, bp)).cloned());
+                    let verified = bp["verified"].as_bool().unwrap_or(false);
+                    let number = bp["id"].as_i64();
+                    let found = number.and_then(|bp| self.breakpoint_ids.get(&(id, bp)).cloned());
+                    if let (None, Some(number)) = (&found, number) {
+                        self.breakpoint_early.insert((id, number), verified);
+                    }
                     if let Some((path, line)) = found
                         && let Some(slot) = self
                             .breakpoints
                             .get_mut(&path)
                             .and_then(|l| l.get_mut(&line))
                     {
-                        *slot = bp["verified"].as_bool().unwrap_or(false);
+                        *slot = verified;
                         cx.notify();
                     }
                 }
@@ -1220,6 +1242,7 @@ impl DebugStore {
         self.children.clear();
         self.pending_browser = None;
         self.breakpoint_ids.clear();
+        self.breakpoint_early.clear();
         self.breakpoint_revisions.clear();
         // The next run's adapter verifies them again.
         for line in self.breakpoints.values_mut().flat_map(|l| l.values_mut()) {
