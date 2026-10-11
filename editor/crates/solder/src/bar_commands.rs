@@ -1,5 +1,6 @@
 //! A bar button uses the same commands as the palette and key bindings.
 
+use crate::lang::t;
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, SharedString, Task, Window, div, prelude::*,
 };
@@ -74,7 +75,7 @@ impl Commands {
 
 impl PickerDelegate for Commands {
     fn placeholder(&self) -> SharedString {
-        "Choose a command for the button".into()
+        t("Choose a command for the button").into()
     }
     fn match_count(&self) -> usize {
         self.matches.len()

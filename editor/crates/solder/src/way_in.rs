@@ -6,6 +6,7 @@
 //! that window's place. Inside a project it is a list over the window, and
 //! what is chosen gets a window next to this one.
 
+use crate::lang::{t, tf};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicBool},
@@ -138,7 +139,7 @@ impl WayIn {
         cx: &mut Context<Picker<Self>>,
     ) {
         let Some(name) = git::clone_name(&address) else {
-            self.failed = Some("This address names no repository".into());
+            self.failed = Some(t("This address names no repository").into());
             cx.notify();
             return;
         };
@@ -187,7 +188,7 @@ impl WayIn {
         self.failed = None;
         self.cloning = Some(Cloning {
             into,
-            said: "Starting".into(),
+            said: t("Starting").into(),
             stop,
             _task: task,
         });
@@ -209,8 +210,8 @@ impl WayIn {
         self.rows
             .iter()
             .map(|row| match row {
-                Row::Folder => "Open a folder".to_string(),
-                Row::Clone(address) => format!("Clone {address}"),
+                Row::Folder => t("Open a folder").to_string(),
+                Row::Clone(address) => tf("Clone {}", &[&address]),
                 Row::Recent(path, _) => path.display().to_string(),
             })
             .collect()
@@ -219,7 +220,7 @@ impl WayIn {
 
 impl PickerDelegate for WayIn {
     fn placeholder(&self) -> SharedString {
-        "Open a project, or paste an address to clone".into()
+        t("Open a project, or paste an address to clone").into()
     }
 
     fn match_count(&self) -> usize {
@@ -275,12 +276,13 @@ impl PickerDelegate for WayIn {
             return;
         }
         match self.rows.get(self.selected).cloned() {
-            Some(Row::Folder) => Self::ask_folder("Open", window, cx, Self::go),
-            Some(Row::Clone(address)) => {
-                Self::ask_folder("Clone here", window, cx, move |this, parent, window, cx| {
-                    this.clone_into(address, parent, window, cx)
-                })
-            }
+            Some(Row::Folder) => Self::ask_folder(t("Open"), window, cx, Self::go),
+            Some(Row::Clone(address)) => Self::ask_folder(
+                t("Clone here"),
+                window,
+                cx,
+                move |this, parent, window, cx| this.clone_into(address, parent, window, cx),
+            ),
             Some(Row::Recent(root, _)) if root.is_dir() => self.go(root, window, cx),
             Some(Row::Recent(root, _)) => {
                 // Its folder is gone: it is no way in any more.
@@ -289,7 +291,7 @@ impl PickerDelegate for WayIn {
                 self.rows
                     .retain(|row| !matches!(row, Row::Recent(known, _) if known == &root));
                 self.selected = self.selected.min(self.rows.len().saturating_sub(1));
-                self.failed = Some(format!("{} is not there any more", Self::shown(&root)));
+                self.failed = Some(tf("{} is not there any more", &[&Self::shown(&root)]));
                 cx.notify();
             }
             None => {}
@@ -323,10 +325,9 @@ impl PickerDelegate for WayIn {
         // What the first row says of the thing in progress or just failed.
         let state = (ix == 0)
             .then(|| match (&self.cloning, &self.failed) {
-                (Some(cloning), _) => Some(format!(
+                (Some(cloning), _) => Some(tf(
                     "Cloning into {}: {}",
-                    Self::shown(&cloning.into),
-                    cloning.said
+                    &[&Self::shown(&cloning.into), &cloning.said],
                 )),
                 (None, Some(failed)) => Some(failed.clone()),
                 (None, None) => None,
@@ -334,11 +335,11 @@ impl PickerDelegate for WayIn {
             .flatten();
         match &self.rows[ix] {
             Row::Folder => row
-                .child("Open a folder")
+                .child(t("Open a folder"))
                 .children(state.map(aside))
                 .into_any_element(),
             Row::Clone(address) => row
-                .child(format!("Clone {address}"))
+                .child(tf("Clone {}", &[&address]))
                 .children(state.map(aside))
                 .into_any_element(),
             Row::Recent(path, positions) => {
@@ -368,7 +369,7 @@ impl PickerDelegate for WayIn {
                                 .flex_none()
                                 .text_size(UI_FONT_SMALL)
                                 .text_color(theme.fg_subtle)
-                                .child("open"),
+                                .child(t("open")),
                         )
                     })
                     .into_any_element()
@@ -377,7 +378,7 @@ impl PickerDelegate for WayIn {
     }
 
     fn empty_text(&self) -> SharedString {
-        "No project of that name".into()
+        t("No project of that name").into()
     }
 
     fn width(&self) -> gpui::Pixels {

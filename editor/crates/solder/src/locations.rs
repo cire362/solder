@@ -1,6 +1,7 @@
 //! Pickers for language-server results: a list of locations (references,
 //! several definitions) and the rename prompt.
 
+use crate::lang::{t, tf};
 use std::path::PathBuf;
 
 use gpui::{
@@ -198,7 +199,7 @@ impl RenamePrompt {
 
 impl PickerDelegate for RenamePrompt {
     fn placeholder(&self) -> SharedString {
-        format!("Rename {}", self.current).into()
+        tf("Rename {}", &[&self.current]).into()
     }
 
     fn match_count(&self) -> usize {
@@ -248,7 +249,7 @@ impl PickerDelegate for RenamePrompt {
     }
 
     fn empty_text(&self) -> SharedString {
-        "Type a new name".into()
+        t("Type a new name").into()
     }
 
     fn width(&self) -> gpui::Pixels {
@@ -284,7 +285,7 @@ impl CodeActionPicker {
 
 impl PickerDelegate for CodeActionPicker {
     fn placeholder(&self) -> SharedString {
-        "Code actions".into()
+        t("Code actions").into()
     }
 
     fn match_count(&self) -> usize {
@@ -353,6 +354,6 @@ impl PickerDelegate for CodeActionPicker {
     }
 
     fn empty_text(&self) -> SharedString {
-        "No code actions here".into()
+        t("No code actions here").into()
     }
 }

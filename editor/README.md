@@ -1798,6 +1798,19 @@ that a line always fits. `ui_density` is how tall those rows are: `compact`,
 `default` or `comfortable`. The bars keep the heights `layout.json` gives
 them.
 
+## The interface in Russian
+
+`"language": "ru"` in the settings puts the interface in Russian, and `"en"`,
+which it is without the setting, in English. It applies as soon as the file
+is saved.
+
+In Russian so far: every command of the palette, which is then found by its
+Russian name, the names of the docks' tabs and of what the bars say, the
+questions about unsaved files, the lists over the window, find and replace,
+the tree of files, the window a start shows, pictures and previews. The inside
+of the tool panels (Git, databases, HTTP, models, the agent, extensions,
+the debugger, tests and the rest) still reads in English.
+
 ## When something goes wrong
 
 An error Solder meets on its own (a file it could not write, a tab it could

@@ -4,6 +4,7 @@
 //! opens as one. A preview is asked for from a Markdown or SVG file and
 //! follows its document, saved or not: what is typed is what is shown.
 
+use crate::lang::{t, tf};
 use std::{
     ops::Range,
     path::{Path, PathBuf},
@@ -303,7 +304,7 @@ impl Viewer {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "untitled".into());
         match self.source {
-            Some(_) => format!("Preview {name}"),
+            Some(_) => tf("Preview {}", &[&name]),
             None => name,
         }
     }
@@ -320,7 +321,7 @@ impl Viewer {
         let read = cx.background_executor().spawn(async move {
             let length = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
             if length > PICTURE_LIMIT {
-                return Err("This picture is too large to show".to_string());
+                return Err(t("This picture is too large to show").to_string());
             }
             let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
             Ok((picture_size(format, &bytes), bytes))
@@ -756,7 +757,7 @@ impl Pen<'_> {
                 .text_size(UI_FONT_SMALL)
                 .text_color(self.theme.fg_subtle)
                 .child(match alt.is_empty() {
-                    true => "picture".to_string(),
+                    true => t("picture").to_string(),
                     false => alt.to_string(),
                 })
                 .into_any_element(),
@@ -1037,7 +1038,7 @@ impl Viewer {
                 picture
                     .failed
                     .clone()
-                    .unwrap_or_else(|| "Reading the picture".into()),
+                    .unwrap_or_else(|| t("Reading the picture").into()),
             );
         };
         let mut facts = Vec::new();
@@ -1068,7 +1069,7 @@ impl Viewer {
                                 div()
                                     .text_size(UI_FONT_SIZE)
                                     .text_color(subtle)
-                                    .child("This picture could not be read")
+                                    .child(t("This picture could not be read"))
                                     .into_any_element()
                             }),
                     ),
@@ -1123,7 +1124,7 @@ impl Render for Viewer {
                 .justify_center()
                 .text_size(UI_FONT_SIZE)
                 .text_color(theme.fg_subtle)
-                .child("Nothing to show yet")
+                .child(t("Nothing to show yet"))
                 .into_any_element(),
             Kind::Markdown(preview) => {
                 let row =

@@ -1,6 +1,7 @@
 //! A query field over a filtered list. The command palette, file finder and
 //! go-to-line all build on this; only the delegate differs.
 
+use crate::lang::t;
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     KeyBinding, MouseButton, Pixels, ScrollStrategy, SharedString, Subscription, Task,
@@ -64,7 +65,7 @@ pub trait PickerDelegate: Sized + 'static {
     ) -> AnyElement;
 
     fn empty_text(&self) -> SharedString {
-        "No matches".into()
+        t("No matches").into()
     }
 
     fn width(&self) -> Pixels {

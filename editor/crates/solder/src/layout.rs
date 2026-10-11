@@ -17,6 +17,7 @@
 //! The title bar and the status bar hold items, from the left end and
 //! from the right one. An item is in one place, or in none.
 
+use crate::lang::t;
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
@@ -156,24 +157,24 @@ impl Panel {
     /// What its tab says.
     pub fn label(self) -> &'static str {
         match self {
-            Panel::Files => "Files",
-            Panel::Search => "Search",
-            Panel::Git => "Git",
-            Panel::Services => "Services",
-            Panel::Database => "Database",
-            Panel::Api => "API",
-            Panel::Ai => "AI",
-            Panel::Extensions => "Extensions",
-            Panel::ExtensionViews => "Views",
-            Panel::Tests => "Tests",
-            Panel::Structure => "Structure",
-            Panel::Problems => "Problems",
-            Panel::Chat => "Chat",
-            Panel::Agent => "Agent",
-            Panel::Terminal => "Terminal",
-            Panel::Results => "Results",
-            Panel::Response => "Response",
-            Panel::Debug => "Debug",
+            Panel::Files => t("Files"),
+            Panel::Search => t("Search"),
+            Panel::Git => t("Git"),
+            Panel::Services => t("Services"),
+            Panel::Database => t("Database"),
+            Panel::Api => t("API"),
+            Panel::Ai => t("AI"),
+            Panel::Extensions => t("Extensions"),
+            Panel::ExtensionViews => t("Views"),
+            Panel::Tests => t("Tests"),
+            Panel::Structure => t("Structure"),
+            Panel::Problems => t("Problems"),
+            Panel::Chat => t("Chat"),
+            Panel::Agent => t("Agent"),
+            Panel::Terminal => t("Terminal"),
+            Panel::Results => t("Results"),
+            Panel::Response => t("Response"),
+            Panel::Debug => t("Debug"),
         }
     }
 
@@ -313,20 +314,20 @@ impl Item {
 
     pub fn label(&self) -> &str {
         match self {
-            Item::Project => "Project",
-            Item::File => "File",
-            Item::Breadcrumbs => "Breadcrumbs",
-            Item::Branch => "Branch",
-            Item::Position => "Position",
-            Item::Indent => "Indent",
-            Item::Encoding => "Encoding",
-            Item::Language => "Language",
-            Item::Problems => "Problems",
-            Item::Activity => "Activity",
-            Item::Connection => "Connection",
-            Item::Extensions => "Extensions",
-            Item::Plugins => "Plugins",
-            Item::Performance => "Performance",
+            Item::Project => t("Project"),
+            Item::File => t("File"),
+            Item::Breadcrumbs => t("Breadcrumbs"),
+            Item::Branch => t("Branch"),
+            Item::Position => t("Position"),
+            Item::Indent => t("Indent"),
+            Item::Encoding => t("Encoding"),
+            Item::Language => t("Language"),
+            Item::Problems => t("Problems"),
+            Item::Activity => t("Activity"),
+            Item::Connection => t("Connection"),
+            Item::Extensions => t("Extensions"),
+            Item::Plugins => t("Plugins"),
+            Item::Performance => t("Performance"),
             Item::Button { button } => button,
         }
     }
@@ -412,10 +413,10 @@ impl BarEnd {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::TitleLeft => "title bar, left",
-            Self::TitleRight => "title bar, right",
-            Self::StatusLeft => "status bar, left",
-            Self::StatusRight => "status bar, right",
+            Self::TitleLeft => t("title bar, left"),
+            Self::TitleRight => t("title bar, right"),
+            Self::StatusLeft => t("status bar, left"),
+            Self::StatusRight => t("status bar, right"),
         }
     }
 

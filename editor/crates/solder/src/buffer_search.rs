@@ -1,5 +1,6 @@
 //! The find and replace bar above the active editor (`cmd-f`, `cmd-alt-f`).
 
+use crate::lang::{t, tf};
 use std::{ops::Range, sync::Arc};
 
 use gpui::{
@@ -71,8 +72,8 @@ pub struct BufferSearchBar {
 
 impl BufferSearchBar {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let query = cx.new(|cx| Editor::single_line("Find", cx));
-        let replacement = cx.new(|cx| Editor::single_line("Replace", cx));
+        let query = cx.new(|cx| Editor::single_line(t("Find"), cx));
+        let replacement = cx.new(|cx| Editor::single_line(t("Replace"), cx));
         let subscriptions = vec![cx.subscribe_in(&query, window, |this, _, e, _, cx| {
             if let EditorEvent::Edited = e {
                 this.follow_cursor = true;
@@ -362,10 +363,10 @@ impl BufferSearchBar {
             return err.clone();
         }
         match (self.matches.len(), self.active) {
-            (0, _) => "No results".into(),
-            (n, Some(i)) if n >= MATCH_LIMIT => format!("{} of {}+", i + 1, n),
-            (n, Some(i)) => format!("{} of {}", i + 1, n),
-            (n, None) => format!("{n} results"),
+            (0, _) => t("No results").into(),
+            (n, Some(i)) if n >= MATCH_LIMIT => tf("{} of {}+", &[&(i + 1), &n]),
+            (n, Some(i)) => tf("{} of {}", &[&(i + 1), &n]),
+            (n, None) => tf("{} results", &[&n]),
         }
     }
 }
@@ -421,7 +422,7 @@ impl Render for BufferSearchBar {
                     .child(ui::toggle(
                         "toggle-replace",
                         if self.show_replace { "▾" } else { "▸" },
-                        "Toggle replace",
+                        t("Toggle replace"),
                         false,
                         &theme,
                         on(|this, window, cx| this.toggle_replace(&ToggleReplace, window, cx)),
@@ -430,7 +431,7 @@ impl Render for BufferSearchBar {
                     .child(ui::toggle(
                         "case",
                         "Aa",
-                        "Match case",
+                        t("Match case"),
                         options.case_sensitive,
                         &theme,
                         on(|this, window, cx| this.toggle_case(&ToggleCase, window, cx)),
@@ -438,7 +439,7 @@ impl Render for BufferSearchBar {
                     .child(ui::toggle(
                         "word",
                         "ab",
-                        "Whole word",
+                        t("Whole word"),
                         options.whole_word,
                         &theme,
                         on(|this, window, cx| this.toggle_word(&ToggleWord, window, cx)),
@@ -446,7 +447,7 @@ impl Render for BufferSearchBar {
                     .child(ui::toggle(
                         "regex",
                         ".*",
-                        "Regular expression",
+                        t("Regular expression"),
                         options.regex,
                         &theme,
                         on(|this, window, cx| this.toggle_regex(&ToggleRegex, window, cx)),
@@ -467,7 +468,7 @@ impl Render for BufferSearchBar {
                     .child(ui::toggle(
                         "prev",
                         "↑",
-                        "Previous match",
+                        t("Previous match"),
                         false,
                         &theme,
                         on(|this, window, cx| this.find_prev(&FindPrev, window, cx)),
@@ -475,7 +476,7 @@ impl Render for BufferSearchBar {
                     .child(ui::toggle(
                         "next",
                         "↓",
-                        "Next match",
+                        t("Next match"),
                         false,
                         &theme,
                         on(|this, window, cx| this.find_next(&FindNext, window, cx)),
@@ -483,7 +484,7 @@ impl Render for BufferSearchBar {
                     .child(ui::toggle(
                         "close",
                         "×",
-                        "Close",
+                        t("Close"),
                         false,
                         &theme,
                         on(|this, window, cx| this.close(&Close, window, cx)),
@@ -504,14 +505,14 @@ impl Render for BufferSearchBar {
                         ))
                         .child(ui::button(
                             "replace-one",
-                            "Replace",
+                            t("Replace"),
                             false,
                             &theme,
                             on(|this, window, cx| this.replace_next(&ReplaceNext, window, cx)),
                         ))
                         .child(ui::button(
                             "replace-all",
-                            "Replace all",
+                            t("Replace all"),
                             false,
                             &theme,
                             on(|this, window, cx| this.replace_all(&ReplaceAll, window, cx)),

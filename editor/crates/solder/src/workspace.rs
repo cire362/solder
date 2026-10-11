@@ -1,3 +1,4 @@
+use crate::lang::{t, tf};
 use std::{
     any::TypeId,
     collections::{HashMap, HashSet, VecDeque},
@@ -1282,9 +1283,9 @@ impl Workspace {
         let name = document.read(cx).title();
         let answer = window.prompt(
             PromptLevel::Warning,
-            &format!("Save changes to {name}?"),
-            Some("Your changes will be lost if you don't save them."),
-            &["Save", "Don't Save", "Cancel"],
+            &tf("Save changes to {}?", &[&name]),
+            Some(t("Your changes will be lost if you don't save them.")),
+            &[t("Save"), t("Don't Save"), t("Cancel")],
             cx,
         );
         let editor = editor.clone();
@@ -1511,15 +1512,15 @@ impl Workspace {
             return true;
         }
         let message = match (dirty.as_slice(), books.as_slice()) {
-            ([one], []) => format!("Save changes to {}?", one.read(cx).title()),
-            ([], [one]) => format!("Save changes to {}?", one.read(cx).title()),
-            _ => format!("Save changes to {} files?", dirty.len() + books.len()),
+            ([one], []) => tf("Save changes to {}?", &[&one.read(cx).title()]),
+            ([], [one]) => tf("Save changes to {}?", &[&one.read(cx).title()]),
+            _ => tf("Save changes to {} files?", &[&(dirty.len() + books.len())]),
         };
         let answer = window.prompt(
             PromptLevel::Warning,
             &message,
-            Some("Your changes will be lost if you don't save them."),
-            &["Save All", "Don't Save", "Cancel"],
+            Some(t("Your changes will be lost if you don't save them.")),
+            &[t("Save All"), t("Don't Save"), t("Cancel")],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
@@ -1674,7 +1675,7 @@ impl Workspace {
             view.update(cx, |view, cx| {
                 view.set_result(
                     Err(crate::git::GitError(
-                        "Open a file inside a Git repository.".into(),
+                        t("Open a file inside a Git repository.").into(),
                     )),
                     cx,
                 )
@@ -1687,7 +1688,7 @@ impl Workspace {
             view.update(cx, |view, cx| {
                 view.set_result(
                     Err(crate::git::GitError(
-                        "This file is outside the Git repository.".into(),
+                        t("This file is outside the Git repository.").into(),
                     )),
                     cx,
                 )
@@ -1877,7 +1878,8 @@ impl Workspace {
                 None => {
                     this.update(cx, |this, cx| {
                         this.git.update(cx, |g, cx| {
-                            g.last_error = Some("No GitHub or GitLab remote named origin".into());
+                            g.last_error =
+                                Some(t("No GitHub or GitLab remote named origin").into());
                             cx.notify();
                         })
                     })
@@ -1917,8 +1919,8 @@ impl Workspace {
                     cx.new(|cx| Editor::for_document(doc, cx))
                 };
                 // Ours to the left of the current pane, theirs to the right.
-                let ours_editor = side(format!("{name} (ours)"), &ours, cx);
-                let theirs_editor = side(format!("{name} (theirs)"), &theirs, cx);
+                let ours_editor = side(tf("{} (ours)", &[&name]), &ours, cx);
+                let theirs_editor = side(tf("{} (theirs)", &[&name]), &theirs, cx);
                 let at = this.active_pane;
                 this.panes.insert(at, Pane::default());
                 this.active_pane = at;
@@ -2431,7 +2433,7 @@ impl Workspace {
             if layout.place(panel).is_some() {
                 items.push(item(
                     "menu-hide".into(),
-                    format!("Hide {}", panel.label()),
+                    tf("Hide {}", &[&panel.label()]),
                     cx,
                     Box::new(move |this, window, cx| this.hide_panel(panel, window, cx)),
                 ));
@@ -2440,7 +2442,7 @@ impl Workspace {
                 if layout.place(panel) != Some(to) {
                     items.push(item(
                         format!("menu-move-{}", to.id()),
-                        format!("Move to {} dock", to.id()),
+                        tf("Move to {} dock", &[&to.id()]),
                         cx,
                         Box::new(move |this, window, cx| {
                             this.put_panel(panel, to, None, window, cx)
@@ -2453,7 +2455,7 @@ impl Workspace {
         for hidden in layout.hidden.iter().copied() {
             items.push(item(
                 format!("menu-show-{}", hidden.id()),
-                format!("Show {}", hidden.label()),
+                tf("Show {}", &[&hidden.label()]),
                 cx,
                 Box::new(move |this, window, cx| this.put_panel(hidden, place, None, window, cx)),
             ));
@@ -2463,7 +2465,7 @@ impl Workspace {
         }
         items.push(item(
             "menu-reset".into(),
-            "Reset layout".into(),
+            t("Reset layout").into(),
             cx,
             Box::new(|this, window, cx| this.reset_layout(&ResetLayout, window, cx)),
         ));
@@ -2486,9 +2488,9 @@ impl Workspace {
             let hidden = item.clone();
             items.push(Self::menu_item(
                 "bar-menu-hide".into(),
-                format!(
+                tf(
                     "Hide {}",
-                    layout.style(&item).label.as_deref().unwrap_or(item.label())
+                    &[&layout.style(&item).label.as_deref().unwrap_or(item.label())],
                 ),
                 Box::new(move |_, _, cx| {
                     layout::put(Layout::get(cx).clone().hiding_item(hidden.clone()), cx);
@@ -2500,7 +2502,7 @@ impl Workspace {
                     let item = item.clone();
                     items.push(Self::menu_item(
                         format!("bar-menu-move-{}", to.id()),
-                        format!("Move to {}", to.label()),
+                        tf("Move to {}", &[&to.label()]),
                         Box::new(move |_, _, cx| {
                             layout::put(
                                 Layout::get(cx).clone().moved_item(item.clone(), to, None),
@@ -2513,9 +2515,9 @@ impl Workspace {
             }
             items.push(separator());
             for (display, id, label) in [
-                (Display::Text, "text", "Text"),
-                (Display::Icon, "icon", "Icon"),
-                (Display::Both, "both", "Text and icon"),
+                (Display::Text, "text", t("Text")),
+                (Display::Icon, "icon", t("Icon")),
+                (Display::Both, "both", t("Text and icon")),
             ] {
                 let item = item.clone();
                 items.push(Self::menu_item(
@@ -2529,7 +2531,7 @@ impl Workspace {
             }
             items.push(Self::menu_item(
                 "bar-menu-edit".into(),
-                "Edit icon or command".into(),
+                t("Edit icon or command").into(),
                 Box::new(|this, window, cx| {
                     this.open_layout(&OpenLayout, window, cx);
                 }),
@@ -2539,7 +2541,7 @@ impl Workspace {
                 let button = button.clone();
                 items.push(Self::menu_item(
                     "bar-menu-remove".into(),
-                    "Remove button".into(),
+                    t("Remove button").into(),
                     Box::new(move |_, _, cx| {
                         layout::put(Layout::get(cx).clone().without_button(&button), cx);
                     }),
@@ -2552,13 +2554,13 @@ impl Workspace {
             if layout.item_place(&hidden).is_none() {
                 items.push(Self::menu_item(
                     format!("bar-menu-show-{}", hidden.id()),
-                    format!(
+                    tf(
                         "Show {}",
-                        layout
+                        &[&layout
                             .style(&hidden)
                             .label
                             .as_deref()
-                            .unwrap_or(hidden.label())
+                            .unwrap_or(hidden.label())],
                     ),
                     Box::new(move |_, _, cx| {
                         layout::put(
@@ -2575,7 +2577,7 @@ impl Workspace {
         items.push(separator());
         items.push(Self::menu_item(
             "bar-menu-add".into(),
-            "Add command button".into(),
+            t("Add command button").into(),
             Box::new(move |this, window, cx| {
                 let commands =
                     crate::bar_commands::Commands::new(end, this.plugins.clone(), window, cx);
@@ -2587,7 +2589,7 @@ impl Workspace {
         ));
         items.push(Self::menu_item(
             "bar-menu-reset".into(),
-            "Reset layout".into(),
+            t("Reset layout").into(),
             Box::new(|this, window, cx| this.reset_layout(&ResetLayout, window, cx)),
             cx,
         ));
@@ -3494,7 +3496,7 @@ impl Workspace {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Import".into()),
+            prompt: Some(t("Import").into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = answer.await else {
@@ -3864,7 +3866,7 @@ impl Workspace {
                 d.child(div().size(px(6.)).rounded(px(3.)).bg(theme.warning))
             })
             .child(crate::icons::draw(crate::icons::panel(Panel::Debug)))
-            .child("Debug")
+            .child(t("Debug"))
             .child(
                 div()
                     .id("debug-close")
@@ -4045,9 +4047,9 @@ impl Workspace {
                         let t = terminal.read(cx);
                         match (t.exited, t.exit_code) {
                             (false, _) => t.title().to_string(),
-                            (true, Some(0)) => format!("{} (exited)", t.title()),
-                            (true, Some(code)) => format!("{} (exited {code})", t.title()),
-                            (true, None) => format!("{} (killed)", t.title()),
+                            (true, Some(0)) => tf("{} (exited)", &[&t.title()]),
+                            (true, Some(code)) => tf("{} (exited {})", &[&t.title(), &code]),
+                            (true, None) => tf("{} (killed)", &[&t.title()]),
                         }
                     })
                     .child(
@@ -4090,9 +4092,9 @@ impl Workspace {
             crate::ui::button(
                 "terminal-split",
                 if self.terminal_pair.is_some() {
-                    "Unsplit"
+                    t("Unsplit")
                 } else {
-                    "Split"
+                    t("Split")
                 },
                 false,
                 &theme,
@@ -4271,7 +4273,7 @@ impl Workspace {
                 cx.notify();
             }))
             .child(crate::icons::draw(crate::icons::panel(Panel::Results)))
-            .child("Results")
+            .child(t("Results"))
             .child(
                 div()
                     .id("results-close")
@@ -4314,7 +4316,7 @@ impl Workspace {
                 cx.notify();
             }))
             .child(crate::icons::draw(crate::icons::panel(Panel::Response)))
-            .child("Response")
+            .child(t("Response"))
             .child(
                 div()
                     .id("response-close")
@@ -4620,9 +4622,9 @@ impl Workspace {
         }
         let answer = window.prompt(
             PromptLevel::Info,
-            "No errors have been written",
-            Some(&format!("They would be in {}.", log.display())),
-            &["OK"],
+            t("No errors have been written"),
+            Some(&tf("They would be in {}.", &[&log.display()])),
+            &[t("OK")],
             cx,
         );
         cx.background_executor()
@@ -4664,9 +4666,11 @@ impl Workspace {
             let Ok(answer) = cx.update(|window, cx| {
                 window.prompt(
                     PromptLevel::Warning,
-                    "Solder closed unexpectedly last time",
-                    Some("A report was kept on this machine. It is not sent anywhere."),
-                    &["Show report", "Dismiss"],
+                    t("Solder closed unexpectedly last time"),
+                    Some(t(
+                        "A report was kept on this machine. It is not sent anywhere.",
+                    )),
+                    &[t("Show report"), t("Dismiss")],
                     cx,
                 )
             }) else {
@@ -4895,7 +4899,7 @@ impl Workspace {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Open".into()),
+            prompt: Some(t("Open").into()),
         });
         cx.spawn(async move |_, cx| {
             if let Ok(Ok(Some(paths))) = answer.await
@@ -5328,9 +5332,9 @@ impl Workspace {
         let name = notebook.read(cx).title();
         let answer = window.prompt(
             PromptLevel::Warning,
-            &format!("Save changes to {name}?"),
-            Some("Your changes will be lost if you don't save them."),
-            &["Save", "Don't Save", "Cancel"],
+            &tf("Save changes to {}?", &[&name]),
+            Some(t("Your changes will be lost if you don't save them.")),
+            &[t("Save"), t("Don't Save"), t("Cancel")],
             cx,
         );
         let notebook = notebook.clone();
@@ -6457,11 +6461,11 @@ impl Workspace {
         }
         self.structure
             .as_ref()
-            .map(|(view, _)| format!("Structure of {}", view.read(cx).title(cx)))
+            .map(|(view, _)| tf("Structure of {}", &[&view.read(cx).title(cx)]))
             .or_else(|| {
                 self.erd
                     .as_ref()
-                    .map(|(view, _)| format!("Diagram of {}", view.read(cx).connection))
+                    .map(|(view, _)| tf("Diagram of {}", &[&view.read(cx).connection]))
             })
             .or_else(|| {
                 self.file_diff
@@ -6584,19 +6588,19 @@ impl Workspace {
             }
             Item::Position => {
                 if self.file_diff.is_some() {
-                    return vec![says("Git diff".into()), says("Read-only".into())];
+                    return vec![says(t("Git diff").into()), says(t("Read-only").into())];
                 }
                 let Some(editor) = editor else {
                     return Vec::new();
                 };
                 let e = editor.read(cx);
                 let (line, col, cursors) = e.cursor_position(cx);
-                let mut parts = vec![says(format!("Ln {line}, Col {col}"))];
+                let mut parts = vec![says(tf("Ln {}, Col {}", &[&line, &col]))];
                 if cursors > 1 {
-                    parts.push(says(format!("{cursors} cursors")));
+                    parts.push(says(tf("{} cursors", &[&cursors])));
                 }
                 if e.doc(cx).is_read_only() {
-                    parts.push(says("Read-only".into()));
+                    parts.push(says(t("Read-only").into()));
                 }
                 parts
             }
@@ -6627,7 +6631,7 @@ impl Workspace {
             Item::Language => editor
                 .map(|e| {
                     let name = e.read(cx).doc(cx).language_name();
-                    says(name.unwrap_or("Plain text").to_string())
+                    says(name.unwrap_or(t("Plain text")).to_string())
                 })
                 .into_iter()
                 .collect(),
@@ -6656,7 +6660,7 @@ impl Workspace {
                     parts.push(says(status.to_string()));
                 }
                 if self.project.read(cx).is_scanning() {
-                    parts.push(says("Indexing files...".into()));
+                    parts.push(says(t("Indexing files...").into()));
                 }
                 // An extension's grammar that stopped answering: its
                 // files are plain text until the editor starts again.
@@ -6676,9 +6680,8 @@ impl Workspace {
                     let store = self.database.read(cx);
                     match store.binding(path) {
                         Some(name) => Some(name.to_string()),
-                        None => {
-                            database::query_file_engines(path).map(|_| "No connection".to_string())
-                        }
+                        None => database::query_file_engines(path)
+                            .map(|_| t("No connection").to_string()),
                     }
                 });
                 connection
@@ -6737,8 +6740,8 @@ impl Workspace {
                     .collect();
                 match plugins.slow().as_slice() {
                     [] => {}
-                    [name] => items.push((format!("Slow plugin: {name}"), true)),
-                    names => items.push((format!("{} slow plugins", names.len()), true)),
+                    [name] => items.push((tf("Slow plugin: {}", &[&name]), true)),
+                    names => items.push((tf("{} slow plugins", &[&names.len()]), true)),
                 }
                 items
                     .into_iter()
@@ -6754,20 +6757,19 @@ impl Workspace {
                 let mut parts = Vec::new();
                 if perf.hud_visible {
                     if let Some((p50, p99)) = perf.input_p50_p99() {
-                        parts.push(says(format!(
+                        parts.push(says(tf(
                             "input {} ms, p99 {}",
-                            perf::ms(p50),
-                            perf::ms(p99)
+                            &[&perf::ms(p50), &perf::ms(p99)],
                         )));
                     }
                     if let Some((p50, _)) = perf.frame_p50_p99() {
-                        parts.push(says(format!("frame {} ms", perf::ms(p50))));
+                        parts.push(says(tf("frame {} ms", &[&perf::ms(p50)])));
                     }
                     if let Some(bytes) = perf::resident_memory() {
                         parts.push(says(format!("{} MB", bytes / (1024 * 1024))));
                     }
                     if let Some(start) = perf.first_frame {
-                        parts.push(says(format!("start {} ms", perf::ms(start))));
+                        parts.push(says(tf("start {} ms", &[&perf::ms(start)])));
                     }
                 }
                 parts
@@ -6970,12 +6972,12 @@ impl Workspace {
             .justify_center()
             .gap_2p5()
             .bg(theme.bg)
-            .child(hint("Go to file", &ToggleFileFinder))
-            .child(hint("Run a command", &ToggleCommandPalette))
-            .child(hint("Search in project", &ShowSearch))
-            .child(hint("New file", &NewFile))
-            .child(hint("Open folder", &OpenFolder))
-            .child(hint("Open project", &OpenProject))
+            .child(hint(t("Go to file"), &ToggleFileFinder))
+            .child(hint(t("Run a command"), &ToggleCommandPalette))
+            .child(hint(t("Search in project"), &ShowSearch))
+            .child(hint(t("New file"), &NewFile))
+            .child(hint(t("Open folder"), &OpenFolder))
+            .child(hint(t("Open project"), &OpenProject))
     }
 }
 
@@ -20949,5 +20951,59 @@ exports.activate = (context) => {
             assert_eq!(ws.panes[0].tabs.len(), 1);
             assert!(ws.panes[0].viewers.is_empty());
         });
+    }
+    #[gpui::test]
+    async fn the_interface_reads_in_russian_when_the_settings_say_so(cx: &mut TestAppContext) {
+        use crate::command_palette::CommandPalette;
+        use crate::lang::{self, Language};
+        let root = fixture("russian");
+        let config = db::testing::dir("russian-config");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        let commands = |cx: &mut VisualTestContext| -> Vec<String> {
+            cx.simulate_keystrokes("secondary-shift-p");
+            let palette = cx
+                .read(|cx| ws.read(cx).modal_view::<Picker<CommandPalette>>())
+                .expect("the palette");
+            let names = cx.read(|cx| palette.read(cx).delegate.names());
+            cx.simulate_keystrokes("escape");
+            names
+        };
+        assert!(commands(cx).contains(&"Workspace: Open folder".to_string()));
+        assert_eq!(Panel::Files.label(), "Files");
+
+        std::fs::write(config.join("settings.json"), r#"{ "language": "ru" }"#).unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert_eq!(lang::current(), Language::Russian);
+        let russian = commands(cx);
+        assert!(
+            russian.contains(&"Окно: открыть папку".to_string()),
+            "{russian:?}"
+        );
+        assert!(!russian.iter().any(|name| name.starts_with("Workspace: ")));
+        assert_eq!(Panel::Files.label(), "Файлы");
+        // A command is found by its Russian name and runs as it did.
+        cx.simulate_keystrokes("secondary-shift-p");
+        cx.simulate_input("новый файл");
+        cx.simulate_keystrokes("enter");
+        assert!(cx.read(|cx| ws.read(cx).active_editor().is_some()));
+        cx.simulate_input("x");
+        cx.simulate_keystrokes("secondary-w");
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Не сохранять");
+        wait_for(cx, "the tab to close", &|cx| {
+            ws.read(cx).active_editor().is_none()
+        });
+
+        // A language the settings do not know leaves the one in use, and
+        // says so; without the setting it is English again.
+        std::fs::write(config.join("settings.json"), r#"{ "language": "tlh" }"#).unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert_eq!(lang::current(), Language::Russian);
+        assert!(cx.read(|cx| !cx.global::<settings::ConfigErrors>().0.is_empty()));
+        std::fs::write(config.join("settings.json"), "{}").unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        assert_eq!(lang::current(), Language::English);
+        assert!(commands(cx).contains(&"Workspace: Open folder".to_string()));
     }
 }

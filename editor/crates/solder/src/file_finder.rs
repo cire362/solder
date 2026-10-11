@@ -1,3 +1,4 @@
+use crate::lang::{t, tf};
 use std::{path::PathBuf, sync::Arc};
 
 use gpui::{
@@ -45,7 +46,7 @@ impl FileFinder {
 
 impl PickerDelegate for FileFinder {
     fn placeholder(&self) -> SharedString {
-        "Go to file".into()
+        t("Go to file").into()
     }
 
     fn match_count(&self) -> usize {
@@ -175,9 +176,9 @@ impl PickerDelegate for FileFinder {
 
     fn empty_text(&self) -> SharedString {
         if self.files.is_empty() {
-            "Indexing files...".into()
+            t("Indexing files...").into()
         } else {
-            format!("No file matches \u{201c}{}\u{201d}", self.query).into()
+            tf("No file matches \u{201c}{}\u{201d}", &[&self.query]).into()
         }
     }
 }

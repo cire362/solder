@@ -393,6 +393,13 @@ pattern for new widgets instead of calling `cx.propagate()` everywhere.
   which follows `ui_density`. Code is sized by `buffer_font_size` alone.
 - Comments explain why, not what. Match the density of the surrounding code.
 - User-facing strings are short and plain, with no em dashes.
+- A string the user reads is given to `lang::t` where it is used, or to
+  `lang::tf` with what is put into its `{}`, and has its Russian in
+  `lang_ru.rs` in the same commit: a test fails for one that has none and
+  for an entry of a string that is gone. A new command needs its name in
+  `COMMANDS` there. The English is the key, so write it once and the same
+  everywhere. What is not for the user to read is not translated: what
+  goes to a model, a log, a file, a program.
 
 ## Website (Next.js)
 

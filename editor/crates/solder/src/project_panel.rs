@@ -1,6 +1,7 @@
 //! File tree. Directories are read only when expanded, so opening a monorepo
 //! costs one `read_dir` of the root, not a walk of `node_modules`.
 
+use crate::lang::{t, tf};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -356,8 +357,8 @@ impl ProjectPanel {
         let editor = cx.new(|cx| {
             let mut e = Editor::single_line(
                 match kind {
-                    EditKind::NewFolder => "Folder name",
-                    _ => "File name",
+                    EditKind::NewFolder => t("Folder name"),
+                    _ => t("File name"),
                 },
                 cx,
             );
@@ -411,7 +412,7 @@ impl ProjectPanel {
         };
         let name = edit.editor.read(cx).text(cx).trim().to_string();
         if name.is_empty() || name.contains(['/', '\\']) && edit.kind == EditKind::Rename {
-            edit.error = Some("Enter a valid name".into());
+            edit.error = Some(t("Enter a valid name").into());
             cx.notify();
             return;
         }
@@ -419,7 +420,7 @@ impl ProjectPanel {
             EditKind::NewFile => {
                 let path = edit.target.join(&name);
                 if path.exists() {
-                    Err(format!("{name} already exists"))
+                    Err(tf("{} already exists", &[&name]))
                 } else {
                     path.parent()
                         .map_or(Ok(()), std::fs::create_dir_all)
@@ -440,7 +441,7 @@ impl ProjectPanel {
                 if to == from {
                     Ok(None)
                 } else if to.exists() {
-                    Err(format!("{name} already exists"))
+                    Err(tf("{} already exists", &[&name]))
                 } else {
                     std::fs::rename(&from, &to)
                         .map(|_| {
@@ -504,9 +505,9 @@ impl ProjectPanel {
             .unwrap_or_default();
         let answer = window.prompt(
             PromptLevel::Warning,
-            &format!("Move \u{201c}{name}\u{201d} to the Trash?"),
-            Some("You can restore it from the Trash."),
-            &["Move to Trash", "Cancel"],
+            &tf("Move \u{201c}{}\u{201d} to the Trash?", &[&name]),
+            Some(t("You can restore it from the Trash.")),
+            &[t("Move to Trash"), t("Cancel")],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
@@ -654,26 +655,31 @@ impl ProjectPanel {
                         this.menu = None;
                         cx.notify();
                     }))
-                    .child(item("m-new-file", "New file", Box::new(NewFile), true))
+                    .child(item("m-new-file", t("New file"), Box::new(NewFile), true))
                     .child(item(
                         "m-new-folder",
-                        "New folder",
+                        t("New folder"),
                         Box::new(NewFolder),
                         true,
                     ))
                     .child(separator())
-                    .child(item("m-rename", "Rename", Box::new(Rename), has_target))
+                    .child(item("m-rename", t("Rename"), Box::new(Rename), has_target))
                     .child(item(
                         "m-delete",
-                        "Move to Trash",
+                        t("Move to Trash"),
                         Box::new(Delete),
                         has_target,
                     ))
                     .child(separator())
-                    .child(item("m-copy", "Copy path", Box::new(CopyPath), has_target))
+                    .child(item(
+                        "m-copy",
+                        t("Copy path"),
+                        Box::new(CopyPath),
+                        has_target,
+                    ))
                     .child(item(
                         "m-reveal",
-                        "Reveal in Finder",
+                        t("Reveal in Finder"),
                         Box::new(RevealInFinder),
                         true,
                     ))

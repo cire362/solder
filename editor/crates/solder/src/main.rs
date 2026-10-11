@@ -59,6 +59,7 @@ mod journal;
 mod key_layout;
 mod key_layout_picker;
 mod key_prompts;
+mod lang;
 mod layout;
 mod layout_picker;
 mod locations;

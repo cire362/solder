@@ -5,6 +5,7 @@ use gpui::{
 
 use crate::{
     fuzzy,
+    lang::t,
     picker::{Picker, PickerDelegate, format_binding, highlighted_text},
     plugin_store::PluginStore,
     theme::{ActiveTheme, UI_FONT_SIZE},
@@ -33,6 +34,21 @@ pub struct CommandPalette {
 
 /// Actions that only make sense inside a specific widget.
 const HIDDEN_NAMESPACES: &[&str] = &["picker", "search_bar", "inline_edit"];
+
+/// Whether the palette lists an action of this name.
+pub fn is_listed(name: &str) -> bool {
+    let namespace = name.split("::").next().unwrap_or("");
+    !HIDDEN_NAMESPACES.contains(&namespace)
+}
+
+/// The name the palette shows for an action, in the language in use.
+fn shown_name(name: &str) -> String {
+    let english = humanize_action_name(name);
+    match crate::lang::command(&english) {
+        Some(named) => named.to_string(),
+        None => english,
+    }
+}
 
 /// `editor::MoveLineUp` becomes `Editor: Move line up`.
 pub fn humanize_action_name(name: &str) -> String {
@@ -71,12 +87,9 @@ impl CommandPalette {
         let mut commands: Vec<Command> = window
             .available_actions(cx)
             .into_iter()
-            .filter(|a| {
-                let ns = a.name().split("::").next().unwrap_or("");
-                !HIDDEN_NAMESPACES.contains(&ns)
-            })
+            .filter(|a| is_listed(a.name()))
             .map(|action| Command {
-                name: humanize_action_name(action.name()),
+                name: shown_name(action.name()),
                 binding: window
                     .highest_precedence_binding_for_action(action.as_ref())
                     .map(|b| format_binding(&b)),
@@ -118,9 +131,20 @@ impl CommandPalette {
     }
 }
 
+#[cfg(test)]
+impl CommandPalette {
+    /// The names of the commands it lists.
+    pub fn names(&self) -> Vec<String> {
+        self.commands
+            .iter()
+            .map(|command| command.name.clone())
+            .collect()
+    }
+}
+
 impl PickerDelegate for CommandPalette {
     fn placeholder(&self) -> SharedString {
-        "Run a command".into()
+        t("Run a command").into()
     }
 
     fn match_count(&self) -> usize {

@@ -7,6 +7,7 @@
 //! brought the server may paint them, as it paints completions: Ruby's
 //! colors the name of a class as one is colored where it is declared.
 
+use crate::lang::t;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -417,8 +418,8 @@ impl Symbols {
 impl PickerDelegate for Symbols {
     fn placeholder(&self) -> SharedString {
         match self.scope {
-            Scope::File => "Go to a symbol of this file".into(),
-            Scope::Project(_) => "Go to a symbol of the project".into(),
+            Scope::File => t("Go to a symbol of this file").into(),
+            Scope::Project(_) => t("Go to a symbol of the project").into(),
         }
     }
 
@@ -538,14 +539,14 @@ impl PickerDelegate for Symbols {
 
     fn empty_text(&self) -> SharedString {
         match (&self.scope, self.loading) {
-            (_, true) => "Asking...".into(),
+            (_, true) => t("Asking...").into(),
             (Scope::File, false) if self.rows.is_empty() => {
-                "Nothing here lists what this file declares".into()
+                t("Nothing here lists what this file declares").into()
             }
             (Scope::Project(_), false) if self.rows.is_empty() => {
-                "Type a name. A language server of the project has to be running".into()
+                t("Type a name. A language server of the project has to be running").into()
             }
-            _ => "No symbol of that name".into(),
+            _ => t("No symbol of that name").into(),
         }
     }
 
