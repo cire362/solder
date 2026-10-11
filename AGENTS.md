@@ -127,6 +127,16 @@ Never guess a signature.
   changed, by one thread and in order, let go when the file is saved, its
   tab closed or the window closed with an answer, and put back at the
   next start only after the tabs are. It never writes to the file itself.
+- A project has one window. A window for a project is asked of
+  `windows::open`, which brings forward the one it has, never of
+  `cx.open_window`. `windows.rs` keeps the set and the projects opened
+  before in `sessions/windows.json`: one thread writes, once the set has
+  been still for a moment, and nothing is written before what an earlier
+  run kept was read. A window leaves the set where it agrees to close
+  (`windows::closed`, from `Workspace::confirm_window_close`), not when
+  the system says it is gone: at the end of a run every window goes and
+  none was closed. The way in (`way_in.rs`) is one list, drawn as the
+  first window or over a project.
 - An error nobody is shown is said with `journal::error`, never
   `eprintln!`: it goes to `logs/solder.log` of the settings folder, which
   `journal.rs` rotates. A panic leaves a report there through the hook

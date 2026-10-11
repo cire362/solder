@@ -92,7 +92,9 @@ mod test_runner;
 mod tests_panel;
 mod theme;
 mod ui;
+mod way_in;
 mod webview;
+mod windows;
 mod workspace;
 
 use std::{
@@ -101,8 +103,8 @@ use std::{
 };
 
 use gpui::{
-    App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowHandle,
-    WindowOptions, point, px, size,
+    App, AppContext, Application, TitlebarOptions, Window, WindowHandle, WindowOptions, point, px,
+    size,
 };
 
 use crate::{perf::Perf, theme::Theme, workspace::Workspace};
@@ -118,29 +120,41 @@ fn main() {
     // Set SOLDER_BENCH_STARTUP=1 to print time-to-first-frame and exit.
     let bench_startup = std::env::var_os("SOLDER_BENCH_STARTUP").is_some();
 
-    let arg = std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let arg = arg.canonicalize().unwrap_or(arg);
-    let (root, file) = if arg.is_file() {
-        (
-            arg.parent().map(PathBuf::from).unwrap_or_default(),
-            Some(arg),
-        )
-    } else {
-        (arg, None)
-    };
-    // Read the file before the window exists, so the first frame is already
-    // an editable file rather than an empty workspace.
-    let initial = file.and_then(|path| {
-        if path.extension().is_some_and(|ext| ext == "ipynb") {
-            let nothing = document::Loaded::of(&[]);
-            return Some((path, nothing));
-        }
-        let loaded = document::load(&path).ok()?;
-        Some((path, loaded))
+    let benchmark =
+        std::env::vars_os().any(|(name, _)| name.to_string_lossy().starts_with("SOLDER_BENCH"));
+    // A folder or a file named on the command line is what is opened.
+    // With none named, the windows of the last run come back.
+    let named = std::env::args_os().nth(1).map(|arg| {
+        let arg = PathBuf::from(arg);
+        let arg = arg.canonicalize().unwrap_or(arg);
+        let (root, file) = if arg.is_file() {
+            (
+                arg.parent().map(PathBuf::from).unwrap_or_default(),
+                Some(arg),
+            )
+        } else {
+            (arg, None)
+        };
+        // Read the file before the window exists, so the first frame is
+        // already an editable file rather than an empty workspace.
+        let initial = file.and_then(|path| {
+            if path.extension().is_some_and(|ext| ext == "ipynb") {
+                let nothing = document::Loaded::of(&[]);
+                return Some((path, nothing));
+            }
+            let loaded = document::load(&path).ok()?;
+            Some((path, loaded))
+        });
+        (root, initial)
     });
+    // Nothing is kept of a benchmark's windows, and it is shown none of
+    // an earlier run's.
+    let kept_in = (!benchmark).then(windows::path);
+    // Which windows to make is known before the first one, like the file.
+    let kept = match (&named, &kept_in) {
+        (None, Some(path)) => Some(windows::Kept::read(path)),
+        _ => None,
+    };
 
     Application::new()
         .with_assets(icons::Assets)
@@ -149,22 +163,42 @@ fn main() {
             settings::reload(cx);
             settings::watch(cx);
             lsp_store::init(cx);
+            windows::init(kept_in.clone(), cx);
 
-            let window = open_workspace_window(root, initial, cx);
-            window
-                .update(cx, |_, window, _| {
-                    window.on_next_frame(move |_, cx| {
-                        let perf = cx.global_mut::<Perf>();
-                        let elapsed = perf.process_start.elapsed();
-                        perf.first_frame = Some(elapsed);
-                        if bench_startup {
-                            println!("first_frame_ms={:.1}", elapsed.as_secs_f64() * 1000.0);
-                            cx.quit();
-                        }
-                    });
-                })
-                .ok();
-            if std::env::var_os("SOLDER_BENCH_TYPING").is_some() {
+            let window = match named {
+                Some((root, initial)) => {
+                    // The projects opened before are not needed to show
+                    // this one: they are read while it is drawn.
+                    windows::learn_from(kept_in, cx);
+                    Some(open_workspace_window(windows::Place::of(root), initial, cx))
+                }
+                None => {
+                    let kept = kept.unwrap_or_default();
+                    windows::learn(&kept, cx);
+                    if windows::restore(&kept, cx) == 0 {
+                        way_in::open_window(cx);
+                    }
+                    None
+                }
+            };
+            if let Some(first) = cx.windows().first() {
+                first
+                    .update(cx, |_, window, _| {
+                        window.on_next_frame(move |_, cx| {
+                            let perf = cx.global_mut::<Perf>();
+                            let elapsed = perf.process_start.elapsed();
+                            perf.first_frame = Some(elapsed);
+                            if bench_startup {
+                                println!("first_frame_ms={:.1}", elapsed.as_secs_f64() * 1000.0);
+                                cx.quit();
+                            }
+                        });
+                    })
+                    .ok();
+            }
+            if let Some(window) = window
+                && std::env::var_os("SOLDER_BENCH_TYPING").is_some()
+            {
                 bench_typing(window, cx);
             }
 
@@ -178,45 +212,59 @@ fn main() {
         });
 }
 
-/// Opens a window on `root`, optionally with a file already loaded.
+/// The theme of the settings, for the first window that asks.
+pub fn ensure_theme(window: &Window, cx: &mut App) {
+    if !cx.has_global::<Theme>() {
+        let theme = settings::Settings::get(cx).theme(window.appearance());
+        cx.set_global(theme);
+    }
+}
+
+/// Opens a window on a project where `place` says, optionally with a
+/// file already loaded.
 pub fn open_workspace_window(
-    root: PathBuf,
+    place: windows::Place,
     initial: Option<(PathBuf, document::Loaded)>,
     cx: &mut App,
 ) -> WindowHandle<Workspace> {
-    let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
-    cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions {
-                title: Some("Solder".into()),
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(14.), px(12.))),
-            }),
-            window_min_size: Some(size(px(480.), px(320.))),
-            app_id: Some("dev.solder.Solder".into()),
-            ..Default::default()
-        },
-        |window, cx| {
-            if !cx.has_global::<Theme>() {
-                let theme = settings::Settings::get(cx).theme(window.appearance());
-                cx.set_global(theme);
-            }
-            let workspace = cx.new(|cx| Workspace::new(root, window, cx));
-            if let Some((path, loaded)) = initial {
-                workspace.update(cx, |w, cx| {
-                    if path.extension().is_some_and(|ext| ext == "ipynb") {
-                        w.open_path(path, None, window, cx);
-                    } else {
-                        w.add_loaded(path, &loaded, None, window, cx);
+    let (window_bounds, display_id) = place.options(size(px(1280.), px(820.)), cx);
+    let root = place.root;
+    let window = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(window_bounds),
+                display_id,
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Solder".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(14.), px(12.))),
+                }),
+                window_min_size: Some(size(px(480.), px(320.))),
+                app_id: Some("dev.solder.Solder".into()),
+                ..Default::default()
+            },
+            {
+                let root = root.clone();
+                move |window, cx| {
+                    ensure_theme(window, cx);
+                    let workspace = cx.new(|cx| Workspace::new(root, window, cx));
+                    if let Some((path, loaded)) = initial {
+                        workspace.update(cx, |w, cx| {
+                            if path.extension().is_some_and(|ext| ext == "ipynb") {
+                                w.open_path(path, None, window, cx);
+                            } else {
+                                w.add_loaded(path, &loaded, None, window, cx);
+                            }
+                        });
                     }
-                });
-            }
-            workspace.update(cx, |w, cx| w.start_session(window, cx));
-            workspace
-        },
-    )
-    .expect("failed to open a window")
+                    workspace.update(cx, |w, cx| w.start_session(window, cx));
+                    workspace
+                }
+            },
+        )
+        .expect("failed to open a window");
+    windows::opened(&root, window, cx);
+    window
 }
 
 /// Types 300 characters into the open file, one per 16 ms, then prints input

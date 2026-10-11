@@ -72,6 +72,8 @@ actions!(
         NewFile,
         SaveAs,
         OpenFolder,
+        OpenProject,
+        NewWindow,
         ShowErrorLog,
         OpenSettings,
         OpenKeymap,
@@ -154,6 +156,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-n", NewFile, None),
         KeyBinding::new("secondary-alt-s", SaveAs, None),
         KeyBinding::new("secondary-o", OpenFolder, None),
+        KeyBinding::new("secondary-alt-o", OpenProject, None),
+        KeyBinding::new("secondary-shift-n", NewWindow, None),
         KeyBinding::new("secondary-,", OpenSettings, None),
         KeyBinding::new("secondary-\\", SplitRight, None),
         KeyBinding::new("secondary-k secondary-right", FocusNextPane, None),
@@ -189,7 +193,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-g", FindNext, None),
         KeyBinding::new("cmd-shift-g", FindPrev, None),
     ]);
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &Quit, cx| {
+        // Before the windows start to close: they are not being closed.
+        crate::windows::quitting(cx);
+        cx.quit()
+    });
 }
 
 const RECENT_LIMIT: usize = 20;
@@ -1430,6 +1438,7 @@ impl Workspace {
             .cloned()
             .collect();
         if dirty.is_empty() && books.is_empty() {
+            crate::windows::closed(window.window_handle().window_id(), cx);
             if self.session_writer.is_some() {
                 let saved = self.keep_session(cx);
                 cx.spawn_in(window, async move |_, cx| {
@@ -1498,6 +1507,7 @@ impl Workspace {
                 this.update_in(cx, |this, window, cx| {
                     // Nothing left to ask about; close for real.
                     this.panes = vec![Pane::default()];
+                    crate::windows::closed(window.window_handle().window_id(), cx);
                     window.remove_window();
                     cx.notify();
                 })
@@ -4827,11 +4837,25 @@ impl Workspace {
             if let Ok(Ok(Some(paths))) = answer.await
                 && let Some(root) = paths.into_iter().next()
             {
-                cx.update(|cx| crate::open_workspace_window(root, None, cx))
-                    .ok();
+                cx.update(|cx| crate::windows::open(root, cx)).ok();
             }
         })
         .detach();
+    }
+
+    /// The projects opened before, a folder, an address to clone: what
+    /// is chosen gets a window of its own.
+    fn open_project(&mut self, _: &OpenProject, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_modal(window, cx, |window, cx| {
+            Picker::new(crate::way_in::WayIn::new(false, cx), window, cx)
+        });
+    }
+
+    fn new_window(&mut self, _: &NewWindow, _: &mut Window, cx: &mut Context<Self>) {
+        // Not in the middle of this window's key.
+        cx.defer(|cx| {
+            crate::way_in::open_window(cx);
+        });
     }
 
     /// Files changed on disk: reload clean documents, refresh the tree.
@@ -4888,6 +4912,12 @@ impl Workspace {
     }
 
     // ------------------------------------------------------------ modals
+
+    /// The list or the box over the window, if it is a `V`.
+    #[cfg(test)]
+    pub(crate) fn modal_view<V: 'static>(&self) -> Option<Entity<V>> {
+        self.modal.as_ref()?.view.clone().downcast::<V>().ok()
+    }
 
     fn toggle_modal<V: ManagedView>(
         &mut self,
@@ -6644,6 +6674,7 @@ impl Workspace {
             .child(hint("Search in project", &ShowSearch))
             .child(hint("New file", &NewFile))
             .child(hint("Open folder", &OpenFolder))
+            .child(hint("Open project", &OpenProject))
     }
 }
 
@@ -6780,6 +6811,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_as))
             .on_action(cx.listener(Self::save_untitled))
             .on_action(cx.listener(Self::open_folder))
+            .on_action(cx.listener(Self::open_project))
+            .on_action(cx.listener(Self::new_window))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::show_error_log))
             .on_action(cx.listener(Self::open_keymap))
@@ -19492,7 +19525,9 @@ exports.activate = (context) => {
         // Every open window follows a switch and remembers it for its
         // project. A window removed before another switch is left alone.
         let second_root = db::testing::dir("ws-named-second").canonicalize().unwrap();
-        let second = cx.update(|_, cx| crate::open_workspace_window(second_root.clone(), None, cx));
+        let second = cx.update(|_, cx| {
+            crate::open_workspace_window(crate::windows::Place::of(second_root.clone()), None, cx)
+        });
         cx.dispatch_action(SwitchLayout {
             name: Some("Review".into()),
         });
@@ -19511,8 +19546,9 @@ exports.activate = (context) => {
             name: Some(layout::DEFAULT_NAME.into()),
         });
         wait(cx, None);
-        let reopened =
-            cx.update(|_, cx| crate::open_workspace_window(second_root.clone(), None, cx));
+        let reopened = cx.update(|_, cx| {
+            crate::open_workspace_window(crate::windows::Place::of(second_root.clone()), None, cx)
+        });
         wait(cx, Some("Review"));
         assert_eq!(
             reopened.read_with(cx, |w, _| w.right).unwrap(),
@@ -20143,5 +20179,228 @@ exports.activate = (context) => {
                 .active_editor()
                 .is_some_and(|editor| editor.read(cx).text(cx).ends_with("error: it\n"))
         });
+    }
+    /// The globals a window needs, and windows remembered in `kept_in`
+    /// with `recent` as the projects opened before.
+    fn windows_setup(cx: &mut TestAppContext, kept_in: Option<PathBuf>, recent: &[PathBuf]) {
+        cx.update(|cx| {
+            cx.set_global(Perf::new(Instant::now()));
+            cx.set_global(crate::theme::Theme::dark());
+            cx.set_global(Settings::default());
+            settings::bind_defaults(cx);
+            crate::lsp_store::init(cx);
+            crate::windows::init(kept_in, cx);
+            let kept = crate::windows::Kept {
+                recent: recent.to_vec(),
+                ..Default::default()
+            };
+            crate::windows::learn(&kept, cx);
+        });
+    }
+
+    fn soon(cx: &mut TestAppContext, what: &str, f: &dyn Fn(&App) -> bool) {
+        for _ in 0..crate::patience::LOOKS {
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+            if cx.read(|cx| f(cx)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// The projects that have a window, as the windows themselves say.
+    fn project_windows(cx: &App) -> Vec<PathBuf> {
+        cx.windows()
+            .into_iter()
+            .filter_map(|window| window.downcast::<Workspace>())
+            .filter_map(|window| window.read(cx).ok().map(|workspace| workspace.root(cx)))
+            .collect()
+    }
+
+    #[gpui::test]
+    async fn the_windows_of_a_run_are_kept_and_the_last_to_close_comes_back(
+        cx: &mut TestAppContext,
+    ) {
+        let (a, b) = (fixture("windows-a"), fixture("windows-b"));
+        let kept_in = db::testing::dir("windows-kept").join("sessions/windows.json");
+        cx.executor().allow_parking();
+        windows_setup(cx, Some(kept_in.clone()), &[]);
+        let first = cx.update(|cx| crate::windows::open(a.clone(), cx));
+        let second = cx.update(|cx| crate::windows::open(b.clone(), cx));
+        // A project has one window: asked for again, it is the same one.
+        let again = cx.update(|cx| crate::windows::open(a.clone(), cx));
+        assert_eq!(first, again);
+        assert_eq!(cx.windows().len(), 2);
+        let roots = |kept: &crate::windows::Kept| -> Vec<PathBuf> {
+            kept.open.iter().map(|place| place.root.clone()).collect()
+        };
+        soon(cx, "both windows in the file", &|_| {
+            roots(&kept_read(&kept_in)) == [a.clone(), b.clone()]
+        });
+        assert_eq!(kept_read(&kept_in).recent, [b.clone(), a.clone()]);
+        let place = &kept_read(&kept_in).open[0];
+        assert!(
+            place
+                .bounds
+                .is_some_and(|[_, _, width, height]| width > 0. && height > 0.)
+        );
+
+        // Closed while another is open, a window is out of the set.
+        assert!(VisualTestContext::from_window(second.into(), cx).simulate_close());
+        second
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        soon(cx, "one window in the file", &|_| {
+            roots(&kept_read(&kept_in)) == [a.clone()]
+        });
+        // The last one ends the run, and is what the next one starts with.
+        assert!(VisualTestContext::from_window(first.into(), cx).simulate_close());
+        first
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        for _ in 0..20 {
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(cx.windows().is_empty());
+        let left = kept_read(&kept_in);
+        assert_eq!(roots(&left), std::slice::from_ref(&a));
+        assert_eq!(left.recent, [b.clone(), a.clone()]);
+
+        // The next start: what was open and is still a folder.
+        let mut left = left;
+        left.open.push(crate::windows::Place::of(b.join("gone")));
+        left.open.push(crate::windows::Place::of(a.clone()));
+        assert_eq!(cx.update(|cx| crate::windows::restore(&left, cx)), 1);
+        assert_eq!(cx.read(project_windows), std::slice::from_ref(&a));
+        assert_eq!(
+            cx.read(crate::windows::open_roots),
+            std::slice::from_ref(&a)
+        );
+
+        // Windows that go because the run ends were not closed by anybody.
+        cx.update(|cx| crate::windows::open(b.clone(), cx));
+        soon(cx, "both windows in the file again", &|_| {
+            roots(&kept_read(&kept_in)) == [a.clone(), b.clone()]
+        });
+        for window in cx.windows() {
+            window
+                .update(cx, |_, window, _| window.remove_window())
+                .unwrap();
+        }
+        for _ in 0..20 {
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(roots(&kept_read(&kept_in)), [a, b]);
+        // The end of a test waits for no thread.
+        cx.update(crate::windows::stop);
+    }
+
+    fn kept_read(path: &Path) -> crate::windows::Kept {
+        crate::windows::Kept::read(path)
+    }
+
+    #[gpui::test]
+    async fn the_way_in_lists_projects_opened_before_and_opens_one(cx: &mut TestAppContext) {
+        let (a, b) = (fixture("way-in-a"), fixture("way-in-b"));
+        let gone = b.join("gone");
+        cx.executor().allow_parking();
+        windows_setup(cx, None, &[a.clone(), gone.clone(), b.clone()]);
+        let way_in = cx.update(crate::way_in::open_window);
+        let list = way_in
+            .read_with(cx, |way_in, _| way_in.list().clone())
+            .unwrap();
+        let listed = |cx: &App| list.read(cx).delegate.listed();
+        let path = |path: &Path| path.display().to_string();
+        assert_eq!(
+            cx.read(listed),
+            ["Open a folder".to_string(), path(&a), path(&gone), path(&b)]
+        );
+        let cx = &mut VisualTestContext::from_window(way_in.into(), cx);
+        // What is typed narrows the list; a folder can always be opened.
+        cx.simulate_input("gone");
+        assert_eq!(cx.read(listed), [path(&gone), "Open a folder".to_string()]);
+        // A project whose folder is gone says so and leaves the list.
+        cx.simulate_keystrokes("enter");
+        assert!(cx.read(|cx| {
+            list.read(cx)
+                .delegate
+                .failure()
+                .is_some_and(|said| said.ends_with("is not there any more"))
+        }));
+        assert_eq!(cx.read(listed), ["Open a folder"]);
+        assert_eq!(cx.read(crate::windows::recent), [a.clone(), b.clone()]);
+        // An address is something to clone, not a name to look for.
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("https://example.com/cire362/solder.git");
+        assert_eq!(
+            cx.read(listed),
+            ["Clone https://example.com/cire362/solder.git"]
+        );
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("way-in-b");
+        cx.simulate_keystrokes("enter");
+        // The project takes the place of the window that led to it.
+        wait_for(cx, "the project's window alone", &|cx| {
+            cx.windows().len() == 1 && project_windows(cx) == [b.clone()]
+        });
+        assert_eq!(cx.read(crate::windows::recent), [b, a]);
+    }
+
+    #[gpui::test]
+    async fn an_address_is_cloned_into_a_folder_and_opened(cx: &mut TestAppContext) {
+        let origin = git_fixture("way-in-origin");
+        let parent = db::testing::dir("way-in-clones").canonicalize().unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, fixture("way-in-from"));
+        cx.update(|_, cx| {
+            crate::windows::init(None, cx);
+            crate::windows::learn(&Default::default(), cx);
+        });
+        cx.simulate_keystrokes("secondary-alt-o");
+        let list = cx
+            .read(|cx| ws.read(cx).modal_view::<Picker<crate::way_in::WayIn>>())
+            .expect("the way in over the window");
+        let clone = |address: String, cx: &mut VisualTestContext| {
+            let parent = parent.clone();
+            list.update_in(cx, |list, window, cx| {
+                list.delegate.clone_into(address, parent, window, cx)
+            });
+        };
+        // What git says of a failure is what the list says.
+        // Not inside the folder it would be cloned into: that would be
+        // a clone of itself.
+        clone(format!("file://{}", origin.join("nothing").display()), cx);
+        assert!(cx.read(|cx| list.read(cx).delegate.is_cloning()));
+        wait_for(cx, "git to say no", &|cx| {
+            list.read(cx).delegate.failure().is_some()
+        });
+        assert!(cx.read(|cx| {
+            let said = list.read(cx).delegate.failure().unwrap().to_string();
+            said.contains("nothing") && !list.read(cx).delegate.is_cloning()
+        }));
+        assert_eq!(cx.read(project_windows).len(), 1);
+
+        clone(format!("file://{}", origin.display()), cx);
+        let cloned = parent.join(origin.file_name().unwrap());
+        wait_for(cx, "the clone in a window of its own", &|cx| {
+            project_windows(cx).contains(&cloned)
+        });
+        assert_eq!(
+            std::fs::read_to_string(cloned.join("a.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+        // The window it was asked from stays, without the list.
+        wait_for(cx, "the list to go", &|cx| {
+            ws.read(cx)
+                .modal_view::<Picker<crate::way_in::WayIn>>()
+                .is_none()
+        });
+        assert_eq!(cx.read(project_windows).len(), 2);
     }
 }

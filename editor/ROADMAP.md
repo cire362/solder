@@ -21,6 +21,15 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] The set of windows across a real quit with several of them open
+      (the key, the Dock, a shutdown), on a second display and with one
+      unplugged, fullscreen or maximized, and on Windows and Linux. Seen
+      live on macOS: the way in, two windows put back, a move written.
+      The rest is checked headlessly
+- [ ] A clone from a real server, and one that needs a password or a key
+      with a passphrase. Checked against a repository on this disk. The
+      system's folder dialogs (Open a folder, Clone here) are not driven
+      by any test
 - [ ] The question about a crash in a real window, and a panic on Windows
       and Linux. The hook is checked in a process of its own on the machine
       that runs the tests, the question and the report's tab headlessly
@@ -119,6 +128,14 @@ something of its own unchecked or unmade adds it here.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] A second `solder` started while one runs is a second process, not a
+      window of the first. Nothing is done when the Dock icon is clicked
+      with no window, or a folder is dropped on it. There is no menu bar,
+      so no Open Recent in one
+- [ ] A clone takes the default branch whole: no branch, depth or
+      submodules to choose, and a clone into a folder inside the
+      repository being cloned is not refused. A project leaves the list of
+      those opened before only when its folder is gone
 - [ ] A crash that is no panic leaves no report: a signal, an abort in
       native code, memory that ran out. Only the editor's own errors reach
       `solder.log`: what the `syntax` and `extension` crates print, what
@@ -663,8 +680,8 @@ update. They come after phase 9, in this order unless one is needed sooner.
 - [x] A command that failed offered to the model to fix (an editable chat draft)
 
 ### Windows and the way in
-- [ ] A first window with the projects opened last, open a folder, clone
-- [ ] Several windows, a project in each, the set restored
+- [x] A first window with the projects opened last, open a folder, clone
+- [x] Several windows, a project in each, the set restored
 - [ ] Markdown shown next to its source; pictures shown as pictures
 - [x] A log of errors with rotation, and a report of a crash at the next start
 - [ ] The interface in Russian as well as English

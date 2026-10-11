@@ -51,6 +51,35 @@ scripts/bench.sh [file]
 
 The status bar shows live input latency, frame time, memory and startup time. Toggle it with `cmd-alt-p`.
 
+## Windows and projects
+
+A project is a folder, and it has one window. `solder path/to/folder` opens
+it; `solder path/to/file` opens the file in a window on its folder. Started
+with nothing named, Solder puts back the windows the last run was left with:
+each project where its window was and as large, on the display it was on if
+that is still there.
+
+A window closed while others are open leaves that set. The last one to close
+ends the run, and is what the next start begins with.
+
+With no window to put back, the start shows the way in: the projects opened
+before, **Open a folder**, and cloning. Type to narrow the list. Paste the
+address of a repository (`https://...`, `git@host:owner/name`, anything
+ending in `.git`) and the list offers **Clone**: choose the folder to clone
+into, and the project opens when git is done. What git says of its progress,
+or of why it could not, is in the row. Git is given no terminal to ask for a
+password on, so a repository that needs one clones only when a credential
+helper or an SSH agent already has it.
+
+Inside a project, **Workspace: Open project** (`cmd-alt-o`) shows the same
+list over the window. What is chosen gets a window of its own, and a project
+that has one already, marked `open`, is brought to the front.
+**Workspace: New window** (`cmd-shift-n`) shows the way in as a window, and
+**Workspace: Open folder** (`cmd-o`) asks for a folder at once.
+
+The set is kept in `~/.config/solder/sessions/windows.json`, with the last
+thirty projects.
+
 ## Editing
 
 Several cursors: `alt`-click adds one, `cmd-alt-up` and `cmd-alt-down` add
