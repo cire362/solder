@@ -21,6 +21,14 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] Two causes of tests of the terminal failing on Linux in some runs
+      and never on macOS are read from the code and fit what was seen, but
+      were not seen on Linux. What an extension types into a terminal as
+      it starts may reach the shell before its prompt, and dash then prints
+      the answer after the prompt, on a line the test did not expect. And
+      what a program prints as it ends can be lost (under "Not finished").
+      The tests no longer depend on either; a wait that gives up says what
+      each terminal did, should it be something else
 - [ ] Failed-command explanations from a real local or hosted model.
       The editable draft, no request before Send, metadata, plain output
       and removing the attachment are checked with the chat fixture
@@ -116,6 +124,14 @@ something of its own unchecked or unmade adds it here.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] On Linux, what a program prints just before it ends can be missing
+      from its terminal: an error and an exit at once, which is what a
+      failed command is. `alacritty_terminal` 0.26 reads the bytes, finds
+      the terminal locked by the window (drawing it, searching it), reads
+      again, is told the other end is closed, and returns without the bytes
+      it had (`EventLoop::pty_read`). macOS does not report the closed end
+      that way. Not fixed: it needs a patched copy of that crate or a
+      terminal kept open by the editor itself, and that is to be decided
 - [ ] Interactive failure reports are for Bash and Zsh only. Bash skips
       disabled, ignored, duplicate or stale history; rewritten history or
       later prompt hooks can defeat attribution. Commands above 8 KB,

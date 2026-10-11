@@ -8232,9 +8232,13 @@ mod tests {
                 w.spawn_terminal(
                     TerminalCommand {
                         program: Some("/bin/sh".into()),
+                        // It lingers a moment before it fails. What a
+                        // program prints as it ends can be lost on Linux
+                        // (see the roadmap): that is not what this test
+                        // is of.
                         args: vec![
                             "-c".into(),
-                            "printf '\\033[31mfailed-output\\033[0m\\n'; exit 7".into(),
+                            "printf '\\033[31mfailed-output\\033[0m\\n'; sleep 0.3; exit 7".into(),
                         ],
                         cwd: root.clone(),
                         ..Default::default()
@@ -8505,9 +8509,19 @@ mod tests {
                 (store.state.clone(), store.console.last().cloned())
             })
         });
+        // A terminal's process is the usual thing a test waits for.
+        let terminals: Vec<String> = cx.read(|cx| {
+            cx.windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<Workspace>())
+                .filter_map(|window| window.read(cx).ok())
+                .flat_map(|workspace| workspace.terminals.iter())
+                .map(|(terminal, _)| terminal.read(cx).told())
+                .collect()
+        });
         panic!(
             "timed out waiting for {what} after {patience:?}; \
-             language server: {lsp:?}; debugger: {debugger:?}"
+             language server: {lsp:?}; debugger: {debugger:?}; terminals: {terminals:#?}"
         );
     }
 
@@ -12867,9 +12881,15 @@ mod tests {
             ws.read(cx).git.read(cx).repo().is_some()
         });
         cx.dispatch_action(ShowGit);
-        cx.dispatch_action(git_panel::GenerateMessage);
         let panel = cx.read(|cx| ws.read(cx).git_panel.clone());
         let message = cx.read(|cx| panel.read(cx).message.clone());
+        // The model here answers at once. Asked through `dispatch_action`,
+        // which runs what is waiting before it returns, it had sometimes
+        // answered before the next line typed anything, and then nothing
+        // was late. Here the question is asked and the message typed with
+        // nothing run in between: the answer cannot come first.
+        cx.update(|window, cx| window.dispatch_action(Box::new(git_panel::GenerateMessage), cx));
+        assert!(cx.read(|cx| panel.read(cx).generating));
         message.update(cx, |e, cx| e.set_text("My own message", false, cx));
         wait_for(cx, "late suggestion", &|cx| !panel.read(cx).generating);
         assert_eq!(cx.read(|cx| message.read(cx).text(cx)), "My own message");
@@ -16402,7 +16422,17 @@ exports.activate = (context) => {
             let Some((terminal, _)) = terminals.get(terminal) else {
                 return false;
             };
-            terminal.read(cx).visible_text().iter().any(|l| l == line)
+            // What is typed before the shell asks for it is run all the
+            // same, and a shell that does not draw its line again (dash,
+            // which is `sh` on Linux) then prints the answer right after
+            // its prompt: `$ solder-42`. Which comes first, the prompt
+            // or the typing, is a race the editor does not decide.
+            let after_prompt = format!(" {line}");
+            terminal
+                .read(cx)
+                .visible_text()
+                .iter()
+                .any(|l| l == line || l.ends_with(&after_prompt))
         };
         // A terminal it only keeps ready takes no room in the dock.
         assert!(cx.read(|cx| ws.read(cx).terminals.is_empty()));

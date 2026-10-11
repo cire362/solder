@@ -345,6 +345,27 @@ impl Terminal {
         }
     }
 
+    /// What a test that waited for this terminal in vain is told: whether
+    /// its process started and ended, and what it shows.
+    #[cfg(test)]
+    pub fn told(&self) -> String {
+        let lines: Vec<String> = self
+            .visible_text()
+            .into_iter()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        format!(
+            "{}: started {}, exited {} with {:?}, failure {}, error {:?}, {} bytes not yet written, shows {lines:?}",
+            self.title,
+            self.sender.is_some(),
+            self.exited,
+            self.exit_code,
+            self.failure.is_some(),
+            self.startup_error,
+            self.pending_input.borrow().len(),
+        )
+    }
+
     /// Visible text, one string per row. For tests and "copy all".
     pub fn visible_text(&self) -> Vec<String> {
         let term = self.term.lock();

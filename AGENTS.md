@@ -350,6 +350,18 @@ pattern for new widgets instead of calling `cx.propagate()` everywhere.
   GPUI 0.2.2 never forgets one: it cannot tell that an element is gone.
   Assert that on the state behind it. For one that should appear, wait for
   it (`bounds_soon` in `workspace.rs`) and do not look in the same breath.
+- A wait is as long as `patience::WAIT` and returns as soon as the thing
+  is there. One that still gives up was not waiting on a slow runner:
+  thirty seconds were once given to three tests that had lost a race, and
+  they went on failing. Read what the test raced with.
+- `cx.dispatch_action` and `simulate_keystrokes` run what is waiting
+  before they return, so the answer of a fake server may be in before the
+  next line of the test. Where something has to happen before the answer,
+  ask with `window.dispatch_action` inside `cx.update` and do it there.
+- CI's `sh` is dash. Typed into before it printed its prompt, it prints
+  the answer after the prompt, on the same line. A program that prints
+  and ends at once may lose that output on Linux (see the roadmap): let
+  a test's program linger unless that loss is what it tests.
 - Tests must not depend on tools that may be missing on CI (CI is Ubuntu:
   `git`, `python3` and `/bin/sh` are there; `rust-analyzer` is not).
 
