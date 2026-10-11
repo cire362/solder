@@ -94,6 +94,8 @@ actions!(
         FocusPrevPane,
         ToggleTerminal,
         NewTerminal,
+        SplitTerminal,
+        UnsplitTerminal,
         ShowGit,
         ShowServices,
         ShowDatabase,
@@ -354,6 +356,9 @@ pub struct Workspace {
     modal: Option<Modal>,
     terminals: Vec<(Entity<Terminal>, Subscription)>,
     active_terminal: usize,
+    terminal_pair: Option<(Entity<Terminal>, Entity<Terminal>)>,
+    terminal_bounds: Option<gpui::Bounds<Pixels>>,
+    terminal_resizing: Option<(Point<Pixels>, f32, gpui::Bounds<Pixels>)>,
     _subscriptions: Vec<Subscription>,
     _hud_tick: Task<()>,
 }
@@ -892,6 +897,9 @@ impl Workspace {
             dragging: None,
             modal: None,
             terminals: Vec::new(),
+            terminal_pair: None,
+            terminal_bounds: None,
+            terminal_resizing: None,
             active_terminal: 0,
             _subscriptions: subscriptions,
             _hud_tick: hud_tick,
@@ -1878,22 +1886,37 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<Terminal>> {
-        let started = match Terminal::start(command) {
-            Ok(t) => t,
-            Err(err) => {
-                eprintln!("could not start a terminal: {err}");
-                return None;
-            }
-        };
-        let terminal = cx.new(|cx| Terminal::new(started, cx));
+        let terminal = cx.new(|cx| Terminal::new(command, window, cx));
         let subscription = cx.subscribe_in(
             &terminal,
             window,
             |this, terminal, event, window, cx| match event {
                 TerminalEvent::TitleChanged => cx.notify(),
+                TerminalEvent::Help(failure) => {
+                    this.chat
+                        .update(cx, |chat, cx| chat.attach_terminal(failure.clone(), cx));
+                    this.show_right(false, window, cx);
+                }
+                TerminalEvent::Focused => {
+                    if let Some(ix) = this.terminals.iter().position(|(t, _)| t == terminal) {
+                        this.active_terminal = ix;
+                        cx.notify();
+                    }
+                }
+                TerminalEvent::OpenFile(link) => this.open_path(
+                    link.path.clone(),
+                    Some(Jump::Point {
+                        row: link.row,
+                        column: link.column,
+                    }),
+                    window,
+                    cx,
+                ),
                 // Services keep their tab so a crash's output stays readable,
                 // and so do the tasks of extensions.
-                TerminalEvent::Exited if terminal.read(cx).keep_on_exit => {
+                TerminalEvent::Exited
+                    if terminal.read(cx).keep_on_exit || terminal.read(cx).has_failure() =>
+                {
                     this.extension_terminal_gone(terminal, cx);
                     cx.notify()
                 }
@@ -1901,7 +1924,7 @@ impl Workspace {
             },
         );
         self.terminals.push((terminal.clone(), subscription));
-        self.active_terminal = self.terminals.len() - 1;
+        self.select_terminal(self.terminals.len() - 1);
         self.show_panel(Panel::Terminal, cx);
         if focus {
             window.focus(&terminal.focus_handle(cx));
@@ -1940,7 +1963,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if let Some(ix) = self.terminals.iter().position(|(t, _)| t == terminal) {
-            self.active_terminal = ix;
+            self.select_terminal(ix);
             self.show_panel(Panel::Terminal, cx);
             window.focus(&terminal.focus_handle(cx));
             cx.notify();
@@ -2598,6 +2621,7 @@ impl Workspace {
         if switched {
             self.dock_menu = None;
             self.bar_menu = None;
+            self.terminal_resizing = None;
         }
         let before = [self.left, self.right, self.bottom];
         for (index, place) in Place::ALL.into_iter().enumerate() {
@@ -3848,6 +3872,20 @@ impl Workspace {
         self.extension_terminal_gone(terminal, cx);
         let was_focused = terminal.focus_handle(cx).contains_focused(window, cx);
         drop(self.terminals.remove(ix));
+        if let Some((first, second)) = &self.terminal_pair
+            && (first == terminal || second == terminal)
+        {
+            let remaining = if first == terminal { second } else { first }.clone();
+            self.terminal_pair = None;
+            self.terminal_resizing = None;
+            self.active_terminal = self
+                .terminals
+                .iter()
+                .position(|(t, _)| *t == remaining)
+                .unwrap_or(0);
+        } else if ix < self.active_terminal {
+            self.active_terminal -= 1;
+        }
         if self.terminals.is_empty() {
             self.active_terminal = 0;
             self.panel_gone(Panel::Terminal, cx);
@@ -3924,7 +3962,7 @@ impl Workspace {
                     .when(active, |d| d.bg(theme.bg_elev))
                     .hover(|d| d.text_color(theme.fg))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.active_terminal = ix;
+                        this.select_terminal(ix);
                         this.show_panel(Panel::Terminal, cx);
                         if let Some((t, _)) = this.terminals.get(ix) {
                             window.focus(&t.focus_handle(cx));
@@ -3977,7 +4015,163 @@ impl Workspace {
                 )
                 .into_any_element(),
         );
+        tabs.push(
+            crate::ui::button(
+                "terminal-split",
+                if self.terminal_pair.is_some() {
+                    "Unsplit"
+                } else {
+                    "Split"
+                },
+                false,
+                &theme,
+                cx.listener(|this, _, window, cx| {
+                    if this.terminal_pair.is_some() {
+                        this.unsplit_terminal(&UnsplitTerminal, window, cx);
+                    } else {
+                        this.split_terminal(&SplitTerminal, window, cx);
+                    }
+                }),
+            )
+            .debug_selector(|| "terminal-split".into())
+            .into_any_element(),
+        );
         tabs
+    }
+
+    fn select_terminal(&mut self, ix: usize) {
+        if let Some((selected, _)) = self.terminals.get(ix)
+            && let Some((first, second)) = &mut self.terminal_pair
+            && selected != first
+            && selected != second
+        {
+            let previous = self.terminals.get(self.active_terminal).map(|(t, _)| t);
+            if previous == Some(second) {
+                *second = selected.clone();
+            } else {
+                *first = selected.clone();
+            }
+        }
+        self.active_terminal = ix;
+    }
+
+    fn split_terminal(&mut self, _: &SplitTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        if self.terminal_pair.is_some() {
+            return;
+        }
+        let Some((first, _)) = self.terminals.get(self.active_terminal) else {
+            return;
+        };
+        let first = first.clone();
+        let other = self
+            .terminals
+            .iter()
+            .rev()
+            .find(|(t, _)| *t != first)
+            .map(|(t, _)| t.clone());
+        let second = other.or_else(|| self.spawn_terminal(self.default_terminal(cx), window, cx));
+        if let Some(second) = second {
+            self.terminal_pair = Some((first, second.clone()));
+            self.select_terminal(
+                self.terminals
+                    .iter()
+                    .position(|(t, _)| *t == second)
+                    .unwrap(),
+            );
+            self.show_panel(Panel::Terminal, cx);
+            window.focus(&second.focus_handle(cx));
+            cx.notify();
+        }
+    }
+
+    fn unsplit_terminal(
+        &mut self,
+        _: &UnsplitTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal_pair = None;
+        self.terminal_resizing = None;
+        if let Some((terminal, _)) = self.terminals.get(self.active_terminal) {
+            window.focus(&terminal.focus_handle(cx));
+        }
+        cx.notify();
+    }
+
+    fn render_terminals(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some((first, second)) = &self.terminal_pair else {
+            return div()
+                .size_full()
+                .children(
+                    self.terminals
+                        .get(self.active_terminal)
+                        .map(|(t, _)| t.clone()),
+                )
+                .into_any_element();
+        };
+        let split = &Layout::get(cx).terminal;
+        let vertical = split.axis == layout::TerminalAxis::Vertical;
+        let theme = cx.theme().clone();
+        let ratio = split.ratio;
+        let parent = cx.entity().downgrade();
+        let grip = div()
+            .id("terminal-divider")
+            .debug_selector(|| "terminal-divider".into())
+            .flex_none()
+            .bg(theme.line)
+            .hover(|d| d.bg(theme.accent))
+            .when(vertical, |d| {
+                d.h(theme.shape.border * 6.)
+                    .w_full()
+                    .cursor(gpui::CursorStyle::ResizeUpDown)
+            })
+            .when(!vertical, |d| {
+                d.w(theme.shape.border * 6.)
+                    .h_full()
+                    .cursor(gpui::CursorStyle::ResizeLeftRight)
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if let Some(bounds) = this.terminal_bounds {
+                        this.terminal_resizing =
+                            Some((event.position, Layout::get(cx).terminal.ratio, bounds));
+                    }
+                }),
+            );
+        div()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .relative()
+            .flex()
+            .when(vertical, |d| d.flex_col())
+            .when(!vertical, |d| d.flex_row())
+            .child(
+                gpui::canvas(
+                    move |bounds, _, cx| {
+                        parent
+                            .update(cx, |this, _| this.terminal_bounds = Some(bounds))
+                            .ok();
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .min_w_0()
+                    .min_h_0()
+                    .when(vertical, |d| d.h(gpui::relative(ratio)).w_full())
+                    .when(!vertical, |d| d.w(gpui::relative(ratio)).h_full())
+                    .child(first.clone()),
+            )
+            .child(grip)
+            .child(div().flex_1().min_w_0().min_h_0().child(second.clone()))
+            .into_any_element()
     }
 
     fn render_results_tab(
@@ -4414,6 +4608,21 @@ impl Workspace {
     /// The pointer moved with a border held: the part follows it. The
     /// file is written once, when the border is let go.
     fn resize_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some((from, ratio, bounds)) = self.terminal_resizing {
+            if event.pressed_button != Some(MouseButton::Left) {
+                return self.resize_end(cx);
+            }
+            let mut layout = Layout::get(cx).clone();
+            let delta = if layout.terminal.axis == layout::TerminalAxis::Vertical {
+                (event.position.y - from.y) / bounds.size.height
+            } else {
+                (event.position.x - from.x) / bounds.size.width
+            };
+            layout.terminal.ratio = (ratio + delta).clamp(0.1, 0.9);
+            cx.set_global(layout);
+            cx.refresh_windows();
+            return;
+        }
         let Some((part, from, size)) = self.resizing else {
             return;
         };
@@ -4435,6 +4644,11 @@ impl Workspace {
     }
 
     fn resize_end(&mut self, cx: &mut Context<Self>) {
+        if let Some((_, before, _)) = self.terminal_resizing.take()
+            && before != Layout::get(cx).terminal.ratio
+        {
+            layout::keep_terminal(cx);
+        }
         if let Some((part, _, size)) = self.resizing.take()
             && Layout::get(cx).size(part) != size
         {
@@ -5189,7 +5403,7 @@ impl Workspace {
             (TerminalAsk::Send(text), Some(terminal)) => terminal.read(cx).write(text.into_bytes()),
             (TerminalAsk::Show, Some(terminal)) => {
                 if let Some(ix) = self.terminals.iter().position(|(t, _)| *t == terminal) {
-                    self.active_terminal = ix;
+                    self.select_terminal(ix);
                 }
                 self.show_panel(Panel::Terminal, cx);
                 cx.notify();
@@ -5785,31 +5999,25 @@ impl Workspace {
                     )
                     .children(tabs),
             )
-            .child(div().flex_1().min_h_0().map(|d| {
-                match tab {
-                    Panel::Files => d.pt_1().child(self.project_panel.clone()),
-                    Panel::Search => d.pt_1().child(self.project_search.clone()),
-                    Panel::Git => d.pt_1().child(self.git_panel.clone()),
-                    Panel::Services => d.pt_1().child(self.services.clone()),
-                    Panel::Database => d.pt_1().child(self.database_panel.clone()),
-                    Panel::Api => d.pt_1().child(self.api_panel.clone()),
-                    Panel::Ai => d.pt_1().child(self.ai_panel.clone()),
-                    Panel::Extensions => d.pt_1().child(self.extensions_panel.clone()),
-                    Panel::ExtensionViews => d.child(self.extension_views.clone()),
-                    Panel::Structure => d.child(self.structure_panel.clone()),
-                    Panel::Problems => d.child(self.problems_panel.clone()),
-                    Panel::Tests => d.child(self.tests_panel.clone()),
-                    Panel::Chat => d.pt_1().child(self.chat.clone()),
-                    Panel::Agent => d.pt_1().child(self.agent.clone()),
-                    Panel::Debug => d.child(self.debug_panel.clone()),
-                    Panel::Response => d.child(self.response.clone()),
-                    Panel::Results => d.child(self.results.clone()),
-                    Panel::Terminal => d.children(
-                        self.terminals
-                            .get(self.active_terminal)
-                            .map(|(t, _)| t.clone()),
-                    ),
-                }
+            .child(div().flex_1().min_h_0().map(|d| match tab {
+                Panel::Files => d.pt_1().child(self.project_panel.clone()),
+                Panel::Search => d.pt_1().child(self.project_search.clone()),
+                Panel::Git => d.pt_1().child(self.git_panel.clone()),
+                Panel::Services => d.pt_1().child(self.services.clone()),
+                Panel::Database => d.pt_1().child(self.database_panel.clone()),
+                Panel::Api => d.pt_1().child(self.api_panel.clone()),
+                Panel::Ai => d.pt_1().child(self.ai_panel.clone()),
+                Panel::Extensions => d.pt_1().child(self.extensions_panel.clone()),
+                Panel::ExtensionViews => d.child(self.extension_views.clone()),
+                Panel::Structure => d.child(self.structure_panel.clone()),
+                Panel::Problems => d.child(self.problems_panel.clone()),
+                Panel::Tests => d.child(self.tests_panel.clone()),
+                Panel::Chat => d.pt_1().child(self.chat.clone()),
+                Panel::Agent => d.pt_1().child(self.agent.clone()),
+                Panel::Debug => d.child(self.debug_panel.clone()),
+                Panel::Response => d.child(self.response.clone()),
+                Panel::Results => d.child(self.results.clone()),
+                Panel::Terminal => d.child(self.render_terminals(cx)),
             }))
     }
 
@@ -6542,6 +6750,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_pull_request))
             .on_action(cx.listener(Self::create_pull_request))
             .on_action(cx.listener(Self::new_terminal))
+            .on_action(cx.listener(Self::split_terminal))
+            .on_action(cx.listener(Self::unsplit_terminal))
             .relative()
             .size_full()
             .flex()
@@ -6946,7 +7156,7 @@ mod tests {
             .unwrap_or_default()
         };
         let listed = |cx: &mut VisualTestContext, names: &[&str]| {
-            for _ in 0..400 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.run_until_parked();
                 let now: Vec<String> = shown(cx).into_iter().map(|row| row.0).collect();
                 if now == names {
@@ -7430,7 +7640,7 @@ mod tests {
         });
         let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
         let wait = |cx: &mut VisualTestContext, what: &str, f: &dyn Fn(&App) -> bool| {
-            for _ in 0..400 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.run_until_parked();
                 if cx.read(|cx| f(cx)) {
                     return;
@@ -7781,6 +7991,431 @@ mod tests {
 
     /// A real PTY: type a command, read its output off the grid, exit.
     #[gpui::test]
+    fn terminal_links_open_the_output_file_and_position(cx: &mut TestAppContext) {
+        let root = fixture("terminal-links");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let path = root.join("src/пример.rs");
+        std::fs::write(&path, "first\nabcdef\n").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let terminal = ws
+            .update_in(cx, |w, window, cx| {
+                w.spawn_terminal(
+                    TerminalCommand {
+                        program: Some("/bin/sh".into()),
+                        args: vec![
+                            "-c".into(),
+                            "printf '\\033[31msrc/пример.rs:2:3\\033[0m\\n'".into(),
+                        ],
+                        cwd: root,
+                        keep_on_exit: true,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        wait_for(cx, "the terminal link", &|cx| {
+            terminal.read(cx).text_position("пример").is_some()
+        });
+        let at = cx.read(|cx| terminal.read(cx).text_position("пример").unwrap());
+        // An ordinary click still selects; only the deliberate link gesture
+        // asks the workspace to open a file.
+        cx.simulate_click(at, gpui::Modifiers::default());
+        assert!(cx.read(|cx| ws.read(cx).active_editor().is_none()));
+        cx.simulate_click(
+            at,
+            gpui::Modifiers {
+                platform: true,
+                ..Default::default()
+            },
+        );
+        wait_for(cx, "the linked file", &|cx| {
+            ws.read(cx).active_editor().is_some()
+        });
+        cx.read(|cx| {
+            let editor = ws.read(cx).active_editor().unwrap().read(cx);
+            assert_eq!(editor.path(cx), Some(path.as_path()));
+            assert_eq!(editor.cursor_position(cx), (2, 3, 1));
+        });
+    }
+
+    #[gpui::test]
+    fn terminal_search_finds_scrollback_and_keeps_enter_out_of_the_shell(cx: &mut TestAppContext) {
+        let root = fixture("terminal-search");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let terminal = ws
+            .update_in(cx, |w, window, cx| {
+                w.spawn_terminal(
+                    TerminalCommand {
+                        program: Some("/bin/sh".into()),
+                        cwd: root,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        terminal.read_with(cx, |t, _| t.write(b"printf 'old-needle\\n'; i=0; while [ $i -lt 80 ]; do echo filler-$i; i=$((i+1)); done; printf 'new-needle\\n'\n".to_vec()));
+        wait_for(cx, "the scrollback", &|cx| {
+            terminal
+                .read(cx)
+                .visible_text()
+                .iter()
+                .any(|line| line == "new-needle")
+        });
+        cx.simulate_keystrokes("secondary-f");
+        cx.simulate_input("needle");
+        // The echoed command contains two occurrences as well.
+        wait_for(cx, "the search results", &|cx| {
+            terminal.read(cx).search_state(cx).1 >= 2
+        });
+        let before = cx.read(|cx| terminal.read(cx).search_state(cx));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            cx.read(|cx| terminal.read(cx).search_state(cx).2),
+            Some((before.2.unwrap() + 1) % before.1)
+        );
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(cx.read(|cx| terminal.read(cx).search_state(cx).2), before.2);
+        cx.simulate_keystrokes("escape");
+        assert!(!cx.read(|cx| terminal.read(cx).search_state(cx).0));
+        cx.simulate_input(" "); // Input returns to the bottom of the terminal.
+        assert!(!cx.read(|cx| terminal.read(cx).search_match_visible(cx)));
+        cx.simulate_keystrokes("secondary-f");
+        wait_for(cx, "the reopened match to be revealed", &|cx| {
+            terminal.read(cx).search_match_visible(cx)
+        });
+        cx.simulate_keystrokes("escape");
+        cx.simulate_input("echo still-running");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the shell after search", &|cx| {
+            terminal
+                .read(cx)
+                .visible_text()
+                .iter()
+                .any(|line| line == "still-running")
+        });
+    }
+
+    #[gpui::test]
+    fn terminal_search_finishes_while_output_keeps_arriving(cx: &mut TestAppContext) {
+        let root = fixture("terminal-busy-search");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let terminal = ws.update_in(cx, |w,window,cx| w.spawn_terminal(TerminalCommand {
+            program: Some("/bin/sh".into()), args: vec!["-c".into(), "printf 'busy-needle\\n'; i=0; while [ $i -lt 100 ]; do echo tick-$i; i=$((i+1)); sleep 0.05; done".into()], cwd: root, keep_on_exit: true, ..Default::default()
+        }, window,cx)).unwrap();
+        wait_for(cx, "the busy process", &|cx| {
+            terminal.read(cx).text_position("busy-needle").is_some()
+        });
+        cx.simulate_keystrokes("secondary-f");
+        cx.simulate_input("busy-needle");
+        wait_for(cx, "search during output", &|cx| {
+            terminal.read(cx).search_state(cx).1 == 1
+        });
+        assert!(!cx.read(|cx| terminal.read(cx).exited));
+        cx.simulate_keystrokes("enter");
+        assert!(cx.read(|cx| terminal.read(cx).search_match_visible(cx)));
+    }
+
+    #[gpui::test]
+    fn terminal_split_keeps_two_processes_focus_and_layout(cx: &mut TestAppContext) {
+        let root = fixture("terminal-split");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let config = db::testing::dir("terminal-split-config");
+        std::fs::write(config.join("layout.json"), "// split preference\n{}\n").unwrap();
+        cx.update(|_, cx| settings::reload_from(&config, cx));
+        let spawn = |cx: &mut VisualTestContext| {
+            ws.update_in(cx, |w, window, cx| {
+                w.spawn_terminal(
+                    TerminalCommand {
+                        program: Some("/bin/sh".into()),
+                        cwd: root.clone(),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .unwrap()
+        };
+        let first = spawn(cx);
+        let second = spawn(cx);
+        cx.dispatch_action(SplitTerminal);
+        wait_for(cx, "the two terminal panes", &|cx| {
+            let (Some(a), Some(b)) = (first.read(cx).bounds(), second.read(cx).bounds()) else {
+                return false;
+            };
+            a.right() <= b.left() || b.right() <= a.left()
+        });
+        let at = cx.read(|cx| first.read(cx).bounds().unwrap().center());
+        cx.simulate_click(at, Default::default());
+        cx.simulate_input("echo pane-one");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the first pane", &|cx| {
+            first
+                .read(cx)
+                .visible_text()
+                .iter()
+                .any(|l| l == "pane-one")
+        });
+        assert_eq!(cx.read(|cx| ws.read(cx).active_terminal), 0);
+        let divider = bounds_soon(cx, "terminal-divider").center();
+        cx.simulate_event(MouseDownEvent {
+            position: divider,
+            button: MouseButton::Left,
+            ..Default::default()
+        });
+        let to = divider + gpui::point(px(50.), px(0.));
+        cx.simulate_event(MouseMoveEvent {
+            position: to,
+            pressed_button: Some(MouseButton::Left),
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: to,
+            button: MouseButton::Left,
+            ..Default::default()
+        });
+        assert!(cx.read(|cx| Layout::get(cx).terminal.ratio) > 0.5);
+        wait_for(cx, "the saved terminal proportion", &|_| {
+            std::fs::read_to_string(config.join("layout.json"))
+                .ok()
+                .is_some_and(|text| {
+                    text.contains("// split preference")
+                        && layout::parse(&text).is_ok_and(|layout| layout.terminal.ratio > 0.5)
+                })
+        });
+        cx.update(|_, cx| {
+            let mut layout = Layout::get(cx).clone();
+            layout.terminal.axis = layout::TerminalAxis::Vertical;
+            cx.set_global(layout);
+            cx.refresh_windows();
+        });
+        wait_for(cx, "the vertical panes", &|cx| {
+            let (Some(a), Some(b)) = (first.read(cx).bounds(), second.read(cx).bounds()) else {
+                return false;
+            };
+            a.bottom() <= b.top() || b.bottom() <= a.top()
+        });
+        let third = spawn(cx);
+        assert!(cx.read(|cx| {
+            ws.read(cx)
+                .terminal_pair
+                .as_ref()
+                .is_some_and(|(a, b)| a == &third || b == &third)
+        }));
+        // A replaced terminal keeps running, and closing a visible pane
+        // collapses the split onto its surviving partner.
+        ws.update_in(cx, |w, window, cx| w.remove_terminal(&third, window, cx));
+        assert!(cx.read(|cx| ws.read(cx).terminal_pair.is_none()));
+        assert_eq!(cx.read(|cx| ws.read(cx).terminals.len()), 2);
+        assert!(!cx.read(|cx| first.read(cx).exited));
+        assert!(!cx.read(|cx| second.read(cx).exited));
+    }
+
+    #[gpui::test]
+    fn terminal_failure_is_an_editable_draft_until_sent(cx: &mut TestAppContext) {
+        let (api, seen) = fake_api_reply(Some("Use a valid option."), Duration::ZERO, true);
+        let urls = crate::ai_providers::Urls {
+            lm_studio: api,
+            ..down_urls()
+        };
+        let (root, store, ws, cx) = ai_setup(cx, "terminal-failure", urls);
+        let terminal = ws
+            .update_in(cx, |w, window, cx| {
+                w.spawn_terminal(
+                    TerminalCommand {
+                        program: Some("/bin/sh".into()),
+                        // It lingers a moment before it fails. What a
+                        // program prints as it ends can be lost on Linux
+                        // (see the roadmap): that is not what this test
+                        // is of.
+                        args: vec![
+                            "-c".into(),
+                            "printf '\\033[31mfailed-output\\033[0m\\n'; sleep 0.3; exit 7".into(),
+                        ],
+                        cwd: root.clone(),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        wait_for(cx, "the failed command", &|cx| {
+            terminal.read(cx).has_failure()
+                && terminal.read(cx).text_position("failed-output").is_some()
+        });
+        // Failed processes keep their output even without keep_on_exit.
+        assert_eq!(cx.read(|cx| ws.read(cx).terminals.len()), 1);
+        click(cx, "terminal-help");
+        let chat = cx.read(|cx| ws.read(cx).chat.clone());
+        wait_for(cx, "the failure draft", &|cx| {
+            chat.read(cx).terminal_draft().is_some()
+        });
+        wait_for(cx, "the chat model", &|cx| {
+            store
+                .read(cx)
+                .provider("lmstudio")
+                .is_some_and(|p| p.models() == ["model-a"])
+        });
+        store.update(cx, |s, cx| {
+            s.choose(
+                ai::Role::Chat,
+                crate::ai_providers::ModelRef {
+                    provider: "lmstudio".into(),
+                    model: "model-a".into(),
+                },
+                cx,
+            )
+        });
+        assert!(seen.lock().unwrap().iter().all(|r| !r.starts_with("POST ")));
+        assert!(cx.read(|cx| chat.read(cx).messages.is_empty()));
+        cx.read(|cx| {
+            let draft = chat.read(cx).terminal_draft().unwrap();
+            assert_eq!(draft.status, 7);
+            assert_eq!(draft.cwd, root);
+            assert!(draft.output.contains("failed-output") && !draft.output.contains('\x1b'));
+            assert!(!chat.read(cx).include_file && !chat.read(cx).include_project);
+        });
+        let input = cx.read(|cx| chat.read(cx).input());
+        input.update(cx, |input, cx| {
+            input.set_text("Explain the bad option, please.", false, cx)
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(chat_answer(&ws, cx), "Use a valid option.");
+        let requests = seen.lock().unwrap();
+        let sent = requests
+            .iter()
+            .filter(|r| r.starts_with("POST "))
+            .collect::<Vec<_>>();
+        assert_eq!(sent.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_str(sent[0].split_once('\n').unwrap().1).unwrap();
+        let prompt = body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(prompt.ends_with("Explain the bad option, please."));
+        let json = prompt.lines().nth(1).unwrap();
+        let data: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(data["status"], 7);
+        assert_eq!(data["command"]["program"], "/bin/sh");
+        assert!(data["output"].as_str().unwrap().contains("failed-output"));
+        assert!(data.get("env").is_none());
+        drop(requests);
+        assert!(cx.read(|cx| chat.read(cx).terminal_draft().is_none()));
+        click(cx, "terminal-help");
+        wait_for(cx, "another draft", &|cx| {
+            chat.read(cx).terminal_draft().is_some()
+        });
+        click(cx, "chat-terminal-remove");
+        assert!(cx.read(|cx| chat.read(cx).terminal_draft().is_none()));
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.starts_with("POST "))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    fn terminal_interactive_failure_names_the_command_and_its_starting_directory(
+        cx: &mut TestAppContext,
+    ) {
+        let root = fixture("terminal-interactive-failure");
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join(".bashrc"), "PS1='hook$ '\nPROMPT_COMMAND=':'\n").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let terminal = ws
+            .update_in(cx, |w, window, cx| {
+                w.spawn_terminal(
+                    TerminalCommand {
+                        program: Some("/bin/bash".into()),
+                        cwd: root.clone(),
+                        env: [("HOME".into(), root.to_string_lossy().into_owned())]
+                            .into_iter()
+                            .collect(),
+                        title: Some("interactive test".into()),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        wait_for(cx, "the shell prompt", &|cx| {
+            terminal
+                .read(cx)
+                .visible_text()
+                .iter()
+                .any(|line| line.contains("hook$"))
+        });
+        cx.simulate_input("cd sub; printf 'directory-ready\\n'");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the changed shell directory", &|cx| {
+            terminal
+                .read(cx)
+                .visible_text()
+                .iter()
+                .any(|line| line == "directory-ready")
+        });
+        cx.simulate_input("printf 'interactive-failure\\n'; false");
+        cx.simulate_keystrokes("enter");
+        wait_for(cx, "the failed command inside a running shell", &|cx| {
+            terminal.read(cx).has_failure()
+        });
+        assert!(!cx.read(|cx| terminal.read(cx).exited));
+        assert_eq!(cx.read(|cx| terminal.read(cx).title()), "interactive test");
+        click(cx, "terminal-help");
+        let chat = cx.read(|cx| ws.read(cx).chat.clone());
+        wait_for(cx, "the interactive failure draft", &|cx| {
+            chat.read(cx).terminal_draft().is_some()
+        });
+        cx.read(|cx| {
+            let failure = chat.read(cx).terminal_draft().unwrap();
+            assert_eq!(failure.cwd, root.join("sub")); assert_eq!(failure.status, 1);
+            assert!(matches!(&failure.command, crate::terminal::failure::Command::Shell {text} if text == "printf 'interactive-failure\\n'; false"));
+            assert!(failure.output.contains("interactive-failure"));
+            assert!(chat.read(cx).messages.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn a_terminal_startup_error_stays_readable_and_can_be_closed(cx: &mut TestAppContext) {
+        let root = fixture("terminal-startup");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let terminal = ws
+            .update_in(cx, |w, window, cx| {
+                w.spawn_terminal(
+                    TerminalCommand {
+                        program: Some(root.join("absent-program").to_string_lossy().into_owned()),
+                        cwd: root,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        wait_for(cx, "the startup error", &|cx| terminal.read(cx).exited);
+        assert!(cx.read(|cx| terminal.read(cx).keep_on_exit));
+        assert!(!cx.read(|cx| terminal.read(cx).has_failure()));
+        ws.update_in(cx, |w, window, cx| w.remove_terminal(&terminal, window, cx));
+        assert!(cx.read(|cx| ws.read(cx).terminals.is_empty()));
+    }
+
+    #[gpui::test]
     fn terminal_runs_commands(cx: &mut TestAppContext) {
         let root = fixture("terminal");
         cx.executor().allow_parking();
@@ -7796,7 +8431,7 @@ mod tests {
             })
             .expect("terminal starts");
         let wait = |cx: &mut VisualTestContext, what: &str, f: &dyn Fn(&App) -> bool| {
-            for _ in 0..500 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.run_until_parked();
                 if cx.read(|cx| f(cx)) {
                     return;
@@ -7847,7 +8482,7 @@ mod tests {
     }
 
     fn wait_for(cx: &mut VisualTestContext, what: &str, f: &dyn Fn(&App) -> bool) {
-        wait_for_with_timeout(cx, what, Duration::from_secs(5), f);
+        wait_for_with_timeout(cx, what, crate::patience::WAIT, f);
     }
 
     fn wait_for_with_timeout(
@@ -7874,9 +8509,19 @@ mod tests {
                 (store.state.clone(), store.console.last().cloned())
             })
         });
+        // A terminal's process is the usual thing a test waits for.
+        let terminals: Vec<String> = cx.read(|cx| {
+            cx.windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<Workspace>())
+                .filter_map(|window| window.read(cx).ok())
+                .flat_map(|workspace| workspace.terminals.iter())
+                .map(|(terminal, _)| terminal.read(cx).told())
+                .collect()
+        });
         panic!(
             "timed out waiting for {what} after {patience:?}; \
-             language server: {lsp:?}; debugger: {debugger:?}"
+             language server: {lsp:?}; debugger: {debugger:?}; terminals: {terminals:#?}"
         );
     }
 
@@ -7885,7 +8530,7 @@ mod tests {
         cx: &mut VisualTestContext,
         selector: &'static str,
     ) -> gpui::Bounds<gpui::Pixels> {
-        for _ in 0..500 {
+        for _ in 0..crate::patience::LOOKS {
             cx.executor().advance_clock(Duration::from_millis(50));
             cx.run_until_parked();
             if let Some(bounds) = cx.debug_bounds(selector) {
@@ -12236,9 +12881,15 @@ mod tests {
             ws.read(cx).git.read(cx).repo().is_some()
         });
         cx.dispatch_action(ShowGit);
-        cx.dispatch_action(git_panel::GenerateMessage);
         let panel = cx.read(|cx| ws.read(cx).git_panel.clone());
         let message = cx.read(|cx| panel.read(cx).message.clone());
+        // The model here answers at once. Asked through `dispatch_action`,
+        // which runs what is waiting before it returns, it had sometimes
+        // answered before the next line typed anything, and then nothing
+        // was late. Here the question is asked and the message typed with
+        // nothing run in between: the answer cannot come first.
+        cx.update(|window, cx| window.dispatch_action(Box::new(git_panel::GenerateMessage), cx));
+        assert!(cx.read(|cx| panel.read(cx).generating));
         message.update(cx, |e, cx| e.set_text("My own message", false, cx));
         wait_for(cx, "late suggestion", &|cx| !panel.read(cx).generating);
         assert_eq!(cx.read(|cx| message.read(cx).text(cx)), "My own message");
@@ -12661,10 +13312,12 @@ mod tests {
         // F5 runs the open file and stops on the breakpoint, verified.
         cx.simulate_keystrokes("f5");
         wait_for(cx, "the pause", &|cx| paused_line(&store, cx) == Some(2));
-        assert_eq!(
-            cx.read(|cx| store.read(cx).lines(&app).cloned()),
-            Some([(2, true)].into())
-        );
+        // The adapter's answer about the breakpoint and its word that the
+        // program stopped come by two ways, and the second may be heard
+        // first: the mark is waited for, not looked at in the same breath.
+        wait_for(cx, "the breakpoint to be verified", &|cx| {
+            store.read(cx).lines(&app).cloned() == Some([(2, true)].into())
+        });
         assert_eq!(cx.read(|cx| ws.read(cx).bottom), Some(Panel::Debug));
         assert_eq!(active_path(&ws, cx), Some(app.clone()));
 
@@ -13941,7 +14594,7 @@ brackets = [
             store.find(Origin::VsCode, "Acme.pack").is_some()
                 && store.find(Origin::VsCode, "Acme.member").is_some()
         };
-        for _ in 0..300 {
+        for _ in 0..crate::patience::LOOKS {
             cx.executor().advance_clock(Duration::from_millis(50));
             cx.run_until_parked();
             if cx.read(|cx| both(cx)) {
@@ -14495,7 +15148,7 @@ exports.activate = async (context) => {
             output.lines().any(|known| known == line)
         };
         let written = |cx: &mut VisualTestContext, line: &'static str| {
-            for _ in 0..500 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.executor().advance_clock(Duration::from_millis(50));
                 cx.run_until_parked();
                 if cx.read(|cx| wrote(cx, line)) {
@@ -14831,7 +15484,7 @@ exports.activate = (context) => {
             cx.foreground_executor()
                 .spawn(async move { *got.borrow_mut() = Some(task.await) })
                 .detach();
-            for _ in 0..500 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.run_until_parked();
                 if answer.borrow().is_some() {
                     break;
@@ -15771,7 +16424,17 @@ exports.activate = (context) => {
             let Some((terminal, _)) = terminals.get(terminal) else {
                 return false;
             };
-            terminal.read(cx).visible_text().iter().any(|l| l == line)
+            // What is typed before the shell asks for it is run all the
+            // same, and a shell that does not draw its line again (dash,
+            // which is `sh` on Linux) then prints the answer right after
+            // its prompt: `$ solder-42`. Which comes first, the prompt
+            // or the typing, is a race the editor does not decide.
+            let after_prompt = format!(" {line}");
+            terminal
+                .read(cx)
+                .visible_text()
+                .iter()
+                .any(|l| l == line || l.ends_with(&after_prompt))
         };
         // A terminal it only keeps ready takes no room in the dock.
         assert!(cx.read(|cx| ws.read(cx).terminals.is_empty()));
@@ -16081,7 +16744,7 @@ exports.activate = (context) => {
         cx.foreground_executor()
             .spawn(async move { *got.borrow_mut() = Some(called_off.await) })
             .detach();
-        for _ in 0..500 {
+        for _ in 0..crate::patience::LOOKS {
             cx.run_until_parked();
             if answer.borrow().is_some() {
                 break;
@@ -17589,7 +18252,7 @@ exports.activate = (context) => {
             })
             .unwrap_or_default()
         };
-        for _ in 0..400 {
+        for _ in 0..crate::patience::LOOKS {
             cx.run_until_parked();
             if shown(cx).first().is_some_and(|row| row.2.is_some()) {
                 break;
@@ -17955,7 +18618,7 @@ exports.activate = (context) => {
         // Where a tab is once the window has drawn it inside `dock`: a
         // tab that moved is still remembered where it was last.
         let inside = |cx: &mut VisualTestContext, dock: &'static str, tab: &'static str| {
-            for _ in 0..200 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.update(|window, _| window.refresh());
                 cx.run_until_parked();
                 if let (Some(dock), Some(tab)) = (cx.debug_bounds(dock), cx.debug_bounds(tab))
@@ -18337,7 +19000,7 @@ exports.activate = (context) => {
         click(cx, "item-button-1");
         assert_eq!(left(cx), Some(Panel::Files));
         // All of it is in the file, next to what the user wrote there.
-        for _ in 0..200 {
+        for _ in 0..crate::patience::LOOKS {
             cx.run_until_parked();
             if std::fs::read_to_string(&file)
                 .is_ok_and(|s| layout::parse(&s).is_ok_and(|read| read == layout(cx)))
@@ -18502,7 +19165,7 @@ exports.activate = (context) => {
 
         // Both bars were edited quickly. Every write reaches the named
         // file, leaving the tab placement and the Default file alone.
-        for _ in 0..200 {
+        for _ in 0..crate::patience::LOOKS {
             cx.run_until_parked();
             if std::fs::read_to_string(&named)
                 .is_ok_and(|s| layout::parse(&s).is_ok_and(|read| read == layout(cx)))
@@ -18579,7 +19242,7 @@ exports.activate = (context) => {
         };
         // The file once all that was done has reached it.
         let written = |cx: &mut VisualTestContext| {
-            for _ in 0..200 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.run_until_parked();
                 let text = std::fs::read_to_string(&file).unwrap_or_default();
                 if layout::parse(&text).is_ok_and(|read| read == layout(cx)) {
@@ -18647,7 +19310,7 @@ exports.activate = (context) => {
         cx.dispatch_action(ResetLayout);
         assert_eq!(docks(cx), (Some(Files), None, None));
         assert_eq!(layout(cx), Layout::default());
-        for _ in 0..200 {
+        for _ in 0..crate::patience::LOOKS {
             cx.run_until_parked();
             if !file.exists() {
                 break;
@@ -18677,7 +19340,7 @@ exports.activate = (context) => {
         let (ws, cx) = setup(cx, root.clone());
         cx.update(|_, cx| settings::reload_from(&config, cx));
         let wait = |cx: &mut VisualTestContext, name: Option<&str>| {
-            for _ in 0..200 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.executor().advance_clock(Duration::from_millis(50));
                 cx.run_until_parked();
                 let ready = cx.read(|cx| {
@@ -18721,7 +19384,7 @@ exports.activate = (context) => {
         assert_eq!(std::fs::read_to_string(&common).unwrap(), common_text);
         cx.update(|window, cx| window.focus(&ws.focus_handle(cx)));
         cx.dispatch_action(OpenLayout);
-        for _ in 0..200 {
+        for _ in 0..crate::patience::LOOKS {
             cx.run_until_parked();
             if active_path(&ws, cx) == Some(review.clone()) {
                 break;
@@ -18801,7 +19464,7 @@ exports.activate = (context) => {
         cx.dispatch_action(SwitchLayout {
             name: Some("Broken".into()),
         });
-        for _ in 0..200 {
+        for _ in 0..crate::patience::LOOKS {
             cx.run_until_parked();
             if cx.read(|cx| {
                 cx.global::<settings::ConfigErrors>()
@@ -18855,7 +19518,7 @@ exports.activate = (context) => {
         };
         // The file once it says `open` is these panels.
         let kept = |cx: &mut VisualTestContext, open: &[Panel]| {
-            for _ in 0..200 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.run_until_parked();
                 let text = std::fs::read_to_string(&file).unwrap_or_default();
                 if layout::parse(&text).is_ok_and(|l| l.open.as_deref() == Some(open)) {
@@ -19005,7 +19668,7 @@ exports.activate = (context) => {
                 .center()
         };
         let written = |cx: &mut VisualTestContext, what: &str| {
-            for _ in 0..200 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.run_until_parked();
                 let text = std::fs::read_to_string(config.join("layout.json")).unwrap_or_default();
                 if text.contains(what) {

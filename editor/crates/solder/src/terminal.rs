@@ -1,7 +1,10 @@
 //! Integrated terminal: Alacritty's emulator and PTY, drawn on the GPU by
 //! Solder's own element. Only the visible grid is shaped each frame.
+pub mod failure;
+mod search;
+mod shell;
 
-use std::{borrow::Cow, collections::HashMap, ops::Range, path::PathBuf, sync::Arc};
+use std::{borrow::Cow, cell::RefCell, collections::HashMap, ops::Range, path::PathBuf, sync::Arc};
 
 use alacritty_terminal::{
     event::{Event as TermEvent, EventListener, WindowSize},
@@ -20,13 +23,13 @@ use gpui::{
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, FontWeight, GlobalElementId,
     Hsla, InspectorElementId, IntoElement, KeyBinding, KeyDownEvent, Keystroke, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, PaintQuad, Pixels, Point, Render,
-    ScrollWheelEvent, ShapedLine, SharedString, Style, Task, TextRun, UTF16Selection, Window,
-    actions, div, fill, point, prelude::*, px, relative, rgb, size,
+    ScrollWheelEvent, ShapedLine, SharedString, Style, Subscription, Task, TextRun, UTF16Selection,
+    Window, actions, div, fill, point, prelude::*, px, relative, rgb, size,
 };
 
 use crate::{settings::Settings, theme::ActiveTheme};
 
-actions!(terminal, [Copy, Paste, Clear]);
+actions!(terminal, [Copy, Paste, Clear, Find]);
 
 pub fn bind_keys(cx: &mut App) {
     let ctx = Some("Terminal");
@@ -34,11 +37,16 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-c", Copy, ctx),
         KeyBinding::new("secondary-v", Paste, ctx),
         KeyBinding::new("secondary-k", Clear, ctx),
+        KeyBinding::new("secondary-f", Find, ctx),
     ]);
+    search::bind_keys(cx);
 }
 
 pub enum TerminalEvent {
     TitleChanged,
+    Focused,
+    OpenFile(crate::terminal_output::FileLink),
+    Help(failure::Failure),
     /// The shell exited; the tab can close.
     Exited,
 }
@@ -88,10 +96,16 @@ pub struct TerminalCommand {
 
 pub struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
-    sender: EventLoopSender,
+    sender: Option<EventLoopSender>,
+    pending_input: RefCell<Vec<u8>>,
+    startup_error: Option<String>,
+    command: Option<failure::Command>,
+    failure: Option<failure::Failure>,
+    integration: Option<shell::Integration>,
     focus_handle: FocusHandle,
     title: SharedString,
     fixed_title: bool,
+    cwd: PathBuf,
     pub keep_on_exit: bool,
     /// The process has exited; `exit_code` is `None` when a signal ended it.
     pub exited: bool,
@@ -100,22 +114,26 @@ pub struct Terminal {
     cell: (Pixels, Pixels),
     last_bounds: Option<Bounds<Pixels>>,
     selecting: bool,
+    search: Entity<search::Search>,
+    _focus: Subscription,
     _events: Task<()>,
 }
 
 /// A started PTY and emulator, before it becomes a view.
 pub struct StartedTerminal {
     term: Arc<FairMutex<Term<Listener>>>,
-    sender: EventLoopSender,
-    events: futures::channel::mpsc::UnboundedReceiver<TermEvent>,
-    title: String,
-    fixed_title: bool,
-    keep_on_exit: bool,
+    sender: Option<EventLoopSender>,
+    events: Option<futures::channel::mpsc::UnboundedReceiver<TermEvent>>,
+    integration: Option<shell::Integration>,
 }
 
 impl Terminal {
     /// Starts the shell (or `command.program`) in a new PTY.
-    pub fn start(command: TerminalCommand) -> std::io::Result<StartedTerminal> {
+    pub fn start(mut command: TerminalCommand) -> std::io::Result<StartedTerminal> {
+        let integration = shell::prepare(&mut command).unwrap_or_else(|error| {
+            eprintln!("Could not prepare shell integration: {error}");
+            None
+        });
         let (tx, rx) = futures::channel::mpsc::unbounded();
         let mut env = command.env.clone();
         env.insert("TERM".into(), "xterm-256color".into());
@@ -151,60 +169,127 @@ impl Terminal {
         let event_loop = EventLoop::new(term.clone(), Listener(tx), pty, true, false)?;
         let sender = event_loop.channel();
         let _io_thread = event_loop.spawn();
-        let fixed_title = command.title.is_some();
-        let title = command.title.unwrap_or_else(|| {
+        Ok(StartedTerminal {
+            term,
+            sender: Some(sender),
+            events: Some(rx),
+            integration,
+        })
+    }
+
+    pub fn new(command: TerminalCommand, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // The entity exists immediately for services and extensions, while
+        // PTY creation and shell startup happen away from the window.
+        let (tx, _) = futures::channel::mpsc::unbounded();
+        let term = Arc::new(FairMutex::new(Term::new(
+            Config::default(),
+            &GridSize {
+                columns: 80,
+                lines: 24,
+            },
+            Listener(tx),
+        )));
+        let parent = cx.entity().downgrade();
+        let search = cx.new(|child| search::Search::new(parent, term.clone(), child));
+        cx.observe(&search, |_, _, cx| cx.notify()).detach();
+        let focus_handle = cx.focus_handle();
+        let focus = cx.on_focus_in(&focus_handle, window, |_, _, cx| {
+            cx.emit(TerminalEvent::Focused)
+        });
+        let title = command.title.clone().unwrap_or_else(|| {
             command
                 .program
                 .as_deref()
                 .and_then(|p| p.rsplit('/').next())
                 .unwrap_or("Terminal")
-                .to_string()
+                .into()
         });
-        Ok(StartedTerminal {
-            term,
-            sender,
-            events: rx,
-            title,
-            fixed_title,
-            keep_on_exit: command.keep_on_exit,
-        })
-    }
-
-    pub fn new(started: StartedTerminal, cx: &mut Context<Self>) -> Self {
-        let StartedTerminal {
-            term,
-            sender,
-            events: mut rx,
-            title,
-            fixed_title,
-            keep_on_exit,
-        } = started;
+        let fixed_title = command.title.is_some();
+        let keep_on_exit = command.keep_on_exit;
+        let cwd = command.cwd.clone();
+        let original = command
+            .program
+            .clone()
+            .map(|program| failure::Command::Program {
+                program,
+                args: command.args.clone(),
+            });
         let events = cx.spawn(async move |this, cx| {
+            let started = cx
+                .background_executor()
+                .spawn(async move { Self::start(command) })
+                .await;
+            let mut started = match started {
+                Ok(started) => started,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.startup_error = Some(format!("Could not start terminal: {error}"));
+                        this.keep_on_exit = true;
+                        this.exited = true;
+                        cx.emit(TerminalEvent::Exited);
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            let mut rx = started.events.take().unwrap();
+            if this
+                .update(cx, |this, cx| {
+                    this.term = started.term.clone();
+                    this.sender = started.sender.take();
+                    this.integration = started.integration.take();
+                    this.term.lock().resize(GridSize {
+                        columns: this.grid.0,
+                        lines: this.grid.1,
+                    });
+                    this.sender
+                        .as_ref()
+                        .unwrap()
+                        .send(Msg::Resize(this.window_size()))
+                        .ok();
+                    let pending = std::mem::take(&mut *this.pending_input.borrow_mut());
+                    if !pending.is_empty() {
+                        this.write(pending);
+                    }
+                    this.search
+                        .update(cx, |search, cx| search.set_term(this.term.clone(), cx));
+                    cx.notify();
+                })
+                .is_err()
+            {
+                return;
+            }
             while let Some(first) = rx.next().await {
                 let mut batch = vec![first];
                 while let Ok(e) = rx.try_recv() {
                     batch.push(e);
                 }
-                let alive = this
+                if this
                     .update(cx, |this, cx| {
-                        for e in batch {
-                            this.handle_event(e, cx);
+                        for event in batch {
+                            this.handle_event(event, cx);
                         }
                         cx.notify();
                     })
-                    .is_ok();
-                if !alive {
+                    .is_err()
+                {
                     break;
                 }
             }
         });
-
         Self {
             term,
-            sender,
-            focus_handle: cx.focus_handle(),
+            sender: None,
+            pending_input: RefCell::new(Vec::new()),
+            startup_error: None,
+            command: original,
+            failure: None,
+            integration: None,
+            focus_handle,
             title: title.into(),
             fixed_title,
+            cwd,
             keep_on_exit,
             exited: false,
             exit_code: None,
@@ -212,8 +297,32 @@ impl Terminal {
             cell: (px(8.), px(16.)),
             last_bounds: None,
             selecting: false,
+            search,
+            _focus: focus,
             _events: events,
         }
+    }
+
+    pub fn has_failure(&self) -> bool {
+        self.failure.is_some()
+    }
+
+    fn help(&mut self, cx: &mut Context<Self>) {
+        let Some(mut failed) = self.failure.clone() else {
+            return;
+        };
+        let term = self.term.clone();
+        cx.spawn(async move |this, cx| {
+            let (output, limited) = cx
+                .background_executor()
+                .spawn(async move { failure::output(&*term.lock()) })
+                .await;
+            failed.output = output;
+            failed.limited = limited;
+            this.update(cx, |_, cx| cx.emit(TerminalEvent::Help(failed)))
+                .ok();
+        })
+        .detach();
     }
 
     pub fn title(&self) -> SharedString {
@@ -226,7 +335,35 @@ impl Terminal {
     }
 
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        let _ = self.sender.send(Msg::Input(bytes.into()));
+        let bytes = bytes.into();
+        if let Some(sender) = &self.sender {
+            sender.send(Msg::Input(bytes)).ok();
+        } else if !self.exited {
+            let mut pending = self.pending_input.borrow_mut();
+            let available = 65_536usize.saturating_sub(pending.len());
+            pending.extend_from_slice(&bytes[..bytes.len().min(available)]);
+        }
+    }
+
+    /// What a test that waited for this terminal in vain is told: whether
+    /// its process started and ended, and what it shows.
+    #[cfg(test)]
+    pub fn told(&self) -> String {
+        let lines: Vec<String> = self
+            .visible_text()
+            .into_iter()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        format!(
+            "{}: started {}, exited {} with {:?}, failure {}, error {:?}, {} bytes not yet written, shows {lines:?}",
+            self.title,
+            self.sender.is_some(),
+            self.exited,
+            self.exit_code,
+            self.failure.is_some(),
+            self.startup_error,
+            self.pending_input.borrow().len(),
+        )
     }
 
     /// Visible text, one string per row. For tests and "copy all".
@@ -246,11 +383,67 @@ impl Terminal {
         rows.into_iter().map(|r| r.trim_end().to_string()).collect()
     }
 
+    #[cfg(test)]
+    pub fn search_match_visible(&self, cx: &App) -> bool {
+        let search = self.search.read(cx);
+        let term = self.term.lock();
+        search
+            .active
+            .and_then(|i| search.found.matches.get(i))
+            .is_some_and(|m| {
+                let row = m.start.line.0 + term.grid().display_offset() as i32;
+                row >= 0 && row < term.screen_lines() as i32
+            })
+    }
+
+    #[cfg(test)]
+    pub fn bounds(&self) -> Option<Bounds<Pixels>> {
+        self.last_bounds
+    }
+
+    #[cfg(test)]
+    pub fn text_position(&self, wanted: &str) -> Option<Point<Pixels>> {
+        let bounds = self.last_bounds?;
+        let term = self.term.lock();
+        let offset = term.grid().display_offset() as i32;
+        for row in 0..self.grid.1 {
+            let line = crate::terminal_output::read_line(&*term, Line(row as i32 - offset));
+            let Some(byte) = line.text.find(wanted) else {
+                continue;
+            };
+            let (_, cell) = line.cells.iter().find(|(range, _)| range.contains(&byte))?;
+            return Some(point(
+                bounds.left() + self.cell.0 * (cell.column.0 as f32 + 0.5),
+                bounds.top() + self.cell.1 * ((cell.line.0 + offset) as f32 + 0.5),
+            ));
+        }
+        None
+    }
+
     fn handle_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
         match event {
-            TermEvent::Title(title) if !self.fixed_title => {
-                self.title = title.into();
-                cx.emit(TerminalEvent::TitleChanged);
+            TermEvent::Wakeup => self.search.update(cx, |s, cx| s.refresh(false, cx)),
+            TermEvent::Title(title) => {
+                if let Some(report) = self
+                    .integration
+                    .as_ref()
+                    .and_then(|hook| hook.report(&title))
+                {
+                    if report.status != 0 {
+                        self.failure = Some(failure::Failure {
+                            command: failure::Command::Shell {
+                                text: report.command,
+                            },
+                            cwd: report.cwd,
+                            status: report.status,
+                            output: String::new(),
+                            limited: false,
+                        });
+                    }
+                } else if !self.fixed_title {
+                    self.title = title.into();
+                    cx.emit(TerminalEvent::TitleChanged);
+                }
             }
             TermEvent::PtyWrite(text) => self.write(text.into_bytes()),
             TermEvent::ClipboardStore(_, text) => {
@@ -271,6 +464,17 @@ impl Terminal {
             TermEvent::ChildExit(status) if !self.exited => {
                 self.exited = true;
                 self.exit_code = status.code();
+                if let (Some(status), Some(command)) =
+                    (status.code().filter(|code| *code != 0), &self.command)
+                {
+                    self.failure = Some(failure::Failure {
+                        command: command.clone(),
+                        cwd: self.cwd.clone(),
+                        status,
+                        output: String::new(),
+                        limited: false,
+                    });
+                }
                 cx.emit(TerminalEvent::Exited);
             }
             TermEvent::Exit if !self.exited => {
@@ -290,14 +494,23 @@ impl Terminal {
         }
     }
 
-    fn resize(&mut self, columns: usize, lines: usize, cell: (Pixels, Pixels)) {
+    fn resize(
+        &mut self,
+        columns: usize,
+        lines: usize,
+        cell: (Pixels, Pixels),
+        cx: &mut Context<Self>,
+    ) {
         if (columns, lines) == self.grid && cell == self.cell {
             return;
         }
         self.grid = (columns, lines);
         self.cell = cell;
         self.term.lock().resize(GridSize { columns, lines });
-        let _ = self.sender.send(Msg::Resize(self.window_size()));
+        if let Some(sender) = &self.sender {
+            sender.send(Msg::Resize(self.window_size())).ok();
+        }
+        self.search.update(cx, |s, cx| s.refresh(false, cx));
     }
 
     fn mode(&self) -> TermMode {
@@ -306,7 +519,12 @@ impl Terminal {
 
     // ------------------------------------------------------------ input
 
-    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus_handle.is_focused(window)
+            || (event.keystroke.modifiers.secondary() && event.keystroke.key == "f")
+        {
+            return;
+        }
         let mode = self.mode();
         if let Some(bytes) = escape_sequence(&event.keystroke, mode.contains(TermMode::APP_CURSOR))
         {
@@ -346,8 +564,21 @@ impl Terminal {
         cx.notify();
     }
 
+    fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        self.search.update(cx, |s, cx| s.deploy(window, cx));
+    }
+
+    #[cfg(test)]
+    pub fn search_state(&self, cx: &App) -> (bool, usize, Option<usize>) {
+        let search = self.search.read(cx);
+        (search.visible, search.found.matches.len(), search.active)
+    }
+
     fn cell_at(&self, position: Point<Pixels>) -> Option<(GridPoint, Side)> {
         let bounds = self.last_bounds?;
+        if !bounds.contains(&position) {
+            return None;
+        }
         let x = (position.x - bounds.left()).max(px(0.));
         let y = (position.y - bounds.top()).max(px(0.));
         let col = ((x / self.cell.0) as usize).min(self.grid.0.saturating_sub(1));
@@ -362,10 +593,23 @@ impl Terminal {
     }
 
     fn mouse_down(&mut self, e: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus_handle);
         let Some((point, side)) = self.cell_at(e.position) else {
             return;
         };
+        window.focus(&self.focus_handle);
+        if e.modifiers.platform || e.modifiers.control {
+            let found =
+                crate::terminal_output::read_line(&*self.term.lock(), point.line).link_at(point);
+            if let Some(mut link) = found {
+                if link.path.is_relative() {
+                    link.path = self.cwd.join(&link.path);
+                }
+                self.selecting = false;
+                cx.emit(TerminalEvent::OpenFile(link));
+                cx.stop_propagation();
+                return;
+            }
+        }
         let kind = match e.click_count {
             1 => SelectionType::Simple,
             2 => SelectionType::Semantic,
@@ -412,7 +656,18 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        let _ = self.sender.send(Msg::Shutdown);
+        if let Some(sender) = &self.sender {
+            sender.send(Msg::Shutdown).ok();
+        }
+    }
+}
+
+impl Drop for StartedTerminal {
+    fn drop(&mut self) {
+        // A view can be closed while its background startup is still running.
+        if let Some(sender) = &self.sender {
+            sender.send(Msg::Shutdown).ok();
+        }
     }
 }
 
@@ -595,19 +850,65 @@ impl Render for Terminal {
             .key_context("Terminal")
             .track_focus(&self.focus_handle)
             .size_full()
-            .px_2()
-            .py_1()
+            .flex()
+            .flex_col()
             .bg(cx.theme().bg)
             .on_key_down(cx.listener(Self::key_down))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::clear))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-            .on_mouse_move(cx.listener(Self::mouse_move))
-            .on_scroll_wheel(cx.listener(Self::scroll))
-            .child(TerminalElement {
-                terminal: cx.entity(),
-            })
+            .on_action(cx.listener(Self::find))
+            .children(self.search.read(cx).visible.then(|| self.search.clone()))
+            .children(self.failure.as_ref().map(|failure| {
+                let theme = cx.theme().clone();
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .p_1()
+                    .bg(theme.bg_sunken)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::theme::UI_FONT_SMALL)
+                            .text_color(theme.fg_subtle)
+                            .child(failure.label()),
+                    )
+                    .child(
+                        crate::ui::button(
+                            "terminal-help",
+                            "Help fix",
+                            false,
+                            &theme,
+                            cx.listener(|this, _, _, cx| this.help(cx)),
+                        )
+                        .debug_selector(|| "terminal-help".into()),
+                    )
+            }))
+            .children(self.startup_error.as_ref().map(|error| {
+                div()
+                    .p_1()
+                    .text_size(crate::theme::UI_FONT_SMALL)
+                    .text_color(cx.theme().error)
+                    .child(error.clone())
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+                    .on_mouse_move(cx.listener(Self::mouse_move))
+                    .on_scroll_wheel(cx.listener(Self::scroll))
+                    .child(TerminalElement {
+                        terminal: cx.entity(),
+                    }),
+            )
     }
 }
 
@@ -744,12 +1045,13 @@ impl Element for TerminalElement {
         let columns = ((bounds.size.width / cell_width) as usize).max(2);
         let lines = ((bounds.size.height / cell_height) as usize).max(1);
 
-        self.terminal.update(cx, |t, _| {
+        self.terminal.update(cx, |t, cx| {
             t.last_bounds = Some(bounds);
-            t.resize(columns, lines, (cell_width, cell_height));
+            t.resize(columns, lines, (cell_width, cell_height), cx);
         });
 
         let terminal = self.terminal.read(cx);
+        let search = terminal.search.read(cx);
         let term = terminal.term.lock();
         let content = term.renderable_content();
         let offset = content.display_offset as i32;
@@ -819,6 +1121,31 @@ impl Element for TerminalElement {
                 }
             }
             // Selection highlight.
+            for (_, _, _, flags, col) in cells {
+                if let Some(active) =
+                    search.highlight(GridPoint::new(Line(row as i32 - offset), *col))
+                {
+                    backgrounds.push(fill(
+                        Bounds::new(
+                            point(origin.x + cell_width * col.0 as f32, y),
+                            size(
+                                cell_width
+                                    * if flags.contains(Flags::WIDE_CHAR) {
+                                        2.
+                                    } else {
+                                        1.
+                                    },
+                                cell_height,
+                            ),
+                        ),
+                        if active {
+                            theme.accent_soft
+                        } else {
+                            theme.search_match
+                        },
+                    ));
+                }
+            }
             if let Some(sel) = selection {
                 let line = Line(row as i32 - offset);
                 if sel.start.line <= line && line <= sel.end.line {

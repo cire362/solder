@@ -65,6 +65,8 @@ mod lsp_store;
 mod mcp_store;
 mod notebook;
 mod outline;
+#[cfg(test)]
+mod patience;
 mod perf;
 mod picker;
 mod plugin_store;
@@ -84,6 +86,7 @@ mod settings;
 mod structure;
 mod symbols;
 mod terminal;
+mod terminal_output;
 mod test_runner;
 mod tests_panel;
 mod theme;

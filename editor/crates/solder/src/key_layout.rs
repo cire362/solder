@@ -341,7 +341,7 @@ mod tests {
             settings::watch_dir(dir.clone(), cx);
         });
         let wait = |cx: &mut gpui::TestAppContext, expected: &str, bad: bool| {
-            for _ in 0..300 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.executor().advance_clock(Duration::from_millis(50));
                 cx.run_until_parked();
                 if cx.read(|cx| {
@@ -389,7 +389,7 @@ mod tests {
         let fresh = db::testing::dir("key-layout-missing");
         std::fs::write(fresh.join("settings.json"), "{\"key_layout\":\"Missing\"}").unwrap();
         cx.update(|cx| settings::reload_from(&fresh, cx));
-        for _ in 0..300 {
+        for _ in 0..crate::patience::LOOKS {
             cx.executor().advance_clock(Duration::from_millis(50));
             cx.run_until_parked();
             if !cx.read(|cx| cx.global::<settings::ConfigErrors>().0.is_empty()) {

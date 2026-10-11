@@ -1,0 +1,7 @@
+if [[ $_solder_zdotdir_set == 1 ]]; then
+    ZDOTDIR=$_solder_zdotdir
+else
+    unset ZDOTDIR
+fi
+[[ ! -r ${ZDOTDIR-$HOME}/.zlogin ]] || builtin source "${ZDOTDIR-$HOME}/.zlogin"
+builtin source "$_solder_dir/zsh.sh"

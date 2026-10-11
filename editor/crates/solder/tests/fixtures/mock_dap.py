@@ -12,6 +12,7 @@ import json
 import socket
 import sys
 import threading
+import time
 
 port = int(sys.argv[1])
 targets = {}
@@ -105,14 +106,23 @@ class Session:
                                     if b.get("condition") not in ("false", "False")
                                     and not b.get("logMessage"))
             ids = [hash((path, line)) % 100000 for line in lines]
-            self.reply(request, {"breakpoints": [
+            answer = {"breakpoints": [
                 {"id": i, "verified": False, "line": line} for i, line in zip(ids, lines)
-            ]})
-            # Verified once the script loads.
+            ]}
+            # Verified once the script loads. The session that runs the
+            # program says so before it answers, and takes its time to
+            # answer: an adapter may, and the editor hears the two by
+            # different ways in any case, so it must take them in either
+            # order. The parent answers first, as js-debug does.
+            if not self.child:
+                self.reply(request, answer)
             for i, line in zip(ids, lines):
                 self.event("breakpoint", {"reason": "changed", "breakpoint": {
                     "id": i, "verified": True, "line": line,
                 }})
+            if self.child:
+                time.sleep(0.2)
+                self.reply(request, answer)
         elif command == "configurationDone":
             self.reply(request)
             if not self.child:

@@ -21,13 +21,32 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
-- [ ] The new real debugpy check has not run yet: CI installs the approved
-      debugpy 1.8.22 wheel in Python 3.12 and checks conditions, logpoints,
-      stepping and variables. Locally, discovery, interpreter selection,
+- [ ] Two causes of tests of the terminal failing on Linux in some runs
+      and never on macOS are read from the code and fit what was seen, but
+      were not seen on Linux. What an extension types into a terminal as
+      it starts may reach the shell before its prompt, and dash then prints
+      the answer after the prompt, on a line the test did not expect. And
+      what a program prints as it ends can be lost (under "Not finished").
+      The tests no longer depend on either; a wait that gives up says what
+      each terminal did, should it be something else
+- [ ] Failed-command explanations from a real local or hosted model.
+      The editable draft, no request before Send, metadata, plain output
+      and removing the attachment are checked with the chat fixture
+- [ ] Terminal search, split panes and failure-draft controls in a real
+      window and on Windows. Retained history, soft wraps, match navigation,
+      keyboard routing, two PTYs, switching panes and resizing are checked
+      headlessly. A macOS window was opened, but its automation did not
+      reliably apply the feature controls, so live input remains unverified
+- [ ] A real paused Python session in a window, other Python versions and
+      Windows interpreter/process behavior. CI of PR #51 passed with the
+      approved debugpy 1.8.22 wheel in Python 3.12, checking conditions,
+      logpoints, stepping and variables. Locally, interpreter selection,
       missing-module errors and the editor's DAP path use executable fixtures.
       The missing-module message and selected interpreter were checked in a
-      real macOS window. A real paused Python session in a window, other
-      Python versions and Windows interpreter/process behavior are unchecked
+      real macOS window
+- [ ] Terminal file links in a real window and on Windows. ANSI colors,
+      soft wraps, Unicode, quoted paths, drive letters and source jumps are
+      checked with the emulator and a real PTY in a headless window
 - [ ] Conditional breakpoints and logpoints with a real JavaScript or
       extension debug adapter. Capability filtering, editing the settings
       and the wire requests are checked with fixtures. Entering a condition
@@ -96,12 +115,55 @@ something of its own unchecked or unmade adds it here.
       Git history or a large patch open, and typing with blame enabled
       (`benchmarks/git-history.md` measures these features inactive);
       test discovery, large test output and a real Python debug session
-      (`benchmarks/tests-running.md` measures these features inactive)
+      (`benchmarks/tests-running.md` measures these features inactive);
+      busy terminal output, retained-history search, two visible terminal
+      panes and model inference (`benchmarks/terminal-workflow.md` measures
+      these features inactive)
 - [ ] The numbers on the website (`src/components/performance.tsx`) are
       placeholders, marked so. The measurements in `benchmarks/` are local
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] A line is moved to where its language wants it only if the tree is
+      in step within a millisecond of the key. On a busy machine a closing
+      tag typed in a language of an extension can stay where it was typed,
+      and is not moved when the tree comes later. Tests wait for the tree,
+      so they check what the language says and not this
+- [ ] On Linux, what a program prints just before it ends can be missing
+      from its terminal: an error and an exit at once, which is what a
+      failed command is. `alacritty_terminal` 0.26 reads the bytes, finds
+      the terminal locked by the window (drawing it, searching it), reads
+      again, is told the other end is closed, and returns without the bytes
+      it had (`EventLoop::pty_read`). macOS does not report the closed end
+      that way. Not fixed: it needs a patched copy of that crate or a
+      terminal kept open by the editor itself, and that is to be decided
+- [ ] Interactive failure reports are for Bash and Zsh only. Bash skips
+      disabled, ignored, duplicate or stale history; rewritten history or
+      later prompt hooks can defeat attribution. Commands above 8 KB,
+      working-directory names above 4 KB and reports above 16 KB are ignored.
+      Global startup overrides can bypass integration. Login Bash exposes
+      temporary HOME to `/etc/profile`; hooked macOS shells bypass
+      `/usr/bin/login` accounting/messages. Missing SHELL opts out. Other
+      shells and Windows offer only explicit programs' process failures.
+      Private temporary hook files are removed asynchronously; forcibly
+      ending the editor can leave them behind
+- [ ] Terminal failure context is the last 200 rows and at most 8 KB of
+      recent output, so it can contain adjacent commands. It does not
+      include environment variables; text a program printed is still
+      included. Non-UTF-8 directory names are displayed with replacement
+      characters in model context. Signal termination and startup errors
+      have no exit code and do not offer a model draft. No fix is executed
+      automatically
+- [ ] Terminal search is literal and case-sensitive, across soft wraps but
+      not hard line breaks. It scans at most 8 MB and keeps 20,000 matches;
+      logical lines have the same 129-row/32-KB limit as links. Only the
+      emulator's retained 10,000 history rows can be searched. The split
+      has two panes, no nested splits; sessions and their pair are not
+      restored after a restart
+- [ ] Terminal relative file links use the starting directory, not later
+      shell `cd` commands. URLs, `file://` URIs and traceback-only positions
+      without colon numbers are not handled. A logical line is inspected
+      up to 129 rows or 32 KB; unquoted paths cannot contain spaces
 - [ ] Built-in Python debugging runs the current file only. It has no
       module/argument picker, attach mode, subprocess sessions or interactive
       terminal input; stdin is not supported by this internal-console launch.
@@ -609,9 +671,10 @@ update. They come after phase 9, in this order unless one is needed sooner.
       something to start
 
 ### The terminal
-- [ ] `file:line:column` in the output opens in the editor
-- [ ] Search in what scrolled by; the dock split in two
-- [ ] A command that failed offered to the model to fix
+- [x] `file:line:column` in the output opens in the editor
+      (Ctrl/Cmd-click, relative to the terminal's starting directory)
+- [x] Search in what scrolled by; the dock split in two
+- [x] A command that failed offered to the model to fix (an editable chat draft)
 
 ### Windows and the way in
 - [ ] A first window with the projects opened last, open a folder, clone

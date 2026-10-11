@@ -499,6 +499,8 @@ pub struct Layout {
     #[serde(default)]
     pub bottom: Low,
     #[serde(default)]
+    pub terminal: TerminalSplit,
+    #[serde(default)]
     pub title_bar: Bar,
     #[serde(default)]
     pub tab_bar: TabBar,
@@ -553,6 +555,7 @@ impl Default for Layout {
                 right: Some(STATUS_RIGHT.to_vec()),
             },
             hidden: Vec::new(),
+            terminal: TerminalSplit::default(),
             open: None,
             items: BTreeMap::new(),
         }
@@ -560,6 +563,30 @@ impl Default for Layout {
 }
 
 impl Global for Layout {}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalAxis {
+    #[default]
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TerminalSplit {
+    pub axis: TerminalAxis,
+    pub ratio: f32,
+}
+
+impl Default for TerminalSplit {
+    fn default() -> Self {
+        Self {
+            axis: TerminalAxis::Horizontal,
+            ratio: 0.5,
+        }
+    }
+}
 
 /// A part whose border can be dragged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -998,6 +1025,11 @@ impl Layout {
     /// was named first, and an end of a bar the file leaves out has the
     /// items it comes with that the file names nowhere.
     fn fitted(mut self) -> Self {
+        self.terminal.ratio = if self.terminal.ratio.is_finite() {
+            self.terminal.ratio.clamp(0.1, 0.9)
+        } else {
+            TerminalSplit::default().ratio
+        };
         let mut placed: Vec<Panel> = Vec::new();
         let mut hidden: Vec<Panel> = Vec::new();
         for panel in std::mem::take(&mut self.hidden) {
@@ -1156,6 +1188,12 @@ pub fn keep(part: Part, cx: &mut App) {
     }
 }
 
+pub fn keep_terminal(cx: &mut App) {
+    if let Ok(value) = serde_json::to_value(&Layout::get(cx).terminal) {
+        write(Change::Set("terminal", value), cx);
+    }
+}
+
 /// The docks were opened, closed or turned to another panel by hand:
 /// `open` is what each shows now, and goes into the file.
 pub fn keep_open(open: Vec<Panel>, cx: &mut App) {
@@ -1184,6 +1222,9 @@ pub fn put(layout: Layout, cx: &mut App) {
     }
     if layout.bottom != old.bottom {
         changed.push(("bottom", serde_json::to_value(&layout.bottom)));
+    }
+    if layout.terminal != old.terminal {
+        changed.push(("terminal", serde_json::to_value(&layout.terminal)));
     }
     if layout.hidden != old.hidden {
         changed.push(("hidden", serde_json::to_value(&layout.hidden)));
@@ -1389,6 +1430,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn terminal_split_fits_and_writes_only_its_layout_key() {
+        let layout = parse(r#"{"terminal":{"axis":"vertical","ratio":4}}"#).unwrap();
+        assert_eq!(layout.terminal.axis, TerminalAxis::Vertical);
+        assert_eq!(layout.terminal.ratio, 0.9);
+        let dir = db::testing::dir("terminal-layout");
+        let path = dir.join(FILE);
+        std::fs::write(&path, "// personal\n{\"left\":{\"width\":320}}\n").unwrap();
+        Change::Set("terminal", serde_json::to_value(&layout.terminal).unwrap())
+            .make(&dir, &path)
+            .unwrap();
+        let saved = read(&path, false).unwrap();
+        assert!(saved.contains("// personal"));
+        assert_eq!(parse(&saved).unwrap().left.width, 320.);
+        assert_eq!(parse(&saved).unwrap().terminal, layout.terminal);
+    }
+
+    #[test]
     fn named_layouts_keep_their_files_and_remember_projects() {
         let dir = db::testing::dir("named-layouts");
         let default = dir.join(FILE);
@@ -1527,7 +1585,7 @@ mod tests {
         });
         let named = layout_path(&dir, Some("Writing"));
         let wait = |cx: &mut gpui::TestAppContext, width: f32, broken: bool| {
-            for _ in 0..200 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.executor()
                     .advance_clock(std::time::Duration::from_millis(50));
                 cx.run_until_parked();

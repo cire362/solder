@@ -283,6 +283,57 @@ Containers are listed below the services when a Docker runtime is running: Docke
 Desktop, OrbStack or Colima. Solder uses the `docker` CLI and its current context,
 and finds OrbStack's CLI in `~/.orbstack/bin` even without the `/usr/local/bin` links.
 
+## Terminal
+
+**Toggle Terminal** opens the dock's terminal; **New Terminal** adds another.
+Ctrl/Cmd-click `file:line:column` in its output to open that position. A column
+can be omitted. Positions are one-based; relative paths use the terminal's
+starting directory. Quote a path containing spaces as `"my file.rs":12:3`.
+Colors and soft wraps do not become part of a path. Ordinary clicks still
+select text. URLs are not opened by this gesture, and changing directory
+inside a shell does not update the base for relative paths.
+
+Ctrl/Cmd-F in a terminal searches its retained history as literal, case-sensitive
+text. Enter and Shift-Enter move between matches; Escape returns to the shell.
+Soft wraps belong to one line. Search runs in the background after a pause and
+is limited to 8 MB and 20,000 matches, shown by `+` in the count. The emulator
+retains at most 10,000 history rows. A logical line is limited to 129 rows or
+32 KB; search does not cross a hard line break.
+
+**Split Terminal** (or **Split** beside the tabs) shows two sessions in the
+same dock. It uses another existing session or starts a new shell. Clicking a
+pane gives it the keyboard; selecting another tab replaces the focused pane
+without ending its old process. **Unsplit Terminal** keeps both sessions alive.
+Closing a visible session returns to one pane. The divider changes their
+proportion, saved in the selected `layout.json` as
+`"terminal": { "axis": "horizontal", "ratio": 0.5 }`; `vertical` stacks them.
+The ratio is fitted between 0.1 and 0.9. The pair itself is not restored after
+restart. Both panes move with the Terminal panel between docks.
+
+For interactive Bash and Zsh, the last failed command also offers **Help fix**
+while the shell stays open. The command's working directory and exit status
+come from a shell hook. Startup files and existing prompt hooks are preserved
+without changing them on disk. Bash uses history: disabled, ignored, duplicate or stale history
+is skipped rather than attributing an error to an older command. Commands are
+limited to 8 KB, the working-directory name to 4 KB and the report to 16 KB.
+Other shells and Windows have no interactive-command hook; explicit programs
+can still offer their process failures. Hooks installed later can replace ours.
+Login Bash uses a temporary HOME for global `/etc/profile`, restoring it before
+user profiles. On macOS, hooked shells keep login startup but bypass
+`/usr/bin/login` accounting and messages. Missing SHELL leaves the normal shell
+without integration. Shell startup and hook files are prepared in the background.
+
+A program that exits with a nonzero code keeps its tab and offers **Help fix**. It opens a chat draft
+with the program and its arguments, working directory, exit code and plain
+output. **Inspect** shows the attachment, **Remove** drops it; edit the question
+and press **Send** when it is ready. Attaching sends no model request, and file
+and project context are initially off for this draft. Existing chat history is
+still included. Output is the recent tail, at most 200 rows and 8 KB, and may
+contain adjacent commands. Escape sequences and hidden terminal cells are
+excluded, but ordinary printed text can still contain sensitive information.
+Environment variables are not attached. A signal or startup error has no
+known exit code; it offers no draft. A suggested fix is not run automatically.
+
 ## Tests
 
 **Show Tests** in the command palette opens the Tests panel, which can move

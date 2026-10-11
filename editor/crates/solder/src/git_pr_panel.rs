@@ -250,7 +250,7 @@ mod tests {
             PullRequestPanel::with_program(f.0.clone(), "feature".into(), program, cx)
         });
         let wait = |cx: &mut gpui::VisualTestContext, state| {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + crate::patience::WAIT;
             while Instant::now() < deadline {
                 cx.run_until_parked();
                 if cx.read(|cx| {
