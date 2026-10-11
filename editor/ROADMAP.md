@@ -21,17 +21,14 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
-- [ ] Why a test of the terminal fails on Linux in some runs and never on
-      macOS: a program that fails at once
-      (`terminal_failure_is_an_editable_draft_until_sent`). Two runs of
-      three were red with it. Since the terminal block a process starts off
-      the thread that draws, so it may have ended before it is looked at. A
-      wait that gives up says what each terminal did; no red run has said
-      it yet. The other test that failed with it has a likely cause, read
-      from the code and not seen on Linux: what an extension types into a
-      terminal as it starts may reach the shell before its prompt, and
-      dash then prints the answer after the prompt, on a line the test did
-      not expect. The test now takes that line too
+- [ ] Two causes of tests of the terminal failing on Linux in some runs
+      and never on macOS are read from the code and fit what was seen, but
+      were not seen on Linux. What an extension types into a terminal as
+      it starts may reach the shell before its prompt, and dash then prints
+      the answer after the prompt, on a line the test did not expect. And
+      what a program prints as it ends can be lost (under "Not finished").
+      The tests no longer depend on either; a wait that gives up says what
+      each terminal did, should it be something else
 - [ ] The question about a crash in a real window, and a panic on Windows
       and Linux. The hook is checked in a process of its own on the machine
       that runs the tests, the question and the report's tab headlessly. A
@@ -141,6 +138,14 @@ something of its own unchecked or unmade adds it here.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] On Linux, what a program prints just before it ends can be missing
+      from its terminal: an error and an exit at once, which is what a
+      failed command is. `alacritty_terminal` 0.26 reads the bytes, finds
+      the terminal locked by the window (drawing it, searching it), reads
+      again, is told the other end is closed, and returns without the bytes
+      it had (`EventLoop::pty_read`). macOS does not report the closed end
+      that way. Not fixed: it needs a patched copy of that crate or a
+      terminal kept open by the editor itself, and that is to be decided
 - [ ] In Russian, the inside of these still reads in English: Git and its
       history, databases with their tables and diagrams, HTTP, models, chat
       and the agent, extensions and plugins, services, the debugger, tests,

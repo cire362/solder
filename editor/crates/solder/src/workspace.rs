@@ -8664,9 +8664,13 @@ mod tests {
                 w.spawn_terminal(
                     TerminalCommand {
                         program: Some("/bin/sh".into()),
+                        // It lingers a moment before it fails. What a
+                        // program prints as it ends can be lost on Linux
+                        // (see the roadmap): that is not what this test
+                        // is of.
                         args: vec![
                             "-c".into(),
-                            "printf '\\033[31mfailed-output\\033[0m\\n'; exit 7".into(),
+                            "printf '\\033[31mfailed-output\\033[0m\\n'; sleep 0.3; exit 7".into(),
                         ],
                         cwd: root.clone(),
                         ..Default::default()
@@ -13309,9 +13313,15 @@ mod tests {
             ws.read(cx).git.read(cx).repo().is_some()
         });
         cx.dispatch_action(ShowGit);
-        cx.dispatch_action(git_panel::GenerateMessage);
         let panel = cx.read(|cx| ws.read(cx).git_panel.clone());
         let message = cx.read(|cx| panel.read(cx).message.clone());
+        // The model here answers at once. Asked through `dispatch_action`,
+        // which runs what is waiting before it returns, it had sometimes
+        // answered before the next line typed anything, and then nothing
+        // was late. Here the question is asked and the message typed with
+        // nothing run in between: the answer cannot come first.
+        cx.update(|window, cx| window.dispatch_action(Box::new(git_panel::GenerateMessage), cx));
+        assert!(cx.read(|cx| panel.read(cx).generating));
         message.update(cx, |e, cx| e.set_text("My own message", false, cx));
         wait_for(cx, "late suggestion", &|cx| !panel.read(cx).generating);
         assert_eq!(cx.read(|cx| message.read(cx).text(cx)), "My own message");
