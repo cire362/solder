@@ -107,7 +107,10 @@ something of its own unchecked or unmade adds it here.
       Git history or a large patch open, and typing with blame enabled
       (`benchmarks/git-history.md` measures these features inactive);
       test discovery, large test output and a real Python debug session
-      (`benchmarks/tests-running.md` measures these features inactive)
+      (`benchmarks/tests-running.md` measures these features inactive);
+      busy terminal output, retained-history search, two visible terminal
+      panes and model inference (`benchmarks/terminal-workflow.md` measures
+      these features inactive)
 - [ ] The numbers on the website (`src/components/performance.tsx`) are
       placeholders, marked so. The measurements in `benchmarks/` are local
       comparisons of a branch with main, not what the site may claim
@@ -120,15 +123,16 @@ something of its own unchecked or unmade adds it here.
       Global startup overrides can bypass integration. Login Bash exposes
       temporary HOME to `/etc/profile`; hooked macOS shells bypass
       `/usr/bin/login` accounting/messages. Missing SHELL opts out. Other
-      shells and Windows offer only explicit programs' process failures
+      shells and Windows offer only explicit programs' process failures.
       Private temporary hook files are removed asynchronously; forcibly
       ending the editor can leave them behind
 - [ ] Terminal failure context is the last 200 rows and at most 8 KB of
       recent output, so it can contain adjacent commands. It does not
       include environment variables; text a program printed is still
       included. Non-UTF-8 directory names are displayed with replacement
-      characters in model context. Signal termination and startup errors have no exit code
-      and do not offer a model draft. No fix is executed automatically
+      characters in model context. Signal termination and startup errors
+      have no exit code and do not offer a model draft. No fix is executed
+      automatically
 - [ ] Terminal search is literal and case-sensitive, across soft wraps but
       not hard line breaks. It scans at most 8 MB and keeps 20,000 matches;
       logical lines have the same 129-row/32-KB limit as links. Only the

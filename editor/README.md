@@ -311,9 +311,9 @@ The ratio is fitted between 0.1 and 0.9. The pair itself is not restored after
 restart. Both panes move with the Terminal panel between docks.
 
 For interactive Bash and Zsh, the last failed command also offers **Help fix**
-while the shell stays open. The starting directory and status come from a shell
-hook. Startup files and existing prompt hooks are preserved without changing
-them on disk. Bash uses history: disabled, ignored, duplicate or stale history
+while the shell stays open. The command's working directory and exit status
+come from a shell hook. Startup files and existing prompt hooks are preserved
+without changing them on disk. Bash uses history: disabled, ignored, duplicate or stale history
 is skipped rather than attributing an error to an older command. Commands are
 limited to 8 KB, the working-directory name to 4 KB and the report to 16 KB.
 Other shells and Windows have no interactive-command hook; explicit programs
