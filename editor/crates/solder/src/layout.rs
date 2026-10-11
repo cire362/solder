@@ -1585,7 +1585,7 @@ mod tests {
         });
         let named = layout_path(&dir, Some("Writing"));
         let wait = |cx: &mut gpui::TestAppContext, width: f32, broken: bool| {
-            for _ in 0..200 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.executor()
                     .advance_clock(std::time::Duration::from_millis(50));
                 cx.run_until_parked();

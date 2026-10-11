@@ -65,6 +65,8 @@ mod lsp_store;
 mod mcp_store;
 mod notebook;
 mod outline;
+#[cfg(test)]
+mod patience;
 mod perf;
 mod picker;
 mod plugin_store;

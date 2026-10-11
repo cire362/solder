@@ -7156,7 +7156,7 @@ mod tests {
             .unwrap_or_default()
         };
         let listed = |cx: &mut VisualTestContext, names: &[&str]| {
-            for _ in 0..400 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.run_until_parked();
                 let now: Vec<String> = shown(cx).into_iter().map(|row| row.0).collect();
                 if now == names {
@@ -7640,7 +7640,7 @@ mod tests {
         });
         let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
         let wait = |cx: &mut VisualTestContext, what: &str, f: &dyn Fn(&App) -> bool| {
-            for _ in 0..400 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.run_until_parked();
                 if cx.read(|cx| f(cx)) {
                     return;
@@ -8427,7 +8427,7 @@ mod tests {
             })
             .expect("terminal starts");
         let wait = |cx: &mut VisualTestContext, what: &str, f: &dyn Fn(&App) -> bool| {
-            for _ in 0..500 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.run_until_parked();
                 if cx.read(|cx| f(cx)) {
                     return;
@@ -8478,7 +8478,7 @@ mod tests {
     }
 
     fn wait_for(cx: &mut VisualTestContext, what: &str, f: &dyn Fn(&App) -> bool) {
-        wait_for_with_timeout(cx, what, Duration::from_secs(5), f);
+        wait_for_with_timeout(cx, what, crate::patience::WAIT, f);
     }
 
     fn wait_for_with_timeout(
@@ -8516,7 +8516,7 @@ mod tests {
         cx: &mut VisualTestContext,
         selector: &'static str,
     ) -> gpui::Bounds<gpui::Pixels> {
-        for _ in 0..500 {
+        for _ in 0..crate::patience::LOOKS {
             cx.executor().advance_clock(Duration::from_millis(50));
             cx.run_until_parked();
             if let Some(bounds) = cx.debug_bounds(selector) {
@@ -14572,7 +14572,7 @@ brackets = [
             store.find(Origin::VsCode, "Acme.pack").is_some()
                 && store.find(Origin::VsCode, "Acme.member").is_some()
         };
-        for _ in 0..300 {
+        for _ in 0..crate::patience::LOOKS {
             cx.executor().advance_clock(Duration::from_millis(50));
             cx.run_until_parked();
             if cx.read(|cx| both(cx)) {
@@ -15126,7 +15126,7 @@ exports.activate = async (context) => {
             output.lines().any(|known| known == line)
         };
         let written = |cx: &mut VisualTestContext, line: &'static str| {
-            for _ in 0..500 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.executor().advance_clock(Duration::from_millis(50));
                 cx.run_until_parked();
                 if cx.read(|cx| wrote(cx, line)) {
@@ -15462,7 +15462,7 @@ exports.activate = (context) => {
             cx.foreground_executor()
                 .spawn(async move { *got.borrow_mut() = Some(task.await) })
                 .detach();
-            for _ in 0..500 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.run_until_parked();
                 if answer.borrow().is_some() {
                     break;
@@ -16712,7 +16712,7 @@ exports.activate = (context) => {
         cx.foreground_executor()
             .spawn(async move { *got.borrow_mut() = Some(called_off.await) })
             .detach();
-        for _ in 0..500 {
+        for _ in 0..crate::patience::LOOKS {
             cx.run_until_parked();
             if answer.borrow().is_some() {
                 break;
@@ -18220,7 +18220,7 @@ exports.activate = (context) => {
             })
             .unwrap_or_default()
         };
-        for _ in 0..400 {
+        for _ in 0..crate::patience::LOOKS {
             cx.run_until_parked();
             if shown(cx).first().is_some_and(|row| row.2.is_some()) {
                 break;
@@ -18586,7 +18586,7 @@ exports.activate = (context) => {
         // Where a tab is once the window has drawn it inside `dock`: a
         // tab that moved is still remembered where it was last.
         let inside = |cx: &mut VisualTestContext, dock: &'static str, tab: &'static str| {
-            for _ in 0..200 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.update(|window, _| window.refresh());
                 cx.run_until_parked();
                 if let (Some(dock), Some(tab)) = (cx.debug_bounds(dock), cx.debug_bounds(tab))
@@ -18968,7 +18968,7 @@ exports.activate = (context) => {
         click(cx, "item-button-1");
         assert_eq!(left(cx), Some(Panel::Files));
         // All of it is in the file, next to what the user wrote there.
-        for _ in 0..200 {
+        for _ in 0..crate::patience::LOOKS {
             cx.run_until_parked();
             if std::fs::read_to_string(&file)
                 .is_ok_and(|s| layout::parse(&s).is_ok_and(|read| read == layout(cx)))
@@ -19133,7 +19133,7 @@ exports.activate = (context) => {
 
         // Both bars were edited quickly. Every write reaches the named
         // file, leaving the tab placement and the Default file alone.
-        for _ in 0..200 {
+        for _ in 0..crate::patience::LOOKS {
             cx.run_until_parked();
             if std::fs::read_to_string(&named)
                 .is_ok_and(|s| layout::parse(&s).is_ok_and(|read| read == layout(cx)))
@@ -19210,7 +19210,7 @@ exports.activate = (context) => {
         };
         // The file once all that was done has reached it.
         let written = |cx: &mut VisualTestContext| {
-            for _ in 0..200 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.run_until_parked();
                 let text = std::fs::read_to_string(&file).unwrap_or_default();
                 if layout::parse(&text).is_ok_and(|read| read == layout(cx)) {
@@ -19278,7 +19278,7 @@ exports.activate = (context) => {
         cx.dispatch_action(ResetLayout);
         assert_eq!(docks(cx), (Some(Files), None, None));
         assert_eq!(layout(cx), Layout::default());
-        for _ in 0..200 {
+        for _ in 0..crate::patience::LOOKS {
             cx.run_until_parked();
             if !file.exists() {
                 break;
@@ -19308,7 +19308,7 @@ exports.activate = (context) => {
         let (ws, cx) = setup(cx, root.clone());
         cx.update(|_, cx| settings::reload_from(&config, cx));
         let wait = |cx: &mut VisualTestContext, name: Option<&str>| {
-            for _ in 0..200 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.executor().advance_clock(Duration::from_millis(50));
                 cx.run_until_parked();
                 let ready = cx.read(|cx| {
@@ -19352,7 +19352,7 @@ exports.activate = (context) => {
         assert_eq!(std::fs::read_to_string(&common).unwrap(), common_text);
         cx.update(|window, cx| window.focus(&ws.focus_handle(cx)));
         cx.dispatch_action(OpenLayout);
-        for _ in 0..200 {
+        for _ in 0..crate::patience::LOOKS {
             cx.run_until_parked();
             if active_path(&ws, cx) == Some(review.clone()) {
                 break;
@@ -19432,7 +19432,7 @@ exports.activate = (context) => {
         cx.dispatch_action(SwitchLayout {
             name: Some("Broken".into()),
         });
-        for _ in 0..200 {
+        for _ in 0..crate::patience::LOOKS {
             cx.run_until_parked();
             if cx.read(|cx| {
                 cx.global::<settings::ConfigErrors>()
@@ -19486,7 +19486,7 @@ exports.activate = (context) => {
         };
         // The file once it says `open` is these panels.
         let kept = |cx: &mut VisualTestContext, open: &[Panel]| {
-            for _ in 0..200 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.run_until_parked();
                 let text = std::fs::read_to_string(&file).unwrap_or_default();
                 if layout::parse(&text).is_ok_and(|l| l.open.as_deref() == Some(open)) {
@@ -19636,7 +19636,7 @@ exports.activate = (context) => {
                 .center()
         };
         let written = |cx: &mut VisualTestContext, what: &str| {
-            for _ in 0..200 {
+            for _ in 0..crate::patience::LOOKS {
                 cx.run_until_parked();
                 let text = std::fs::read_to_string(config.join("layout.json")).unwrap_or_default();
                 if text.contains(what) {
