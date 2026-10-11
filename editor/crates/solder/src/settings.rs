@@ -662,7 +662,7 @@ pub fn reload_from(dir: &Path, cx: &mut App) {
     errors.extend(keymap_errors);
     errors.extend(crate::layout::reload_from(dir, cx));
     for e in &errors {
-        eprintln!("{e}");
+        crate::journal::error(format_args!("{e}"));
     }
     cx.set_global(ConfigErrors(errors));
     cx.refresh_windows();

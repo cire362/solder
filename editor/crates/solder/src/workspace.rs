@@ -72,6 +72,7 @@ actions!(
         NewFile,
         SaveAs,
         OpenFolder,
+        ShowErrorLog,
         OpenSettings,
         OpenKeymap,
         OpenLayout,
@@ -1163,7 +1164,7 @@ impl Workspace {
             let loaded = match loaded {
                 Ok(loaded) => loaded,
                 Err(err) => {
-                    eprintln!("could not open {}: {err}", path.display());
+                    crate::journal::error(format_args!("could not open {}: {err}", path.display()));
                     return;
                 }
             };
@@ -2859,7 +2860,7 @@ impl Workspace {
                 })
                 .await;
             if let Err(e) = created {
-                eprintln!("could not create the scratch file: {e}");
+                crate::journal::error(format_args!("could not create the scratch file: {e}"));
                 return;
             }
             this.update_in(cx, |this, window, cx| {
@@ -4367,7 +4368,10 @@ impl Workspace {
                         return;
                     };
                     if loaded.read_only.is_some() {
-                        eprintln!("not edited, it cannot be: {}", path.display());
+                        crate::journal::error(format_args!(
+                            "not edited, it cannot be: {}",
+                            path.display()
+                        ));
                         return;
                     }
                     let mut buffer = text::Buffer::new(&loaded.text);
@@ -4382,7 +4386,10 @@ impl Workspace {
                         })
                         .and_then(|bytes| std::fs::write(&path, bytes).map_err(|e| e.to_string()));
                     if let Err(err) = written {
-                        eprintln!("could not write {}: {err}", path.display());
+                        crate::journal::error(format_args!(
+                            "could not write {}: {err}",
+                            path.display()
+                        ));
                     }
                 })
                 .detach();
@@ -4509,7 +4516,7 @@ impl Workspace {
                 let _ = std::fs::create_dir_all(dir);
             }
             if let Err(err) = std::fs::write(&path, default) {
-                eprintln!("could not create {}: {err}", path.display());
+                crate::journal::error(format_args!("could not create {}: {err}", path.display()));
                 return;
             }
         }
@@ -4524,6 +4531,93 @@ impl Workspace {
     fn open_keymap(&mut self, _: &OpenKeymap, window: &mut Window, cx: &mut Context<Self>) {
         let default = settings::DEFAULT_KEYMAP.to_string();
         self.open_config_file(settings::keymap_path(), default, window, cx);
+    }
+
+    fn show_error_log(&mut self, _: &ShowErrorLog, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_log(crate::journal::dir(), window, cx);
+    }
+
+    /// Opens the log of errors kept in `dir`, or says there is none yet.
+    pub(crate) fn show_log(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let log = crate::journal::path(&dir);
+        if log.is_file() {
+            self.open_path(log, None, window, cx);
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Info,
+            "No errors have been written",
+            Some(&format!("They would be in {}.", log.display())),
+            &["OK"],
+            cx,
+        );
+        cx.background_executor()
+            .spawn(async move {
+                answer.await.ok();
+            })
+            .detach();
+    }
+
+    /// The first window of a run says what the run before left. A
+    /// benchmark is asked nothing: it types into the window.
+    pub(crate) fn offer_crash_once(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if ASKED.swap(true, std::sync::atomic::Ordering::Relaxed)
+            || std::env::vars_os()
+                .any(|(name, _)| name.to_string_lossy().starts_with("SOLDER_BENCH"))
+        {
+            return;
+        }
+        self.offer_crash(crate::journal::dir(), window, cx);
+    }
+
+    /// Says once that a run before this one ended in a crash, if it left
+    /// a report in `dir`. Asked or not, a report is said one time.
+    pub(crate) fn offer_crash(
+        &mut self,
+        dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move { crate::journal::crashes(&dir) })
+                .await;
+            if found.is_empty() {
+                return;
+            }
+            let Ok(answer) = cx.update(|window, cx| {
+                window.prompt(
+                    PromptLevel::Warning,
+                    "Solder closed unexpectedly last time",
+                    Some("A report was kept on this machine. It is not sent anywhere."),
+                    &["Show report", "Dismiss"],
+                    cx,
+                )
+            }) else {
+                return;
+            };
+            let show = answer.await == Ok(0);
+            let last = cx
+                .background_executor()
+                .spawn(async move {
+                    // Every one of them, and the newest is the one shown.
+                    let kept: Vec<PathBuf> = found
+                        .iter()
+                        .filter_map(|report| crate::journal::seen(report))
+                        .collect();
+                    kept.into_iter().next_back()
+                })
+                .await;
+            if let Some(report) = last.filter(|_| show) {
+                this.update_in(cx, |this, window, cx| {
+                    this.open_path(report, None, window, cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// The borders that can be dragged: a strip over each, as long as the
@@ -6687,6 +6781,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_untitled))
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::show_error_log))
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::open_layout))
             .on_action(cx.listener(Self::switch_layout))
@@ -19994,5 +20089,59 @@ exports.activate = (context) => {
         });
         assert!(cx.read(|cx| store.read(cx).file_marks(&file).is_empty()));
         assert!(cx.read(|cx| editor.read(cx).doc(cx).inlays().is_empty()));
+    }
+    #[gpui::test]
+    async fn a_crash_of_the_last_run_is_said_once_and_its_report_shown(cx: &mut TestAppContext) {
+        let root = fixture("crash-report");
+        let logs = db::testing::dir("ws-crash-logs");
+        std::fs::write(logs.join("crash-1-1-000000000.txt"), "an older one\n").unwrap();
+        std::fs::write(logs.join("crash-2-1-000000000.txt"), "the reason\n").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |ws, window, cx| {
+            ws.offer_crash(logs.clone(), window, cx)
+        });
+        for _ in 0..crate::patience::LOOKS {
+            cx.run_until_parked();
+            if cx.has_pending_prompt() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cx.simulate_prompt_answer("Show report");
+        wait_for(cx, "the report in a tab", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|editor| editor.read(cx).text(cx) == "the reason\n")
+        });
+        // Both were said, the one shown and the one before it.
+        assert!(crate::journal::crashes(&logs).is_empty());
+        assert_eq!(crate::journal::crashes(&logs.join("seen")).len(), 2);
+
+        // Nothing is asked when nothing was left.
+        ws.update_in(cx, |ws, window, cx| {
+            ws.offer_crash(logs.clone(), window, cx)
+        });
+        for _ in 0..20 {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!cx.has_pending_prompt());
+
+        // The log is a file like another, shown when there is one.
+        ws.update_in(cx, |ws, window, cx| ws.show_log(logs.clone(), window, cx));
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Ok");
+        std::fs::write(
+            crate::journal::path(&logs),
+            "2026-10-11 09:30:00Z error: it\n",
+        )
+        .unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.show_log(logs.clone(), window, cx));
+        wait_for(cx, "the log in a tab", &|cx| {
+            ws.read(cx)
+                .active_editor()
+                .is_some_and(|editor| editor.read(cx).text(cx).ends_with("error: it\n"))
+        });
     }
 }

@@ -522,7 +522,10 @@ impl ProjectPanel {
                 .await;
             this.update(cx, |this, cx| {
                 if let Err(err) = result {
-                    eprintln!("could not move {} to trash: {err}", path.display());
+                    crate::journal::error(format_args!(
+                        "could not move {} to trash: {err}",
+                        path.display()
+                    ));
                 }
                 this.refresh(cx);
             })

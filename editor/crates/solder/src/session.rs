@@ -92,7 +92,7 @@ impl Writer {
                     .map_err(|e| e.to_string())
                     .and_then(|bytes| crate::ipynb::write_atomic(&path, &bytes));
                 if let Err(error) = &result {
-                    eprintln!("could not save tabs: {error}");
+                    crate::journal::error(format_args!("could not save tabs: {error}"));
                 }
                 let _ = reply.send(result.is_ok());
             }
@@ -236,6 +236,7 @@ impl Workspace {
         self.session_writer = Some(Writer::new(path.clone()));
         self.restore_session(path, window, cx);
         self.start_recovery(window, cx);
+        self.offer_crash_once(window, cx);
         self._subscriptions.push(cx.on_app_quit(|this, cx| {
             let saved = this.keep_session(cx);
             async move {
@@ -345,7 +346,7 @@ impl Workspace {
                             front_page = id.as_str().map(|id| (page.extension.clone(), id.to_string()));
                         }
                         Ok(_) => {},
-                        Err(error) => eprintln!("could not restore {}: {error}", page.title),
+                        Err(error) => crate::journal::error(format_args!("could not restore {}: {error}", page.title)),
                     }
                 }
             }

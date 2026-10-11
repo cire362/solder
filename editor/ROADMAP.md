@@ -21,6 +21,9 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] The question about a crash in a real window, and a panic on Windows
+      and Linux. The hook is checked in a process of its own on the machine
+      that runs the tests, the question and the report's tab headlessly
 - [ ] Failed-command explanations from a real local or hosted model.
       The editable draft, no request before Send, metadata, plain output
       and removing the attachment are checked with the chat fixture
@@ -116,6 +119,10 @@ something of its own unchecked or unmade adds it here.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] A crash that is no panic leaves no report: a signal, an abort in
+      native code, memory that ran out. Only the editor's own errors reach
+      `solder.log`: what the `syntax` and `extension` crates print, what
+      GPUI logs and what a language server writes to its error stream do not
 - [ ] Interactive failure reports are for Bash and Zsh only. Bash skips
       disabled, ignored, duplicate or stale history; rewritten history or
       later prompt hooks can defeat attribution. Commands above 8 KB,
@@ -659,7 +666,7 @@ update. They come after phase 9, in this order unless one is needed sooner.
 - [ ] A first window with the projects opened last, open a folder, clone
 - [ ] Several windows, a project in each, the set restored
 - [ ] Markdown shown next to its source; pictures shown as pictures
-- [ ] A log of errors with rotation, and a report of a crash at the next start
+- [x] A log of errors with rotation, and a report of a crash at the next start
 - [ ] The interface in Russian as well as English
 
 ### Projects that are somewhere else

@@ -1059,7 +1059,7 @@ impl ExtensionStore {
         };
         if source != self.api.keys {
             for error in crate::settings::set_extension_keys(&source, cx) {
-                eprintln!("{error}");
+                crate::journal::error(format_args!("{error}"));
             }
             self.api.keys = source;
         }

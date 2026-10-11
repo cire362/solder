@@ -1751,6 +1751,23 @@ that a line always fits. `ui_density` is how tall those rows are: `compact`,
 `default` or `comfortable`. The bars keep the heights `layout.json` gives
 them.
 
+## When something goes wrong
+
+An error Solder meets on its own (a file it could not write, a tab it could
+not restore, a setting it could not read) is a line of
+`~/.config/solder/logs/solder.log`, with the time in UTC. **Workspace: Show
+error log** opens it. At a megabyte the log is put aside as `solder.1.log`,
+and three old ones are kept.
+
+A panic writes a report before the process ends: the version, the system,
+the thread, the place, the message and the stack, in
+`logs/crash-<time>-<pid>-<nanos>.txt`. The first window of the next start
+says so once, with **Show report** and **Dismiss**. Either way the report
+moves to `logs/seen`, where the last five stay. Nothing leaves the machine.
+
+A crash that is no panic (a signal, an abort in native code) leaves no
+report. What a language server or an extension prints is not in the log.
+
 ## Settings from another editor
 
 On a first launch (no `~/.config/solder/settings.json` yet) Solder looks for VS

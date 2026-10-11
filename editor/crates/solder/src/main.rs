@@ -55,6 +55,7 @@ mod indent;
 mod inline_completion;
 mod inline_edit;
 mod ipynb;
+mod journal;
 mod key_layout;
 mod key_layout_picker;
 mod key_prompts;
@@ -113,6 +114,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
     let started = Instant::now();
+    journal::start(journal::dir());
     // Set SOLDER_BENCH_STARTUP=1 to print time-to-first-frame and exit.
     let bench_startup = std::env::var_os("SOLDER_BENCH_STARTUP").is_some();
 

@@ -127,6 +127,11 @@ Never guess a signature.
   changed, by one thread and in order, let go when the file is saved, its
   tab closed or the window closed with an answer, and put back at the
   next start only after the tabs are. It never writes to the file itself.
+- An error nobody is shown is said with `journal::error`, never
+  `eprintln!`: it goes to `logs/solder.log` of the settings folder, which
+  `journal.rs` rotates. A panic leaves a report there through the hook
+  `journal::start` sets, and the next start says so once
+  (`Workspace::offer_crash`). Nothing in tests writes to that folder.
 - Language-server requests triggered by typing must run after the current
   effect cycle (`cx.defer`), so the `didChange` for what was just typed
   reaches the server first. See `Editor::after_typing`.

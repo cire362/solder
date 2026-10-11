@@ -131,7 +131,7 @@ impl Terminal {
     /// Starts the shell (or `command.program`) in a new PTY.
     pub fn start(mut command: TerminalCommand) -> std::io::Result<StartedTerminal> {
         let integration = shell::prepare(&mut command).unwrap_or_else(|error| {
-            eprintln!("Could not prepare shell integration: {error}");
+            crate::journal::error(format_args!("Could not prepare shell integration: {error}"));
             None
         });
         let (tx, rx) = futures::channel::mpsc::unbounded();
