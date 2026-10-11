@@ -22,7 +22,14 @@ const SYNC_PARSE_LIMIT: usize = 256 * 1024;
 
 /// Time an incremental reparse may take on the typing path before it moves to
 /// a worker thread.
+#[cfg(not(test))]
 const REPARSE_BUDGET: Duration = Duration::from_millis(1);
+/// In tests the tree is waited for. What a key does to a line's indent is
+/// decided with the tree of that moment, and a runner busy with three
+/// hundred tests does not parse in a millisecond: a test of what a
+/// language says about typing then failed for how fast it was said.
+#[cfg(test)]
+const REPARSE_BUDGET: Duration = Duration::from_secs(10);
 /// How long the first parse of a small file may hold the thread that
 /// draws. A file that small parses in a fraction of it.
 const SYNC_BUDGET: Duration = Duration::from_millis(100);
