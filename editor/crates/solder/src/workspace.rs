@@ -13744,10 +13744,12 @@ mod tests {
         // F5 runs the open file and stops on the breakpoint, verified.
         cx.simulate_keystrokes("f5");
         wait_for(cx, "the pause", &|cx| paused_line(&store, cx) == Some(2));
-        assert_eq!(
-            cx.read(|cx| store.read(cx).lines(&app).cloned()),
-            Some([(2, true)].into())
-        );
+        // The adapter's answer about the breakpoint and its word that the
+        // program stopped come by two ways, and the second may be heard
+        // first: the mark is waited for, not looked at in the same breath.
+        wait_for(cx, "the breakpoint to be verified", &|cx| {
+            store.read(cx).lines(&app).cloned() == Some([(2, true)].into())
+        });
         assert_eq!(cx.read(|cx| ws.read(cx).bottom), Some(Panel::Debug));
         assert_eq!(active_path(&ws, cx), Some(app.clone()));
 
