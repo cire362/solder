@@ -96,6 +96,14 @@ pub struct McpTool {
 }
 
 impl McpTool {
+    pub fn display_label(&self) -> &str {
+        match self.kind {
+            Kind::Tool => &self.tool,
+            Kind::Resources => crate::lang::t("list resources"),
+            Kind::Read => crate::lang::t("read resource"),
+        }
+    }
+
     /// Runs it: the answer as text, and whether it failed. Blocking.
     pub fn run(&self, input: serde_json::Value) -> (String, bool) {
         let ran = match self.kind {
@@ -123,8 +131,17 @@ impl McpTool {
         ran.unwrap_or_else(|error| (error, true))
     }
 
-    /// The call as the user is shown it before allowing it.
-    pub fn shown(&self, input: &serde_json::Value) -> String {
+    /// Model feedback retains the tool's raw name and the protocol's language.
+    pub fn raw_call(&self, input: &serde_json::Value) -> String {
+        format!(
+            "{} of {}: {}",
+            self.tool,
+            self.server_name,
+            Self::arguments(input)
+        )
+    }
+
+    fn arguments(input: &serde_json::Value) -> String {
         let mut arguments = input.to_string();
         if arguments.len() > 400 {
             let mut cut = 400;
@@ -134,7 +151,19 @@ impl McpTool {
             arguments.truncate(cut);
             arguments.push_str("...");
         }
-        format!("{} of {}: {arguments}", self.tool, self.server_name)
+        arguments
+    }
+
+    /// The call as the user is shown it before allowing it.
+    pub fn shown(&self, input: &serde_json::Value) -> String {
+        crate::lang::tf(
+            "{} of {}: {}",
+            &[
+                &self.display_label(),
+                &self.server_name,
+                &Self::arguments(input),
+            ],
+        )
     }
 }
 
@@ -177,7 +206,7 @@ fn launch(
     env: Option<Vec<(String, String)>>,
 ) -> Result<Launch, String> {
     let Some(program) = config.program() else {
-        return Err("It has no command in settings.json".into());
+        return Err(crate::lang::t("It has no command in settings.json").into());
     };
     let mut env: BTreeMap<String, String> = env
         .unwrap_or_else(extension::world::user_env)
@@ -452,6 +481,42 @@ impl McpStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_text_is_localized_without_changing_model_feedback() {
+        let launch = ai::mcp::Launch {
+            program: "python3".into(),
+            args: vec![
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../ai/tests/fixtures/mock_mcp.py"
+                )
+                .into(),
+            ],
+            env: std::env::vars().collect(),
+            cwd: None,
+        };
+        let server = Server::start(&launch, Duration::from_secs(10)).unwrap();
+        let tool = McpTool {
+            spec: ToolSpec {
+                name: "fixture".into(),
+                description: "fixture".into(),
+                parameters: serde_json::json!({}),
+            },
+            server: Arc::new(server),
+            server_name: "fixture".into(),
+            tool: "list resources".into(),
+            kind: Kind::Resources,
+        };
+        let input = serde_json::json!({"uri": "resource://fixture/{id}"});
+        let raw = tool.raw_call(&input);
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_ne!(tool.shown(&input), raw);
+        assert!(tool.shown(&input).contains(&input.to_string()));
+        assert_eq!(tool.raw_call(&input), raw);
+        crate::lang::set(crate::lang::Language::English);
+        assert_eq!(tool.shown(&input), raw);
+    }
 
     #[test]
     fn tools_get_names_a_model_may_call() {

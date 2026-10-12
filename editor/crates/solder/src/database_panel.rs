@@ -12,6 +12,7 @@ use gpui::{
 use crate::{
     database::{DatabaseEvent, DatabaseStore, SchemaState, Status},
     fuzzy,
+    lang::{t, tf},
     picker::{Picker, PickerDelegate},
     theme::{ActiveTheme, Theme, UI_FONT_SIZE},
     ui,
@@ -93,12 +94,13 @@ impl DatabasePanel {
         let store = self.store.read(cx);
         let mut rows = Vec::new();
         if !store.detected() {
-            rows.push(Row::Empty("Looking for databases...".into()));
+            rows.push(Row::Empty(t("Looking for databases...").into()));
             return rows;
         }
         if store.connections().is_empty() {
             rows.push(Row::Empty(
-                "No databases found in .env or compose files. Add one with New connection.".into(),
+                t("No databases found in .env or compose files. Add one with New connection.")
+                    .into(),
             ));
         }
         for (i, conn) in store.connections().iter().enumerate() {
@@ -113,16 +115,16 @@ impl DatabasePanel {
             match &conn.schema {
                 SchemaState::NotLoaded | SchemaState::Loading => {
                     let text = if conn.status == Status::Connecting {
-                        "Connecting..."
+                        t("Connecting...")
                     } else {
-                        "Reading schema..."
+                        t("Reading schema...")
                     };
                     rows.push(Row::Note(text.into(), false));
                 }
                 SchemaState::Failed(e) => rows.push(Row::Note(e.clone(), true)),
                 SchemaState::Loaded(schema) => {
                     if schema.objects.is_empty() {
-                        rows.push(Row::Note("Empty".into(), false));
+                        rows.push(Row::Note(t("Empty").into(), false));
                     }
                     for (j, object) in schema.objects.iter().enumerate() {
                         rows.push(Row::Object(i, j));
@@ -132,7 +134,7 @@ impl DatabasePanel {
                         }
                     }
                     if schema.truncated {
-                        rows.push(Row::Note("More keys not listed".into(), false));
+                        rows.push(Row::Note(t("More keys not listed").into(), false));
                     }
                 }
             }
@@ -291,7 +293,11 @@ impl DatabasePanel {
                                 .text_color(if locked { theme.warning } else { theme.error })
                                 .hover(|d| d.bg(theme.line))
                                 // Unlocked lasts until quit; locking again is a restart.
-                                .child(if locked { "read-only" } else { "writable" })
+                                .child(if locked {
+                                    t("read-only")
+                                } else {
+                                    t("writable")
+                                })
                                 .on_click(move |_, window, cx| {
                                     cx.stop_propagation();
                                     if locked {
@@ -340,7 +346,7 @@ impl DatabasePanel {
                                     .text_size(crate::theme::text(11.))
                                     .text_color(theme.fg_subtle)
                                     .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                                    .child("Query")
+                                    .child(t("Query"))
                                     .on_click(cx.listener(move |_, _, _, cx| {
                                         cx.stop_propagation();
                                         cx.emit(DatabasePanelEvent::NewQuery {
@@ -362,7 +368,7 @@ impl DatabasePanel {
                                         .text_size(crate::theme::text(11.))
                                         .text_color(theme.fg_subtle)
                                         .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                                        .child("Key")
+                                        .child(t("Key"))
                                         .on_click(cx.listener(move |_, _, _, cx| {
                                             cx.stop_propagation();
                                             cx.emit(DatabasePanelEvent::NewKey {
@@ -387,7 +393,7 @@ impl DatabasePanel {
                                         .text_size(crate::theme::text(11.))
                                         .text_color(theme.fg_subtle)
                                         .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                                        .child("Table")
+                                        .child(t("Table"))
                                         .on_click(cx.listener(move |_, _, _, cx| {
                                             cx.stop_propagation();
                                             cx.emit(DatabasePanelEvent::Structure {
@@ -410,7 +416,7 @@ impl DatabasePanel {
                                         .text_size(crate::theme::text(11.))
                                         .text_color(theme.fg_subtle)
                                         .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                                        .child("ERD")
+                                        .child(t("ERD"))
                                         .on_click({
                                             let connection = conn_name.clone();
                                             cx.listener(move |_, _, _, cx| {
@@ -432,10 +438,10 @@ impl DatabasePanel {
                     return base.into_any_element();
                 };
                 let glyph = match &object.kind {
-                    ObjectKind::Table => "T",
-                    ObjectKind::View => "V",
-                    ObjectKind::Collection => "C",
-                    ObjectKind::Key(_) => "K",
+                    ObjectKind::Table => t("T"),
+                    ObjectKind::View => t("V"),
+                    ObjectKind::Collection => t("C"),
+                    ObjectKind::Key(_) => t("K"),
                 };
                 let detail = match &object.kind {
                     ObjectKind::Key(t) => t.clone(),
@@ -485,7 +491,7 @@ impl DatabasePanel {
                                 .text_size(crate::theme::text(11.))
                                 .text_color(theme.fg_subtle)
                                 .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                                .child("Structure")
+                                .child(t("Structure"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     let Some((engine, connection, _)) = this.object(i, j, cx)
@@ -524,7 +530,7 @@ impl DatabasePanel {
                             .child(column.type_name.clone()),
                     )
                     .when(column.primary_key, |d| {
-                        d.child(div().flex_none().text_color(theme.accent).child("key"))
+                        d.child(div().flex_none().text_color(theme.accent).child(t("key")))
                     })
                     .into_any_element()
             }
@@ -559,7 +565,7 @@ impl Render for DatabasePanel {
                     .child(
                         ui::button(
                             "db-new",
-                            "New connection",
+                            t("New connection"),
                             false,
                             &theme,
                             |_, window, cx| window.dispatch_action(Box::new(NewConnection), cx),
@@ -568,7 +574,7 @@ impl Render for DatabasePanel {
                     )
                     .child(ui::button(
                         "db-refresh",
-                        "Refresh",
+                        t("Refresh"),
                         false,
                         &theme,
                         |_, window, cx| window.dispatch_action(Box::new(RefreshDatabases), cx),
@@ -672,15 +678,15 @@ impl PickerDelegate for NewConnectionPrompt {
         div()
             .text_size(UI_FONT_SIZE)
             .text_color(cx.theme().fg)
-            .child(format!(
-                "Add {engine} connection \u{201c}{}\u{201d}",
-                db::suggested_name(&self.url)
+            .child(tf(
+                "Add {} connection \u{201c}{}\u{201d}",
+                &[&engine, &db::suggested_name(&self.url)],
             ))
             .into_any_element()
     }
 
     fn empty_text(&self) -> SharedString {
-        "Paste a Postgres, MySQL, Redis or MongoDB URL, or a SQLite file path".into()
+        t("Paste a Postgres, MySQL, Redis or MongoDB URL, or a SQLite file path").into()
     }
 
     fn width(&self) -> gpui::Pixels {
@@ -733,7 +739,7 @@ impl ConnectionPicker {
 
 impl PickerDelegate for ConnectionPicker {
     fn placeholder(&self) -> SharedString {
-        "Run this file on...".into()
+        t("Run this file on...").into()
     }
 
     fn match_count(&self) -> usize {
@@ -803,7 +809,7 @@ impl PickerDelegate for ConnectionPicker {
     }
 
     fn empty_text(&self) -> SharedString {
-        "No connections for this kind of file. Add one in the Database tab.".into()
+        t("No connections for this kind of file. Add one in the Database tab.").into()
     }
 
     fn width(&self) -> gpui::Pixels {

@@ -1,4 +1,5 @@
 //! Python uses the same DAP connection and session as every other debugger.
+use crate::lang::{t, tf};
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
@@ -38,9 +39,9 @@ pub fn launch(
             .and_then(|name| crate::lsp_store::find_program(name, root))
     }
     .ok_or_else(|| {
-        format!(
+        tf(
             "Python was not found: {}. Set python_path in settings",
-            chosen.display()
+            &[&chosen.display()],
         )
     })?;
     // A missing module should say how to fix it, rather than look like an
@@ -55,15 +56,15 @@ pub fn launch(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("Could not start {}: {e}", program.display()))?;
+        .map_err(|e| tf("Could not start {}: {}", &[&program.display(), &e]))?;
     let start = Instant::now();
     loop {
         match probe.try_wait() {
             Ok(Some(status)) if status.success() => break,
             Ok(Some(_)) => {
-                return Err(format!(
+                return Err(tf(
                     "debugpy is missing or could not be loaded in {}. Install it in this Python environment",
-                    program.display()
+                    &[&program.display()],
                 ));
             }
             Err(e) => {
@@ -74,7 +75,7 @@ pub fn launch(
             _ if start.elapsed() > Duration::from_secs(10) => {
                 let _ = probe.kill();
                 let _ = probe.wait();
-                return Err("Python did not answer while checking debugpy".into());
+                return Err(t("Python did not answer while checking debugpy").into());
             }
             _ => std::thread::sleep(Duration::from_millis(20)),
         }
@@ -89,10 +90,11 @@ pub fn launch(
         listen: None,
         patience: Duration::from_secs(15),
     };
-    let (adapter, link) = dap::Adapter::launch(&launch).map_err(|e| e.to_string())?;
+    let (adapter, link) =
+        dap::Adapter::launch(&launch).map_err(|e| crate::debug::error_label(&e))?;
     Ok((
         adapter,
-        link.ok_or("Python's debug adapter has no connection")?,
+        link.ok_or(t("Python's debug adapter has no connection"))?,
         request,
     ))
 }

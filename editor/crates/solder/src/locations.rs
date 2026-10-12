@@ -172,7 +172,7 @@ impl PickerDelegate for LocationPicker {
     }
 
     fn empty_text(&self) -> SharedString {
-        format!("No {}", self.title.to_lowercase()).into()
+        tf("No {}", &[&self.title.to_lowercase()]).into()
     }
 
     fn width(&self) -> gpui::Pixels {
@@ -241,9 +241,9 @@ impl PickerDelegate for RenamePrompt {
         div()
             .text_size(UI_FONT_SIZE)
             .text_color(cx.theme().fg)
-            .child(format!(
+            .child(tf(
                 "Rename \u{201c}{}\u{201d} to \u{201c}{}\u{201d}",
-                self.current, self.new_name
+                &[&self.current, &self.new_name],
             ))
             .into_any_element()
     }

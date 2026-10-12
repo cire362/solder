@@ -1,6 +1,7 @@
 //! The workspace's view of its git repository: status, refreshed after
 //! changes on disk, and the operations the UI runs, all off the UI thread.
 
+use crate::lang::{t, tf};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -11,6 +12,27 @@ use std::{
 use gpui::{Context, EventEmitter, SharedString, Task};
 
 use crate::git::{self, Repo, RepoStatus};
+
+/// Editor notices get UI labels; Git's own errors stay as the program wrote them.
+pub(crate) fn error_label(error: &git::GitError) -> String {
+    match error.0.as_str() {
+        "Resolve this file in the conflict view." => {
+            t("Resolve this file in the conflict view.").into()
+        }
+        "Binary files cannot be compared as text." => {
+            t("Binary files cannot be compared as text.").into()
+        }
+        "This file is not UTF-8 text." => t("This file is not UTF-8 text.").into(),
+        "git failed" => t("git failed").into(),
+        other => {
+            if let Some(rest) = other.strip_prefix("Cannot read ") {
+                tf("Cannot read {}", &[&rest])
+            } else {
+                error.0.clone()
+            }
+        }
+    }
+}
 
 pub enum GitStoreEvent {
     /// Status (and so the index) may have changed.
@@ -131,7 +153,7 @@ impl GitStore {
             return Task::ready(false);
         };
         if self.busy {
-            self.last_error = Some("Wait for the current Git operation.".into());
+            self.last_error = Some(t("Wait for the current Git operation.").into());
             cx.notify();
             return Task::ready(false);
         }
@@ -148,7 +170,7 @@ impl GitStore {
             let ok = this
                 .update(cx, |this, cx| {
                     this.busy = false;
-                    this.last_error = result.err().map(|e| e.0.into());
+                    this.last_error = result.err().map(|e| error_label(&e).into());
                     this.refresh_now(cx);
                     // A commit can change HEAD without changing the status list.
                     cx.emit(GitStoreEvent::StatusChanged);
@@ -223,5 +245,28 @@ impl GitStore {
             }
         }
         tints
+    }
+}
+
+#[cfg(test)]
+mod localization_tests {
+    use super::*;
+
+    #[test]
+    fn russian_git_notices_leave_program_errors_and_raw_messages_unchanged() {
+        let owned = git::GitError("Resolve this file in the conflict view.".into());
+        let program = git::GitError("fatal: repository not found".into());
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_eq!(error_label(&owned), "Разрешите конфликт в окне сравнения.");
+        assert_eq!(owned.0, "Resolve this file in the conflict view.");
+        assert_eq!(error_label(&program), program.0);
+        assert_eq!(
+            error_label(&git::GitError(
+                "Cannot read a.txt: Permission denied".into()
+            )),
+            "Не удалось прочитать a.txt: Permission denied"
+        );
+        crate::lang::set(crate::lang::Language::English);
+        assert_eq!(error_label(&owned), owned.0);
     }
 }

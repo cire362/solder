@@ -59,7 +59,7 @@ impl Prompts {
 
 impl PickerDelegate for Prompts {
     fn placeholder(&self) -> SharedString {
-        "Use a prompt of a context server".into()
+        crate::lang::t("Use a prompt of a context server").into()
     }
 
     fn match_count(&self) -> usize {
@@ -145,11 +145,11 @@ impl PickerDelegate for Prompts {
 
     fn empty_text(&self) -> SharedString {
         if self.starting {
-            "Starting the context servers...".into()
+            crate::lang::t("Starting the context servers...").into()
         } else if self.prompts.is_empty() {
-            "No context server that runs has a prompt".into()
+            crate::lang::t("No context server that runs has a prompt").into()
         } else {
-            "No prompt of that name".into()
+            crate::lang::t("No prompt of that name").into()
         }
     }
 
@@ -198,7 +198,7 @@ impl PickerDelegate for Told {
             text.push_str(&argument.description);
         }
         if !argument.required {
-            text.push_str(" (may be left out)");
+            text.push_str(crate::lang::t(" (may be left out)"));
         }
         text.into()
     }
@@ -256,15 +256,15 @@ impl PickerDelegate for Told {
             .text_size(UI_FONT_SIZE)
             .text_color(cx.theme().fg)
             .child(if self.value.is_empty() {
-                format!("Leave {name} out")
+                crate::lang::tf("Leave {} out", &[&name])
             } else {
-                format!("{name} is \u{201c}{}\u{201d}", self.value)
+                crate::lang::tf("{} is \u{201c}{}\u{201d}", &[&name, &self.value])
             })
             .into_any_element()
     }
 
     fn empty_text(&self) -> SharedString {
-        format!("Type {}", self.argument().name).into()
+        crate::lang::tf("Type {}", &[&self.argument().name]).into()
     }
 
     fn width(&self) -> gpui::Pixels {

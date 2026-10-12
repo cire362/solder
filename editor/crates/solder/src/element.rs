@@ -1329,7 +1329,7 @@ fn layout(
             }
         }
     }
-    let placeholder = match &editor.placeholder {
+    let placeholder = match editor.placeholder_text() {
         Some(text) if buffer.is_empty() => {
             let run = TextRun {
                 len: text.len(),

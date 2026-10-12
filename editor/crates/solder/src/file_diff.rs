@@ -501,14 +501,16 @@ impl Render for FileDiff {
             .into_owned();
         let summary = self.model.as_ref().map(|model| {
             if model.changes.is_empty() {
-                "No changes".to_string()
+                crate::lang::t("No changes").to_string()
             } else {
-                format!(
+                crate::lang::tf(
                     "{} of {} changes   +{} / −{}",
-                    self.selected.unwrap_or(0) + 1,
-                    model.changes.len(),
-                    model.added,
-                    model.removed
+                    &[
+                        &(self.selected.unwrap_or(0) + 1),
+                        &model.changes.len(),
+                        &model.added,
+                        &model.removed,
+                    ],
                 )
             }
         });
@@ -520,7 +522,7 @@ impl Render for FileDiff {
             if model.rows.is_empty() {
                 div()
                     .p_4()
-                    .child("Both versions are empty.")
+                    .child(crate::lang::t("Both versions are empty."))
                     .into_any_element()
             } else {
                 gpui::uniform_list(
@@ -556,14 +558,16 @@ impl Render for FileDiff {
                 .child(
                     self.error
                         .clone()
-                        .unwrap_or_else(|| "Loading comparison...".into()),
+                        .unwrap_or_else(|| crate::lang::t("Loading comparison...").into()),
                 )
                 .into_any_element()
         };
         let labels = match (self.preview, self.scope) {
-            (true, _) => ("Before", "Proposed"),
-            (false, DiffScope::Working) => ("Index", "Working copy"),
-            (false, DiffScope::Staged) => ("HEAD", "Index (staged)"),
+            (true, _) => (crate::lang::t("Before"), crate::lang::t("Proposed")),
+            (false, DiffScope::Working) => {
+                (crate::lang::t("Index"), crate::lang::t("Working copy"))
+            }
+            (false, DiffScope::Staged) => ("HEAD", crate::lang::t("Index (staged)")),
         };
         let heading = |label: &'static str, no_newline: bool| {
             div()
@@ -572,7 +576,9 @@ impl Render for FileDiff {
                 .px_3()
                 .py_2()
                 .child(label)
-                .when(no_newline, |heading| heading.child(" · No final newline"))
+                .when(no_newline, |heading| {
+                    heading.child(crate::lang::t(" · No final newline"))
+                })
         };
         div()
             .id("file-diff")
@@ -611,7 +617,7 @@ impl Render for FileDiff {
                             |bar| {
                                 bar.child(ui::button(
                                     "diff-open",
-                                    "Open file",
+                                    crate::lang::t("Open file"),
                                     false,
                                     &theme,
                                     cx.listener(|_, _, _, cx| cx.emit(FileDiffEvent::OpenFile)),
@@ -620,14 +626,14 @@ impl Render for FileDiff {
                         )
                         .child(ui::button(
                             "diff-refresh",
-                            "Refresh",
+                            crate::lang::t("Refresh"),
                             false,
                             &theme,
                             cx.listener(|_, _, _, cx| cx.emit(FileDiffEvent::Refresh)),
                         ))
                         .child(ui::button(
                             "diff-close",
-                            "Close",
+                            crate::lang::t("Close"),
                             false,
                             &theme,
                             cx.listener(|_, _, _, cx| cx.emit(FileDiffEvent::Close)),
@@ -646,14 +652,14 @@ impl Render for FileDiff {
                     .when(ready, |bar| {
                         bar.child(ui::button(
                             "diff-prev",
-                            "Previous",
+                            crate::lang::t("Previous"),
                             false,
                             &theme,
                             cx.listener(|this, _, _, cx| this.step(true, cx)),
                         ))
                         .child(ui::button(
                             "diff-next",
-                            "Next",
+                            crate::lang::t("Next"),
                             false,
                             &theme,
                             cx.listener(|this, _, _, cx| this.step(false, cx)),

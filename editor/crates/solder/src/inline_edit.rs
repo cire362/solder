@@ -51,18 +51,18 @@ struct Snapshot {
 impl Snapshot {
     fn capture(editor: &Editor, root: &std::path::Path, cx: &App) -> Result<Self, String> {
         if editor.doc(cx).is_read_only() {
-            return Err("This file is read-only.".into());
+            return Err(crate::lang::t("This file is read-only.").into());
         }
         if editor.cursor_position(cx).2 != 1 {
-            return Err("Use one selection for an inline edit.".into());
+            return Err(crate::lang::t("Use one selection for an inline edit.").into());
         }
         let source = editor
             .path(cx)
-            .ok_or("Save this file before using AI edits.")?
+            .ok_or(crate::lang::t("Save this file before using AI edits."))?
             .to_path_buf();
         let path = source
             .strip_prefix(root)
-            .map_err(|_| "Open a file inside this project.")?
+            .map_err(|_| crate::lang::t("Open a file inside this project."))?
             .to_string_lossy()
             .replace('\\', "/");
         let rope = editor.rope(cx).clone();
@@ -73,7 +73,10 @@ impl Snapshot {
             selected
         };
         if rope.byte_slice(range.clone()).len_chars() > FILE_LIMIT {
-            return Err("Select a smaller part of the file (up to 24,000 characters).".into());
+            return Err(crate::lang::t(
+                "Select a smaller part of the file (up to 24,000 characters).",
+            )
+            .into());
         }
         Ok(Self {
             source,
@@ -149,7 +152,7 @@ impl InlineEdit {
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.subscribe(&document, |this, _, _, cx| {
                 if this.snapshot.is_some() && !this.current(cx) {
-                    this.fail("File changed. Generate again.".into(), cx);
+                    this.fail(crate::lang::t("File changed. Generate again.").into(), cx);
                 }
             }),
         ];
@@ -159,7 +162,7 @@ impl InlineEdit {
             target: target.downgrade(),
             root,
             store,
-            input: cx.new(|cx| Editor::single_line("Describe the change", cx)),
+            input: cx.new(|cx| Editor::localized_field("Describe the change", cx)),
             focus: cx.focus_handle(),
             snapshot: None,
             proposal: None,
@@ -168,9 +171,9 @@ impl InlineEdit {
             include_project: false,
             task: None,
             status: if selected {
-                "Edit selection"
+                crate::lang::t("Edit selection")
             } else {
-                "Edit whole file"
+                crate::lang::t("Edit whole file")
             }
             .into(),
             error: None,
@@ -211,7 +214,7 @@ impl InlineEdit {
         self.task = None;
         self.snapshot = None;
         self.proposal = None;
-        self.status = "Stopped. Generate again to retry.".into();
+        self.status = crate::lang::t("Stopped. Generate again to retry.").into();
         cx.notify();
     }
 
@@ -245,7 +248,7 @@ impl InlineEdit {
             return;
         }
         let Some(model) = self.store.read(cx).roles.get(&Role::Chat).cloned() else {
-            self.fail("Choose a chat model first.".into(), cx);
+            self.fail(crate::lang::t("Choose a chat model first.").into(), cx);
             return;
         };
         let Some(target) = self.target.upgrade() else {
@@ -258,7 +261,7 @@ impl InlineEdit {
                 return;
             }
         };
-        self.status = format!("Preparing {}...", snapshot.path);
+        self.status = crate::lang::tf("Preparing {}...", &[&snapshot.path]);
         self.error = None;
         self.proposal = None;
         self.diff = None;
@@ -279,7 +282,8 @@ impl InlineEdit {
                     .spawn(async move {
                         let prepared = ai_context::prepare(context, &flag)?;
                         if prepared.file.is_none() {
-                            return Err("This file is excluded from AI context.".to_string());
+                            return Err(crate::lang::t("This file is excluded from AI context.")
+                                .to_string());
                         }
                         let context = snapshot.text_context(prepared.map.map(|map| map.text));
                         let original = context.target.clone();
@@ -292,7 +296,7 @@ impl InlineEdit {
                     })
                     .await?;
                 this.update(cx, |this, cx| {
-                    this.status = "Generating preview...".into();
+                    this.status = crate::lang::t("Generating preview...").into();
                     cx.notify();
                 })
                 .map_err(|error| error.to_string())?;
@@ -302,7 +306,10 @@ impl InlineEdit {
                 while let Some(event) = stream.recv().await {
                     if let Event::Text(text) = event? {
                         if answer.len().saturating_add(text.len()) > edit::RESPONSE_LIMIT {
-                            return Err("The proposed edit is too large. Select less code.".into());
+                            return Err(crate::lang::t(
+                                "The proposed edit is too large. Select less code.",
+                            )
+                            .into());
                         }
                         answer.push_str(&text);
                         if painted.elapsed() >= Duration::from_millis(80) {
@@ -333,7 +340,7 @@ impl InlineEdit {
                             .map(|snapshot| snapshot.source.clone())
                     })
                     .map_err(|error| error.to_string())?
-                    .ok_or("File changed. Generate again.")?;
+                    .ok_or(crate::lang::t("File changed. Generate again."))?;
                 let (proposal, diff, changed) = executor
                     .spawn(async move {
                         let proposal = edit::replacement(&answer, &original)?;
@@ -349,7 +356,7 @@ impl InlineEdit {
                     .await?;
                 this.update(cx, |this, cx| {
                     if !this.current(cx) {
-                        this.fail("File changed. Generate again.".into(), cx);
+                        this.fail(crate::lang::t("File changed. Generate again.").into(), cx);
                         return;
                     }
                     let path = this.snapshot.as_ref().unwrap().source.clone();
@@ -366,9 +373,9 @@ impl InlineEdit {
                     this.lines.clear();
                     this.task = None;
                     this.status = if changed {
-                        "Review the edit. Apply with Cmd/Ctrl+Enter."
+                        crate::lang::t("Review the edit. Apply with Cmd/Ctrl+Enter.")
                     } else {
-                        "No changes. Try another instruction."
+                        crate::lang::t("No changes. Try another instruction.")
                     }
                     .into();
                     cx.notify();
@@ -395,14 +402,15 @@ impl InlineEdit {
                 .context(self.root.clone(), false, String::new());
         let executor = cx.background_executor().clone();
         let cancellation = Cancellation::new();
-        self.status = "Checking file...".into();
+        self.status = crate::lang::t("Checking file...").into();
         self.task = Some(cx.spawn(async move |this, cx| {
             let flag = cancellation.flag();
             let checked = executor
                 .spawn(async move {
                     let prepared = ai_context::prepare(context, &flag)?;
                     if prepared.file.is_none() {
-                        return Err("This file is now excluded from AI context.".to_string());
+                        return Err(crate::lang::t("This file is now excluded from AI context.")
+                            .to_string());
                     }
                     Ok(())
                 })
@@ -413,7 +421,7 @@ impl InlineEdit {
                     return;
                 }
                 if !this.current(cx) {
-                    this.fail("File changed. Generate again.".into(), cx);
+                    this.fail(crate::lang::t("File changed. Generate again.").into(), cx);
                     return;
                 }
                 let target = this.target.upgrade().unwrap();
@@ -455,7 +463,7 @@ impl Render for InlineEdit {
             .roles
             .get(&Role::Chat)
             .map(|model| self.store.read(cx).model_label(model))
-            .unwrap_or_else(|| "No chat model".into());
+            .unwrap_or_else(|| crate::lang::t("No chat model").into());
         let ready = self.proposal.is_some() && self.current(cx) && !busy;
         div()
             .id("inline-edit")
@@ -495,12 +503,18 @@ impl Render for InlineEdit {
                             .items_center()
                             .gap_2()
                             .flex_wrap()
-                            .child(div().flex_1().min_w_0().truncate().child("Inline edit"))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(crate::lang::t("Inline edit")),
+                            )
                             .when(ready, |bar| {
                                 bar.child(
                                     ui::button(
                                         "edit-apply",
-                                        "Apply",
+                                        crate::lang::t("Apply"),
                                         true,
                                         &theme,
                                         cx.listener(|this, _, window, cx| {
@@ -512,7 +526,7 @@ impl Render for InlineEdit {
                             })
                             .child(ui::button(
                                 "edit-discard",
-                                "Discard",
+                                crate::lang::t("Discard"),
                                 false,
                                 &theme,
                                 cx.listener(|this, _, _, cx| {
@@ -534,7 +548,11 @@ impl Render for InlineEdit {
                             ))
                             .child(ui::button(
                                 "edit-generate",
-                                if busy { "Stop" } else { "Generate" },
+                                if busy {
+                                    crate::lang::t("Stop")
+                                } else {
+                                    crate::lang::t("Generate")
+                                },
                                 !ready,
                                 &theme,
                                 cx.listener(move |this, _, window, cx| {
@@ -555,8 +573,8 @@ impl Render for InlineEdit {
                             .child(
                                 ui::toggle(
                                     "edit-project",
-                                    "Project map",
-                                    "Include project declarations",
+                                    crate::lang::t("Project map"),
+                                    crate::lang::t("Include project declarations"),
                                     self.include_project,
                                     &theme,
                                     cx.listener(|this, _, window, cx| {
@@ -578,11 +596,11 @@ impl Render for InlineEdit {
                                     .min_w_0()
                                     .truncate()
                                     .text_color(theme.fg_muted)
-                                    .child(format!("Chat model: {model}")),
+                                    .child(crate::lang::tf("Chat model: {}", &[&model])),
                             )
                             .child(ui::button(
                                 "edit-models",
-                                "Models",
+                                crate::lang::t("Models"),
                                 false,
                                 &theme,
                                 cx.listener(|_, _, _, cx| cx.emit(InlineEditEvent::ChooseModel)),
@@ -598,15 +616,20 @@ impl Render for InlineEdit {
                             .child(self.error.clone().unwrap_or_else(|| self.status.clone())),
                     )
                     .children(self.snapshot.as_ref().map(|snapshot| {
-                        div().text_color(theme.fg_muted).truncate().child(format!(
-                            "{} · lines {}-{}",
-                            snapshot.path,
-                            snapshot.rope.byte_to_line(snapshot.range.start) + 1,
-                            snapshot
-                                .rope
-                                .byte_to_line(snapshot.range.end.saturating_sub(1))
-                                + 1,
-                        ))
+                        div()
+                            .text_color(theme.fg_muted)
+                            .truncate()
+                            .child(crate::lang::tf(
+                                "{} · lines {}-{}",
+                                &[
+                                    &snapshot.path,
+                                    &(snapshot.rope.byte_to_line(snapshot.range.start) + 1),
+                                    &(snapshot
+                                        .rope
+                                        .byte_to_line(snapshot.range.end.saturating_sub(1))
+                                        + 1),
+                                ],
+                            ))
                     })),
             )
             .when(self.diff.is_some() || !self.lines.is_empty(), |panel| {

@@ -1,3 +1,4 @@
+use crate::lang::{t, tf};
 use std::path::PathBuf;
 
 use gpui::{
@@ -48,9 +49,9 @@ impl Prompt {
 impl PickerDelegate for Prompt {
     fn placeholder(&self) -> SharedString {
         match self.field {
-            Field::Condition => "Breakpoint condition; empty clears it",
-            Field::Hits => "Hit condition; syntax belongs to the debugger",
-            Field::Log => "Log message; expressions go in {braces}",
+            Field::Condition => t("Breakpoint condition; empty clears it"),
+            Field::Hits => t("Hit condition; syntax belongs to the debugger"),
+            Field::Log => t("Log message; expressions go in {braces}"),
         }
         .into()
     }
@@ -91,14 +92,14 @@ impl PickerDelegate for Prompt {
         cx: &mut Context<Picker<Self>>,
     ) -> AnyElement {
         let label = if self.query.trim().is_empty() {
-            "Clear this setting"
+            tf("Clear this setting at line {}", &[&self.line])
         } else {
-            "Set this setting"
+            tf("Set this setting at line {}", &[&self.line])
         };
         div()
             .text_size(UI_FONT_SIZE)
             .text_color(cx.theme().fg)
-            .child(format!("{label} at line {}", self.line))
+            .child(label)
             .into_any_element()
     }
 }

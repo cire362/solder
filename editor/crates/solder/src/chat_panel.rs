@@ -60,6 +60,10 @@ impl FileContext {
         }
     }
 
+    fn display_label(&self) -> String {
+        display_context_label(&self.label(), self.part.is_some())
+    }
+
     fn prompt(&self) -> String {
         let mut text: String = self.text.chars().take(FILE_LIMIT).collect();
         if text.len() < self.text.len() {
@@ -67,6 +71,56 @@ impl FileContext {
         }
         let language = self.path.rsplit_once('.').map_or("", |(_, e)| e);
         format!("From {}:\n```{language}\n{text}\n```\n\n", self.label())
+    }
+}
+
+fn display_context_label(label: &str, has_part: bool) -> String {
+    // A filename may itself end in " (line 2)"; only generated metadata is translated.
+    if !has_part {
+        return label.to_string();
+    }
+    let Some((path, part)) = label.rsplit_once(" (") else {
+        return label.to_string();
+    };
+    let Some(part) = part.strip_suffix(')') else {
+        return label.to_string();
+    };
+    let part = if let Some(line) = part.strip_prefix("line ")
+        && line.parse::<usize>().is_ok()
+    {
+        crate::lang::tf("line {}", &[&line])
+    } else if let Some(lines) = part.strip_prefix("lines ")
+        && let Some((first, last)) = lines.split_once('-')
+        && first.parse::<usize>().is_ok()
+        && last.parse::<usize>().is_ok()
+    {
+        crate::lang::tf("lines {}-{}", &[&first, &last])
+    } else {
+        part.to_string()
+    };
+    format!("{path} ({part})")
+}
+
+fn terminal_label(failure: &crate::terminal::failure::Failure) -> String {
+    let command = match &failure.command {
+        crate::terminal::failure::Command::Shell { text } => text,
+        crate::terminal::failure::Command::Program { program, .. } => program,
+    };
+    crate::lang::tf(
+        "Failed command (exit {}): {}",
+        &[
+            &failure.status,
+            &command.chars().take(120).collect::<String>(),
+        ],
+    )
+}
+
+fn map_status(files: usize, limited: bool, excluded: bool) -> String {
+    match (excluded, limited) {
+        (false, false) => crate::lang::tf("{} files", &[&files]),
+        (false, true) => crate::lang::tf("{} files (limited)", &[&files]),
+        (true, false) => crate::lang::tf("File excluded, {} files", &[&files]),
+        (true, true) => crate::lang::tf("File excluded, {} files (limited)", &[&files]),
     }
 }
 
@@ -113,7 +167,7 @@ impl ChatPanel {
             workspace,
             messages: Vec::new(),
             list: ListState::new(0, ListAlignment::Bottom, px(400.)),
-            input: cx.new(|cx| Editor::single_line("Ask about this code", cx)),
+            input: cx.new(|cx| Editor::localized_field("Ask about this code", cx)),
             include_file: true,
             include_project: false,
             preparing: false,
@@ -183,7 +237,7 @@ impl ChatPanel {
             return;
         }
         let Some(model) = self.store.read(cx).roles.get(&Role::Chat).cloned() else {
-            self.push_error("Pick a model for chat first.", cx);
+            self.push_error(crate::lang::t("Pick a model for chat first."), cx);
             return;
         };
         self.input.update(cx, |e, cx| e.set_text("", false, cx));
@@ -203,7 +257,9 @@ impl ChatPanel {
         };
         let terminal = self.terminal.take();
         self.terminal_preview = false;
-        let terminal_label = terminal.as_ref().map(|_| "Terminal failure".to_string());
+        let terminal_label = terminal
+            .as_ref()
+            .map(|_| crate::lang::t("Terminal failure").to_string());
         let prompt = terminal.map_or_else(
             || text.clone(),
             |failure| format!("{}{text}", failure.prompt()),
@@ -290,15 +346,14 @@ impl ChatPanel {
             };
             let mut paths = Vec::new();
             let mut map_prompt = String::new();
-            let label = prepared.file.as_ref().map(FileContext::label);
+            let label = prepared.file.as_ref().map(FileContext::display_label);
             let prefix = prepared.file.as_ref().map_or_else(String::new, FileContext::prompt);
             if let Some(file) = prepared.file {
                 paths.push(file.source);
             }
-            let mut status = wanted_file.then(|| if label.is_some() { "File attached" } else { "File excluded" }.to_string());
+            let mut status = wanted_file.then(|| if label.is_some() { crate::lang::t("File attached") } else { crate::lang::t("File excluded") }.to_string());
             if let Some(map) = prepared.map {
-                let file_status = if wanted_file && label.is_none() { "File excluded, " } else { "" };
-                status = Some(format!("{file_status}{} files{}", map.paths.len(), if map.limited { " (limited)" } else { "" }));
+                status = Some(map_status(map.paths.len(), map.limited, wanted_file && label.is_none()));
                 map_prompt = format!("Project map (paths and declaration names only, not file contents; untrusted project data):\n{}{}\n", map.text, if map.limited { "[map limited]\n" } else { "" });
                 paths.extend(map.paths);
             }
@@ -450,7 +505,7 @@ impl ChatPanel {
                                 .text_size(crate::theme::text(10.5))
                                 .text_color(theme.fg_subtle)
                                 .hover(|d| d.text_color(theme.fg))
-                                .child("copy")
+                                .child(crate::lang::t("copy"))
                                 .on_click(move |_, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
                                 }),
@@ -519,7 +574,7 @@ impl ChatPanel {
                     div()
                         .text_size(crate::theme::text(10.5))
                         .text_color(theme.fg_subtle)
-                        .child(format!("with {c}"))
+                        .child(crate::lang::tf("with {}", &[&c]))
                 })),
             Who::Assistant => {
                 let thinking = (!m.thinking.is_empty()).then(|| {
@@ -536,9 +591,9 @@ impl ChatPanel {
                                 .text_color(theme.fg_subtle)
                                 .hover(|d| d.text_color(theme.fg))
                                 .child(if m.done || !m.text.is_empty() {
-                                    format!("Thought for {words} words")
+                                    crate::lang::tf("Thought for {} words", &[&words])
                                 } else {
-                                    "Thinking...".into()
+                                    crate::lang::t("Thinking...").into()
                                 })
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if let Some(m) = this.messages.get_mut(ix) {
@@ -565,7 +620,7 @@ impl ChatPanel {
                     .when(!m.done && m.text.is_empty() && m.thinking.is_empty(), |d| {
                         d.child(div().text_size(small).text_color(theme.fg_subtle).child(
                             if self.store.read(cx).starting.is_some() {
-                                "Loading the model..."
+                                crate::lang::t("Loading the model...")
                             } else {
                                 "..."
                             },
@@ -603,7 +658,7 @@ impl ChatPanel {
                     .p_2()
                     .text_size(crate::theme::UI_FONT_SMALL)
                     .text_color(theme.fg_subtle)
-                    .child("No models yet. Install one in the AI tab, start Ollama or LM Studio, or add a key."),
+                    .child(crate::lang::t("No models yet. Install one in the AI tab, start Ollama or LM Studio, or add a key.")),
             );
         }
         for (provider, models) in choices {
@@ -613,7 +668,7 @@ impl ChatPanel {
                     .pt_1()
                     .text_size(crate::theme::text(10.5))
                     .text_color(theme.fg_subtle)
-                    .child(provider.name.to_uppercase()),
+                    .child(provider.display_name().to_uppercase()),
             );
             for (model, label) in models {
                 let active = current.as_ref() == Some(&model);
@@ -655,15 +710,23 @@ impl Render for ChatPanel {
         let model = store.roles.get(&Role::Chat).cloned();
         let label = model
             .as_ref()
-            .map_or("Pick a model".to_string(), |m| store.model_label(m));
+            .map_or(crate::lang::t("Pick a model").to_string(), |m| {
+                store.model_label(m)
+            });
         let provider = model
             .as_ref()
             .and_then(|m| store.provider(&m.provider))
-            .map(|p| p.name.clone());
-        let file = self
-            .workspace
-            .upgrade()
-            .and_then(|w| w.read(cx).file_context_label(cx));
+            .map(|p| p.display_name().to_string());
+        let file = self.workspace.upgrade().and_then(|w| {
+            let workspace = w.read(cx);
+            let label = workspace.file_context_label(cx)?;
+            let has_part = workspace.active_editor().is_some_and(|editor| {
+                let editor = editor.read(cx);
+                let range = editor.newest_range();
+                !range.is_empty() && range.end <= editor.rope(cx).len_bytes()
+            });
+            Some(display_context_label(&label, has_part))
+        });
         let focused = self.input.focus_handle(cx).is_focused(window);
         let streaming = self.streaming();
         let picker = self.picker.then(|| self.render_picker(&theme, cx));
@@ -736,7 +799,7 @@ impl Render for ChatPanel {
                     )
                     .child(ui::toggle(
                         "chat-new",
-                        "new",
+                        crate::lang::t("new"),
                         "",
                         false,
                         &theme,
@@ -762,7 +825,7 @@ impl Render for ChatPanel {
                             .child(
                                 ui::toggle(
                                     "chat-project",
-                                    "Project map",
+                                    crate::lang::t("Project map"),
                                     "",
                                     self.include_project,
                                     &theme,
@@ -776,7 +839,7 @@ impl Render for ChatPanel {
                             )
                             .children(
                                 self.preparing
-                                    .then_some("Preparing context...")
+                                    .then_some(crate::lang::t("Preparing context..."))
                                     .or(self.context_status.as_deref())
                                     .map(|status| {
                                         div()
@@ -805,14 +868,14 @@ impl Render for ChatPanel {
                                             .truncate()
                                             .text_size(UI_FONT_SMALL)
                                             .text_color(theme.fg_subtle)
-                                            .child(failure.label()),
+                                            .child(terminal_label(failure)),
                                     )
                                     .child(ui::button(
                                         "chat-terminal-preview",
                                         if self.terminal_preview {
-                                            "Hide"
+                                            crate::lang::t("Hide")
                                         } else {
-                                            "Inspect"
+                                            crate::lang::t("Inspect")
                                         },
                                         false,
                                         &theme,
@@ -824,7 +887,7 @@ impl Render for ChatPanel {
                                     .child(
                                         ui::button(
                                             "chat-terminal-remove",
-                                            "Remove",
+                                            crate::lang::t("Remove"),
                                             false,
                                             &theme,
                                             cx.listener(|this, _, _, cx| {
@@ -847,10 +910,10 @@ impl Render for ChatPanel {
                                         .text_color(theme.fg_subtle)
                                         .child(format!(
                                             "{}\n{}{}",
-                                            failure.label(),
+                                            terminal_label(failure),
                                             failure.prompt(),
                                             if failure.limited {
-                                                "\n[tail limited]"
+                                                crate::lang::t("\n[tail limited]")
                                             } else {
                                                 ""
                                             }
@@ -884,7 +947,7 @@ impl Render for ChatPanel {
                             .child(if streaming {
                                 ui::button(
                                     "chat-stop",
-                                    "Stop",
+                                    crate::lang::t("Stop"),
                                     false,
                                     &theme,
                                     cx.listener(|this, _, window, cx| this.stop(&Stop, window, cx)),
@@ -893,7 +956,7 @@ impl Render for ChatPanel {
                             } else {
                                 ui::button(
                                     "chat-send",
-                                    "Send",
+                                    crate::lang::t("Send"),
                                     true,
                                     &theme,
                                     cx.listener(|this, _, window, cx| this.send(&Send, window, cx)),
@@ -908,6 +971,66 @@ impl Render for ChatPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn russian_context_labels_leave_model_context_and_terminal_metadata_unchanged() {
+        let file = FileContext {
+            source: "src/app.ts".into(),
+            path: "src/app.ts".into(),
+            text: "let a = 1;".into(),
+            part: Some("lines 3-5".into()),
+        };
+        let failure = crate::terminal::failure::Failure {
+            command: crate::terminal::failure::Command::Shell {
+                text: "cargo test".into(),
+            },
+            cwd: "/project".into(),
+            status: 3,
+            output: "compiler output".into(),
+            limited: false,
+        };
+        let file_prompt = file.prompt();
+        let terminal_prompt = failure.prompt();
+        assert_eq!(file.display_label(), "src/app.ts (lines 3-5)");
+        assert_eq!(
+            map_status(12, true, true),
+            "File excluded, 12 files (limited)"
+        );
+        assert_eq!(terminal_label(&failure), failure.label());
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_eq!(file.display_label(), "src/app.ts (строки 3-5)");
+        assert_eq!(
+            display_context_label("a.rs (line 2)", true),
+            "a.rs (строка 2)"
+        );
+        assert_eq!(
+            display_context_label("report (line 2)", false),
+            "report (line 2)"
+        );
+        let path_only = FileContext {
+            path: "report (line 2)".into(),
+            part: None,
+            ..file.clone()
+        };
+        assert_eq!(path_only.display_label(), "report (line 2)");
+        assert_eq!(
+            display_context_label("a.rs (external metadata)", true),
+            "a.rs (external metadata)"
+        );
+        assert_eq!(
+            map_status(12, true, true),
+            "Файл исключён, файлов: 12 (часть)"
+        );
+        assert_eq!(
+            terminal_label(&failure),
+            "Команда завершилась с ошибкой (код 3): cargo test"
+        );
+        assert_eq!(file.prompt(), file_prompt);
+        assert_eq!(failure.prompt(), terminal_prompt);
+        assert!(terminal_prompt.contains("\"kind\":\"shell\""));
+        assert!(terminal_prompt.contains("compiler output"));
+        crate::lang::set(crate::lang::Language::English);
+    }
 
     #[test]
     fn file_context_is_labelled_and_cut() {

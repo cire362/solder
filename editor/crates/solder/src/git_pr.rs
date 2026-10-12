@@ -2,6 +2,7 @@
 //! in the background and no credentials are copied into the editor.
 
 use crate::git::{GitError, Repo, Result};
+use crate::lang::{t, tf};
 use std::{
     ffi::OsStr,
     path::Path,
@@ -19,11 +20,11 @@ pub enum State {
 impl State {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Passed => "Passed",
-            Self::Failed => "Failed",
-            Self::Pending => "Pending",
-            Self::Skipped => "Skipped",
-            Self::Cancelled => "Cancelled",
+            Self::Passed => t("Passed"),
+            Self::Failed => t("Failed"),
+            Self::Pending => t("Pending"),
+            Self::Skipped => t("Skipped"),
+            Self::Cancelled => t("Cancelled"),
         }
     }
 }
@@ -45,6 +46,17 @@ pub struct PullRequest {
     pub checks: Vec<Check>,
 }
 
+impl PullRequest {
+    pub fn state_label(&self) -> &str {
+        match self.state.as_str() {
+            "OPEN" => t("OPEN"),
+            "CLOSED" => t("CLOSED"),
+            "MERGED" => t("MERGED"),
+            other => other,
+        }
+    }
+}
+
 pub fn read(repo: &Repo, branch: &str, program: &Path) -> Result<PullRequest> {
     let out = Command::new(program)
         .current_dir(&repo.workdir)
@@ -63,16 +75,16 @@ pub fn read(repo: &Repo, branch: &str, program: &Path) -> Result<PullRequest> {
         .output()
         .map_err(|e| {
             GitError(if e.kind() == std::io::ErrorKind::NotFound {
-                "Install GitHub CLI (gh) to read pull requests.".into()
+                t("Install GitHub CLI (gh) to read pull requests.").into()
             } else {
-                format!("GitHub CLI: {e}")
+                tf("GitHub CLI: {}", &[&e])
             })
         })?;
     if !out.status.success() {
         let message = String::from_utf8_lossy(&out.stderr)
             .lines()
             .find(|line| !line.trim().is_empty())
-            .unwrap_or("Could not read the branch's pull request.")
+            .unwrap_or(t("Could not read the branch's pull request."))
             .to_string();
         return Err(GitError(message));
     }
@@ -85,12 +97,12 @@ fn link(value: &serde_json::Value) -> Option<String> {
 }
 fn parse(bytes: &[u8]) -> Result<PullRequest> {
     let value: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|_| GitError("GitHub CLI returned unreadable pull request data.".into()))?;
+        .map_err(|_| GitError(t("GitHub CLI returned unreadable pull request data.").into()))?;
     let required = |field: &str| {
         value[field]
             .as_str()
             .map(str::to_owned)
-            .ok_or_else(|| GitError(format!("GitHub CLI did not return {field}.")))
+            .ok_or_else(|| GitError(tf("GitHub CLI did not return {}.", &[&field])))
     };
     let mut checks = Vec::new();
     for check in value["statusCheckRollup"].as_array().into_iter().flatten() {
@@ -112,19 +124,19 @@ fn parse(bytes: &[u8]) -> Result<PullRequest> {
             name: check["name"]
                 .as_str()
                 .or_else(|| check["context"].as_str())
-                .unwrap_or("Check")
+                .unwrap_or(t("Check"))
                 .into(),
             state,
             url: link(&check["detailsUrl"]).or_else(|| link(&check["targetUrl"])),
         });
     }
     Ok(PullRequest {
-        number: value["number"]
-            .as_u64()
-            .ok_or_else(|| GitError("GitHub CLI did not return a pull request number.".into()))?,
+        number: value["number"].as_u64().ok_or_else(|| {
+            GitError(t("GitHub CLI did not return a pull request number.").into())
+        })?,
         title: required("title")?,
         url: link(&value["url"])
-            .ok_or_else(|| GitError("GitHub CLI did not return a web URL.".into()))?,
+            .ok_or_else(|| GitError(t("GitHub CLI did not return a web URL.").into()))?,
         state: required("state")?,
         draft: value["isDraft"].as_bool().unwrap_or(false),
         head: required("headRefName")?,
@@ -136,6 +148,28 @@ fn parse(bytes: &[u8]) -> Result<PullRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn russian_labels_keep_provider_states_and_names_unchanged() {
+        let data = serde_json::json!({
+            "number": 5, "title": "Provider title", "url": "https://github.com/a/b/pull/5",
+            "state": "OPEN", "headRefName": "feature", "baseRefName": "main",
+            "statusCheckRollup": [{"name": "Provider check", "conclusion": "FAILURE"}]
+        });
+        let mut pr = parse(data.to_string().as_bytes()).unwrap();
+        assert_eq!(pr.state_label(), "OPEN");
+        assert_eq!(pr.checks[0].state.label(), "Failed");
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_eq!(pr.state_label(), "Открыт");
+        assert_eq!(pr.checks[0].state.label(), "Ошибка");
+        assert_eq!(pr.state, "OPEN");
+        assert_eq!(pr.title, "Provider title");
+        assert_eq!(pr.checks[0].name, "Provider check");
+        pr.state = "PROVIDER_STATE".into();
+        assert_eq!(pr.state_label(), "PROVIDER_STATE");
+        crate::lang::set(crate::lang::Language::English);
+        assert_eq!(pr.checks[0].state.label(), "Failed");
+    }
     #[test]
     fn reads_check_runs_and_legacy_statuses_without_treating_pending_as_passed() {
         let value = serde_json::json!({"number":5,"title":"Example","url":"https://github.com/a/b/pull/5","state":"OPEN","isDraft":true,"headRefName":"feature","baseRefName":"main","statusCheckRollup":[

@@ -138,9 +138,9 @@ impl PickerDelegate for AskPick {
         let Some(row) = row.map(|row| &self.rows[row]) else {
             let picked = self.rows.iter().filter(|row| row.picked).count();
             let text = match picked {
-                0 => "Answer with none picked".to_string(),
-                1 => "Answer with the 1 picked".to_string(),
-                n => format!("Answer with the {n} picked"),
+                0 => crate::lang::t("Answer with none picked").to_string(),
+                1 => crate::lang::t("Answer with the 1 picked").to_string(),
+                n => crate::lang::tf("Answer with the {} picked", &[&n]),
             };
             return div()
                 .text_size(UI_FONT_SIZE)
@@ -190,7 +190,7 @@ impl PickerDelegate for AskPick {
     }
 
     fn empty_text(&self) -> SharedString {
-        "Nothing matches".into()
+        crate::lang::t("Nothing matches").into()
     }
 }
 
@@ -255,9 +255,9 @@ impl PickerDelegate for AskInput {
             .debug_selector(|| "extension-input-guidance".into())
             .text_size(UI_FONT_SIZE)
             .text_color(cx.theme().fg_muted)
-            .child(format!(
+            .child(crate::lang::tf(
                 "{}  (Enter to answer, Escape to cancel)",
-                self.title
+                &[&self.title],
             ))
             .into_any_element()
     }
@@ -325,7 +325,7 @@ impl TaskPick {
 
 impl PickerDelegate for TaskPick {
     fn placeholder(&self) -> SharedString {
-        "Run a task of an extension".into()
+        crate::lang::t("Run a task of an extension").into()
     }
 
     fn match_count(&self) -> usize {
@@ -375,7 +375,14 @@ impl PickerDelegate for TaskPick {
             if let Err(error) = running.await {
                 store
                     .update(cx, |store, cx| {
-                        store.report(format!("{}: {error}", task.name), cx)
+                        store.report(
+                            format!(
+                                "{}: {}",
+                                task.name,
+                                crate::extension_store::error_label(&error)
+                            ),
+                            cx,
+                        )
                     })
                     .ok();
             }
@@ -405,11 +412,11 @@ impl PickerDelegate for TaskPick {
 
     fn empty_text(&self) -> SharedString {
         if self.loading {
-            "Asking the extensions...".into()
+            crate::lang::t("Asking the extensions...").into()
         } else if self.tasks.is_empty() {
-            "No extension has a task to run".into()
+            crate::lang::t("No extension has a task to run").into()
         } else {
-            "No task of that name".into()
+            crate::lang::t("No task of that name").into()
         }
     }
 }

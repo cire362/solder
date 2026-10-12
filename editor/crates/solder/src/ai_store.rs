@@ -371,7 +371,7 @@ impl AiStore {
             return Ok(path);
         }
         let asset = install::runtime_asset(&hw)
-            .ok_or_else(|| format!("No llama.cpp build for {} {}", hw.os, hw.arch))?;
+            .ok_or_else(|| crate::lang::tf("No llama.cpp build for {} {}", &[&hw.os, &hw.arch]))?;
         ai::spawn(install::install_runtime(dirs, asset, progress)).await
     }
 
@@ -612,7 +612,8 @@ impl AiStore {
             let result = removed.await;
             this.update(cx, |this, cx| {
                 if let Err(e) = result {
-                    this.error = Some(format!("Could not delete {name}: {e}").into());
+                    this.error =
+                        Some(crate::lang::tf("Could not delete {}: {}", &[&name, &e]).into());
                 }
                 this.refresh_disk(cx);
                 cx.notify();
@@ -650,8 +651,9 @@ impl AiStore {
                 match result {
                     Ok(model) => {
                         if this.models().iter().any(|m| m.id == model.id) {
-                            this.error =
-                                Some(format!("{} is already in the list", model.name).into());
+                            this.error = Some(
+                                crate::lang::tf("{} is already in the list", &[&model.name]).into(),
+                            );
                         } else {
                             if matches!(&model.source, Source::File(p) if p.is_file()) {
                                 this.installed.push(model.id.clone());

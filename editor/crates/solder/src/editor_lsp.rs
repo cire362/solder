@@ -924,7 +924,7 @@ impl Editor {
             let found = locations(request.await.ok().flatten(), encoding);
             this.update(cx, |_, cx| {
                 cx.emit(EditorEvent::OpenLocations {
-                    title: "Definitions".into(),
+                    title: crate::lang::t("Definitions").into(),
                     locations: found,
                     always_list: false,
                 })
@@ -958,7 +958,7 @@ impl Editor {
             let found = locations(request.await.ok().flatten(), encoding);
             this.update(cx, |_, cx| {
                 cx.emit(EditorEvent::OpenLocations {
-                    title: "Implementations".into(),
+                    title: crate::lang::t("Implementations").into(),
                     locations: found,
                     always_list: false,
                 })
@@ -1067,7 +1067,7 @@ impl Editor {
             );
             this.update(cx, |_, cx| {
                 cx.emit(EditorEvent::OpenLocations {
-                    title: "References".into(),
+                    title: crate::lang::t("References").into(),
                     locations: found,
                     always_list: true,
                 })

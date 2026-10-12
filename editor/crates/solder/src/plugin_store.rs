@@ -348,10 +348,9 @@ impl PluginStore {
             Err(e) => return PluginState::Invalid(e.clone()),
         };
         if installed.hash.is_empty() {
-            return PluginState::Invalid(format!(
+            return PluginState::Invalid(crate::lang::tf(
                 "Neither {} nor {} is there",
-                plugin::MODULE,
-                plugin::SCRIPT
+                &[&plugin::MODULE, &plugin::SCRIPT],
             ));
         }
         match self.enabled.get(name) {

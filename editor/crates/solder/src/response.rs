@@ -11,6 +11,7 @@ use gpui::{
 use rest::{Request, Response};
 
 use crate::{
+    lang::{t, tf},
     settings::Settings,
     theme::{ActiveTheme, Theme, UI_FONT_SIZE},
     ui,
@@ -99,26 +100,33 @@ impl ResponseView {
         let view = cx.entity();
         let (status, detail): (Option<(String, Hsla)>, String) = match &self.state {
             ResponseState::Empty => (None, String::new()),
-            ResponseState::Sending => (None, "Sending...".into()),
-            ResponseState::Failed(e) => (Some(("Failed".into(), theme.error)), e.to_string()),
+            ResponseState::Sending => (None, t("Sending...").into()),
+            ResponseState::Failed(e) => (Some((t("Failed").into(), theme.error)), e.to_string()),
             ResponseState::Done(r, _) => {
                 let size = r.body.len();
                 let size = if size >= 1024 * 1024 {
-                    format!("{:.1} MB", size as f64 / 1048576.)
+                    tf("{} MB", &[&format!("{:.1}", size as f64 / 1048576.)])
                 } else if size >= 1024 {
-                    format!("{:.1} KB", size as f64 / 1024.)
+                    tf("{} KB", &[&format!("{:.1}", size as f64 / 1024.)])
                 } else {
-                    format!("{size} B")
+                    tf("{} B", &[&size])
                 };
                 (
                     Some((
                         format!("{} {}", r.status, r.reason),
                         Self::status_color(r.status, theme),
                     )),
-                    format!(
-                        "{:.0} ms · {size}{}",
-                        r.elapsed.as_secs_f64() * 1000.,
-                        if r.truncated { " (cut at 10 MB)" } else { "" }
+                    tf(
+                        "{} ms · {}{}",
+                        &[
+                            &format!("{:.0}", r.elapsed.as_secs_f64() * 1000.),
+                            &size,
+                            &if r.truncated {
+                                t(" (cut at 10 MB)")
+                            } else {
+                                ""
+                            },
+                        ],
                     ),
                 )
             }
@@ -167,7 +175,7 @@ impl ResponseView {
             .when(matches!(self.state, ResponseState::Done(..)), |d| {
                 d.child(ui::toggle(
                     "response-body",
-                    "body",
+                    t("body"),
                     "",
                     !self.show_headers,
                     theme,
@@ -183,7 +191,7 @@ impl ResponseView {
                 ))
                 .child(ui::toggle(
                     "response-headers",
-                    "headers",
+                    t("headers"),
                     "",
                     self.show_headers,
                     theme,
@@ -197,7 +205,7 @@ impl ResponseView {
                         }
                     },
                 ))
-                .child(ui::button("response-copy", "Copy", false, theme, {
+                .child(ui::button("response-copy", t("Copy"), false, theme, {
                     let view = view.clone();
                     move |_, _, cx| {
                         let text = view.read(cx).lines().join("\n");

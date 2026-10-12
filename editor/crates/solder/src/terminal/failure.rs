@@ -41,10 +41,9 @@ impl Failure {
             Command::Shell { text } => text.as_str(),
             Command::Program { program, .. } => program.as_str(),
         };
-        format!(
+        crate::lang::tf(
             "Failed command (exit {}): {}",
-            self.status,
-            name.chars().take(120).collect::<String>()
+            &[&self.status, &name.chars().take(120).collect::<String>()],
         )
     }
 
@@ -110,6 +109,28 @@ pub fn output<T: EventListener>(term: &Term<T>) -> (String, bool) {
 mod tests {
     use super::*;
     use alacritty_terminal::event::VoidListener;
+
+    #[test]
+    fn the_failure_label_is_translated_but_model_data_is_not() {
+        let failure = Failure {
+            command: Command::Program {
+                program: "my-tool".into(),
+                args: vec!["--raw".into()],
+            },
+            cwd: PathBuf::from("/project"),
+            status: 7,
+            output: "plain error".into(),
+            limited: false,
+        };
+        let prompt = failure.prompt();
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_eq!(
+            failure.label(),
+            "Команда завершилась с ошибкой (код 7): my-tool"
+        );
+        assert_eq!(failure.prompt(), prompt);
+        crate::lang::set(crate::lang::Language::English);
+    }
 
     struct Size;
     impl Dimensions for Size {

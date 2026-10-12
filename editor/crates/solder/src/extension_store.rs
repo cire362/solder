@@ -141,6 +141,77 @@ enum Heard {
 const SAID: usize = 200;
 const STOPPED: &str = "It ended on its own";
 
+/// Editor-owned notices at a UI boundary. Host replies keep their English values.
+fn notice_label(error: &str) -> String {
+    match error {
+        "Only files can be opened" => return crate::lang::t("Only files can be opened").into(),
+        "Only files can be shown" => return crate::lang::t("Only files can be shown").into(),
+        "Only files can be saved" => return crate::lang::t("Only files can be saved").into(),
+        "A setting has a name" => return crate::lang::t("A setting has a name").into(),
+        "The editor is closing" => return crate::lang::t("The editor is closing").into(),
+        "It ended on its own" => return crate::lang::t("It ended on its own").into(),
+        "Its code named no debug adapter" => {
+            return crate::lang::t("Its code named no debug adapter").into();
+        }
+        "The extension stopped without an answer" => {
+            return crate::lang::t("The extension stopped without an answer").into();
+        }
+        "The extension called the launch off" => {
+            return crate::lang::t("The extension called the launch off").into();
+        }
+        "The debugger was not found" => return crate::lang::t("The debugger was not found").into(),
+        "The extension did not answer. Restart its code in Extensions." => {
+            return crate::lang::t("The extension did not answer. Restart its code in Extensions.")
+                .into();
+        }
+        _ => {}
+    }
+    if let Some(name) = error.strip_suffix(" is not installed") {
+        return crate::lang::tf("{} is not installed", &[&name]);
+    }
+    if let Some(name) = error.strip_suffix(" has no debugger to start") {
+        return crate::lang::tf("{} has no debugger to start", &[&name]);
+    }
+    if let Some(name) = error.strip_suffix(" has no code to ask") {
+        return crate::lang::tf("{} has no code to ask", &[&name]);
+    }
+    if let Some(name) =
+        error.strip_suffix(" says what its debugger is in code, which was not allowed to run")
+    {
+        return crate::lang::tf(
+            "{} says what its debugger is in code, which was not allowed to run",
+            &[&name],
+        );
+    }
+    if let Some(seconds) = error
+        .strip_prefix("It did not answer for ")
+        .and_then(|seconds| seconds.strip_suffix(" s"))
+    {
+        return crate::lang::tf("It did not answer for {} s", &[&seconds]);
+    }
+    if let Some(command) = error.strip_prefix("No command ") {
+        return crate::lang::tf("No command {}", &[&command]);
+    }
+    if let Some(method) = error.strip_prefix("Solder does not do ") {
+        return crate::lang::tf("Solder does not do {}", &[&method]);
+    }
+    error.to_string()
+}
+
+pub(crate) fn error_label(error: &str) -> String {
+    let label = notice_label(error);
+    if label != error {
+        return label;
+    }
+    if let Some((name, detail)) = error.split_once(": ") {
+        let label = notice_label(detail);
+        if label != detail {
+            return format!("{name}: {label}");
+        }
+    }
+    label
+}
+
 /// The snippets of one file and the languages they are for.
 struct SnippetSet {
     /// The extension the file belongs to.
@@ -470,10 +541,12 @@ impl ExtensionStore {
                 let text: Option<SharedString> = match status {
                     Status::Ready => None,
                     Status::CheckingForUpdate => {
-                        Some(format!("Checking {server} for updates...").into())
+                        Some(crate::lang::tf("Checking {} for updates...", &[&server]).into())
                     }
-                    Status::Downloading => Some(format!("Downloading {server}...").into()),
-                    Status::Failed(why) => Some(format!("{server}: {why}").into()),
+                    Status::Downloading => {
+                        Some(crate::lang::tf("Downloading {}...", &[&server]).into())
+                    }
+                    Status::Failed(why) => Some(format!("{server}: {}", error_label(&why)).into()),
                 };
                 let shown = cx.update(|cx| {
                     if let Some(lsp) = LspStore::global(cx) {
@@ -805,7 +878,7 @@ impl ExtensionStore {
                     let choice = import_settings::Choice {
                         settings: vec![import::Setting {
                             key: "icon_theme",
-                            label: "Icon theme",
+                            label: crate::lang::t("Icon theme"),
                             value: chosen.into(),
                         }],
                         ..Default::default()
@@ -2225,5 +2298,24 @@ impl ExtensionStore {
             .ok();
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod language_tests {
+    use super::*;
+
+    #[test]
+    fn host_failure_notices_localize_only_when_displayed() {
+        let raw = format!("probe: {STOPPED}");
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_eq!(error_label(&raw), "probe: Завершилось само");
+        assert_eq!(raw, "probe: It ended on its own");
+        assert_eq!(
+            error_label("probe: provider error"),
+            "probe: provider error"
+        );
+        crate::lang::set(crate::lang::Language::English);
+        assert_eq!(error_label(&raw), raw);
     }
 }

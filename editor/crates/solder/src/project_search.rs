@@ -98,7 +98,7 @@ pub struct ProjectSearch {
 
 impl ProjectSearch {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let query = cx.new(|cx| Editor::single_line(t("Search files"), cx));
+        let query = cx.new(|cx| Editor::localized_field("Search files", cx));
         // Search as you type, after a short pause.
         let subscription = cx.subscribe_in(&query, window, |this, _, e, _, cx| {
             if let EditorEvent::Edited = e {

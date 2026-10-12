@@ -55,7 +55,7 @@ impl AgentPanel {
             workspace,
             root,
             task: None,
-            input: cx.new(|cx| Editor::single_line("Describe a task for the agent", cx)),
+            input: cx.new(|cx| Editor::localized_field("Describe a task for the agent", cx)),
             plan_fields: Vec::new(),
             list: ListState::new(0, ListAlignment::Bottom, px(400.)),
             error: None,
@@ -149,7 +149,7 @@ impl AgentPanel {
 
     fn start(&mut self, text: String, _: &mut Window, cx: &mut Context<Self>) {
         let Some(model) = self.store.read(cx).roles.get(&Role::Chat).cloned() else {
-            self.error = Some("Pick a chat model first: the agent uses it.".into());
+            self.error = Some(crate::lang::t("Pick a chat model first: the agent uses it.").into());
             cx.notify();
             return;
         };
@@ -187,9 +187,9 @@ impl AgentPanel {
             t.status,
             Status::Merged | Status::Discarded | Status::Failed(_)
         ) {
-            "Describe a task for the agent"
+            crate::lang::t("Describe a task for the agent")
         } else {
-            "Tell the agent what to do next"
+            crate::lang::t("Tell the agent what to do next")
         };
         self.input
             .update(cx, |e, _| e.placeholder = Some(placeholder.into()));
@@ -201,7 +201,7 @@ impl AgentPanel {
                     .into_iter()
                     .map(|text| {
                         cx.new(|cx| {
-                            let mut e = Editor::single_line("Step", cx);
+                            let mut e = Editor::localized_field("Step", cx);
                             e.set_text(&text, false, cx);
                             // Show the step from its start.
                             e.select_ranges(std::slice::from_ref(&(0..0)), cx);
@@ -228,7 +228,7 @@ impl AgentPanel {
     }
 
     fn add_step(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let field = cx.new(|cx| Editor::single_line("Step", cx));
+        let field = cx.new(|cx| Editor::localized_field("Step", cx));
         window.focus(&field.focus_handle(cx));
         self.plan_fields.push(field);
         cx.notify();
@@ -348,7 +348,7 @@ impl AgentPanel {
                 div()
                     .text_size(crate::theme::text(11.))
                     .text_color(theme.fg_subtle)
-                    .child("PLAN"),
+                    .child(crate::lang::t("PLAN")),
             );
         if task.status == Status::AwaitingPlan && !self.plan_fields.is_empty() {
             for (i, field) in self.plan_fields.iter().enumerate() {
@@ -389,7 +389,7 @@ impl AgentPanel {
                     .child(
                         ui::button(
                             "agent-approve",
-                            "Approve plan",
+                            crate::lang::t("Approve plan"),
                             true,
                             theme,
                             cx.listener(|this, _, _, cx| this.approve_plan(cx)),
@@ -398,18 +398,15 @@ impl AgentPanel {
                     )
                     .child(ui::button(
                         "agent-add-step",
-                        "Add step",
+                        crate::lang::t("Add step"),
                         false,
                         theme,
                         cx.listener(|this, _, window, cx| this.add_step(window, cx)),
                     )),
             );
-            block = block.child(
-                div()
-                    .text_size(small)
-                    .text_color(theme.fg_subtle)
-                    .child("Edit the steps, or tell the agent below what to change."),
-            );
+            block = block.child(div().text_size(small).text_color(theme.fg_subtle).child(
+                crate::lang::t("Edit the steps, or tell the agent below what to change."),
+            ));
         } else {
             for step in &task.plan {
                 block = block.child(
@@ -437,9 +434,15 @@ impl AgentPanel {
                 reason,
             } => {
                 let what = match access {
-                    Access::Network => "The agent wants to run this with network access:",
-                    Access::Full => "The agent wants to run this outside the sandbox:",
-                    Access::Sandboxed => "There is no sandbox here. The agent wants to run:",
+                    Access::Network => {
+                        crate::lang::t("The agent wants to run this with network access:")
+                    }
+                    Access::Full => {
+                        crate::lang::t("The agent wants to run this outside the sandbox:")
+                    }
+                    Access::Sandboxed => {
+                        crate::lang::t("There is no sandbox here. The agent wants to run:")
+                    }
                 };
                 let (allow, deny) = (task_entity.clone(), task_entity.clone());
                 Some(
@@ -479,7 +482,7 @@ impl AgentPanel {
                                 .child(
                                     ui::button(
                                         "agent-allow",
-                                        "Allow once",
+                                        crate::lang::t("Allow once"),
                                         true,
                                         theme,
                                         move |_, _, cx| {
@@ -491,7 +494,7 @@ impl AgentPanel {
                                 .child(
                                     ui::button(
                                         "agent-deny",
-                                        "Don't run",
+                                        crate::lang::t("Don't run"),
                                         false,
                                         theme,
                                         move |_, _, cx| {
@@ -529,9 +532,9 @@ impl AgentPanel {
                         .text_size(crate::theme::text(11.))
                         .text_color(theme.fg_subtle)
                         .child(match task.changes.len() {
-                            0 => "NO CHANGES".to_string(),
-                            1 => "1 FILE CHANGED".to_string(),
-                            n => format!("{n} FILES CHANGED"),
+                            0 => crate::lang::t("NO CHANGES").to_string(),
+                            1 => crate::lang::t("1 FILE CHANGED").to_string(),
+                            n => crate::lang::tf("{} FILES CHANGED", &[&n]),
                         }),
                 );
                 for (i, change) in task.changes.iter().enumerate() {
@@ -579,7 +582,7 @@ impl AgentPanel {
                             d.child(
                                 ui::button(
                                     "agent-merge",
-                                    "Merge into my branch",
+                                    crate::lang::t("Merge into my branch"),
                                     true,
                                     theme,
                                     move |_, _, cx| merge.update(cx, |t, cx| t.merge(cx)),
@@ -590,7 +593,7 @@ impl AgentPanel {
                         .child(
                             ui::button(
                                 "agent-discard",
-                                "Discard",
+                                crate::lang::t("Discard"),
                                 false,
                                 theme,
                                 move |_, _, cx| discard.update(cx, |t, cx| t.discard(cx)),
@@ -622,20 +625,33 @@ impl Render for AgentPanel {
         };
         let title = self.task.as_ref().map(|t| t.read(cx).title.clone());
         let status_text: Option<(String, gpui::Hsla)> = status.as_ref().map(|s| match s {
-            Status::Starting => ("Making a worktree...".into(), theme.fg_subtle),
+            Status::Starting => (
+                crate::lang::t("Making a worktree...").into(),
+                theme.fg_subtle,
+            ),
             Status::Thinking => {
                 let steps = self.task.as_ref().map_or(0, |t| t.read(cx).steps);
-                (format!("Working, step {steps}..."), theme.accent)
+                (
+                    crate::lang::tf("Working, step {}...", &[&steps]),
+                    theme.accent,
+                )
             }
-            Status::AwaitingPlan => ("Waiting for you to approve the plan".into(), theme.accent),
-            Status::AwaitingApproval { .. } => {
-                ("Waiting for you to allow a command".into(), theme.warning)
-            }
-            Status::Finished => ("Done; review and merge".into(), theme.git_added),
-            Status::Stopped => ("Stopped".into(), theme.fg_subtle),
+            Status::AwaitingPlan => (
+                crate::lang::t("Waiting for you to approve the plan").into(),
+                theme.accent,
+            ),
+            Status::AwaitingApproval { .. } => (
+                crate::lang::t("Waiting for you to allow a command").into(),
+                theme.warning,
+            ),
+            Status::Finished => (
+                crate::lang::t("Done; review and merge").into(),
+                theme.git_added,
+            ),
+            Status::Stopped => (crate::lang::t("Stopped").into(), theme.fg_subtle),
             Status::Failed(e) => (e.to_string(), theme.error),
-            Status::Merged => ("Merged".into(), theme.git_added),
-            Status::Discarded => ("Discarded".into(), theme.fg_subtle),
+            Status::Merged => (crate::lang::t("Merged").into(), theme.git_added),
+            Status::Discarded => (crate::lang::t("Discarded").into(), theme.fg_subtle),
         });
         let busy = status.as_ref().is_some_and(Status::busy);
         let plan = self.render_plan(window, &theme, cx);
@@ -684,11 +700,11 @@ impl Render for AgentPanel {
                                     .truncate()
                                     .text_size(UI_FONT_SIZE)
                                     .text_color(theme.fg)
-                                    .child(title.unwrap_or_else(|| "Agent".into())),
+                                    .child(title.unwrap_or_else(|| crate::lang::t("Agent").into())),
                             )
                             .when(busy || matches!(status, Some(Status::AwaitingApproval { .. })), |d| {
                                 d.child(
-                                    ui::button("agent-stop", "Stop", false, &theme, cx.listener(|this, _, _, cx| {
+                                    ui::button("agent-stop", crate::lang::t("Stop"), false, &theme, cx.listener(|this, _, _, cx| {
                                         if let Some(t) = &this.task {
                                             t.update(cx, |t, cx| t.stop(cx));
                                         }
@@ -700,10 +716,8 @@ impl Render for AgentPanel {
                     .child(match status_text {
                         Some((text, color)) => div().text_size(small).text_color(color).child(text),
                         None => div().text_size(small).text_color(theme.fg_subtle).child(match &model {
-                            Some(m) => format!(
-                                "Uses {m}. It works on its own branch from your last commit: you approve its plan, allow commands that need more than the sandbox, then review and merge."
-                            ),
-                            None => "Pick a chat model first; the agent uses it.".into(),
+                            Some(m) => crate::lang::tf("Uses {}. It works on its own branch from your last commit: you approve its plan, allow commands that need more than the sandbox, then review and merge.", &[&m]),
+                            None => crate::lang::t("Pick a chat model first; the agent uses it.").into(),
                         }),
                     }),
             )
@@ -725,13 +739,13 @@ impl Render for AgentPanel {
                                 .text_size(small)
                                 .text_color(theme.fg_muted)
                                 .child(if n == 1 {
-                                    "An earlier task left its branch and worktree.".to_string()
+                                    crate::lang::t("An earlier task left its branch and worktree.").to_string()
                                 } else {
-                                    format!("{n} earlier tasks left their branches and worktrees.")
+                                    crate::lang::tf("{} earlier tasks left their branches and worktrees.", &[&n])
                                 }),
                         )
                         .child(
-                            ui::button("agent-leftovers", "Remove", false, &theme, cx.listener(|this, _, _, cx| this.remove_leftovers(cx)))
+                            ui::button("agent-leftovers", crate::lang::t("Remove"), false, &theme, cx.listener(|this, _, _, cx| this.remove_leftovers(cx)))
                                 .debug_selector(|| "agent-leftovers".into()),
                         ),
                 )
@@ -757,7 +771,7 @@ impl Render for AgentPanel {
                     .child(
                         ui::button(
                             "agent-submit",
-                            if placeholder_new { "Start" } else { "Send" },
+                            if placeholder_new { crate::lang::t("Start") } else { crate::lang::t("Send") },
                             placeholder_new,
                             &theme,
                             cx.listener(move |this, _, window, cx| {

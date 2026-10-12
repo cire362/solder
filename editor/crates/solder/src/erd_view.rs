@@ -21,6 +21,7 @@ use gpui::{
 use crate::{
     database::{DatabaseEvent, DatabaseStore},
     editor::Editor,
+    lang::{t, tf},
     theme::{ActiveTheme, Theme, UI_FONT_SIZE},
     ui,
 };
@@ -113,7 +114,7 @@ impl ErdView {
             pan: (0., 0.),
             zoom: 1.,
             selected: None,
-            search: cx.new(|cx| Editor::single_line("Find a table", cx)),
+            search: cx.new(|cx| Editor::localized_field("Find a table", cx)),
             drag: None,
             canvas: Bounds::default(),
             fit_pending: true,
@@ -344,7 +345,7 @@ impl ErdView {
         self.save = Some(cx.spawn(async move |this, cx| {
             if let Err(e) = write.await {
                 this.update(cx, |this, cx| {
-                    this.notice = Some(format!("Could not save the layout: {e}").into());
+                    this.notice = Some(tf("Could not save the layout: {}", &[&e]).into());
                     cx.notify();
                 })
                 .ok();
@@ -403,7 +404,7 @@ impl ErdView {
             let result = write.await;
             this.update(cx, |this, cx| {
                 this.notice = Some(match result {
-                    Ok(()) => format!("Saved {}", path.display()).into(),
+                    Ok(()) => tf("Saved {}", &[&path.display()]).into(),
                     Err(e) => e.into(),
                 });
                 cx.notify();
@@ -420,7 +421,7 @@ impl ErdView {
 
     pub fn copy_mermaid(&mut self, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(erd::mermaid(&self.diagram)));
-        self.notice = Some("Copied the diagram as Mermaid".into());
+        self.notice = Some(t("Copied the diagram as Mermaid").into());
         cx.notify();
     }
 
@@ -480,7 +481,7 @@ impl ErdView {
             .child(act("erd-zoom-in", "+", false, |this, cx| {
                 this.zoom_by(1.25, None, cx)
             }))
-            .child(act("erd-fit", "Fit", false, Self::fit))
+            .child(act("erd-fit", t("Fit"), false, Self::fit))
             .child(act("erd-mermaid", "Mermaid", false, Self::copy_mermaid))
             .child(act("erd-svg", "SVG", false, |this, cx| {
                 this.export("svg", cx)
@@ -488,7 +489,7 @@ impl ErdView {
             .child(act("erd-png", "PNG", false, |this, cx| {
                 this.export("png", cx)
             }))
-            .child(act("erd-new-table", "New table", true, |_, cx| {
+            .child(act("erd-new-table", t("New table"), true, |_, cx| {
                 cx.emit(ErdEvent::Structure(None))
             }))
     }
@@ -535,12 +536,12 @@ impl ErdView {
                         .items_center()
                         .gap_2()
                         .child(div().text_color(theme.fg).child(n.name.clone()))
-                        .child(ui::button("erd-data", "Data", false, theme, {
+                        .child(ui::button("erd-data", t("Data"), false, theme, {
                             let (view, object) = (view.clone(), object.clone());
                             move |_, _, cx| view.update(cx, |_, cx| cx.emit(ErdEvent::Browse(object.clone())))
                         }))
                         .when(!n.view, |d| {
-                            d.child(ui::button("erd-structure", "Structure", false, theme, {
+                            d.child(ui::button("erd-structure", t("Structure"), false, theme, {
                                 let (view, object) = (view.clone(), object.clone());
                                 move |_, _, cx| {
                                     view.update(cx, |_, cx| cx.emit(ErdEvent::Structure(Some(object.clone()))))
@@ -551,7 +552,7 @@ impl ErdView {
                             div()
                                 .text_size(px(11.5))
                                 .text_color(theme.fg_subtle)
-                                .child("Drag from a column's right edge onto another column to add a foreign key"),
+                                .child(t("Drag from a column's right edge onto another column to add a foreign key")),
                         ),
                 )
                 .children(relations.into_iter().enumerate().map(|(k, (label, query))| {
@@ -562,7 +563,7 @@ impl ErdView {
                         .gap_2()
                         .text_size(px(11.5))
                         .child(div().font_family(crate::theme::CODE_FONT).text_color(theme.fg_muted).child(label))
-                        .child(ui::button(("erd-join", k), "Join", false, theme, move |_, _, cx| {
+                        .child(ui::button(("erd-join", k), t("Join"), false, theme, move |_, _, cx| {
                             view.update(cx, |_, cx| cx.emit(ErdEvent::RunQuery(query.clone())))
                         }))
                 })),
@@ -635,7 +636,7 @@ impl ErdView {
                             .text_color(theme.fg)
                             .child(n.name.clone())
                             .when(n.view, |d| {
-                                d.child(div().text_color(theme.fg_subtle).child("view"))
+                                d.child(div().text_color(theme.fg_subtle).child(t("view")))
                             }),
                     )
                     .children(n.fields.iter().map(|f| {
@@ -773,7 +774,7 @@ impl Render for ErdView {
                             div()
                                 .p_4()
                                 .text_color(theme.fg_subtle)
-                                .child("Reading the schema..."),
+                                .child(t("Reading the schema...")),
                         )
                     }),
             )

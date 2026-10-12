@@ -85,7 +85,7 @@ fn base(root: &Path) -> Option<String> {
 
 /// The commits and diff a push of `HEAD` would send.
 pub fn outgoing(root: &Path) -> Result<Outgoing, String> {
-    git(root, &["rev-parse", "HEAD"]).ok_or("There are no commits to push")?;
+    git(root, &["rev-parse", "HEAD"]).ok_or(crate::lang::t("There are no commits to push"))?;
     let base = base(root);
     let range = match &base {
         Some(b) => format!("{b}..HEAD"),
@@ -110,7 +110,7 @@ pub fn outgoing(root: &Path) -> Result<Outgoing, String> {
         Some(b) => git(root, &["diff", "--no-color", "-U3", &format!("{b}...HEAD")]),
         None => git(root, &["show", "--no-color", "-U3", "--format=", "HEAD"]),
     }
-    .ok_or("Could not read the diff")?;
+    .ok_or(crate::lang::t("Could not read the diff"))?;
     let (diff, skipped) = filter(root, &diff);
     Ok(Outgoing {
         base,

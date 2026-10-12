@@ -1,5 +1,6 @@
 //! The Git tab in the sidebar: branch, commit box and changed files.
 
+use crate::lang::{t, tf};
 use std::path::PathBuf;
 
 use gpui::{
@@ -72,10 +73,10 @@ enum Section {
 impl Section {
     fn title(self) -> &'static str {
         match self {
-            Section::Conflicts => "Conflicts",
-            Section::Staged => "Staged",
-            Section::Changes => "Changes",
-            Section::Untracked => "Untracked",
+            Section::Conflicts => t("Conflicts"),
+            Section::Staged => t("Staged"),
+            Section::Changes => t("Changes"),
+            Section::Untracked => t("Untracked"),
         }
     }
 }
@@ -92,9 +93,18 @@ pub enum PushReview {
     Running(String),
     Found {
         review: ai::review::Review,
+        // Model context, never used as a UI label.
         summary: String,
     },
     Failed(SharedString),
+}
+
+fn review_progress(commits: usize) -> String {
+    if commits == 1 {
+        tf("Reviewing {} commit before the push...", &[&commits])
+    } else {
+        tf("Reviewing {} commits before the push...", &[&commits])
+    }
 }
 
 pub struct GitPanel {
@@ -120,7 +130,7 @@ pub struct GitPanel {
 
 impl GitPanel {
     pub fn new(root: PathBuf, git: Entity<GitStore>, cx: &mut Context<Self>) -> Self {
-        let message = cx.new(|cx| Editor::single_line("Commit message", cx));
+        let message = cx.new(|cx| Editor::localized_field("Commit message", cx));
         let subscription = cx.observe(&git, |this, git, cx| {
             if this.pull_request.as_ref().is_some_and(|panel| {
                 git.read(cx).status().branch.as_deref() != Some(panel.read(cx).branch.as_str())
@@ -169,7 +179,7 @@ impl GitPanel {
                 match result {
                     Ok(stashes) => this.stashes = Some(stashes),
                     Err(e) => this.git.update(cx, |g, cx| {
-                        g.last_error = Some(e.0.into());
+                        g.last_error = Some(crate::git_store::error_label(&e).into());
                         cx.notify();
                     }),
                 }
@@ -214,9 +224,9 @@ impl GitPanel {
         let answer = (operation == "drop").then(|| {
             window.prompt(
                 PromptLevel::Warning,
-                "Delete this stash?",
-                Some("Its saved changes will be lost."),
-                &["Delete", "Cancel"],
+                t("Delete this stash?"),
+                Some(t("Its saved changes will be lost.")),
+                &[t("Delete"), t("Cancel")],
                 cx,
             )
         });
@@ -263,9 +273,9 @@ impl GitPanel {
                 .text_size(UI_FONT_SIZE)
                 .text_color(theme.fg_subtle)
                 .child(if self.stash_busy {
-                    "Working..."
+                    t("Working...")
                 } else {
-                    "No stashes"
+                    t("No stashes")
                 })
                 .into_any_element();
         }
@@ -291,35 +301,42 @@ impl GitPanel {
                                         .text_color(theme.fg)
                                         .child(format!("{} {}", stash.reference, stash.subject)),
                                 )
-                                .child(div().flex().gap_1().children(
-                                    [("Apply", "apply"), ("Pop", "pop"), ("Delete", "drop")].map(
-                                        |(label, operation)| {
-                                            let id = stash.id.clone();
-                                            ui::button(
-                                                (
-                                                    "stash-action",
-                                                    ix * 3
-                                                        + match operation {
-                                                            "apply" => 0,
-                                                            "pop" => 1,
-                                                            _ => 2,
-                                                        },
-                                                ),
-                                                label,
-                                                false,
-                                                &theme,
-                                                cx.listener(move |this, _, window, cx| {
-                                                    this.stash_action(
-                                                        id.clone(),
-                                                        operation,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                }),
-                                            )
-                                        },
+                                .child(
+                                    div().flex().gap_1().children(
+                                        [
+                                            (t("Apply"), "apply"),
+                                            (t("Pop"), "pop"),
+                                            (t("Delete"), "drop"),
+                                        ]
+                                        .map(
+                                            |(label, operation)| {
+                                                let id = stash.id.clone();
+                                                ui::button(
+                                                    (
+                                                        "stash-action",
+                                                        ix * 3
+                                                            + match operation {
+                                                                "apply" => 0,
+                                                                "pop" => 1,
+                                                                _ => 2,
+                                                            },
+                                                    ),
+                                                    label,
+                                                    false,
+                                                    &theme,
+                                                    cx.listener(move |this, _, window, cx| {
+                                                        this.stash_action(
+                                                            id.clone(),
+                                                            operation,
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    }),
+                                                )
+                                            },
+                                        ),
                                     ),
-                                ))
+                                )
                         })
                     })
                     .collect()
@@ -395,7 +412,7 @@ impl GitPanel {
             .as_ref()
             .and_then(|s| s.read(cx).roles.get(&ai::Role::Chat).cloned());
         let (Some(store), Some(model)) = (store, model) else {
-            self.generation_note = Some("Choose a chat model first.".into());
+            self.generation_note = Some(t("Choose a chat model first.").into());
             cx.notify();
             return;
         };
@@ -428,16 +445,16 @@ impl GitPanel {
                 ))
                 .await?;
                 if step.stop == ai::tools::Stop::Length || !step.calls.is_empty() {
-                    return Err("The model gave no complete commit subject.".into());
+                    return Err(t("The model gave no complete commit subject.").into());
                 }
                 let subject = crate::ai_commit::subject(&step.text)?;
                 let tree = cx
                     .background_executor()
                     .spawn(async move { repo.run(&["write-tree"]) })
                     .await
-                    .map_err(|e| e.0)?;
+                    .map_err(|e| crate::git_store::error_label(&e))?;
                 if String::from_utf8_lossy(&tree).trim() != staged.tree {
-                    return Err("Staged changes moved. Generate the message again.".into());
+                    return Err(t("Staged changes moved. Generate the message again.").into());
                 }
                 Ok::<_, String>((subject, staged.skipped))
             }
@@ -451,10 +468,11 @@ impl GitPanel {
                             this.message
                                 .update(cx, |e, cx| e.set_text(&subject, false, cx));
                             this.generation_note = (!skipped.is_empty())
-                                .then(|| format!("Left out: {}", skipped.join(", ")).into());
+                                .then(|| tf("Left out: {}", &[&skipped.join(", ")]).into());
                         } else {
-                            this.generation_note =
-                                Some(format!("Your message was kept. Suggested: {subject}").into());
+                            this.generation_note = Some(
+                                tf("Your message was kept. Suggested: {}", &[&subject]).into(),
+                            );
                         }
                     }
                     Err(e) => this.generation_note = Some(e.into()),
@@ -484,7 +502,9 @@ impl GitPanel {
             return;
         }
         let root = self.root.clone();
-        self.review = Some(PushReview::Running("Reading what the push sends...".into()));
+        self.review = Some(PushReview::Running(
+            t("Reading what the push sends...").into(),
+        ));
         cx.notify();
         let outgoing = cx
             .background_executor()
@@ -510,13 +530,9 @@ impl GitPanel {
                 .ok();
                 return;
             }
-            let summary = outgoing.summary();
+            let model_summary = outgoing.summary();
             this.update(cx, |this, cx| {
-                let n = outgoing.commits.len();
-                this.review = Some(PushReview::Running(format!(
-                    "Reviewing {n} commit{} before the push...",
-                    if n == 1 { "" } else { "s" }
-                )));
+                this.review = Some(PushReview::Running(review_progress(outgoing.commits.len())));
                 cx.notify();
             })
             .ok();
@@ -533,7 +549,7 @@ impl GitPanel {
                 ai::spawn(ai::review::review(
                     endpoint,
                     name,
-                    summary.clone(),
+                    model_summary.clone(),
                     outgoing.diff,
                 ))
                 .await
@@ -546,7 +562,12 @@ impl GitPanel {
                         this.review = None;
                         window.dispatch_action(Box::new(Push), cx);
                     }
-                    Ok(review) => this.review = Some(PushReview::Found { review, summary }),
+                    Ok(review) => {
+                        this.review = Some(PushReview::Found {
+                            review,
+                            summary: model_summary,
+                        })
+                    }
                     Err(e) => this.review = Some(PushReview::Failed(e.into())),
                 }
                 cx.notify();
@@ -592,7 +613,7 @@ impl GitPanel {
                 .child(
                     ui::button(
                         "review-cancel",
-                        "Cancel",
+                        t("Cancel"),
                         false,
                         theme,
                         cx.listener(|this, _, window, cx| this.end_review(false, window, cx)),
@@ -610,7 +631,7 @@ impl GitPanel {
                             .text_color(theme.fg_muted)
                             .child(text.clone()),
                     )
-                    .child(buttons("Push without review", cx));
+                    .child(buttons(t("Push without review"), cx));
             }
             PushReview::Failed(e) => {
                 block = block
@@ -619,17 +640,21 @@ impl GitPanel {
                         div()
                             .text_size(small)
                             .text_color(theme.error)
-                            .child(format!("The review failed: {e}")),
+                            .child(tf("The review failed: {}", &[&e])),
                     )
-                    .child(buttons("Push anyway", cx));
+                    .child(buttons(t("Push anyway"), cx));
             }
             PushReview::Found { review, .. } => {
                 let n = review.findings.len();
                 block = block.border_color(theme.warning).child(
-                    div().text_size(small).text_color(theme.fg).child(format!(
-                        "The review found {n} problem{} before the push:",
-                        if n == 1 { "" } else { "s" }
-                    )),
+                    div()
+                        .text_size(small)
+                        .text_color(theme.fg)
+                        .child(if n == 1 {
+                            tf("The review found {} problem before the push:", &[&n])
+                        } else {
+                            tf("The review found {} problems before the push:", &[&n])
+                        }),
                 );
                 for (i, f) in review.findings.iter().enumerate() {
                     let color = match f.severity {
@@ -658,7 +683,11 @@ impl GitPanel {
                                     .flex()
                                     .gap_1p5()
                                     .text_size(crate::theme::text(11.))
-                                    .child(div().text_color(color).child(f.severity.label()))
+                                    .child(div().text_color(color).child(match f.severity {
+                                        ai::review::Severity::Bug => t("bug"),
+                                        ai::review::Severity::Risk => t("risk"),
+                                        ai::review::Severity::Note => t("note"),
+                                    }))
                                     .child(
                                         div()
                                             .truncate()
@@ -686,7 +715,7 @@ impl GitPanel {
                             .child(review.note.clone()),
                     );
                 }
-                block = block.child(buttons("Push anyway", cx));
+                block = block.child(buttons(t("Push anyway"), cx));
             }
         }
         Some(block.into_any_element())
@@ -758,9 +787,9 @@ impl GitPanel {
     fn discard(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         let answer = window.prompt(
             PromptLevel::Warning,
-            &format!("Discard changes to {path}?"),
-            Some("This restores the staged version. It cannot be undone."),
-            &["Discard", "Cancel"],
+            &tf("Discard changes to {}?", &[&path]),
+            Some(t("This restores the staged version. It cannot be undone.")),
+            &[t("Discard"), t("Cancel")],
             cx,
         );
         let git = self.git.clone();
@@ -825,11 +854,13 @@ impl GitPanel {
             Row::Header(section, count) => {
                 let section = *section;
                 let action: Option<(&'static str, SectionAction)> = match section {
-                    Section::Staged => Some(("Unstage all", |this, w, cx| {
+                    Section::Staged => Some((t("Unstage all"), |this, w, cx| {
                         this.unstage_all(&UnstageAll, w, cx)
                     })),
                     Section::Changes | Section::Untracked => {
-                        Some(("Stage all", |this, w, cx| this.stage_all(&StageAll, w, cx)))
+                        Some((t("Stage all"), |this, w, cx| {
+                            this.stage_all(&StageAll, w, cx)
+                        }))
                     }
                     Section::Conflicts => None,
                 };
@@ -1023,10 +1054,10 @@ impl Render for GitPanel {
                 .gap_3()
                 .text_size(UI_FONT_SIZE)
                 .text_color(theme.fg_muted)
-                .child("This folder is not a git repository.")
+                .child(t("This folder is not a git repository."))
                 .child(ui::button(
                     "git-init",
-                    "Initialize repository",
+                    t("Initialize repository"),
                     true,
                     &theme,
                     {
@@ -1045,11 +1076,11 @@ impl Render for GitPanel {
         let branch: SharedString = status
             .branch
             .clone()
-            .unwrap_or_else(|| "detached HEAD".into())
+            .unwrap_or_else(|| t("detached HEAD").into())
             .into();
         let sync = match (status.ahead, status.behind) {
             (0, 0) if status.upstream.is_some() => String::new(),
-            (0, 0) => "no upstream".into(),
+            (0, 0) => t("no upstream").into(),
             (a, 0) => format!("↑{a}"),
             (0, b) => format!("↓{b}"),
             (a, b) => format!("↑{a} ↓{b}"),
@@ -1103,14 +1134,20 @@ impl Render for GitPanel {
                                     }),
                             )
                             .child(
-                                ui::button("git-push", "Push", false, &theme, |_, window, cx| {
-                                    window.dispatch_action(Box::new(ReviewAndPush), cx)
-                                })
+                                ui::button(
+                                    "git-push",
+                                    t("Push"),
+                                    false,
+                                    &theme,
+                                    |_, window, cx| {
+                                        window.dispatch_action(Box::new(ReviewAndPush), cx)
+                                    },
+                                )
                                 .debug_selector(|| "git-push".into()),
                             )
                             .child(ui::button(
                                 "git-pr",
-                                "PR",
+                                t("PR"),
                                 false,
                                 &theme,
                                 |_, window, cx| {
@@ -1124,21 +1161,21 @@ impl Render for GitPanel {
                             .gap_1()
                             .child(ui::button(
                                 "git-history-button",
-                                "History",
+                                t("History"),
                                 false,
                                 &theme,
                                 |_, window, cx| window.dispatch_action(Box::new(History), cx),
                             ))
                             .child(ui::button(
                                 "git-file-history",
-                                "File history",
+                                t("File history"),
                                 false,
                                 &theme,
                                 |_, window, cx| window.dispatch_action(Box::new(FileHistory), cx),
                             ))
                             .child(ui::button(
                                 "git-blame",
-                                "Blame",
+                                t("Blame"),
                                 false,
                                 &theme,
                                 |_, window, cx| window.dispatch_action(Box::new(ToggleBlame), cx),
@@ -1150,7 +1187,7 @@ impl Render for GitPanel {
                             .gap_1()
                             .child(ui::button(
                                 "git-stash",
-                                "Stash",
+                                t("Stash"),
                                 false,
                                 &theme,
                                 cx.listener(|this, _, window, cx| {
@@ -1160,9 +1197,9 @@ impl Render for GitPanel {
                             .child(ui::button(
                                 "git-stashes",
                                 if self.stashes.is_some() {
-                                    "Changes"
+                                    t("Changes")
                                 } else {
-                                    "Stashes"
+                                    t("Stashes")
                                 },
                                 false,
                                 &theme,
@@ -1180,7 +1217,7 @@ impl Render for GitPanel {
                             ))
                             .child(ui::button(
                                 "git-fetch",
-                                "Fetch",
+                                t("Fetch"),
                                 false,
                                 &theme,
                                 cx.listener(|this, _, window, cx| this.fetch(&Fetch, window, cx)),
@@ -1190,15 +1227,15 @@ impl Render for GitPanel {
                         div()
                             .text_size(crate::theme::UI_FONT_SMALL)
                             .text_color(theme.fg_subtle)
-                            .child("Working...")
+                            .child(t("Working..."))
                     }))
                     .children(self.render_review(&theme, cx))
                     .child(ui::button(
                         "git-generate-message",
                         if self.generating {
-                            "Cancel suggestion"
+                            t("Cancel suggestion")
                         } else {
-                            "Suggest message"
+                            t("Suggest message")
                         },
                         false,
                         &theme,
@@ -1225,7 +1262,7 @@ impl Render for GitPanel {
                             .child(
                                 ui::button(
                                     "git-commit",
-                                    if amend { "Amend" } else { "Commit" },
+                                    if amend { t("Amend") } else { t("Commit") },
                                     true,
                                     &theme,
                                     {
@@ -1239,8 +1276,8 @@ impl Render for GitPanel {
                             )
                             .child(ui::toggle(
                                 "git-amend",
-                                "amend",
-                                "Amend last commit",
+                                t("amend"),
+                                t("Amend last commit"),
                                 amend,
                                 &theme,
                                 {
@@ -1274,7 +1311,7 @@ impl Render for GitPanel {
                     .py_2()
                     .text_size(UI_FONT_SIZE)
                     .text_color(theme.fg_subtle)
-                    .child("No changes")
+                    .child(t("No changes"))
                     .into_any_element()
             } else {
                 uniform_list(
@@ -1345,7 +1382,7 @@ impl BranchPicker {
 
 impl crate::picker::PickerDelegate for BranchPicker {
     fn placeholder(&self) -> SharedString {
-        "Switch to branch, or type a new name".into()
+        t("Switch to branch, or type a new name").into()
     }
 
     fn match_count(&self) -> usize {
@@ -1419,7 +1456,7 @@ impl crate::picker::PickerDelegate for BranchPicker {
                 theme.accent,
             )
             .into_any_element(),
-            None => format!("Create branch \u{201c}{}\u{201d}", self.query).into_any_element(),
+            None => tf("Create branch \u{201c}{}\u{201d}", &[&self.query]).into_any_element(),
         };
         div()
             .text_size(UI_FONT_SIZE)
@@ -1429,6 +1466,37 @@ impl crate::picker::PickerDelegate for BranchPicker {
     }
 
     fn empty_text(&self) -> SharedString {
-        "Loading branches...".into()
+        t("Loading branches...").into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lang::{self, Language};
+
+    #[test]
+    fn russian_review_progress_keeps_the_model_summary_in_english() {
+        let outgoing = crate::ai_review::Outgoing {
+            base: Some("origin/main".into()),
+            commits: vec!["abc123 Fix parser".into()],
+            diff: "diff --git a/parser.rs b/parser.rs".into(),
+            skipped: vec!["private.txt".into()],
+        };
+        let model_summary = outgoing.summary();
+        assert_eq!(review_progress(1), "Reviewing 1 commit before the push...");
+        lang::set(Language::Russian);
+        assert_eq!(
+            review_progress(1),
+            "Проверка коммита (1) перед отправкой..."
+        );
+        assert_eq!(
+            review_progress(2),
+            "Проверка коммитов (2) перед отправкой..."
+        );
+        assert_eq!(outgoing.summary(), model_summary);
+        assert!(model_summary.starts_with("1 commit to push onto origin/main:"));
+        assert!(model_summary.contains("Left out of the diff: private.txt"));
+        lang::set(Language::English);
     }
 }

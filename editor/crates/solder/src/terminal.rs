@@ -223,7 +223,8 @@ impl Terminal {
                 Ok(started) => started,
                 Err(error) => {
                     this.update(cx, |this, cx| {
-                        this.startup_error = Some(format!("Could not start terminal: {error}"));
+                        this.startup_error =
+                            Some(crate::lang::tf("Could not start terminal: {}", &[&error]));
                         this.keep_on_exit = true;
                         this.exited = true;
                         cx.emit(TerminalEvent::Exited);
@@ -880,7 +881,7 @@ impl Render for Terminal {
                     .child(
                         crate::ui::button(
                             "terminal-help",
-                            "Help fix",
+                            crate::lang::t("Help fix"),
                             false,
                             &theme,
                             cx.listener(|this, _, _, cx| this.help(cx)),

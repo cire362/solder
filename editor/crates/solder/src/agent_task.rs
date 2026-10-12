@@ -104,22 +104,22 @@ pub struct AgentTask {
 fn describe(call: &ToolCall) -> String {
     let s = |k: &str| call.input[k].as_str().unwrap_or("").to_string();
     match call.name.as_str() {
-        "list_files" => format!(
+        "list_files" => crate::lang::tf(
             "Listed {}",
-            if s("path").is_empty() {
+            &[&if s("path").is_empty() {
                 ".".into()
             } else {
                 s("path")
-            }
+            }],
         ),
-        "read_file" => format!("Read {}", s("path")),
-        "search" => format!("Searched for {}", s("pattern")),
-        "write_file" => format!("Wrote {}", s("path")),
-        "edit_file" => format!("Edited {}", s("path")),
-        "run" => format!("Ran {}", s("command")),
-        "update_plan" => "Updated the plan".into(),
-        "finish" => "Finished".into(),
-        other => format!("Called {other}"),
+        "read_file" => crate::lang::tf("Read {}", &[&s("path")]),
+        "search" => crate::lang::tf("Searched for {}", &[&s("pattern")]),
+        "write_file" => crate::lang::tf("Wrote {}", &[&s("path")]),
+        "edit_file" => crate::lang::tf("Edited {}", &[&s("path")]),
+        "run" => crate::lang::tf("Ran {}", &[&s("command")]),
+        "update_plan" => crate::lang::t("Updated the plan").into(),
+        "finish" => crate::lang::t("Finished").into(),
+        other => crate::lang::tf("Called {}", &[&other]),
     }
 }
 
@@ -162,15 +162,11 @@ impl AgentTask {
             let created = created.await;
             this.update(cx, |this, cx| match created {
                 Ok((wt, sandbox)) => {
-                    this.entries.push(Entry::Note(format!(
-                        "Working on branch {} from the last commit{}.",
-                        wt.branch,
-                        if sandbox == Sandbox::None {
-                            "; there is no sandbox here, so every command asks first"
-                        } else {
-                            ""
-                        }
-                    )));
+                    this.entries.push(Entry::Note(if sandbox == Sandbox::None {
+                        crate::lang::tf("Working on branch {} from the last commit; there is no sandbox here, so every command asks first.", &[&wt.branch])
+                    } else {
+                        crate::lang::tf("Working on branch {} from the last commit.", &[&wt.branch])
+                    }));
                     this.worktree = Some(wt);
                     this.sandbox = sandbox;
                     this.connect(cx);
@@ -195,8 +191,9 @@ impl AgentTask {
             ready.await;
             this.update(cx, |this, cx| {
                 for (name, why) in store.read(cx).failures() {
-                    this.entries.push(Entry::Note(format!(
-                        "The context server {name} did not start: {why}"
+                    this.entries.push(Entry::Note(crate::lang::tf(
+                        "The context server {} did not start: {}",
+                        &[&name, &why],
                     )));
                 }
                 this.next(cx);
@@ -208,7 +205,10 @@ impl AgentTask {
     /// What a call is called in the list of what the agent did.
     fn title(&self, call: &ToolCall) -> String {
         match self.mcp.iter().find(|tool| tool.spec.name == call.name) {
-            Some(tool) => format!("Called {} of {}", tool.tool, tool.server_name),
+            Some(tool) => crate::lang::tf(
+                "Called {} of {}",
+                &[&tool.display_label(), &tool.server_name],
+            ),
             None => describe(call),
         }
     }
@@ -310,8 +310,9 @@ impl AgentTask {
     fn next(&mut self, cx: &mut Context<Self>) {
         self.mcp = McpStore::global(cx).read(cx).tools();
         if self.steps >= MAX_STEPS {
-            self.entries.push(Entry::Note(format!(
-                "Stopped after {MAX_STEPS} steps. Say how to continue, or review what changed."
+            self.entries.push(Entry::Note(crate::lang::tf(
+                "Stopped after {} steps. Say how to continue, or review what changed.",
+                &[&MAX_STEPS],
             )));
             self.status = Status::Stopped;
             self.refresh_changes(cx);
@@ -387,7 +388,7 @@ impl AgentTask {
     /// needs the user.
     fn run_pending(&mut self, approved_first: bool, cx: &mut Context<Self>) {
         let Some(toolbox) = self.toolbox() else {
-            return self.fail("The worktree is gone".into(), cx);
+            return self.fail(crate::lang::t("The worktree is gone").into(), cx);
         };
         let calls = std::mem::take(&mut self.pending);
         let phase = self.phase;
@@ -416,10 +417,7 @@ impl AgentTask {
                         Outcome::NeedsApproval {
                             command: tool.shown(&c.input),
                             access: Access::Full,
-                            reason: format!(
-                                "{} is a context server. Allowing this lets the task call this tool again without asking.",
-                                tool.server_name
-                            ),
+                            reason: crate::lang::tf("{} is a context server. Allowing this lets the task call this tool again without asking.", &[&tool.server_name]),
                         }
                     }
                     Some(tool) => {
@@ -578,7 +576,8 @@ impl AgentTask {
         self.turns.push(Turn::User(format!(
             "The plan is approved:\n{list}Carry it out now. Mark steps done with update_plan and call finish when the work is checked."
         )));
-        self.entries.push(Entry::Note("Plan approved.".into()));
+        self.entries
+            .push(Entry::Note(crate::lang::t("Plan approved.").into()));
         self.phase = Phase::Working;
         self.next(cx);
     }
@@ -595,10 +594,16 @@ impl AgentTask {
             if let Some(call) = calls.next() {
                 self.entries.push(Entry::Tool {
                     title: self.title(&call),
-                    output: "Declined by the user.".into(),
+                    output: crate::lang::t("Declined by the user.").into(),
                     error: true,
                     open: false,
                 });
+                let command = self
+                    .mcp
+                    .iter()
+                    .find(|tool| tool.spec.name == call.name)
+                    .map(|tool| tool.raw_call(&call.input))
+                    .unwrap_or(command);
                 self.results.push(ToolResult {
                     id: call.id,
                     output: format!("The user declined to run `{command}`. Find another way, or explain what is needed."),
@@ -659,7 +664,8 @@ impl AgentTask {
         if self.task.take().is_some() || matches!(self.status, Status::AwaitingApproval { .. }) {
             self.close_open_calls("Not run: the user stopped the task.");
             self.status = Status::Stopped;
-            self.entries.push(Entry::Note("Stopped.".into()));
+            self.entries
+                .push(Entry::Note(crate::lang::t("Stopped.").into()));
             self.refresh_changes(cx);
             self.changed(cx);
         }
@@ -686,8 +692,9 @@ impl AgentTask {
                 match merged {
                     Ok(()) => {
                         this.status = Status::Merged;
-                        this.entries
-                            .push(Entry::Note("Merged into your branch.".into()));
+                        this.entries.push(Entry::Note(
+                            crate::lang::t("Merged into your branch.").into(),
+                        ));
                     }
                     Err(e) => {
                         this.status = Status::Finished;
@@ -707,7 +714,8 @@ impl AgentTask {
         };
         self.task = None;
         self.status = Status::Discarded;
-        self.entries.push(Entry::Note("Discarded.".into()));
+        self.entries
+            .push(Entry::Note(crate::lang::t("Discarded.").into()));
         cx.background_executor()
             .spawn(async move { wt.remove() })
             .detach();
@@ -739,6 +747,31 @@ impl AgentTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn translated_call_titles_keep_tool_names_and_model_instructions() {
+        let call = ToolCall {
+            id: "request-1".into(),
+            name: "run".into(),
+            input: serde_json::json!({"command": "cargo test --workspace"}),
+        };
+        let original = call.clone();
+        let english_specs = agent::specs(Phase::Working);
+        let english_system = SYSTEM;
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_eq!(describe(&call), "Выполнено: cargo test --workspace");
+        assert_eq!(call.name, original.name);
+        assert_eq!(call.input, original.input);
+        let russian_specs = agent::specs(Phase::Working);
+        for (english, russian) in english_specs.iter().zip(&russian_specs) {
+            assert_eq!(english.name, russian.name);
+            assert_eq!(english.description, russian.description);
+            assert_eq!(english.parameters, russian.parameters);
+        }
+        assert_eq!(SYSTEM, english_system);
+        crate::lang::set(crate::lang::Language::English);
+        assert_eq!(describe(&call), "Ran cargo test --workspace");
+    }
 
     #[test]
     fn describes_calls() {
