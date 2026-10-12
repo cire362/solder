@@ -12,6 +12,7 @@ use gpui::{
 };
 
 use crate::{
+    lang::{t, tf},
     services::{self, Container, ServiceSpec},
     terminal::Terminal,
     theme::{ActiveTheme, Theme, UI_FONT_SIZE},
@@ -39,6 +40,19 @@ pub enum Status {
     Running,
     Stopping,
     Exited(Option<i32>),
+}
+
+impl Status {
+    fn label(self, kind: services::ServiceKind) -> String {
+        match self {
+            Self::Running => t("running").into(),
+            Self::Stopping => t("stopping").into(),
+            Self::Exited(Some(0)) => t("exited").into(),
+            Self::Exited(Some(code)) => tf("exited {}", &[&code]),
+            Self::Exited(None) => t("killed").into(),
+            Self::Stopped => kind.label().into(),
+        }
+    }
 }
 
 struct Run {
@@ -357,22 +371,26 @@ impl ServicesPanel {
     }
 
     fn rows(&self) -> Vec<Row> {
-        let mut rows = vec![Row::Header("Services")];
+        let mut rows = vec![Row::Header(t("Services"))];
         if !self.detected {
-            rows.push(Row::Note("Looking for services...".into()));
+            rows.push(Row::Note(t("Looking for services...").into()));
         } else if self.specs.is_empty() {
             rows.push(Row::Note(
-                format!("No services found. Add them in {}.", services::CUSTOM_FILE).into(),
+                tf(
+                    "No services found. Add them in {}.",
+                    &[&services::CUSTOM_FILE],
+                )
+                .into(),
             ));
         }
         rows.extend((0..self.specs.len()).map(Row::Service));
-        rows.push(Row::Header("Containers"));
+        rows.push(Row::Header(t("Containers")));
         if let Some(e) = &self.containers_error {
             rows.push(Row::Note(e.clone()));
         } else if !self.containers_loaded {
-            rows.push(Row::Note("Checking Docker...".into()));
+            rows.push(Row::Note(t("Checking Docker...").into()));
         } else if self.containers.is_empty() {
-            rows.push(Row::Note("No containers".into()));
+            rows.push(Row::Note(t("No containers").into()));
         }
         rows.extend((0..self.containers.len()).map(Row::Container));
         rows
@@ -452,14 +470,13 @@ impl ServicesPanel {
                 let spec = &self.specs[*i];
                 let name = spec.name.clone();
                 let status = self.status(&name, cx);
-                let (dot, label) = match status {
-                    Status::Running => (theme.git_added, "running".to_string()),
-                    Status::Stopping => (theme.warning, "stopping".to_string()),
-                    Status::Exited(Some(0)) => (theme.fg_subtle, "exited".to_string()),
-                    Status::Exited(Some(code)) => (theme.error, format!("exited {code}")),
-                    Status::Exited(None) => (theme.error, "killed".to_string()),
-                    Status::Stopped => (theme.fg_subtle, spec.kind.label().to_string()),
+                let dot = match status {
+                    Status::Running => theme.git_added,
+                    Status::Stopping => theme.warning,
+                    Status::Exited(Some(0)) | Status::Stopped => theme.fg_subtle,
+                    Status::Exited(_) => theme.error,
                 };
+                let label = status.label(spec.kind);
                 let entity = cx.entity();
                 let act = move |f: fn(&mut Self, &str, &mut Context<Self>)| {
                     let entity = entity.clone();
@@ -491,7 +508,7 @@ impl ServicesPanel {
                     .children(Self::port_chips(self.ports(&spec.name), theme))
                     .child(div().flex_1());
                 if let Some(terminal) = terminal {
-                    row = row.child(Self::icon_button(("logs", *i), "Logs", theme, {
+                    row = row.child(Self::icon_button(("logs", *i), t("Logs"), theme, {
                         let entity = cx.entity();
                         move |_, _, cx| {
                             let terminal = terminal.clone();
@@ -503,20 +520,20 @@ impl ServicesPanel {
                     row = row
                         .child(Self::icon_button(
                             ("restart", *i),
-                            "Restart",
+                            t("Restart"),
                             theme,
                             act(Self::restart_named),
                         ))
                         .child(Self::icon_button(
                             ("stop", *i),
-                            "Stop",
+                            t("Stop"),
                             theme,
                             act(Self::stop_named),
                         ));
                 } else {
                     row = row.child(Self::icon_button(
                         ("start", *i),
-                        "Start",
+                        t("Start"),
                         theme,
                         act(Self::start_named),
                     ));
@@ -564,17 +581,17 @@ impl ServicesPanel {
                             .text_color(theme.fg_subtle)
                             .child(format!("{}  {}", c.image, c.status)),
                     )
-                    .child(Self::icon_button(("clogs", *i), "Logs", theme, logs))
+                    .child(Self::icon_button(("clogs", *i), t("Logs"), theme, logs))
                     .when(running, |d| {
                         d.child(Self::icon_button(
                             ("crestart", *i),
-                            "Restart",
+                            t("Restart"),
                             theme,
                             action("restart"),
                         ))
                         .child(Self::icon_button(
                             ("cstop", *i),
-                            "Stop",
+                            t("Stop"),
                             theme,
                             action("stop"),
                         ))
@@ -582,7 +599,7 @@ impl ServicesPanel {
                     .when(!running, |d| {
                         d.child(Self::icon_button(
                             ("cstart", *i),
-                            "Start",
+                            t("Start"),
                             theme,
                             action("start"),
                         ))
@@ -624,15 +641,19 @@ impl Render for ServicesPanel {
                     .flex()
                     .gap_1p5()
                     .child(
-                        ui::button("run-stack", "Run stack", true, &theme, |_, window, cx| {
-                            window.dispatch_action(Box::new(RunStack), cx)
-                        })
+                        ui::button(
+                            "run-stack",
+                            t("Run stack"),
+                            true,
+                            &theme,
+                            |_, window, cx| window.dispatch_action(Box::new(RunStack), cx),
+                        )
                         .flex_1(),
                     )
                     .when(any_running, |d| {
                         d.child(ui::button(
                             "stop-all",
-                            "Stop all",
+                            t("Stop all"),
                             false,
                             &theme,
                             |_, window, cx| window.dispatch_action(Box::new(StopAll), cx),
@@ -640,7 +661,7 @@ impl Render for ServicesPanel {
                     })
                     .child(ui::button(
                         "services-refresh",
-                        "Refresh",
+                        t("Refresh"),
                         false,
                         &theme,
                         |_, window, cx| window.dispatch_action(Box::new(RefreshServices), cx),
@@ -675,5 +696,41 @@ impl Render for ServicesPanel {
                 )
                 .flex_1(),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lang::{self, Language};
+    use services::ServiceKind;
+
+    #[test]
+    fn service_status_labels_follow_language_and_keep_exit_codes() {
+        let language = lang::current();
+        lang::set(Language::English);
+        assert_eq!(
+            Status::Exited(Some(7)).label(ServiceKind::Custom),
+            "exited 7"
+        );
+        assert_eq!(Status::Stopped.label(ServiceKind::Custom), "custom");
+        lang::set(Language::Russian);
+        assert_eq!(Status::Running.label(ServiceKind::Custom), "работает");
+        assert_eq!(
+            Status::Stopping.label(ServiceKind::Custom),
+            "останавливается"
+        );
+        assert_eq!(
+            Status::Exited(Some(0)).label(ServiceKind::Custom),
+            "завершён"
+        );
+        assert_eq!(
+            Status::Exited(Some(7)).label(ServiceKind::Custom),
+            "завершён, код 7"
+        );
+        assert_eq!(Status::Exited(None).label(ServiceKind::Custom), "прерван");
+        assert_eq!(Status::Stopped.label(ServiceKind::Custom), "свой");
+        assert_eq!(Status::Stopped.label(ServiceKind::Rust), "rust");
+        lang::set(language);
     }
 }

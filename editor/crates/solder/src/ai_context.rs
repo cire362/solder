@@ -73,13 +73,13 @@ struct Policy {
 impl Policy {
     fn load(root: &Path) -> Result<Self, String> {
         if !ai::context::allows_file(root) {
-            return Err("This project folder is excluded from AI context.".into());
+            return Err(crate::lang::t("This project folder is excluded from AI context.").into());
         }
         let canonical = root
             .canonicalize()
-            .map_err(|_| "Cannot read the project folder.")?;
+            .map_err(|_| crate::lang::t("Cannot read the project folder."))?;
         if !ai::context::allows_file(&canonical) {
-            return Err("This project folder is excluded from AI context.".into());
+            return Err(crate::lang::t("This project folder is excluded from AI context.").into());
         }
         let path = canonical.join(".solderignore");
         let mut builder = GitignoreBuilder::new(&canonical);
@@ -87,33 +87,33 @@ impl Policy {
         match fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 if !metadata.is_file() || metadata.len() > IGNORE_LIMIT {
-                    return Err("Cannot read .solderignore safely.".into());
+                    return Err(crate::lang::t("Cannot read .solderignore safely.").into());
                 }
                 let mut bytes = Vec::new();
                 File::open(&path)
                     .and_then(|file| file.take(IGNORE_LIMIT + 1).read_to_end(&mut bytes))
-                    .map_err(|_| "Cannot read .solderignore.")?;
+                    .map_err(|_| crate::lang::t("Cannot read .solderignore."))?;
                 if bytes.len() as u64 > IGNORE_LIMIT {
-                    return Err(".solderignore is too large.".into());
+                    return Err(crate::lang::t(".solderignore is too large.").into());
                 }
-                let source =
-                    String::from_utf8(bytes).map_err(|_| ".solderignore must be UTF-8.")?;
+                let source = String::from_utf8(bytes)
+                    .map_err(|_| crate::lang::t(".solderignore must be UTF-8."))?;
                 for line in source.lines() {
                     builder
                         .add_line(Some(path.clone()), line)
-                        .map_err(|_| "Invalid pattern in .solderignore.")?;
+                        .map_err(|_| crate::lang::t("Invalid pattern in .solderignore."))?;
                 }
                 rules = Some(source);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err("Cannot read .solderignore.".into()),
+            Err(_) => return Err(crate::lang::t("Cannot read .solderignore.").into()),
         }
         Ok(Self {
             root: canonical,
             original_root: root.to_path_buf(),
             ignore: builder
                 .build()
-                .map_err(|_| "Invalid pattern in .solderignore.")?,
+                .map_err(|_| crate::lang::t("Invalid pattern in .solderignore."))?,
             rules,
         })
     }
@@ -169,7 +169,7 @@ pub fn allows_path(root: &Path, path: &Path) -> Result<bool, String> {
 pub fn prepare(input: Input, cancelled: &AtomicBool) -> Result<Prepared, String> {
     let stopped = || cancelled.load(Ordering::Relaxed);
     if stopped() {
-        return Err("Context preparation stopped.".into());
+        return Err(crate::lang::t("Context preparation stopped.").into());
     }
     if !input.project && input.file.is_none() && input.history.is_empty() {
         return Ok(Prepared {
@@ -196,15 +196,16 @@ pub fn prepare(input: Input, cancelled: &AtomicBool) -> Result<Prepared, String>
     let mut limited = false;
     for (visited, entry) in walker.build().enumerate() {
         if stopped() {
-            return Err("Context preparation stopped.".into());
+            return Err(crate::lang::t("Context preparation stopped.").into());
         }
         if visited >= SCAN_LIMIT || Instant::now() >= deadline {
             limited = true;
             break;
         }
-        let entry = entry.map_err(|_| "Cannot check the project's context rules.")?;
+        let entry =
+            entry.map_err(|_| crate::lang::t("Cannot check the project's context rules."))?;
         if entry.error().is_some() {
-            return Err("Cannot check the project's context rules.".into());
+            return Err(crate::lang::t("Cannot check the project's context rules.").into());
         }
         if entry.file_type().is_some_and(|kind| kind.is_file()) && entry.path().to_str().is_some() {
             paths.push(entry.into_path());
@@ -216,7 +217,7 @@ pub fn prepare(input: Input, cancelled: &AtomicBool) -> Result<Prepared, String>
         .iter()
         .any(|path| !policy.indexed(path, &files))
     {
-        return Err("Context rules changed. Start a new chat.".into());
+        return Err(crate::lang::t("Context rules changed. Start a new chat.").into());
     }
     let file = input
         .file
@@ -234,7 +235,7 @@ pub fn prepare(input: Input, cancelled: &AtomicBool) -> Result<Prepared, String>
         None
     };
     if Policy::load(&input.root)?.rules != policy.rules {
-        return Err("Context rules changed. Try again.".into());
+        return Err(crate::lang::t("Context rules changed. Try again.").into());
     }
     Ok(Prepared { file, map })
 }
@@ -272,7 +273,7 @@ fn build_map(
     let mut budget = SOURCE_BUDGET;
     for path in paths.into_iter().take(FILE_LIMIT) {
         if cancelled.load(Ordering::Relaxed) {
-            return Err("Context preparation stopped.".into());
+            return Err(crate::lang::t("Context preparation stopped.").into());
         }
         let relative = policy.relative(&path).unwrap();
         let mut entry = serde_json::to_string(&relative.to_string_lossy()).unwrap();

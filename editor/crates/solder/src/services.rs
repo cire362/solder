@@ -16,6 +16,8 @@ use std::{
 use regex::Regex;
 use serde::Deserialize;
 
+use crate::lang::{t, tf};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceKind {
     Node,
@@ -34,7 +36,7 @@ impl ServiceKind {
             ServiceKind::Rust => "rust",
             ServiceKind::Python => "python",
             ServiceKind::Compose => "compose",
-            ServiceKind::Custom => "custom",
+            ServiceKind::Custom => t("custom"),
         }
     }
 }
@@ -473,7 +475,7 @@ pub fn parse_docker_ps(out: &str) -> Vec<Container> {
 
 /// Lists containers. `Err` carries a short reason (no Docker, daemon off).
 pub fn list_containers() -> Result<Vec<Container>, String> {
-    let out = std::process::Command::new(docker_path().ok_or("Docker is not installed")?)
+    let out = std::process::Command::new(docker_path().ok_or(t("Docker is not installed"))?)
         .args(["ps", "-a", "--format", "{{json .}}"])
         .output()
         .map_err(|e| e.to_string())?;
@@ -488,7 +490,11 @@ pub fn list_containers() -> Result<Vec<Container>, String> {
 /// runtime is down.
 fn docker_error(stderr: &str) -> String {
     if !(stderr.contains("Cannot connect") || stderr.contains("daemon")) {
-        return stderr.lines().next().unwrap_or("docker failed").to_string();
+        return stderr
+            .lines()
+            .next()
+            .unwrap_or(t("docker failed"))
+            .to_string();
     }
     let runtime = if stderr.contains(".orbstack") {
         "OrbStack"
@@ -497,11 +503,11 @@ fn docker_error(stderr: &str) -> String {
     } else {
         "Docker"
     };
-    format!("{runtime} is not running")
+    tf("{} is not running", &[&runtime])
 }
 
 pub fn container_action(id: &str, action: &str) -> Result<(), String> {
-    let out = std::process::Command::new(docker_path().ok_or("Docker is not installed")?)
+    let out = std::process::Command::new(docker_path().ok_or(t("Docker is not installed"))?)
         .args([action, id])
         .output()
         .map_err(|e| e.to_string())?;
@@ -511,7 +517,7 @@ pub fn container_action(id: &str, action: &str) -> Result<(), String> {
         Err(String::from_utf8_lossy(&out.stderr)
             .lines()
             .next()
-            .unwrap_or("docker failed")
+            .unwrap_or(t("docker failed"))
             .to_string())
     }
 }
@@ -719,6 +725,25 @@ not json"#;
         assert!(candidates.contains(&PathBuf::from(
             "/Applications/OrbStack.app/Contents/MacOS/xbin/docker"
         )));
+    }
+
+    #[test]
+    fn russian_docker_notices_preserve_external_state_and_stderr() {
+        use crate::lang::{self, Language};
+        let language = lang::current();
+        lang::set(Language::Russian);
+        assert_eq!(
+            docker_error("Cannot connect to the Docker daemon"),
+            "Docker не запущен"
+        );
+        assert_eq!(docker_error("permission denied\nmore"), "permission denied");
+        let containers = parse_docker_ps(
+            r#"{"ID":"abc","Names":"db","Image":"postgres:17","State":"running","Status":"Up 2 minutes"}"#,
+        );
+        assert!(containers[0].running());
+        assert_eq!(containers[0].state, "running");
+        assert_eq!(containers[0].status, "Up 2 minutes");
+        lang::set(language);
     }
 
     #[test]

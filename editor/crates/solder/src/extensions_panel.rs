@@ -90,7 +90,7 @@ fn catalog_name(origin: Origin) -> &'static str {
 
 impl ExtensionsPanel {
     pub fn new(store: Entity<ExtensionStore>, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| Editor::single_line("Search extensions", cx));
+        let input = cx.new(|cx| Editor::localized_field("Search extensions", cx));
         let subscriptions = [
             cx.observe(&store, |this, store, cx| {
                 if this.wants_updates && store.read(cx).loaded {
@@ -175,7 +175,7 @@ impl ExtensionsPanel {
         };
         let note = |origin: Origin, id: &str, description: &str| -> (SharedString, bool) {
             match store.errors.get(&key(origin, id)) {
-                Some(error) => (error.clone().into(), true),
+                Some(error) => (crate::extension_store::error_label(error).into(), true),
                 None => (description.to_string().into(), false),
             }
         };
@@ -360,16 +360,19 @@ impl ExtensionsPanel {
             details = details.child(line(description.into(), theme.fg));
         }
         if let Some(error) = store.errors.get(&key(row.origin, &row.id)) {
-            details = details.child(line(error.clone().into(), theme.error));
+            details = details.child(line(
+                crate::extension_store::error_label(error).into(),
+                theme.error,
+            ));
         }
 
         // What a downloaded extension would do outside a sandbox, and the
         // two answers. Nothing of it is in place until Install is pressed.
         let asks = store.asks(row.origin, &row.id);
         if !asks.is_empty() {
-            details = details.child(heading("INSTALLING IT LETS IT"));
+            details = details.child(heading(crate::lang::t("INSTALLING IT LETS IT")));
             for what in asks {
-                details = details.child(line(what.into(), theme.fg));
+                details = details.child(line(permission_label(&what).into(), theme.fg));
             }
             let (allow, refuse) = (cx.entity(), cx.entity());
             let (origin, id) = (row.origin, row.id.clone());
@@ -382,7 +385,7 @@ impl ExtensionsPanel {
                     .child(
                         ui::button(
                             "extension-allow",
-                            "Install",
+                            crate::lang::t("Install"),
                             true,
                             theme,
                             move |_, _, cx| {
@@ -398,7 +401,7 @@ impl ExtensionsPanel {
                     .child(
                         ui::button(
                             "extension-refuse",
-                            "Cancel",
+                            crate::lang::t("Cancel"),
                             false,
                             theme,
                             move |_, _, cx| {
@@ -424,15 +427,21 @@ impl ExtensionsPanel {
             // The sentence, then the button under it: side by side they do
             // not fit a sidebar.
             details = details
-                .child(div().pt_1().child(line(
-                    format!("For the language itself, install {zed} from Zed's catalog.").into(),
-                    theme.fg_muted,
-                )))
+                .child(
+                    div().pt_1().child(line(
+                        crate::lang::tf(
+                            "For the language itself, install {} from Zed's catalog.",
+                            &[&zed],
+                        )
+                        .into(),
+                        theme.fg_muted,
+                    )),
+                )
                 .child(
                     div().flex().child(
                         ui::button(
                             "extension-equivalent",
-                            "Find it",
+                            crate::lang::t("Find it"),
                             false,
                             theme,
                             move |_, window, cx| {
@@ -463,7 +472,11 @@ impl ExtensionsPanel {
                         .child(
                             ui::button(
                                 "extension-off",
-                                if off { "Turn on" } else { "Turn off" },
+                                if off {
+                                    crate::lang::t("Turn on")
+                                } else {
+                                    crate::lang::t("Turn off")
+                                },
                                 false,
                                 theme,
                                 move |_, _, cx| {
@@ -481,9 +494,9 @@ impl ExtensionsPanel {
                             ui::button(
                                 "extension-keep",
                                 if kept {
-                                    "Follow updates"
+                                    crate::lang::t("Follow updates")
                                 } else {
-                                    "Keep this version"
+                                    crate::lang::t("Keep this version")
                                 },
                                 false,
                                 theme,
@@ -503,7 +516,7 @@ impl ExtensionsPanel {
                         .child(
                             ui::button(
                                 "extension-remove",
-                                "Remove",
+                                crate::lang::t("Remove"),
                                 false,
                                 theme,
                                 move |_, _, cx| {
@@ -520,19 +533,24 @@ impl ExtensionsPanel {
                 );
                 if off {
                     details = details.child(line(
-                        "Turned off: its languages, snippets and servers are not used.".into(),
+                        crate::lang::t(
+                            "Turned off: its languages, snippets and servers are not used.",
+                        )
+                        .into(),
                         theme.fg_subtle,
                     ));
                 }
                 details = details
-                    .child(heading("SOLDER USES"))
-                    .child(line(installed.provides().into(), theme.fg_muted));
+                    .child(heading(crate::lang::t("SOLDER USES")))
+                    .child(line(provides_label(installed).into(), theme.fg_muted));
                 // Said before a file needs it: this is the one thing an
                 // extension does outside its sandbox.
                 if installed.runs_code() && !installed.servers.is_empty() {
                     details = details.child(line(
-                        "Its language server is downloaded and started when a file needs it."
-                            .into(),
+                        crate::lang::t(
+                            "Its language server is downloaded and started when a file needs it.",
+                        )
+                        .into(),
                         theme.fg_subtle,
                     ));
                 }
@@ -565,7 +583,11 @@ impl ExtensionsPanel {
                             .child(
                                 ui::button(
                                     (name, index),
-                                    if no { "Allow" } else { "Refuse" },
+                                    if no {
+                                        crate::lang::t("Allow")
+                                    } else {
+                                        crate::lang::t("Refuse")
+                                    },
                                     false,
                                     theme,
                                     move |_, _, cx| {
@@ -583,12 +605,12 @@ impl ExtensionsPanel {
                                 .h(px(20.)),
                             )
                     };
-                    details = details.child(heading("IT MAY"));
+                    details = details.child(heading(crate::lang::t("IT MAY")));
                     if !installed.commands.is_empty() {
                         details = details.child(may(
                             "extension-may-run",
                             0,
-                            "Run the commands it declares".into(),
+                            crate::lang::t("Run the commands it declares").into(),
                             refused.commands,
                             Rc::new(|r| r.commands = !r.commands),
                         ));
@@ -597,14 +619,14 @@ impl ExtensionsPanel {
                         .child(may(
                             "extension-may-npm",
                             0,
-                            "Install packages from npm".into(),
+                            crate::lang::t("Install packages from npm").into(),
                             refused.npm,
                             Rc::new(|r| r.npm = !r.npm),
                         ))
                         .child(may(
                             "extension-may-download",
                             0,
-                            "Download files".into(),
+                            crate::lang::t("Download files").into(),
                             refused.downloads,
                             Rc::new(|r| r.downloads = !r.downloads),
                         ));
@@ -625,7 +647,7 @@ impl ExtensionsPanel {
                             details = details.child(may(
                                 "extension-may-host",
                                 i,
-                                format!("Download from {host}"),
+                                crate::lang::tf("Download from {}", &[&host]),
                                 no,
                                 Rc::new(move |r| {
                                     match r.hosts.iter().position(|h| *h == toggled) {
@@ -639,20 +661,32 @@ impl ExtensionsPanel {
                         }
                     }
                     if !did.is_empty() {
-                        details = details.child(heading("SINCE SOLDER STARTED, IT"));
+                        details =
+                            details.child(heading(crate::lang::t("SINCE SOLDER STARTED, IT")));
                         for event in did {
                             let (text, color) = match event {
-                                Event::Ran(command) => (format!("Ran {command}"), theme.fg_muted),
-                                Event::Installed(package) => {
-                                    (format!("Installed {package} from npm"), theme.fg_muted)
+                                Event::Ran(command) => {
+                                    (crate::lang::tf("Ran {}", &[&command]), theme.fg_muted)
                                 }
-                                Event::Downloaded(host) => {
-                                    (format!("Downloaded from {host}"), theme.fg_muted)
-                                }
-                                Event::Refused(what) => {
-                                    (format!("Was refused: {what}"), theme.warning)
-                                }
-                                Event::Failed(what) => (format!("Failed: {what}"), theme.error),
+                                Event::Installed(package) => (
+                                    crate::lang::tf("Installed {} from npm", &[&package]),
+                                    theme.fg_muted,
+                                ),
+                                Event::Downloaded(host) => (
+                                    crate::lang::tf("Downloaded from {}", &[&host]),
+                                    theme.fg_muted,
+                                ),
+                                Event::Refused(what) => (
+                                    crate::lang::tf("Was refused: {}", &[&permission_label(&what)]),
+                                    theme.warning,
+                                ),
+                                Event::Failed(what) => (
+                                    crate::lang::tf(
+                                        "Failed: {}",
+                                        &[&crate::extension_store::error_label(&what)],
+                                    ),
+                                    theme.error,
+                                ),
                             };
                             details = details.child(line(text.into(), color));
                         }
@@ -661,23 +695,23 @@ impl ExtensionsPanel {
                 // The code of a VS Code extension: whether it runs, and
                 // what it asked of VS Code's API that is not here.
                 if installed.node().is_some() {
-                    details = details.child(heading("ITS CODE"));
+                    details = details.child(heading(crate::lang::t("ITS CODE")));
                     let asks = store.asks_installed(installed.origin, &installed.id);
                     let code = store.code(&installed.id);
                     let (view, id) = (cx.entity(), installed.id.clone());
                     if !asks.is_empty() {
                         details = details.child(line(
-                            "Waits for you to allow it. It would:".into(),
+                            crate::lang::t("Waits for you to allow it. It would:").into(),
                             theme.fg_muted,
                         ));
                         for what in asks {
-                            details = details.child(line(what.into(), theme.fg));
+                            details = details.child(line(permission_label(&what).into(), theme.fg));
                         }
                         details = details.child(
                             div().flex().child(
                                 ui::button(
                                     "extension-allow-code",
-                                    "Allow",
+                                    crate::lang::t("Allow"),
                                     false,
                                     theme,
                                     move |_, _, cx| {
@@ -696,30 +730,40 @@ impl ExtensionsPanel {
                         match code.map(|code| &code.state) {
                             None => {
                                 details = details.child(line(
-                                    "Starts when it is needed.".into(),
+                                    crate::lang::t("Starts when it is needed.").into(),
                                     theme.fg_subtle,
                                 ))
                             }
                             Some(CodeState::Starting) => {
-                                details = details.child(line("Starting...".into(), theme.fg_muted))
+                                details = details.child(line(
+                                    crate::lang::t("Starting...").into(),
+                                    theme.fg_muted,
+                                ))
                             }
                             Some(CodeState::Running) => {
                                 let commands = code.map_or(0, |code| code.commands.len());
                                 let text = match commands {
-                                    0 => "Running".to_string(),
-                                    1 => "Running, with 1 command".to_string(),
-                                    n => format!("Running, with {n} commands"),
+                                    0 => crate::lang::t("Running").to_string(),
+                                    1 => crate::lang::t("Running, with 1 command").to_string(),
+                                    n => crate::lang::tf("Running, with {} commands", &[&n]),
                                 };
                                 details = details.child(line(text.into(), theme.fg_muted));
                             }
                             Some(CodeState::Stopped(why)) => {
                                 details = details
-                                    .child(line(format!("Stopped: {why}").into(), theme.error))
+                                    .child(line(
+                                        crate::lang::tf(
+                                            "Stopped: {}",
+                                            &[&crate::extension_store::error_label(why)],
+                                        )
+                                        .into(),
+                                        theme.error,
+                                    ))
                                     .child(
                                         div().flex().child(
                                             ui::button(
                                                 "extension-restart-code",
-                                                "Start again",
+                                                crate::lang::t("Start again"),
                                                 false,
                                                 theme,
                                                 move |_, _, cx| {
@@ -742,11 +786,11 @@ impl ExtensionsPanel {
                         if !code.languages.is_empty() {
                             let every = code.languages.iter().any(|language| language == "*");
                             let of = match every {
-                                true => "every language".to_string(),
+                                true => crate::lang::t("every language").to_string(),
                                 false => code.languages.join(", "),
                             };
                             details = details.child(line(
-                                format!("Gives language features for {of}").into(),
+                                crate::lang::tf("Gives language features for {}", &[&of]).into(),
                                 theme.fg_muted,
                             ));
                         }
@@ -754,12 +798,15 @@ impl ExtensionsPanel {
                             let mut names =
                                 code.missing.iter().take(12).cloned().collect::<Vec<_>>();
                             if code.missing.len() > names.len() {
-                                names.push(format!("{} more", code.missing.len() - names.len()));
+                                names.push(crate::lang::tf(
+                                    "{} more",
+                                    &[&(code.missing.len() - names.len())],
+                                ));
                             }
                             details = details.child(line(
-                                format!(
+                                crate::lang::tf(
                                     "Asked for what Solder does not have yet: {}",
-                                    names.join(", ")
+                                    &[&names.join(", ")],
                                 )
                                 .into(),
                                 theme.fg_subtle,
@@ -768,8 +815,10 @@ impl ExtensionsPanel {
                         if let Some(last) =
                             code.said.back().and_then(|(_, text)| text.lines().next())
                         {
-                            details = details
-                                .child(line(format!("Last said: {last}").into(), theme.fg_subtle));
+                            details = details.child(line(
+                                crate::lang::tf("Last said: {}", &[&last]).into(),
+                                theme.fg_subtle,
+                            ));
                         }
                     }
                     // What it wrote to its output channels, to read in a tab.
@@ -779,7 +828,7 @@ impl ExtensionsPanel {
                         details = details.child(div().flex().flex_wrap().gap_1().children(
                             channels.into_iter().enumerate().map(|(i, channel)| {
                                 let (view, id) = (view.clone(), installed.id.clone());
-                                let label = format!("Show output: {channel}");
+                                let label = crate::lang::tf("Show output: {}", &[&channel]);
                                 ui::button(
                                     ("extension-output", i),
                                     label,
@@ -801,19 +850,19 @@ impl ExtensionsPanel {
                 }
                 let missing = not_running(installed);
                 if !missing.is_empty() {
-                    details = details.child(heading("DOES NOT RUN HERE"));
+                    details = details.child(heading(crate::lang::t("DOES NOT RUN HERE")));
                     for what in missing {
                         details = details.child(line(what.into(), theme.fg_muted));
                     }
                 }
                 if !installed.settings.is_empty() {
-                    details = details.child(heading("SETTINGS, IN SETTINGS.JSON"));
+                    details = details.child(heading(crate::lang::t("SETTINGS, IN SETTINGS.JSON")));
                     // What each is now: the user's value, or what the
                     // extension says it is when not set.
                     for setting in installed.settings.iter().take(40) {
                         let now = store.configuration(&setting.key, cx);
                         let value = match now {
-                            serde_json::Value::Null => "not set".to_string(),
+                            serde_json::Value::Null => crate::lang::t("not set").to_string(),
                             value => value.to_string(),
                         };
                         let own = now_set(&setting.key, cx);
@@ -824,20 +873,21 @@ impl ExtensionsPanel {
                     }
                     if installed.settings.len() > 40 {
                         details = details.child(line(
-                            format!("and {} more", installed.settings.len() - 40).into(),
+                            crate::lang::tf("and {} more", &[&(installed.settings.len() - 40)])
+                                .into(),
                             theme.fg_subtle,
                         ));
                     }
                 }
                 if !installed.themes.is_empty() {
-                    details = details.child(heading("THEMES"));
+                    details = details.child(heading(crate::lang::t("THEMES")));
                     let view = cx.entity();
                     details = details.child(div().flex().flex_wrap().gap_1().children(
                         installed.themes.iter().enumerate().map(|(i, theme_file)| {
                             let (view, theme_file) = (view.clone(), theme_file.clone());
                             ui::button(
                                 ("extension-theme", i),
-                                format!("Use {}", theme_file.name),
+                                crate::lang::tf("Use {}", &[&theme_file.name]),
                                 false,
                                 theme,
                                 move |_, _, cx| {
@@ -855,25 +905,28 @@ impl ExtensionsPanel {
                     match &store.theme_status {
                         Some(Ok(name)) => {
                             details = details.child(line(
-                                format!("The theme is now {name}").into(),
+                                crate::lang::tf("The theme is now {}", &[&name]).into(),
                                 theme.fg_subtle,
                             ))
                         }
                         Some(Err(error)) => {
-                            details = details.child(line(error.clone().into(), theme.error))
+                            details = details.child(line(
+                                crate::extension_store::error_label(error).into(),
+                                theme.error,
+                            ))
                         }
                         None => {}
                     }
                 }
                 if !installed.icon_themes.is_empty() {
-                    details = details.child(heading("ICON THEMES"));
+                    details = details.child(heading(crate::lang::t("ICON THEMES")));
                     let view = cx.entity();
                     details = details.child(div().flex().flex_wrap().gap_1().children(
                         installed.icon_themes.iter().enumerate().map(|(i, icons)| {
                             let (view, name) = (view.clone(), icons.name.clone());
                             ui::button(
                                 ("extension-icons", i),
-                                format!("Use {name}"),
+                                crate::lang::tf("Use {}", &[&name]),
                                 false,
                                 theme,
                                 move |_, _, cx| {
@@ -891,12 +944,15 @@ impl ExtensionsPanel {
                     match &store.icon_status {
                         Some(Ok(name)) => {
                             details = details.child(line(
-                                format!("File icons are now {name}").into(),
+                                crate::lang::tf("File icons are now {}", &[&name]).into(),
                                 theme.fg_subtle,
                             ))
                         }
                         Some(Err(error)) => {
-                            details = details.child(line(error.clone().into(), theme.error))
+                            details = details.child(line(
+                                crate::extension_store::error_label(error).into(),
+                                theme.error,
+                            ))
                         }
                         None => {}
                     }
@@ -906,14 +962,20 @@ impl ExtensionsPanel {
                 if let Some(entry) = &row.entry
                     && !entry.provides.is_empty()
                 {
-                    details = details.child(heading("HAS")).child(line(
-                        entry.provides.join(", ").replace('-', " ").into(),
+                    details = details.child(heading(crate::lang::t("HAS"))).child(line(
+                        entry
+                            .provides
+                            .iter()
+                            .map(|part| capability_label(part))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                            .into(),
                         theme.fg_muted,
                     ));
                 }
                 if row.origin == Origin::VsCode {
                     details = details.child(line(
-                        "From a VS Code extension Solder takes themes, snippets and languages. Its code runs with the parts of VS Code's API Solder has.".into(),
+                        crate::lang::t("From a VS Code extension Solder takes themes, snippets and languages. Its code runs with the parts of VS Code's API Solder has.").into(),
                         theme.fg_subtle,
                     ));
                 }
@@ -924,9 +986,160 @@ impl ExtensionsPanel {
     }
 }
 
+/// Approval text is an English identifier in state.json. Translate only its display.
+fn permission_label(text: &str) -> String {
+    match text {
+        "Run its code with Node.js, outside a sandbox" => {
+            return crate::lang::t("Run its code with Node.js, outside a sandbox").into();
+        }
+        "Draw notebook outputs with browser code" => {
+            return crate::lang::t("Draw notebook outputs with browser code").into();
+        }
+        _ => {}
+    }
+    if let Some(name) = text.strip_prefix("Download and start the language server ") {
+        return crate::lang::tf("Download and start the language server {}", &[&name]);
+    }
+    if let Some(name) = text.strip_prefix("Get and start the debug adapter ") {
+        return crate::lang::tf("Get and start the debug adapter {}", &[&name]);
+    }
+    if let Some(name) = text.strip_prefix("Get and start the context server ") {
+        return crate::lang::tf("Get and start the context server {}", &[&name]);
+    }
+    if let Some(host) = text.strip_prefix("Download from ") {
+        return crate::lang::tf("Download from {}", &[&host]);
+    }
+    if let Some(package) = text
+        .strip_prefix("Install ")
+        .and_then(|package| package.strip_suffix(" from npm"))
+    {
+        return crate::lang::tf("Install {} from npm", &[&package]);
+    }
+    if let Some(command) = text.strip_prefix("Run ") {
+        if let Some(command) = command.strip_suffix(", which its manifest does not declare") {
+            return crate::lang::tf("Run {}, which its manifest does not declare", &[&command]);
+        }
+        return crate::lang::tf("Run {}", &[&command]);
+    }
+    text.to_string()
+}
+
+fn provides_label(extension: &Extension) -> String {
+    if crate::lang::current() == crate::lang::Language::English {
+        return extension.provides();
+    }
+    let runs = extension.runs_code();
+    let parts = [
+        (
+            extension
+                .languages
+                .iter()
+                .filter(|language| language.grammar.is_some())
+                .count(),
+            crate::lang::t("Languages"),
+        ),
+        (
+            if runs { extension.servers.len() } else { 0 },
+            crate::lang::t("Language servers"),
+        ),
+        (
+            if runs {
+                extension.debug_adapters.len()
+            } else {
+                0
+            },
+            crate::lang::t("Debug adapters"),
+        ),
+        (
+            if runs {
+                extension.context_servers.len()
+            } else {
+                0
+            },
+            crate::lang::t("Context servers"),
+        ),
+        (extension.debuggers.len(), crate::lang::t("Debuggers")),
+        (extension.contributed.len(), crate::lang::t("Commands")),
+        (extension.keys.len(), crate::lang::t("Key bindings")),
+        (extension.themes.len(), crate::lang::t("Themes")),
+        (extension.icon_themes.len(), crate::lang::t("Icon themes")),
+        (extension.snippets.len(), crate::lang::t("Snippet files")),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, label)| format!("{label}: {count}"))
+    .collect::<Vec<_>>();
+    if parts.is_empty() {
+        crate::lang::t("Nothing Solder can use").into()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn capability_label(capability: &str) -> String {
+    if crate::lang::current() == crate::lang::Language::English {
+        return capability.replace('-', " ");
+    }
+    match capability {
+        "languages" => crate::lang::t("Languages").into(),
+        "language-servers" => crate::lang::t("Language servers").into(),
+        "themes" => crate::lang::t("Themes").into(),
+        "icon-themes" => crate::lang::t("Icon themes").into(),
+        "debug-adapters" => crate::lang::t("Debug adapters").into(),
+        "context-servers" => crate::lang::t("Context servers").into(),
+        "slash-commands" => crate::lang::t("Slash commands").into(),
+        "agent-servers" => crate::lang::t("Agent servers").into(),
+        "indexed-docs-providers" => crate::lang::t("Documentation indexing").into(),
+        _ => capability.replace('-', " "),
+    }
+}
+
+fn missing_label(text: &str) -> String {
+    match text {
+        "Slash commands" => return crate::lang::t("Slash commands").into(),
+        "Agent servers" => return crate::lang::t("Agent servers").into(),
+        "Documentation indexing" => return crate::lang::t("Documentation indexing").into(),
+        "Its code (the file it starts from is not there)" => {
+            return crate::lang::t("Its code (the file it starts from is not there)").into();
+        }
+        "Its code, which is made for a browser" => {
+            return crate::lang::t("Its code, which is made for a browser").into();
+        }
+        "An icon theme (drawn with a font, or not readable)" => {
+            return crate::lang::t("An icon theme (drawn with a font, or not readable)").into();
+        }
+        "A debugger its code starts" => return crate::lang::t("A debugger its code starts").into(),
+        "Product icon themes" => return crate::lang::t("Product icon themes").into(),
+        "A key binding (a key Solder cannot bind)" => {
+            return crate::lang::t("A key binding (a key Solder cannot bind)").into();
+        }
+        _ => {}
+    }
+    if let Some(count) = text.strip_suffix(" of its themes (could not be read)") {
+        return crate::lang::tf("{} of its themes (could not be read)", &[&count]);
+    }
+    if let Some(count) = text.strip_suffix(" icon themes (drawn with a font, or not readable)") {
+        return crate::lang::tf(
+            "{} icon themes (drawn with a font, or not readable)",
+            &[&count],
+        );
+    }
+    if let Some(count) = text.strip_suffix(" debuggers its code starts") {
+        return crate::lang::tf("{} debuggers its code starts", &[&count]);
+    }
+    if let Some(count) = text.strip_suffix(" key bindings (keys Solder cannot bind)") {
+        return crate::lang::tf("{} key bindings (keys Solder cannot bind)", &[&count]);
+    }
+    text.to_string()
+}
+
 /// What an installed extension has that Solder does not run, in words.
 fn not_running(extension: &Extension) -> Vec<String> {
-    let mut missing = extension.missing.clone();
+    let mut missing = extension
+        .missing
+        .iter()
+        .map(|text| missing_label(text))
+        .collect::<Vec<_>>();
     // A language server is the extension's code at work. Code built for a
     // version of Zed's API this host does not have stays unused.
     if let (false, Code::Zed { api }) = (extension.servers.is_empty(), &extension.code)
@@ -935,9 +1148,9 @@ fn not_running(extension: &Extension) -> Vec<String> {
         let names: Vec<&str> = extension.servers.iter().map(|s| s.name.as_str()).collect();
         missing.insert(
             0,
-            format!(
-                "Language server {} (built for Zed's extension API {api})",
-                names.join(", ")
+            crate::lang::tf(
+                "Language server {} (built for Zed's extension API {})",
+                &[&names.join(", "), &api],
             ),
         );
     }
@@ -947,7 +1160,10 @@ fn not_running(extension: &Extension) -> Vec<String> {
         .filter(|l| l.grammar.is_none())
         .count();
     if plain > 0 && extension.origin == Origin::Zed {
-        missing.push(format!("{plain} of its languages (the grammar is missing)"));
+        missing.push(crate::lang::tf(
+            "{} of its languages (the grammar is missing)",
+            &[&plain],
+        ));
     }
     missing
 }
@@ -994,11 +1210,11 @@ impl Render for ExtensionsPanel {
             .collect();
         let empty: Option<SharedString> = (count == 0).then(|| {
             if !store.loaded || searching {
-                "Looking...".into()
+                crate::lang::t("Looking...").into()
             } else if failures.is_empty() {
-                "Nothing found".into()
+                crate::lang::t("Nothing found").into()
             } else {
-                "Nothing to show".into()
+                crate::lang::t("Nothing to show").into()
             }
         });
         let focused = self.input.focus_handle(cx).is_focused(window);
@@ -1024,23 +1240,30 @@ impl Render for ExtensionsPanel {
                     let row = rows[i].clone();
                     let (select, act) = (view.clone(), view.clone());
                     let (label, primary) = match &row.state {
-                        State::Available => ("Install", true),
-                        State::Update(_) => ("Update", true),
-                        State::Installed => ("Remove", false),
-                        State::Installing(_) => ("Cancel", false),
-                        State::Review => ("Review", true),
+                        State::Available => (crate::lang::t("Install"), true),
+                        State::Update(_) => (crate::lang::t("Update"), true),
+                        State::Installed => (crate::lang::t("Remove"), false),
+                        State::Installing(_) => (crate::lang::t("Cancel"), false),
+                        State::Review => (crate::lang::t("Review"), true),
                     };
                     let badge: Option<(SharedString, gpui::Hsla)> = match &row.state {
-                        State::Installed if row.off => Some(("Off".into(), theme.fg_subtle)),
-                        State::Installed => Some(("Installed".into(), theme.git_added)),
-                        State::Review => Some(("Asks first".into(), theme.warning)),
-                        State::Update(version) => {
-                            Some((format!("{version} is out").into(), theme.warning))
+                        State::Installed if row.off => {
+                            Some((crate::lang::t("Off").into(), theme.fg_subtle))
                         }
+                        State::Installed => {
+                            Some((crate::lang::t("Installed").into(), theme.git_added))
+                        }
+                        State::Review => Some((crate::lang::t("Asks first").into(), theme.warning)),
+                        State::Update(version) => Some((
+                            crate::lang::tf("{} is out", &[&version]).into(),
+                            theme.warning,
+                        )),
                         State::Installing(Some(done)) => {
                             Some((format!("{:.0}%", done * 100.).into(), theme.fg_muted))
                         }
-                        State::Installing(None) => Some(("Downloading".into(), theme.fg_muted)),
+                        State::Installing(None) => {
+                            Some((crate::lang::t("Downloading").into(), theme.fg_muted))
+                        }
                         State::Available => None,
                     };
                     let source: SharedString = match row.origin {
@@ -1163,7 +1386,7 @@ impl Render for ExtensionsPanel {
                         d.child(
                             ui::button(
                                 "extensions-update-all",
-                                format!("Update {updates}"),
+                                crate::lang::tf("Update {}", &[&updates]),
                                 true,
                                 &theme,
                                 move |_, _, cx| {
@@ -1178,7 +1401,7 @@ impl Render for ExtensionsPanel {
                     .child(
                         ui::button(
                             "extensions-folder",
-                            "Folder",
+                            crate::lang::t("Folder"),
                             false,
                             &theme,
                             move |_, _, cx| cx.reveal_path(&folder),
@@ -1228,4 +1451,27 @@ fn now_set(key: &str, cx: &App) -> bool {
         .get(first)
         .and_then(|inside| parts.try_fold(inside, |at, part| at.get(part)))
         .is_some_and(|value| !value.is_null())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_and_capability_display_leave_their_english_identifiers() {
+        let approval = "Run gem install solargraph";
+        let capability = "language-servers";
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_eq!(
+            permission_label(approval),
+            "Запускать gem install solargraph"
+        );
+        assert_eq!(approval, "Run gem install solargraph");
+        assert_eq!(capability_label(capability), "Языковые серверы");
+        assert_eq!(capability, "language-servers");
+        assert_eq!(permission_label("provider text"), "provider text");
+        crate::lang::set(crate::lang::Language::English);
+        assert_eq!(permission_label(approval), approval);
+        assert_eq!(capability_label(capability), "language servers");
+    }
 }

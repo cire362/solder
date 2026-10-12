@@ -833,7 +833,7 @@ impl ExtensionStore {
     /// Opens what an extension wrote to a channel, in the window in front.
     pub fn show_output(&mut self, extension: &str, channel: &str, cx: &mut Context<Self>) {
         if let Some(text) = self.output(extension, channel).map(str::to_string) {
-            let title = format!("Output: {channel}");
+            let title = crate::lang::tf("Output: {}", &[&channel]);
             self.ask(Ask::Output { title, text }, cx);
         }
     }
@@ -869,7 +869,12 @@ impl ExtensionStore {
 
     /// Says in the status bar that something of an extension went wrong.
     pub fn report(&mut self, text: String, cx: &mut Context<Self>) {
-        self.note("", Tone::Error, text, cx);
+        self.note(
+            "",
+            Tone::Error,
+            crate::extension_store::error_label(&text),
+            cx,
+        );
     }
 
     /// Everything of an extension that was on screen goes with its code.
@@ -1012,7 +1017,7 @@ impl ExtensionStore {
                     continue;
                 };
                 offered.push(Offered {
-                    title: format!("Open with {}", editor.name),
+                    title: crate::lang::tf("Open with {}", &[&editor.name]),
                     action: RunExtensionCommand {
                         command: OPEN_WITH.into(),
                         args: json!([extension.id, editor.view_type, { "$uri": uri(path) }]),
@@ -1027,7 +1032,7 @@ impl ExtensionStore {
                     continue;
                 };
                 offered.push(Offered {
-                    title: format!("Open with {}", notebook.name),
+                    title: crate::lang::tf("Open with {}", &[&notebook.name]),
                     action: RunExtensionCommand {
                         command: OPEN_NOTEBOOK.into(),
                         args: json!([extension.id, notebook.view_type, { "$uri": uri(path) }]),
@@ -1419,7 +1424,7 @@ impl ExtensionStore {
                 }
                 // Read and closed, or one of its answers chosen.
                 let rows = match items.is_empty() {
-                    true => vec!["OK".to_string()],
+                    true => vec![crate::lang::t("OK").to_string()],
                     false => items,
                 };
                 let rows = rows
@@ -1460,7 +1465,7 @@ impl ExtensionStore {
                     .into_iter()
                     .map(text)
                     .find(|title| !title.is_empty())
-                    .unwrap_or_else(|| "Pick one".into());
+                    .unwrap_or_else(|| crate::lang::t("Pick one").into());
                 let many = params["many"] == true;
                 self.ask(
                     Ask::Pick {
@@ -1477,7 +1482,7 @@ impl ExtensionStore {
                     .into_iter()
                     .map(text)
                     .find(|title| !title.is_empty())
-                    .unwrap_or_else(|| "Type a value".into());
+                    .unwrap_or_else(|| crate::lang::t("Type a value").into());
                 let value = text(&params["value"]);
                 let secret = params["password"] == true;
                 self.ask(

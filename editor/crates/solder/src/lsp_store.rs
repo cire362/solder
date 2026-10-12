@@ -769,7 +769,7 @@ impl LspStore {
                 (Some(ServerState::Starting | ServerState::Failed), ..) => {}
                 (None, Some(spec), _) if waits => {
                     self.servers.insert(key, ServerState::Starting);
-                    self.status = Some(format!("Starting {}...", spec.name).into());
+                    self.status = Some(crate::lang::tf("Starting {}...", &[&spec.name]).into());
                     cx.notify();
                 }
                 (None, Some(spec), _) => self.start(key, spec, cx),
@@ -941,7 +941,7 @@ impl LspStore {
         cx: &mut Context<Self>,
     ) {
         self.servers.insert(key.clone(), ServerState::Starting);
-        self.status = Some(format!("Getting {} ready...", server.name).into());
+        self.status = Some(crate::lang::tf("Getting {} ready...", &[&server.name]).into());
         cx.notify();
         let store = crate::extension_store::ExtensionStore::global(cx);
         let resolving = store.update(cx, |store, cx| store.resolve(&server, &key.root, cx));
@@ -1028,9 +1028,9 @@ impl LspStore {
             None => find_program(spec.program, &key.root),
         };
         let Some(program) = program else {
-            let message = format!(
+            let message = crate::lang::tf(
                 "{} not found. Install it: {}",
-                spec.program, spec.install_hint
+                &[&spec.program, &spec.install_hint],
             );
             self.status = Some(message.clone().into());
             self.servers.insert(key, ServerState::Failed);
@@ -1045,7 +1045,7 @@ impl LspStore {
             env: Vec::new(),
         };
         self.servers.insert(key.clone(), ServerState::Starting);
-        self.status = Some(format!("Starting {}...", spec.name).into());
+        self.status = Some(crate::lang::tf("Starting {}...", &[&spec.name]).into());
         cx.notify();
         // The user's options, and on top of them what extensions add.
         let mut options = overrides.initialization_options;
@@ -1093,9 +1093,9 @@ impl LspStore {
                     this.started(key, server, notifications, cx)
                 }
                 Err(err) => {
-                    let message = format!(
-                        "{} failed to start: {err}. {}",
-                        spec.name, spec.install_hint
+                    let message = crate::lang::tf(
+                        "{} failed to start: {}. {}",
+                        &[&spec.name, &err, &spec.install_hint],
                     );
                     this.status = Some(message.clone().into());
                     this.servers.insert(key, ServerState::Failed);

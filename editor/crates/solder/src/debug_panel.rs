@@ -2,6 +2,7 @@
 //! stack and variables of a pause, and the console, where expressions run
 //! in the paused frame.
 
+use crate::lang::{t, tf};
 use std::path::PathBuf;
 
 use gpui::{
@@ -57,7 +58,7 @@ impl DebugPanel {
             selected: 0,
             picking: false,
             timeline_open: false,
-            input: cx.new(|cx| Editor::single_line("Evaluate an expression", cx)),
+            input: cx.new(|cx| Editor::localized_field("Evaluate an expression", cx)),
             focus: cx.focus_handle(),
         }
     }
@@ -194,7 +195,7 @@ impl DebugPanel {
             .gap_1p5()
             .border_b(theme.shape.border)
             .border_color(theme.line);
-        let config = self.configs.get(self.selected).map(|c| c.name.clone());
+        let config = self.configs.get(self.selected).map(LaunchConfig::label);
         match &state {
             State::Idle | State::Failed(_) => {
                 bar = bar
@@ -221,7 +222,7 @@ impl DebugPanel {
                                 div().truncate().child(
                                     config
                                         .clone()
-                                        .unwrap_or_else(|| "Nothing to debug here".into()),
+                                        .unwrap_or_else(|| t("Nothing to debug here").into()),
                                 ),
                             )
                             .on_click(|_, window, cx| {
@@ -230,7 +231,7 @@ impl DebugPanel {
                     )
                     .when(config.is_some(), |d| {
                         d.child(
-                            ui::button("debug-start", "Start", true, theme, |_, window, cx| {
+                            ui::button("debug-start", t("Start"), true, theme, |_, window, cx| {
                                 window.dispatch_action(Box::new(crate::workspace::DebugStart), cx)
                             })
                             .debug_selector(|| "debug-start".into()),
@@ -239,34 +240,44 @@ impl DebugPanel {
             }
             State::Starting(_) | State::Running => {
                 bar = bar
-                    .child(self.control("debug-pause", "Pause", false, theme, |s, cx| s.pause(cx)))
-                    .child(self.control("debug-stop", "Stop", false, theme, |s, cx| s.stop(cx)));
+                    .child(
+                        self.control("debug-pause", t("Pause"), false, theme, |s, cx| s.pause(cx)),
+                    )
+                    .child(self.control("debug-stop", t("Stop"), false, theme, |s, cx| s.stop(cx)));
             }
             State::Paused => {
                 bar = bar
                     .child(
-                        self.control("debug-continue", "Continue", true, theme, |s, cx| {
+                        self.control("debug-continue", t("Continue"), true, theme, |s, cx| {
                             s.resume(cx)
                         }),
                     )
                     .child(
-                        self.control("debug-over", "Over", false, theme, |s, cx| s.step_over(cx)),
+                        self.control("debug-over", t("Over"), false, theme, |s, cx| {
+                            s.step_over(cx)
+                        }),
                     )
-                    .child(self.control("debug-in", "Into", false, theme, |s, cx| s.step_in(cx)))
-                    .child(self.control("debug-out", "Out", false, theme, |s, cx| s.step_out(cx)))
-                    .child(self.control("debug-stop", "Stop", false, theme, |s, cx| s.stop(cx)));
+                    .child(self.control("debug-in", t("Into"), false, theme, |s, cx| s.step_in(cx)))
+                    .child(
+                        self.control("debug-out", t("Out"), false, theme, |s, cx| s.step_out(cx)),
+                    )
+                    .child(self.control("debug-stop", t("Stop"), false, theme, |s, cx| s.stop(cx)));
             }
         }
         let status: (String, gpui::Hsla) = match &state {
             State::Idle => (
-                "F5 starts; click a line number for a breakpoint".into(),
+                t("F5 starts; click a line number for a breakpoint").into(),
                 theme.fg_subtle,
             ),
             State::Starting(s) => (s.to_string(), theme.fg_subtle),
             State::Running => (
-                format!(
+                tf(
                     "Running {}",
-                    store.config.as_ref().map(|c| c.name.as_str()).unwrap_or("")
+                    &[&store
+                        .config
+                        .as_ref()
+                        .map(LaunchConfig::label)
+                        .unwrap_or_default()],
                 ),
                 theme.git_added,
             ),
@@ -274,9 +285,9 @@ impl DebugPanel {
                 store
                     .paused
                     .as_ref()
-                    .map(|p| match store.session_name(p.session) {
-                        Some(name) => format!("Paused on {} in {name}", p.reason),
-                        None => format!("Paused on {}", p.reason),
+                    .map(|p| match store.session_label(p.session) {
+                        Some(name) => tf("Paused on {} in {}", &[&p.reason_label(), &name]),
+                        None => tf("Paused on {}", &[&p.reason_label()]),
                     })
                     .unwrap_or_default(),
                 theme.warning,
@@ -315,7 +326,7 @@ impl DebugPanel {
                     .p_2()
                     .text_size(crate::theme::UI_FONT_SMALL)
                     .text_color(theme.fg_subtle)
-                    .child("Open a .js or .ts file, or add scripts to package.json."),
+                    .child(t("Open a .js or .ts file, or add scripts to package.json.")),
             );
         }
         for (i, c) in self.configs.iter().enumerate() {
@@ -333,7 +344,7 @@ impl DebugPanel {
                         theme.fg
                     })
                     .hover(|d| d.bg(theme.accent_soft))
-                    .child(c.name.clone())
+                    .child(c.label())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected = i;
                         this.picking = false;
@@ -365,20 +376,23 @@ impl DebugPanel {
             .flex()
             .gap_2()
             .child(
-                tab("debug-console-tab", "CONSOLE".into(), !self.timeline_open).on_click(
-                    cx.listener(|this, _, _, cx| {
-                        this.timeline_open = false;
-                        cx.notify();
-                    }),
-                ),
+                tab(
+                    "debug-console-tab",
+                    t("CONSOLE").into(),
+                    !self.timeline_open,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.timeline_open = false;
+                    cx.notify();
+                })),
             )
             .child(
                 tab(
                     "debug-timeline-tab",
                     if count == 0 {
-                        "TIMELINE".into()
+                        t("TIMELINE").into()
                     } else {
-                        format!("TIMELINE {count}").into()
+                        tf("TIMELINE {}", &[&count]).into()
                     },
                     self.timeline_open,
                 )
@@ -401,7 +415,7 @@ impl DebugPanel {
                 .pt_1()
                 .text_size(crate::theme::text(12.))
                 .text_color(theme.fg_subtle)
-                .child("Requests and SQL queries of a Node run show up here.")
+                .child(t("Requests and SQL queries of a Node run show up here."))
                 .into_any_element();
         }
         let entries = store.timeline.clone();
@@ -413,15 +427,15 @@ impl DebugPanel {
                 .map(|i| {
                     let e = &entries[i];
                     let (badge, badge_color) = match e.kind {
-                        Kind::In => ("IN", theme.accent),
-                        Kind::Out => ("OUT", theme.syntax.function),
+                        Kind::In => (t("IN"), theme.accent),
+                        Kind::Out => (t("OUT"), theme.syntax.function),
                         Kind::Sql => ("SQL", theme.syntax.string),
                     };
                     let result: SharedString = match (&e.error, e.status, e.rows) {
-                        (Some(_), _, _) => "failed".into(),
+                        (Some(_), _, _) => t("failed").into(),
                         (None, Some(status), _) => status.to_string().into(),
-                        (None, None, Some(1)) => "1 row".into(),
-                        (None, None, Some(rows)) => format!("{rows} rows").into(),
+                        (None, None, Some(1)) => t("1 row").into(),
+                        (None, None, Some(rows)) => tf("{} rows", &[&rows]).into(),
                         _ => "".into(),
                     };
                     let place: SharedString = match (&e.path, e.line) {
@@ -524,9 +538,9 @@ impl DebugPanel {
 /// `12 ms`, `1.4 s`.
 fn duration(ms: f64) -> SharedString {
     if ms < 1000. {
-        format!("{} ms", ms.round() as u64).into()
+        tf("{} ms", &[&(ms.round() as u64)]).into()
     } else {
-        format!("{:.1} s", ms / 1000.).into()
+        tf("{} s", &[&format!("{:.1}", ms / 1000.)]).into()
     }
 }
 
@@ -598,7 +612,7 @@ impl Render for DebugPanel {
                             .flex_col()
                             .border_r(theme.shape.border)
                             .border_color(theme.line)
-                            .child(Self::header("CALL STACK", &theme))
+                            .child(Self::header(t("CALL STACK"), &theme))
                             .child(
                                 uniform_list("debug-frames", frame_rows, {
                                     let store = store_entity.clone();
@@ -663,7 +677,7 @@ impl Render for DebugPanel {
                             .flex_col()
                             .border_r(theme.shape.border)
                             .border_color(theme.line)
-                            .child(Self::header("VARIABLES", &theme))
+                            .child(Self::header(t("VARIABLES"), &theme))
                             .child(
                                 uniform_list("debug-vars", var_count, {
                                     let store = store_entity.clone();

@@ -156,7 +156,50 @@ pub const READ_LIMIT: u64 = 512 * 1024 * 1024;
 pub struct Loaded {
     pub text: String,
     pub encoding: text::encoding::Encoding,
-    pub read_only: Option<String>,
+    pub read_only: Option<ReadOnly>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadOnly {
+    Binary,
+    Large(u64),
+    TooLarge(u64),
+}
+
+impl ReadOnly {
+    pub fn message(&self) -> String {
+        match self {
+            Self::Binary => crate::lang::t(
+                "This is not a text file. It is shown as it is and cannot be edited.",
+            )
+            .into(),
+            Self::Large(bytes) => crate::lang::tf(
+                "This file is {}: too large to edit. It is open for reading.",
+                &[&megabytes(*bytes)],
+            ),
+            Self::TooLarge(bytes) => crate::lang::tf(
+                "This file is {}: too large to open here.",
+                &[&megabytes(*bytes)],
+            ),
+        }
+    }
+}
+
+enum SaveFailure {
+    Encoding(char, text::encoding::Encoding),
+    Io(std::io::Error),
+}
+
+impl SaveFailure {
+    fn message(&self) -> String {
+        match self {
+            Self::Encoding(character, encoding) => crate::lang::tf(
+                "Not saved: {} cannot be written in {}. Save with another encoding.",
+                &[&format!("{character:?}"), &encoding.name()],
+            ),
+            Self::Io(error) => crate::lang::tf("Not saved: {}", &[&error]),
+        }
+    }
 }
 
 impl Loaded {
@@ -170,12 +213,9 @@ impl Loaded {
         let decoded = text::encoding::decode(bytes);
         let size = bytes.len() as u64;
         let read_only = if decoded.binary {
-            Some("This is not a text file. It is shown as it is and cannot be edited.".into())
+            Some(ReadOnly::Binary)
         } else if size > edit_limit {
-            let size = megabytes(size);
-            Some(format!(
-                "This file is {size}: too large to edit. It is open for reading."
-            ))
+            Some(ReadOnly::Large(size))
         } else {
             None
         };
@@ -189,8 +229,8 @@ impl Loaded {
 
 fn megabytes(bytes: u64) -> String {
     match bytes {
-        0..1_048_576 => format!("{} KB", bytes.div_ceil(1024)),
-        _ => format!("{} MB", bytes / 1_048_576),
+        0..1_048_576 => crate::lang::tf("{} KB", &[&bytes.div_ceil(1024)]),
+        _ => crate::lang::tf("{} MB", &[&(bytes / 1_048_576)]),
     }
 }
 
@@ -198,11 +238,10 @@ fn megabytes(bytes: u64) -> String {
 pub fn load(path: &Path) -> std::io::Result<Loaded> {
     let size = std::fs::metadata(path)?.len();
     if size > READ_LIMIT {
-        let size = megabytes(size);
         return Ok(Loaded {
             text: String::new(),
             encoding: Default::default(),
-            read_only: Some(format!("This file is {size}: too large to open here.")),
+            read_only: Some(ReadOnly::TooLarge(size)),
         });
     }
     Ok(Loaded::of(&std::fs::read(path)?))
@@ -334,7 +373,7 @@ impl Document {
     fn take(&mut self, loaded: &Loaded) {
         self.encoding = loaded.encoding;
         self.read_only = loaded.read_only.is_some();
-        self.notice = loaded.read_only.clone().map(Into::into);
+        self.notice = loaded.read_only.as_ref().map(|why| why.message().into());
     }
 
     /// Reads the file again as written in another encoding: what is on
@@ -542,9 +581,9 @@ impl Document {
 
     pub fn indent_label(&self) -> &'static str {
         match self.indent_unit {
-            "\t" => "Tabs",
-            "  " => "Spaces: 2",
-            _ => "Spaces: 4",
+            "\t" => crate::lang::t("Tabs"),
+            "  " => crate::lang::t("Spaces: 2"),
+            _ => crate::lang::t("Spaces: 4"),
         }
     }
 
@@ -1000,11 +1039,9 @@ impl Document {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let bytes = text::encoding::encode(&text, encoding).map_err(|c| {
-                        let name = encoding.name();
-                        format!("Not saved: {c:?} cannot be written in {name}. Save with another encoding.")
-                    })?;
-                    std::fs::write(&path, bytes).map_err(|err| format!("Not saved: {err}"))
+                    let bytes = text::encoding::encode(&text, encoding)
+                        .map_err(|character| SaveFailure::Encoding(character, encoding))?;
+                    std::fs::write(&path, bytes).map_err(SaveFailure::Io)
                 })
                 .await;
             this.update(cx, |this, cx| match result {
@@ -1018,7 +1055,9 @@ impl Document {
                     true
                 }
                 Err(why) => {
-                    this.notice = Some(why.into());
+                    // Choose the language on the window's thread, after IO:
+                    // the user may have changed it while the save ran.
+                    this.notice = Some(why.message().into());
                     cx.emit(DocumentEvent::DirtyChanged);
                     false
                 }
@@ -1059,7 +1098,9 @@ impl Document {
             .edit([(0..len, text.to_string())], &[], Instant::now())
             .into();
         self.text.seal_history();
-        let said = "This text was not saved when Solder closed. Undo brings back the file as it is on disk.";
+        let said = crate::lang::t(
+            "This text was not saved when Solder closed. Undo brings back the file as it is on disk.",
+        );
         self.notice = Some(said.into());
         self.after_change(applied, None, cx);
         true
@@ -1195,6 +1236,25 @@ pub fn map_offset(offset: usize, edits: &[text::Edit]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::AppContext;
+
+    #[gpui::test]
+    fn file_notices_use_the_language_when_the_file_is_shown(cx: &mut gpui::TestAppContext) {
+        let loaded = std::thread::spawn(|| Loaded::of(b"\0\x01\x02"))
+            .join()
+            .unwrap();
+        crate::lang::set(crate::lang::Language::Russian);
+        let doc = cx.new(|cx| Document::open(PathBuf::from("data.bin"), &loaded, cx));
+        assert_eq!(
+            doc.read_with(cx, |doc, _| doc.notice().unwrap().to_string()),
+            crate::lang::t("This is not a text file. It is shown as it is and cannot be edited.")
+        );
+        assert!(ReadOnly::Large(2048).message().contains("2 КБ"));
+        let failure = SaveFailure::Io(std::io::Error::other("disk detail"));
+        assert_eq!(failure.message(), "Не сохранено: disk detail");
+        crate::lang::set(crate::lang::Language::English);
+        assert_eq!(failure.message(), "Not saved: disk detail");
+    }
 
     #[test]
     fn finds_conflict_blocks() {

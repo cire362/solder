@@ -2,6 +2,7 @@
 //! have the same ancestry here as they do at the command line.
 
 use crate::git::{Repo, Result};
+use crate::lang::t;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Commit {
@@ -28,7 +29,7 @@ pub struct Blame {
 impl Blame {
     pub fn label(&self) -> String {
         if self.id.bytes().all(|b| b == b'0') {
-            "Not committed".into()
+            t("Not committed").into()
         } else {
             format!(
                 "{} {}",
@@ -84,7 +85,7 @@ impl Repo {
                     end -= 1;
                 }
                 text.truncate(end);
-                text.push_str("\n[The rest of this patch is not shown.]\n");
+                text.push_str(t("\n[The rest of this patch is not shown.]\n"));
             }
             text
         })

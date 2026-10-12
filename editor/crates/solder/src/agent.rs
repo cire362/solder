@@ -50,7 +50,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
                     .trim_start_matches("fatal: ")
             })
             .find(|l| !l.trim().is_empty())
-            .unwrap_or("git failed")
+            .unwrap_or(crate::lang::t("git failed"))
             .to_string())
     }
 }
@@ -95,7 +95,8 @@ impl Worktree {
         let repo = PathBuf::from(git(repo, &["rev-parse", "--show-toplevel"])?.trim());
         let base = git(&repo, &["rev-parse", "HEAD"])
             .map_err(|_| {
-                "The project needs at least one commit for an agent to branch from".to_string()
+                crate::lang::t("The project needs at least one commit for an agent to branch from")
+                    .to_string()
             })?
             .trim()
             .to_string();
@@ -190,7 +191,7 @@ impl Worktree {
     /// the merge would overwrite (Git's own check).
     pub fn merge(&self, message: &str) -> Result<(), String> {
         if !self.commit(message)? {
-            return Err("The agent changed nothing to merge".into());
+            return Err(crate::lang::t("The agent changed nothing to merge").into());
         }
         git(
             &self.repo,
@@ -198,7 +199,7 @@ impl Worktree {
         )
         .map_err(|e| {
             let _ = git(&self.repo, &["merge", "--abort"]);
-            format!("Could not merge: {e}")
+            crate::lang::tf("Could not merge: {}", &[&e])
         })?;
         self.remove();
         Ok(())

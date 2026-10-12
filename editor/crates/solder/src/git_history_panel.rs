@@ -1,3 +1,4 @@
+use crate::lang::t;
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, SharedString, Task, Window, div,
     prelude::*, px, uniform_list,
@@ -62,7 +63,7 @@ impl HistoryPanel {
                 this.loading = false;
                 match result {
                     Ok(rows) => this.rows = rows,
-                    Err(e) => this.error = Some(e.0.into()),
+                    Err(e) => this.error = Some(crate::git_store::error_label(&e).into()),
                 }
                 cx.notify();
             })
@@ -87,7 +88,7 @@ impl HistoryPanel {
                         title: commit.subject,
                         text,
                     }),
-                    Err(e) => this.error = Some(e.0.into()),
+                    Err(e) => this.error = Some(crate::git_store::error_label(&e).into()),
                 }
                 cx.notify();
             })
@@ -117,7 +118,7 @@ impl Render for HistoryPanel {
                             .child(
                                 ui::button(
                                     "history-back",
-                                    "Changes",
+                                    t("Changes"),
                                     false,
                                     &theme,
                                     cx.listener(|_, _, _, cx| cx.emit(HistoryEvent::Close)),
@@ -126,22 +127,23 @@ impl Render for HistoryPanel {
                             )
                             .child(ui::button(
                                 "history-refresh",
-                                "Refresh",
+                                t("Refresh"),
                                 false,
                                 &theme,
                                 cx.listener(|this, _, _, cx| this.load(cx)),
                             )),
                     )
                     .child(
-                        div()
-                            .text_color(theme.fg)
-                            .truncate()
-                            .child(self.file.clone().unwrap_or_else(|| "All branches".into())),
+                        div().text_color(theme.fg).truncate().child(
+                            self.file
+                                .clone()
+                                .unwrap_or_else(|| t("All branches").into()),
+                        ),
                     )
                     .children(self.loading.then(|| {
                         div()
                             .text_color(theme.fg_subtle)
-                            .child("Reading history...")
+                            .child(t("Reading history..."))
                     }))
                     .children(
                         self.error
@@ -150,7 +152,7 @@ impl Render for HistoryPanel {
                     )
                     .child(ui::button(
                         "history-more",
-                        "Older commits",
+                        t("Older commits"),
                         false,
                         &theme,
                         cx.listener(|this, _, _, cx| {
@@ -161,7 +163,14 @@ impl Render for HistoryPanel {
             )
             .when(
                 !self.loading && self.rows.is_empty() && self.error.is_none(),
-                |d| d.child(div().p_2().text_color(theme.fg_subtle).child("No commits")),
+                |d| {
+                    d.child(
+                        div()
+                            .p_2()
+                            .text_color(theme.fg_subtle)
+                            .child(t("No commits")),
+                    )
+                },
             )
             .child(
                 uniform_list(

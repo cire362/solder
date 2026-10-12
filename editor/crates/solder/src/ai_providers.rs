@@ -76,6 +76,13 @@ pub struct ProviderInfo {
 }
 
 impl ProviderInfo {
+    pub fn display_name(&self) -> &str {
+        match self.kind {
+            Kind::Local => crate::lang::t("This machine"),
+            _ => &self.name,
+        }
+    }
+
     pub fn api(&self) -> Api {
         match self.kind {
             Kind::Anthropic => Api::Anthropic,
@@ -237,7 +244,7 @@ impl AiStore {
                     };
                     match ai::spawn(ai::provider::list_models(endpoint)).await {
                         Ok(models) if models.is_empty() => {
-                            Status::Unavailable("No models loaded".into())
+                            Status::Unavailable(crate::lang::t("No models loaded").into())
                         }
                         Ok(models) => Status::Ready(models),
                         Err(e) => Status::Unavailable(e.into()),
@@ -302,13 +309,14 @@ impl AiStore {
         let name = name.trim().to_string();
         let url = url.trim().trim_end_matches('/').to_string();
         if name.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
-            self.error = Some("Give the provider a name and an http(s) address".into());
+            self.error =
+                Some(crate::lang::t("Give the provider a name and an http(s) address").into());
             cx.notify();
             return;
         }
         let id = custom_id(&name);
         if self.provider(&id).is_some() {
-            self.error = Some(format!("{name} is already a provider").into());
+            self.error = Some(crate::lang::tf("{} is already a provider", &[&name]).into());
             cx.notify();
             return;
         }
@@ -393,10 +401,13 @@ impl AiStore {
         cx: &mut Context<Self>,
     ) -> Task<Result<Endpoint, String>> {
         let Some(provider) = self.provider(&model.provider).cloned() else {
-            return Task::ready(Err(format!("No provider {}", model.provider)));
+            return Task::ready(Err(crate::lang::tf("No provider {}", &[&model.provider])));
         };
         if self.offline && provider.is_remote() {
-            return Task::ready(Err(format!("{} is off in offline mode", provider.name)));
+            return Task::ready(Err(crate::lang::tf(
+                "{} is off in offline mode",
+                &[&provider.display_name()],
+            )));
         }
         if provider.kind == Kind::Local {
             return self.local_endpoint(model.model.clone(), cx);
@@ -406,7 +417,10 @@ impl AiStore {
         cx.background_executor().spawn(async move {
             let key = keys.get(&id);
             if provider.needs_key() && key.is_none() {
-                return Err(format!("Add a key for {} in the AI tab", provider.name));
+                return Err(crate::lang::tf(
+                    "Add a key for {} in the AI tab",
+                    &[&provider.display_name()],
+                ));
             }
             Ok(Endpoint {
                 api: provider.api(),
@@ -443,7 +457,9 @@ impl AiStore {
                                     .iter()
                                     .find(|r| r.model == id)
                                     .map(|r| Self::local_api(&r.server))
-                                    .ok_or_else(|| "The model did not start".to_string()),
+                                    .ok_or_else(|| {
+                                        crate::lang::t("The model did not start").to_string()
+                                    }),
                             )
                         })
                         .map_err(|e| e.to_string())?;
@@ -454,12 +470,13 @@ impl AiStore {
             });
         }
         let Some(model) = self.models().into_iter().find(|m| m.id == id) else {
-            return Task::ready(Err("That model is not installed".into()));
+            return Task::ready(Err(crate::lang::t("That model is not installed").into()));
         };
         let Some(binary) = ai::install::installed_runtime(&self.dirs) else {
-            return Task::ready(Err(
-                "Run the benchmark in the AI tab to install llama.cpp".into()
-            ));
+            return Task::ready(Err(crate::lang::t(
+                "Run the benchmark in the AI tab to install llama.cpp",
+            )
+            .into()));
         };
         // Room for the chat model and the completion model; a third
         // replaces the one used longest ago.
@@ -573,6 +590,24 @@ impl AiStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_display_name_does_not_change_stored_names_or_roles() {
+        let providers = builtin(&Urls::default());
+        let local = &providers[0];
+        let model = ModelRef::local("example-model");
+        let stored = local.to_json();
+        let role = model.to_json();
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_eq!(local.display_name(), "Этот компьютер");
+        assert_eq!(local.name, "This machine");
+        assert_eq!(local.id, "local");
+        assert_eq!(local.to_json(), stored);
+        assert_eq!(model.to_json(), role);
+        assert_eq!(providers[1].display_name(), "Ollama");
+        crate::lang::set(crate::lang::Language::English);
+        assert_eq!(local.display_name(), "This machine");
+    }
 
     #[test]
     fn tells_local_from_remote_and_reads_old_roles() {

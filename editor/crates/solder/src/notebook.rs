@@ -168,7 +168,7 @@ impl Notebook {
             }
             let read = match reading {
                 Some(reading) => reading.await,
-                None => Err("Extensions are not there to read it".into()),
+                None => Err(crate::lang::t("Extensions are not there to read it").into()),
             };
             this.update(cx, |this, cx| this.read(read, cx)).ok();
         })
@@ -304,7 +304,7 @@ impl Notebook {
             Some(store) => store.update(cx, |store, cx| {
                 store.ask_host(&self.extension, method, params, cx)
             }),
-            None => Task::ready(Err("Extensions are not there".into())),
+            None => Task::ready(Err(crate::lang::t("Extensions are not there").into())),
         }
     }
 
@@ -389,7 +389,9 @@ impl Notebook {
         for cell in &mut self.cells {
             cell.running = false;
         }
-        self.note = Some("Its extension stopped. Open the file again to run or save it.".into());
+        self.note = Some(
+            crate::lang::t("Its extension stopped. Open the file again to run or save it.").into(),
+        );
         cx.notify();
     }
 
@@ -599,8 +601,8 @@ impl Notebook {
         let selected = ix == self.selected;
         let handle = cell.handle as usize;
         let state: SharedString = match (cell.code, cell.running, cell.order) {
-            (false, _, _) => "Text".into(),
-            (true, true, _) => "Running".into(),
+            (false, _, _) => crate::lang::t("Text").into(),
+            (true, true, _) => crate::lang::t("Running").into(),
             (true, false, Some(order)) => format!("[{order}]").into(),
             (true, false, None) => "[ ]".into(),
         };
@@ -725,16 +727,16 @@ impl Notebook {
                                 let label = renderer
                                     .as_ref()
                                     .map(|(_, _, renderer)| {
-                                        format!(
+                                        crate::lang::tf(
                                             "View with {}",
-                                            if renderer.name.is_empty() {
+                                            &[&if renderer.name.is_empty() {
                                                 &renderer.id
                                             } else {
                                                 &renderer.name
-                                            }
+                                            }],
                                         )
                                     })
-                                    .unwrap_or_else(|| "View HTML output".into());
+                                    .unwrap_or_else(|| crate::lang::t("View HTML output").into());
                                 result = result.child(
                                     crate::ui::button(
                                         ("rich-output", handle * 1000 + output_ix),
@@ -743,10 +745,9 @@ impl Notebook {
                                         &theme,
                                         cx.listener(move |this, _: &ClickEvent, _, cx| {
                                             cx.emit(NotebookEvent::Output {
-                                                title: format!(
+                                                title: crate::lang::tf(
                                                     "{}: output {}",
-                                                    this.title(),
-                                                    ix + 1
+                                                    &[&this.title(), &(ix + 1)],
                                                 ),
                                                 uri: this.uri.clone(),
                                                 items: items.clone(),
@@ -759,11 +760,9 @@ impl Notebook {
                                     ),
                                 );
                             } else {
-                                result = result.child(
-                                    div()
-                                        .text_color(theme.fg_subtle)
-                                        .child("No renderer is allowed for this output"),
-                                );
+                                result = result.child(div().text_color(theme.fg_subtle).child(
+                                    crate::lang::t("No renderer is allowed for this output"),
+                                ));
                             }
                             result
                         }
@@ -862,8 +861,8 @@ impl Render for Notebook {
         }
         let running = self.cells.iter().any(|cell| cell.running);
         let runner: SharedString = match (&self.state, &self.runner) {
-            (State::Ready, Some(runner)) => format!("Runs with {runner}").into(),
-            (State::Ready, None) => "Nothing here runs its cells yet".into(),
+            (State::Ready, Some(runner)) => crate::lang::tf("Runs with {}", &[&runner]).into(),
+            (State::Ready, None) => crate::lang::t("Nothing here runs its cells yet").into(),
             _ => "".into(),
         };
         let bar = div()
@@ -879,7 +878,7 @@ impl Render for Notebook {
             .child(
                 crate::ui::button(
                     "notebook-run-all",
-                    "Run all",
+                    crate::lang::t("Run all"),
                     false,
                     &theme,
                     cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -891,7 +890,7 @@ impl Render for Notebook {
             .when(running, |d| {
                 d.child(crate::ui::button(
                     "notebook-stop",
-                    "Stop",
+                    crate::lang::t("Stop"),
                     false,
                     &theme,
                     cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -902,7 +901,7 @@ impl Render for Notebook {
             .child(
                 crate::ui::button(
                     "notebook-add-code",
-                    "Add code",
+                    crate::lang::t("Add code"),
                     false,
                     &theme,
                     cx.listener(|this, _: &ClickEvent, window, cx| this.add(true, window, cx)),
@@ -911,7 +910,7 @@ impl Render for Notebook {
             )
             .child(crate::ui::button(
                 "notebook-add-text",
-                "Add text",
+                crate::lang::t("Add text"),
                 false,
                 &theme,
                 cx.listener(|this, _: &ClickEvent, window, cx| this.add(false, window, cx)),
@@ -922,7 +921,7 @@ impl Render for Notebook {
                     .min_w_0()
                     .truncate()
                     .text_color(theme.error)
-                    .child(note)
+                    .child(crate::extension_store::error_label(&note))
             }))
             .child(div().flex_none().text_color(theme.fg_subtle).child(runner));
         let said = |words: SharedString| {
@@ -937,9 +936,9 @@ impl Render for Notebook {
                 .into_any_element()
         };
         let body = match &self.state {
-            State::Reading => said("Reading the notebook".into()),
-            State::Failed(why) => said(why.clone()),
-            State::Ready if self.cells.is_empty() => said("No cells yet".into()),
+            State::Reading => said(crate::lang::t("Reading the notebook").into()),
+            State::Failed(why) => said(crate::extension_store::error_label(why).into()),
+            State::Ready if self.cells.is_empty() => said(crate::lang::t("No cells yet").into()),
             State::Ready => {
                 let cell =
                     cx.processor(|this, ix: usize, window, cx| this.render_cell(ix, window, cx));
@@ -1069,7 +1068,7 @@ pub(crate) fn outputs(said: &Value) -> Vec<Output> {
         let first = items.first()?;
         let (mime, size) = (text(&first["mime"]), first["size"].as_u64().unwrap_or(0));
         Some(Output::Unknown(
-            format!("{mime}, {}: not drawn here", size_of(size)).into(),
+            crate::lang::tf("{}, {}: not drawn here", &[&mime, &size_of(size)]).into(),
         ))
     };
     said.as_array()
@@ -1094,16 +1093,16 @@ fn cut(words: &str) -> SharedString {
     let kept: Vec<&str> = words[..end].split('\n').take(OUTPUT_LINES).collect();
     let left = words.split('\n').count() - kept.len();
     match left {
-        0 => format!("{}\n(cut here)", kept.join("\n")).into(),
-        left => format!("{}\n({left} more lines)", kept.join("\n")).into(),
+        0 => crate::lang::tf("{}\n(cut here)", &[&kept.join("\n")]).into(),
+        left => crate::lang::tf("{}\n({} more lines)", &[&kept.join("\n"), &left]).into(),
     }
 }
 
 fn size_of(bytes: u64) -> String {
     match bytes {
-        0..1024 => format!("{bytes} B"),
-        1024..1_048_576 => format!("{:.1} KB", bytes as f64 / 1024.),
-        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.),
+        0..1024 => crate::lang::tf("{} B", &[&bytes]),
+        1024..1_048_576 => crate::lang::tf("{} KB", &[&format!("{:.1}", bytes as f64 / 1024.)]),
+        _ => crate::lang::tf("{} MB", &[&format!("{:.1}", bytes as f64 / 1_048_576.)]),
     }
 }
 
@@ -1135,6 +1134,34 @@ fn unbase64(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn localized_output_notices_keep_the_program_output_and_mime() {
+        let value = json!([
+            {"items":[{"mime":"application/vnd.code.notebook.error","text":"Error: provider detail"}]},
+            {"items":[{"mime":"application/custom","size":2048}]}
+        ]);
+        crate::lang::set(crate::lang::Language::Russian);
+        let shown = outputs(&value);
+        assert!(
+            matches!(&shown[0], Output::Error(words) if words.as_str() == "Error: provider detail")
+        );
+        assert!(
+            matches!(&shown[1], Output::Unknown(words) if words.as_str() == "application/custom, 2.0 КБ: здесь не отображается")
+        );
+        let long = "provider line\n".repeat(OUTPUT_LINES + 2);
+        let clipped = cut(&long);
+        assert!(clipped.starts_with("provider line\n"));
+        assert!(clipped.ends_with("\n(ещё строк: 2)"));
+        assert_eq!(
+            value[0]["items"][0]["mime"],
+            "application/vnd.code.notebook.error"
+        );
+        crate::lang::set(crate::lang::Language::English);
+        assert!(
+            matches!(&outputs(&value)[1], Output::Unknown(words) if words.as_str() == "application/custom, 2.0 KB: not drawn here")
+        );
+    }
 
     #[test]
     fn of_each_output_the_form_that_can_be_drawn_is_taken() {

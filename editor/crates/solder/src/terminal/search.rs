@@ -65,7 +65,7 @@ impl Search {
         term: Arc<FairMutex<Term<Listener>>>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let query = cx.new(|cx| Editor::single_line("Find in terminal", cx));
+        let query = cx.new(|cx| Editor::localized_field("Find in terminal", cx));
         let subscription = cx.subscribe(&query, |this, _, event, cx| {
             if matches!(event, EditorEvent::Edited) {
                 this.refresh(true, cx);
@@ -287,7 +287,7 @@ impl Render for Search {
         let theme = cx.theme().clone();
         let focused = self.query.focus_handle(cx).is_focused(window);
         let status: String = if self.pending && self.found.matches.is_empty() {
-            "Searching...".into()
+            crate::lang::t("Searching...").into()
         } else {
             format!(
                 "{} / {}{}",

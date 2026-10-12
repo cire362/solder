@@ -2,6 +2,7 @@
 //! project's files, by file. A file need not be open to be in it: a server
 //! says what it finds in files it read itself.
 
+use crate::lang::{t, tf};
 use std::{
     collections::HashSet,
     ops::Range,
@@ -347,9 +348,12 @@ impl Render for ProblemsPanel {
         let theme = cx.theme().clone();
         let (errors, warnings, files) = self.totals;
         let said = match files {
-            0 => "No problems reported".to_string(),
-            1 => format!("{errors} errors, {warnings} warnings in 1 file"),
-            files => format!("{errors} errors, {warnings} warnings in {files} files"),
+            0 => t("No problems reported").to_string(),
+            1 => tf("{} errors, {} warnings in 1 file", &[&errors, &warnings]),
+            files => tf(
+                "{} errors, {} warnings in {} files",
+                &[&errors, &warnings, &files],
+            ),
         };
         div()
             .size_full()

@@ -2,7 +2,7 @@
 //! install, delete, models added by hand and which model serves chat and
 //! completions.
 
-use ai::{Candidate, Role, Source, Speed, format_size};
+use ai::{Candidate, Role, Source, Speed};
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable, Hsla, KeyBinding, PathPromptOptions,
     SharedString, Window, actions, div, prelude::*, px, uniform_list,
@@ -16,6 +16,31 @@ use crate::{
     theme::{ActiveTheme, Theme, UI_FONT_SIZE},
     ui,
 };
+
+fn format_size(bytes: u64) -> String {
+    let formatted = ai::format_size(bytes);
+    let (number, unit) = formatted.rsplit_once(' ').unwrap_or((&formatted, ""));
+    let unit = match unit {
+        "GB" => crate::lang::t("GB"),
+        "MB" => crate::lang::t("MB"),
+        other => other,
+    };
+    format!("{number} {unit}")
+}
+
+fn hardware_summary(hw: &ai::Hardware) -> String {
+    let mut parts = vec![hw.cpu.clone(), crate::lang::tf("{} cores", &[&hw.cores])];
+    parts.push(crate::lang::tf(
+        "{} GB",
+        &[&(hw.memory as f64 / (1u64 << 30) as f64).round()],
+    ));
+    if let Some(gpu) = &hw.gpu
+        && gpu.memory > 0
+    {
+        parts.push(format!("{} ({})", gpu.name, format_size(gpu.memory)));
+    }
+    parts.join(" · ")
+}
 
 const ROW_HEIGHT: gpui::Pixels = px(54.);
 
@@ -57,18 +82,19 @@ pub struct AiPanel {
 impl AiPanel {
     pub fn new(store: Entity<AiStore>, cx: &mut Context<Self>) -> Self {
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
-        let add_field = cx.new(|cx| Editor::single_line("org/model-GGUF or a .gguf path", cx));
+        let add_field = cx.new(|cx| Editor::localized_field("org/model-GGUF or a .gguf path", cx));
         Self {
             store,
             view: View::Models,
             add_field,
             key_for: None,
-            key_field: cx.new(|cx| Editor::masked("Paste the API key", cx)),
+            key_field: cx.new(|cx| Editor::masked(crate::lang::t("Paste the API key"), cx)),
             new_provider: false,
             completion_picker: false,
-            provider_name: cx.new(|cx| Editor::single_line("Name", cx)),
+            provider_name: cx.new(|cx| Editor::localized_field("Name", cx)),
             provider_url: cx.new(|cx| Editor::single_line("https://host/v1", cx)),
-            provider_key: cx.new(|cx| Editor::masked("API key, if it needs one", cx)),
+            provider_key: cx
+                .new(|cx| Editor::masked(crate::lang::t("API key, if it needs one"), cx)),
             servers_watch: None,
             focus: cx.focus_handle(),
         }
@@ -127,21 +153,26 @@ impl AiPanel {
         let mut list = div().flex().flex_col().gap_0p5().px_1p5();
         for p in store.providers.iter().filter(|p| p.kind != Kind::Local) {
             let status: (String, Hsla) = match &p.status {
-                Status::Unknown | Status::Checking => ("Checking...".into(), theme.fg_subtle),
+                Status::Unknown | Status::Checking => {
+                    (crate::lang::t("Checking...").into(), theme.fg_subtle)
+                }
                 Status::Ready(models) => (
                     match models.len() {
-                        1 => "1 model".into(),
-                        n => format!("{n} models"),
+                        1 => crate::lang::t("1 model").into(),
+                        n => crate::lang::tf("{} models", &[&n]),
                     },
                     theme.git_added,
                 ),
-                Status::NoKey => ("No key".into(), theme.fg_subtle),
+                Status::NoKey => (crate::lang::t("No key").into(), theme.fg_subtle),
                 Status::Unavailable(e) => (e.to_string(), theme.fg_subtle),
-                Status::Offline => ("Off in offline mode".into(), theme.fg_subtle),
+                Status::Offline => (
+                    crate::lang::t("Off in offline mode").into(),
+                    theme.fg_subtle,
+                ),
             };
             let key_note = p.key_source.map(|source| match source {
-                "saved" => "key saved".to_string(),
-                var => format!("key from {var}"),
+                "saved" => crate::lang::t("key saved").to_string(),
+                var => crate::lang::tf("key from {}", &[&var]),
             });
             let id = p.id.clone();
             let editing = self.key_for.as_deref() == Some(id.as_str());
@@ -151,9 +182,9 @@ impl AiPanel {
                 && p.key_source != Some("OPENAI_API_KEY")
             {
                 let (label, sel) = if p.key_source.is_some() {
-                    ("forget key", format!("ai-forget-key-{id}"))
+                    (crate::lang::t("forget key"), format!("ai-forget-key-{id}"))
                 } else {
-                    ("add key", format!("ai-key-{id}"))
+                    (crate::lang::t("add key"), format!("ai-key-{id}"))
                 };
                 let forget = p.key_source.is_some();
                 let entity = entity.clone();
@@ -188,7 +219,7 @@ impl AiPanel {
                 let target = id.clone();
                 actions = actions.child(ui::toggle(
                     SharedString::from(format!("ai-remove-provider-{id}")),
-                    "remove",
+                    crate::lang::t("remove"),
                     "",
                     false,
                     theme,
@@ -248,7 +279,7 @@ impl AiPanel {
                                 .child(
                                     ui::button(
                                         "ai-save-key",
-                                        "Save",
+                                        crate::lang::t("Save"),
                                         true,
                                         theme,
                                         cx.listener(|this, _, window, cx| {
@@ -261,88 +292,86 @@ impl AiPanel {
                     }),
             );
         }
-        let form = if self.new_provider {
-            let field = |editor: &Entity<Editor>| {
-                let focused = editor.focus_handle(cx).is_focused(window);
-                ui::text_field(editor.clone(), focused, theme)
-            };
-            div()
-                .px_3()
-                .pt_2()
-                .flex()
-                .flex_col()
-                .gap_1p5()
-                .key_context("AiNewProvider")
-                .on_action(cx.listener(Self::add_provider))
-                .child(
-                    div()
-                        .text_size(small)
-                        .text_color(theme.fg_subtle)
-                        .child("Any service with OpenAI's chat completions API."),
-                )
-                .child(div().flex().child(field(&self.provider_name)))
-                .child(div().flex().child(field(&self.provider_url)))
-                .child(div().flex().child(field(&self.provider_key)))
-                .child(
-                    div()
-                        .flex()
-                        .gap_1p5()
-                        .child(
-                            ui::button(
-                                "ai-add-provider",
-                                "Add provider",
-                                true,
-                                theme,
-                                cx.listener(|this, _, window, cx| {
-                                    this.add_provider(&AddProvider, window, cx)
-                                }),
+        let form =
+            if self.new_provider {
+                let field = |editor: &Entity<Editor>| {
+                    let focused = editor.focus_handle(cx).is_focused(window);
+                    ui::text_field(editor.clone(), focused, theme)
+                };
+                div()
+                    .px_3()
+                    .pt_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .key_context("AiNewProvider")
+                    .on_action(cx.listener(Self::add_provider))
+                    .child(div().text_size(small).text_color(theme.fg_subtle).child(
+                        crate::lang::t("Any service with OpenAI's chat completions API."),
+                    ))
+                    .child(div().flex().child(field(&self.provider_name)))
+                    .child(div().flex().child(field(&self.provider_url)))
+                    .child(div().flex().child(field(&self.provider_key)))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1p5()
+                            .child(
+                                ui::button(
+                                    "ai-add-provider",
+                                    crate::lang::t("Add provider"),
+                                    true,
+                                    theme,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.add_provider(&AddProvider, window, cx)
+                                    }),
+                                )
+                                .debug_selector(|| "ai-add-provider".into()),
                             )
-                            .debug_selector(|| "ai-add-provider".into()),
-                        )
-                        .child(ui::button(
-                            "ai-cancel-provider",
-                            "Cancel",
+                            .child(ui::button(
+                                "ai-cancel-provider",
+                                crate::lang::t("Cancel"),
+                                false,
+                                theme,
+                                cx.listener(|this, _, _, cx| {
+                                    this.new_provider = false;
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .px_3()
+                    .pt_2()
+                    .flex()
+                    .gap_1p5()
+                    .child(
+                        ui::button(
+                            "ai-new-provider",
+                            crate::lang::t("Add provider"),
                             false,
                             theme,
-                            cx.listener(|this, _, _, cx| {
-                                this.new_provider = false;
+                            cx.listener(|this, _, window, cx| {
+                                this.new_provider = true;
+                                window.focus(&this.provider_name.focus_handle(cx));
                                 cx.notify();
                             }),
-                        )),
-                )
-                .into_any_element()
-        } else {
-            div()
-                .px_3()
-                .pt_2()
-                .flex()
-                .gap_1p5()
-                .child(
-                    ui::button(
-                        "ai-new-provider",
-                        "Add provider",
+                        )
+                        .debug_selector(|| "ai-new-provider".into()),
+                    )
+                    .child(ui::button(
+                        "ai-refresh-providers",
+                        crate::lang::t("Check again"),
                         false,
                         theme,
-                        cx.listener(|this, _, window, cx| {
-                            this.new_provider = true;
-                            window.focus(&this.provider_name.focus_handle(cx));
-                            cx.notify();
-                        }),
-                    )
-                    .debug_selector(|| "ai-new-provider".into()),
-                )
-                .child(ui::button(
-                    "ai-refresh-providers",
-                    "Check again",
-                    false,
-                    theme,
-                    {
-                        let entity = entity.clone();
-                        move |_, _, cx| entity.update(cx, |s, cx| s.refresh_providers(cx))
-                    },
-                ))
-                .into_any_element()
-        };
+                        {
+                            let entity = entity.clone();
+                            move |_, _, cx| entity.update(cx, |s, cx| s.refresh_providers(cx))
+                        },
+                    ))
+                    .into_any_element()
+            };
         let completions = self.render_completions(theme, cx);
         let store = self.store.read(cx);
         let entity = self.store.clone();
@@ -363,15 +392,15 @@ impl AiPanel {
                             .text_size(small)
                             .text_color(theme.fg_subtle)
                             .child(if offline {
-                                "Offline: only this machine answers."
+                                crate::lang::t("Offline: only this machine answers.")
                             } else {
-                                "Local servers, and services with your key."
+                                crate::lang::t("Local servers, and services with your key.")
                             }),
                     )
                     .child(
                         ui::toggle(
                             "ai-offline",
-                            "offline",
+                            crate::lang::t("offline"),
                             "",
                             offline,
                             theme,
@@ -398,19 +427,36 @@ impl AiPanel {
         for (i, (name, config, extension)) in configured.iter().enumerate() {
             let entry = store.servers.iter().find(|entry| entry.name == *name);
             let (state, color, tools) = match entry.map(|entry| &entry.state) {
-                _ if !config.enabled => ("Off".to_string(), theme.fg_subtle, String::new()),
+                _ if !config.enabled => (
+                    crate::lang::t("Off").to_string(),
+                    theme.fg_subtle,
+                    String::new(),
+                ),
                 Some(State::Running(_, offer)) => {
-                    let count = |n: usize, one: &str, many: &str| match n {
+                    let count = |n: usize, one: &str, many: String| match n {
                         0 => None,
-                        1 => Some(format!("1 {one}")),
-                        n => Some(format!("{n} {many}")),
+                        1 => Some(one.to_string()),
+                        _ => Some(many),
                     };
                     let has: Vec<String> = [
                         Some(
-                            count(offer.tools.len(), "tool", "tools").unwrap_or("No tools".into()),
+                            count(
+                                offer.tools.len(),
+                                crate::lang::t("1 tool"),
+                                crate::lang::tf("{} tools", &[&offer.tools.len()]),
+                            )
+                            .unwrap_or(crate::lang::t("No tools").into()),
                         ),
-                        count(offer.prompts.len(), "prompt", "prompts"),
-                        count(offer.resources.len(), "resource", "resources"),
+                        count(
+                            offer.prompts.len(),
+                            crate::lang::t("1 prompt"),
+                            crate::lang::tf("{} prompts", &[&offer.prompts.len()]),
+                        ),
+                        count(
+                            offer.resources.len(),
+                            crate::lang::t("1 resource"),
+                            crate::lang::tf("{} resources", &[&offer.resources.len()]),
+                        ),
                     ]
                     .into_iter()
                     .flatten()
@@ -426,10 +472,14 @@ impl AiPanel {
                             .join(", "),
                     )
                 }
-                Some(State::Starting) => ("Starting...".to_string(), theme.fg_muted, String::new()),
+                Some(State::Starting) => (
+                    crate::lang::t("Starting...").to_string(),
+                    theme.fg_muted,
+                    String::new(),
+                ),
                 Some(State::Failed(why)) => (why.to_string(), theme.error, String::new()),
                 Some(State::Stopped) | None => (
-                    "Starts with the next agent task".to_string(),
+                    crate::lang::t("Starts with the next agent task").to_string(),
                     theme.fg_subtle,
                     String::new(),
                 ),
@@ -441,7 +491,9 @@ impl AiPanel {
                     .debug_selector(move || format!("context-server-{i}"))
                     .child(div().text_size(UI_FONT_SIZE).text_color(theme.fg).child(
                         match extension {
-                            Some(extension) => format!("{name} (extension {extension})"),
+                            Some(extension) => {
+                                crate::lang::tf("{} (extension {})", &[&name, &extension])
+                            }
                             None => name.clone(),
                         },
                     ))
@@ -457,9 +509,13 @@ impl AiPanel {
             );
         }
         let hint = if configured.is_empty() {
-            "A context server gives the agent tools of its own: a database to query, an issue tracker to read. Add one under context_servers in settings.json, with the command that starts it, or install an extension that brings one."
+            crate::lang::t(
+                "A context server gives the agent tools of its own: a database to query, an issue tracker to read. Add one under context_servers in settings.json, with the command that starts it, or install an extension that brings one.",
+            )
         } else {
-            "They start when an agent task begins. A tool runs outside the agent's sandbox, so the agent asks before the first call of each."
+            crate::lang::t(
+                "They start when an agent task begins. A tool runs outside the agent's sandbox, so the agent asks before the first call of each.",
+            )
         };
         list.child(
             div()
@@ -483,7 +539,7 @@ impl AiPanel {
                 div()
                     .text_size(crate::theme::text(11.))
                     .text_color(theme.fg_subtle)
-                    .child("REVIEW BEFORE PUSH"),
+                    .child(crate::lang::t("REVIEW BEFORE PUSH")),
             )
             .child(
                 div()
@@ -495,10 +551,10 @@ impl AiPanel {
                             .flex_1()
                             .text_size(crate::theme::UI_FONT_SMALL)
                             .text_color(theme.fg_subtle)
-                            .child("Push in the Git tab first has the chat model read what it sends; problems stop the push until you decide."),
+                            .child(crate::lang::t("Push in the Git tab first has the chat model read what it sends; problems stop the push until you decide.")),
                     )
                     .child(
-                        ui::toggle("ai-review-push", "on", "", on, theme, move |_, _, cx| {
+                        ui::toggle("ai-review-push", crate::lang::t("on"), "", on, theme, move |_, _, cx| {
                             entity.update(cx, |s, cx| s.set_review_push(!on, cx))
                         })
                         .debug_selector(|| "ai-review-push".into()),
@@ -514,7 +570,9 @@ impl AiPanel {
         let current = store.roles.get(&Role::Completion).cloned();
         let label = current
             .as_ref()
-            .map_or("No model".to_string(), |m| store.model_label(m));
+            .map_or(crate::lang::t("No model").to_string(), |m| {
+                store.model_label(m)
+            });
         let on = store.completions;
         let entity = self.store.clone();
         let mut block = div()
@@ -527,7 +585,7 @@ impl AiPanel {
                 div()
                     .text_size(crate::theme::text(11.))
                     .text_color(theme.fg_subtle)
-                    .child("COMPLETIONS"),
+                    .child(crate::lang::t("COMPLETIONS")),
             )
             .child(
                 div()
@@ -556,7 +614,7 @@ impl AiPanel {
                             })),
                     )
                     .child(
-                        ui::toggle("ai-completions", "as I type", "", on, theme, {
+                        ui::toggle("ai-completions", crate::lang::t("as I type"), "", on, theme, {
                             let entity = entity.clone();
                             move |_, _, cx| entity.update(cx, |s, cx| s.set_completions(!on, cx))
                         })
@@ -567,7 +625,7 @@ impl AiPanel {
                 div()
                     .text_size(small)
                     .text_color(theme.fg_subtle)
-                    .child("Suggests code at the end of a line; Tab accepts, Escape dismisses. A small fast model works best."),
+                    .child(crate::lang::t("Suggests code at the end of a line; Tab accepts, Escape dismisses. A small fast model works best.")),
             );
         if self.completion_picker {
             let mut menu = div()
@@ -585,7 +643,7 @@ impl AiPanel {
                         .pt_1()
                         .text_size(crate::theme::text(10.5))
                         .text_color(theme.fg_subtle)
-                        .child(provider.name.to_uppercase()),
+                        .child(provider.display_name().to_uppercase()),
                 );
                 for (model, label) in models {
                     let active = current.as_ref() == Some(&model);
@@ -631,7 +689,7 @@ impl AiPanel {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Add".into()),
+            prompt: Some(crate::lang::t("Add").into()),
         });
         let store = self.store.clone();
         cx.spawn(async move |_, cx| {
@@ -666,7 +724,7 @@ impl AiPanel {
     }
 
     fn speed_text(speed: Speed) -> String {
-        format!("{:.0} tok/s", speed.generate)
+        crate::lang::tf("{} tok/s", &[&format!("{:.0}", speed.generate)])
     }
 
     fn progress_bar(fraction: Option<f32>, theme: &Theme) -> impl IntoElement {
@@ -690,9 +748,9 @@ impl AiPanel {
         let mut block = div().px_3().pb_3().flex().flex_col().gap_2();
         if let Some(step) = &store.benchmark {
             let (label, fraction) = match step {
-                BenchStep::Runtime(p) => ("Downloading llama.cpp", p.fraction()),
-                BenchStep::Model(p) => ("Downloading the test model", p.fraction()),
-                BenchStep::Measuring => ("Measuring speed", None),
+                BenchStep::Runtime(p) => (crate::lang::t("Downloading llama.cpp"), p.fraction()),
+                BenchStep::Model(p) => (crate::lang::t("Downloading the test model"), p.fraction()),
+                BenchStep::Measuring => (crate::lang::t("Measuring speed"), None),
             };
             let label = match fraction {
                 Some(f) => format!("{label} {:.0}%", f * 100.),
@@ -715,11 +773,11 @@ impl AiPanel {
                         div()
                             .text_size(small)
                             .text_color(theme.fg_subtle)
-                            .child("Measure this machine to find the best model it runs well. Downloads llama.cpp (12 MB) and a 0.8 GB test model."),
+                            .child(crate::lang::t("Measure this machine to find the best model it runs well. Downloads llama.cpp (12 MB) and a 0.8 GB test model.")),
                     )
                     .child(
                         div().flex().child(
-                            ui::button("ai-benchmark", "Run benchmark", true, theme, move |_, _, cx| {
+                            ui::button("ai-benchmark", crate::lang::t("Run benchmark"), true, theme, move |_, _, cx| {
                                 entity.update(cx, |s, cx| s.run_benchmark(cx))
                             })
                             .debug_selector(|| "ai-benchmark".into()),
@@ -745,22 +803,31 @@ impl AiPanel {
                                 .min_w_0()
                                 .text_size(small)
                                 .text_color(theme.fg_muted)
-                                .child(format!(
-                                    "Reads {:.0} and writes {:.0} tokens per second on the test model.",
-                                    speed.prompt, speed.generate
+                                .child(crate::lang::tf(
+                                    "Reads {} and writes {} tokens per second on the test model.",
+                                    &[
+                                        &format!("{:.0}", speed.prompt),
+                                        &format!("{:.0}", speed.generate),
+                                    ],
                                 )),
                         )
-                        .child(ui::button("ai-benchmark", "Again", false, theme, {
-                            let entity = entity.clone();
-                            move |_, _, cx| entity.update(cx, |s, cx| s.run_benchmark(cx))
-                        })),
+                        .child(ui::button(
+                            "ai-benchmark",
+                            crate::lang::t("Again"),
+                            false,
+                            theme,
+                            {
+                                let entity = entity.clone();
+                                move |_, _, cx| entity.update(cx, |s, cx| s.run_benchmark(cx))
+                            },
+                        )),
                 );
                 if !missing.is_empty() {
                     block = block.child(
                         div().flex().child(
                             ui::button(
                                 "ai-install-recommended",
-                                format!("Install recommended ({})", format_size(size)),
+                                crate::lang::tf("Install recommended ({})", &[&format_size(size)]),
                                 true,
                                 theme,
                                 move |_, _, cx| {
@@ -772,7 +839,7 @@ impl AiPanel {
                     );
                 } else if store.candidates().iter().all(|c| c.picks.is_empty()) {
                     block = block.child(div().text_size(small).text_color(theme.warning).child(
-                        "No model runs fast enough here. Use a provider with your own key instead.",
+                        crate::lang::t("No model runs fast enough here. Use a provider with your own key instead."),
                     ));
                 }
             }
@@ -802,21 +869,26 @@ impl AiPanel {
         let found = store.is_found(&id);
         let budget = store.hardware.as_ref().map_or(0, |h| h.model_budget());
         let detail = if !c.fits && !installed {
-            format!(
+            crate::lang::tf(
                 "Needs {}, {} available",
-                format_size(model.memory()),
-                format_size(budget)
+                &[&format_size(model.memory()), &format_size(budget)],
             )
         } else {
             let speed = match (verified, c.speed) {
-                (Some(v), _) => format!(" · {} measured", Self::speed_text(v)),
-                (None, Some(p)) => format!(" · about {}", Self::speed_text(p)),
+                (Some(v), _) => crate::lang::tf(" · {} measured", &[&Self::speed_text(v)]),
+                (None, Some(p)) => crate::lang::tf(" · about {}", &[&Self::speed_text(p)]),
                 _ => String::new(),
             };
             let active = if model.active < model.params * 0.9 {
-                format!(" · {:.0}B, {:.1}B active", model.params, model.active)
+                crate::lang::tf(
+                    " · {}B, {}B active",
+                    &[
+                        &format!("{:.0}", model.params),
+                        &format!("{:.1}", model.active),
+                    ],
+                )
             } else {
-                format!(" · {:.1}B", model.params)
+                crate::lang::tf(" · {}B", &[&format!("{:.1}", model.params)])
             };
             format!("{}{active}{speed}", format_size(model.size))
         };
@@ -828,7 +900,10 @@ impl AiPanel {
             let model_id = id.clone();
             ui::toggle(
                 SharedString::from(selector.clone()),
-                label,
+                match role {
+                    Role::Chat => crate::lang::t("chat"),
+                    Role::Completion => crate::lang::t("complete"),
+                },
                 "",
                 active,
                 theme,
@@ -852,7 +927,7 @@ impl AiPanel {
                 )
                 .child(ui::toggle(
                     SharedString::from(format!("ai-cancel-{id}")),
-                    "cancel",
+                    crate::lang::t("cancel"),
                     "",
                     false,
                     theme,
@@ -866,13 +941,13 @@ impl AiPanel {
             div()
                 .text_size(crate::theme::text(11.))
                 .text_color(theme.fg_subtle)
-                .child("Measuring...")
+                .child(crate::lang::t("Measuring..."))
                 .into_any_element()
         } else if installed {
             // Files Solder did not download are only taken off the list.
             let remove_label = match model.source {
-                Source::Hub { .. } => "delete",
-                Source::File(_) => "remove",
+                Source::Hub { .. } => crate::lang::t("delete"),
+                Source::File(_) => crate::lang::t("remove"),
             };
             let selector = format!("ai-delete-{id}");
             let removed = model.clone();
@@ -885,7 +960,7 @@ impl AiPanel {
                     let entity = entity.clone();
                     d.child(ui::toggle(
                         SharedString::from(format!("ai-measure-{id}")),
-                        "measure",
+                        crate::lang::t("measure"),
                         "",
                         false,
                         theme,
@@ -919,7 +994,7 @@ impl AiPanel {
             let selector = format!("ai-install-{id}");
             ui::button(
                 SharedString::from(selector.clone()),
-                "Install",
+                crate::lang::t("Install"),
                 !c.picks.is_empty(),
                 theme,
                 move |_, _, cx| entity.update(cx, |s, cx| s.install(model.clone(), cx)),
@@ -932,7 +1007,7 @@ impl AiPanel {
         let origin = if found {
             Some("LM Studio")
         } else if c.model.is_custom() {
-            Some("added")
+            Some(crate::lang::t("added"))
         } else {
             None
         };
@@ -969,17 +1044,25 @@ impl AiPanel {
                                     .child(div().truncate().child(c.model.name.clone()))
                                     // Advice for what to install; once installed,
                                     // the role toggles say what it does.
-                                    .children(
-                                        (!installed && c.picks.contains(&Role::Chat)).then(|| {
-                                            Self::tag("best for chat", theme.accent, theme)
-                                        }),
-                                    )
+                                    .children((!installed && c.picks.contains(&Role::Chat)).then(
+                                        || {
+                                            Self::tag(
+                                                crate::lang::t("best for chat"),
+                                                theme.accent,
+                                                theme,
+                                            )
+                                        },
+                                    ))
                                     .children(
                                         (!installed
                                             && c.picks.contains(&Role::Completion)
                                             && !c.picks.contains(&Role::Chat))
                                         .then(|| {
-                                            Self::tag("best to complete", theme.accent, theme)
+                                            Self::tag(
+                                                crate::lang::t("best to complete"),
+                                                theme.accent,
+                                                theme,
+                                            )
                                         }),
                                     )
                                     .children(origin.map(|o| Self::tag(o, theme.fg_subtle, theme))),
@@ -1017,7 +1100,11 @@ impl AiPanel {
             .child(
                 ui::button(
                     "ai-add",
-                    if adding { "Adding..." } else { "Add" },
+                    if adding {
+                        crate::lang::t("Adding...")
+                    } else {
+                        crate::lang::t("Add")
+                    },
                     false,
                     theme,
                     cx.listener(|this, _, window, cx| this.add(&AddModel, window, cx)),
@@ -1026,7 +1113,7 @@ impl AiPanel {
             )
             .child(ui::button(
                 "ai-browse",
-                "File...",
+                crate::lang::t("File..."),
                 false,
                 theme,
                 cx.listener(|this, _, _, cx| this.browse(cx)),
@@ -1053,7 +1140,7 @@ impl Render for AiPanel {
             .child(
                 ui::toggle(
                     "ai-view-models",
-                    "models",
+                    crate::lang::t("models"),
                     "",
                     view == View::Models,
                     &theme,
@@ -1064,7 +1151,7 @@ impl Render for AiPanel {
             .child(
                 ui::toggle(
                     "ai-view-providers",
-                    "providers",
+                    crate::lang::t("providers"),
                     "",
                     view == View::Providers,
                     &theme,
@@ -1075,7 +1162,7 @@ impl Render for AiPanel {
             .child(
                 ui::toggle(
                     "ai-view-servers",
-                    "context servers",
+                    crate::lang::t("context servers"),
                     "",
                     view == View::Servers,
                     &theme,
@@ -1124,7 +1211,7 @@ impl Render for AiPanel {
                 .px_3()
                 .text_size(small)
                 .text_color(theme.fg_subtle)
-                .child("Reading this machine..."),
+                .child(crate::lang::t("Reading this machine...")),
             Some(hw) => div()
                 .px_3()
                 .flex()
@@ -1134,19 +1221,23 @@ impl Render for AiPanel {
                     div()
                         .text_size(UI_FONT_SIZE)
                         .text_color(theme.fg)
-                        .child(hw.summary()),
+                        .child(hardware_summary(hw)),
                 )
                 .child(
                     div()
                         .text_size(small)
                         .text_color(theme.fg_subtle)
-                        .child(format!(
+                        .child(crate::lang::tf(
                             "{} for models{}",
-                            format_size(hw.model_budget()),
-                            store
-                                .free_disk
-                                .map(|f| format!(" · {} free on disk", format_size(f)))
-                                .unwrap_or_default()
+                            &[
+                                &format_size(hw.model_budget()),
+                                &store
+                                    .free_disk
+                                    .map(|f| {
+                                        crate::lang::tf(" · {} free on disk", &[&format_size(f)])
+                                    })
+                                    .unwrap_or_default(),
+                            ],
                         )),
                 ),
         };

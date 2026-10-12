@@ -13,6 +13,7 @@ use gpui::{
 use crate::{
     editor::{Editor, EditorEvent},
     fuzzy,
+    lang::t,
     theme::{ActiveTheme, Theme, UI_FONT_SIZE},
     ui,
 };
@@ -55,7 +56,7 @@ pub struct ApiPanel {
 
 impl ApiPanel {
     pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
-        let filter = cx.new(|cx| Editor::single_line("Filter routes", cx));
+        let filter = cx.new(|cx| Editor::localized_field("Filter routes", cx));
         cx.subscribe(&filter, |this, _, event: &EditorEvent, cx| {
             if matches!(event, EditorEvent::Edited) {
                 this.refilter(cx);
@@ -228,7 +229,7 @@ impl ApiPanel {
                                         .text_size(crate::theme::text(11.))
                                         .text_color(theme.fg_subtle)
                                         .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                                        .child("Send")
+                                        .child(t("Send"))
                                         .on_click(cx.listener(move |_, _, _, cx| {
                                             cx.stop_propagation();
                                             cx.emit(ApiEvent::Send(send.clone()));
@@ -274,10 +275,10 @@ impl Render for ApiPanel {
         let count = self.matches.len();
         let focused = self.filter.focus_handle(cx).is_focused(window);
         let empty: Option<SharedString> = if !self.loaded {
-            Some("Looking for routes...".into())
+            Some(t("Looking for routes...").into())
         } else if self.routes.is_empty() {
             Some(
-                "No routes found. Import an OpenAPI file, or write requests in a .http file."
+                t("No routes found. Import an OpenAPI file, or write requests in a .http file.")
                     .into(),
             )
         } else {
@@ -300,7 +301,7 @@ impl Render for ApiPanel {
                     .child(
                         ui::button(
                             "api-requests",
-                            "Requests",
+                            t("Requests"),
                             false,
                             &theme,
                             |_, window, cx| window.dispatch_action(Box::new(OpenRequests), cx),
@@ -309,14 +310,14 @@ impl Render for ApiPanel {
                     )
                     .child(ui::button(
                         "api-import",
-                        "Import OpenAPI",
+                        t("Import OpenAPI"),
                         false,
                         &theme,
                         |_, window, cx| window.dispatch_action(Box::new(ImportOpenApi), cx),
                     ))
                     .child(ui::button(
                         "api-refresh",
-                        "Refresh",
+                        t("Refresh"),
                         false,
                         &theme,
                         |_, window, cx| window.dispatch_action(Box::new(RefreshRoutes), cx),

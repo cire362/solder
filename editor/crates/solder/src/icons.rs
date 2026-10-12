@@ -287,25 +287,56 @@ pub fn item(item: &Item) -> &'static str {
 }
 
 pub fn button(label: &str) -> Option<&'static str> {
-    Some(match label {
-        "Run" | "Start" | "Query" | "Send" => "play",
-        "Stop" => "stop",
-        "Pause" => "pause",
-        "Save" | "Save all" => "floppy-disk",
-        "Copy" => "copy",
-        "Remove" | "Delete" => "trash",
-        "Close" | "Cancel" => "x",
-        "New" | "Add" => "plus",
-        "Refresh" | "Restart" => "arrows-clockwise",
-        "Settings" => "gear",
-        "Install" => "puzzle-piece",
-        _ => return None,
-    })
+    const LABELS: &[(&str, &str)] = &[
+        ("Run", "play"),
+        ("Start", "play"),
+        ("Query", "play"),
+        ("Send", "play"),
+        ("Stop", "stop"),
+        ("Pause", "pause"),
+        ("Save", "floppy-disk"),
+        ("Save all", "floppy-disk"),
+        ("Save All", "floppy-disk"),
+        ("Copy", "copy"),
+        ("Remove", "trash"),
+        ("Delete", "trash"),
+        ("Close", "x"),
+        ("Cancel", "x"),
+        ("New", "plus"),
+        ("Add", "plus"),
+        ("Refresh", "arrows-clockwise"),
+        ("Restart", "arrows-clockwise"),
+        ("Settings", "gear"),
+        ("Install", "puzzle-piece"),
+    ];
+    // Only labels with icons participate: another word with the same
+    // translation (Update and Refresh) cannot hide a button's icon.
+    LABELS
+        .iter()
+        .find(|&&(key, _)| key == label)
+        .or_else(|| {
+            LABELS
+                .iter()
+                .find(|&&(key, _)| crate::lang::t(key) == label)
+        })
+        .map(|&(_, icon)| icon)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn translating_a_button_keeps_its_icon() {
+        crate::lang::set(crate::lang::Language::Russian);
+        for label in [
+            "Run", "Stop", "Save", "Copy", "Remove", "Install", "Refresh",
+        ] {
+            assert_eq!(button(crate::lang::t(label)), button(label), "{label}");
+        }
+        assert_eq!(button("Моя команда"), None);
+        crate::lang::set(crate::lang::Language::English);
+    }
 
     #[gpui::test]
     fn embedded_icons_render_without_files_or_fonts(cx: &mut gpui::TestAppContext) {
@@ -334,9 +365,11 @@ mod tests {
             .map(panel)
             .chain(Item::ALL.iter().map(item))
             .chain(
-                ["Run", "Stop", "Save", "Copy", "Remove", "Install"]
-                    .into_iter()
-                    .filter_map(button),
+                [
+                    "Run", "Stop", "Save", "Copy", "Remove", "Install", "Refresh",
+                ]
+                .into_iter()
+                .filter_map(button),
             )
         {
             assert!(

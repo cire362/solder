@@ -2,6 +2,7 @@
 //! credential that is still staged, and errors must not let a commit through.
 
 use crate::git::{GitError, Repo, Result};
+use crate::lang::{t, tf};
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -10,6 +11,22 @@ pub struct Finding {
     pub path: String,
     pub line: usize,
     pub kind: &'static str,
+}
+
+impl Finding {
+    pub fn label(&self) -> &'static str {
+        match self.kind {
+            "Private key" => t("Private key"),
+            "AWS access key" => t("AWS access key"),
+            "GitHub token" => t("GitHub token"),
+            "GitLab token" => t("GitLab token"),
+            "Slack token" => t("Slack token"),
+            "API key" => t("API key"),
+            "Connection password" => t("Connection password"),
+            "Credential value" => t("Credential value"),
+            other => other,
+        }
+    }
 }
 
 fn rules() -> &'static Vec<(&'static str, Regex)> {
@@ -82,17 +99,18 @@ impl Repo {
         let mut found = Vec::new();
         for path in names.split(|b| *b == 0).filter(|p| !p.is_empty()) {
             let path = std::str::from_utf8(path).map_err(|_| {
-                GitError("Cannot check a staged filename that is not UTF-8.".into())
+                GitError(t("Cannot check a staged filename that is not UTF-8.").into())
             })?;
             let spec = format!(":0:{path}");
             let size = self.run(&["cat-file", "-s", &spec])?;
             let size: u64 = String::from_utf8_lossy(&size)
                 .trim()
                 .parse()
-                .map_err(|_| GitError("Cannot read a staged file's size.".into()))?;
+                .map_err(|_| GitError(t("Cannot read a staged file's size.").into()))?;
             if size > 5 * 1024 * 1024 {
-                return Err(GitError(format!(
-                    "Cannot check {path}: staged file is over 5 MB. Commit it through Git after checking it."
+                return Err(GitError(tf(
+                    "Cannot check {}: staged file is over 5 MB. Commit it through Git after checking it.",
+                    &[&path],
                 )));
             }
             // Gitlinks name commits, not file contents.
@@ -114,11 +132,11 @@ impl Repo {
         let locations: Vec<_> = found
             .iter()
             .take(10)
-            .map(|f| format!("{}:{} ({})", f.path, f.line, f.kind))
+            .map(|f| format!("{}:{} ({})", f.path, f.line, f.label()))
             .collect();
-        Err(GitError(format!(
+        Err(GitError(tf(
             "Commit stopped: possible secrets in {}. Remove them from the index and try again.",
-            locations.join(", ")
+            &[&locations.join(", ")],
         )))
     }
 }
@@ -127,6 +145,20 @@ impl Repo {
 mod tests {
     use super::*;
     use crate::git_history::tests::Fixture;
+
+    #[test]
+    fn russian_secret_labels_keep_scanning_kinds_and_locations_unchanged() {
+        let secret = ["ghp_", &"A".repeat(36)].concat();
+        let findings = scan("private.cfg", format!("safe\n{secret}\n").as_bytes());
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_eq!(findings[0].label(), "Токен GitHub");
+        assert_eq!(findings[0].kind, "GitHub token");
+        assert_eq!(findings[0].path, "private.cfg");
+        assert_eq!(findings[0].line, 2);
+        assert!(!findings[0].label().contains(&secret));
+        crate::lang::set(crate::lang::Language::English);
+        assert_eq!(findings[0].label(), "GitHub token");
+    }
     #[test]
     fn the_index_is_checked_even_when_the_working_file_is_clean() {
         let f = Fixture::new("staged-secret");

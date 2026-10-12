@@ -20,6 +20,20 @@ pub struct LaunchConfig {
     pub adapter: Option<ExtensionAdapter>,
 }
 
+impl LaunchConfig {
+    /// The configuration name is also sent to adapters and stays unchanged.
+    pub fn label(&self) -> String {
+        if self.adapter.is_none()
+            && self.browser.is_some()
+            && let Some(name) = self.name.strip_suffix(" + browser")
+        {
+            crate::lang::tf("{} + browser", &[&name])
+        } else {
+            self.name.clone()
+        }
+    }
+}
+
 /// A debug adapter an installed extension brings, and what to debug with it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExtensionAdapter {
@@ -217,6 +231,30 @@ pub fn browser_request(url: &str, web_root: &Path, profile: &Path) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_russian_browser_label_keeps_the_launch_configuration_unchanged() {
+        let config = LaunchConfig {
+            name: "npm run dev + browser".into(),
+            request: node_config("npm run dev", Path::new("/project")),
+            browser: Some("http://localhost:3000".into()),
+            adapter: None,
+        };
+        let request = config.request.clone();
+        assert_eq!(config.label(), config.name);
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_eq!(config.label(), "npm run dev + браузер");
+        assert_eq!(config.name, "npm run dev + browser");
+        assert_eq!(config.request, request);
+        let browser = browser_request(
+            "http://localhost:3000",
+            Path::new("/project"),
+            Path::new("/profile"),
+        );
+        assert_eq!(browser["name"], "Browser");
+        assert_eq!(browser["type"], "pwa-chrome");
+        crate::lang::set(crate::lang::Language::English);
+    }
 
     #[test]
     fn finds_scripts_files_and_next_apps() {

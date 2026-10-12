@@ -15,7 +15,7 @@ pub struct File {
 impl File {
     pub fn read(path: &Path) -> Result<(Self, Value), String> {
         if std::fs::metadata(path).map_err(|e| e.to_string())?.len() > LIMIT {
-            return Err("This notebook is larger than 64 MB".into());
+            return Err(crate::lang::t("This notebook is larger than 64 MB").into());
         }
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
         Self::decode(&bytes)
@@ -24,11 +24,11 @@ impl File {
     fn decode(bytes: &[u8]) -> Result<(Self, Value), String> {
         let original: Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
         if original["nbformat"] != 4 {
-            return Err("This notebook needs Jupyter format 4".into());
+            return Err(crate::lang::t("This notebook needs Jupyter format 4").into());
         }
         let cells = original["cells"]
             .as_array()
-            .ok_or("The notebook has no cells")?;
+            .ok_or(crate::lang::t("The notebook has no cells"))?;
         let language = original["metadata"]["language_info"]["name"]
             .as_str()
             .or(original["metadata"]["kernelspec"]["language"].as_str())
@@ -36,8 +36,11 @@ impl File {
         let mut shown = Vec::new();
         let mut kept = HashMap::new();
         for (handle, cell) in cells.iter().enumerate() {
-            let kind = cell["cell_type"].as_str().ok_or("A cell has no kind")?;
-            let value = multiline(&cell["source"]).ok_or("A cell has invalid source text")?;
+            let kind = cell["cell_type"]
+                .as_str()
+                .ok_or(crate::lang::t("A cell has no kind"))?;
+            let value = multiline(&cell["source"])
+                .ok_or(crate::lang::t("A cell has invalid source text"))?;
             let code = kind == "code";
             shown.push(json!({"handle":handle, "code":code,
                 "language":if code {language} else if kind == "markdown" {"markdown"} else {"plaintext"},
@@ -93,7 +96,9 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let parent = path.parent().ok_or("This file has no folder")?;
+    let parent = path
+        .parent()
+        .ok_or(crate::lang::t("This file has no folder"))?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let temporary = parent.join(format!(
         ".solder-save-{}-{}",
@@ -134,7 +139,7 @@ fn output(value: &Value) -> Value {
             json!({"items":[{"mime":if value["name"] == "stderr" {"application/vnd.code.notebook.stderr"} else {"application/vnd.code.notebook.stdout"},"text":multiline(&value["text"]).unwrap_or_default()}]})
         }
         Some("error") => {
-            json!({"items":[{"mime":"application/vnd.code.notebook.error","text": value["traceback"].as_array().map(|lines| lines.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n")).filter(|text| !text.is_empty()).unwrap_or_else(|| format!("{}: {}",value["ename"].as_str().unwrap_or("Error"),value["evalue"].as_str().unwrap_or_default()))}]})
+            json!({"items":[{"mime":"application/vnd.code.notebook.error","text": value["traceback"].as_array().map(|lines| lines.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n")).filter(|text| !text.is_empty()).unwrap_or_else(|| format!("{}: {}",value["ename"].as_str().unwrap_or(crate::lang::t("Error")),value["evalue"].as_str().unwrap_or_default()))}]})
         }
         Some("display_data" | "execute_result") => {
             let items: Vec<Value> = value["data"]
@@ -162,6 +167,35 @@ fn output(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn localized_validation_keeps_the_jupyter_file_and_cell_identifiers() {
+        crate::lang::set(crate::lang::Language::Russian);
+        let invalid = json!({"nbformat":3});
+        assert_eq!(
+            File::decode(&serde_json::to_vec(&invalid).unwrap())
+                .err()
+                .unwrap(),
+            "Для этого блокнота нужен формат Jupyter 4"
+        );
+        let source = json!({"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[
+            {"cell_type":"markdown","id":"source","metadata":{},"source":"# Original content"}
+        ]});
+        let (file, shown) = File::decode(&serde_json::to_vec(&source).unwrap()).unwrap();
+        assert_eq!(shown["cells"][0]["language"], "markdown");
+        assert_eq!(shown["cells"][0]["value"], "# Original content");
+        assert_eq!(
+            file.content(&[(0, false, "# Original content".into())]),
+            source
+        );
+        crate::lang::set(crate::lang::Language::English);
+        assert_eq!(
+            File::decode(&serde_json::to_vec(&invalid).unwrap())
+                .err()
+                .unwrap(),
+            "This notebook needs Jupyter format 4"
+        );
+    }
 
     #[test]
     fn jupyter_edit_keeps_metadata_outputs_attachments_and_cell_identity() {

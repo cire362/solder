@@ -316,7 +316,10 @@ impl Page {
                 Ok(wry::raw_window_handle::RawWindowHandle::Xlib(_)
                     | wry::raw_window_handle::RawWindowHandle::Xcb(_))
             ) {
-                return Err("Webviews need X11 on Linux. Start Solder with an X11 session.".into());
+                return Err(crate::lang::t(
+                    "Webviews need X11 on Linux. Start Solder with an X11 session.",
+                )
+                .into());
             }
             gtk::init().map_err(|e| e.to_string())?;
         }
@@ -412,7 +415,7 @@ impl Render for Page {
             .child(if let Some(error) = &self.error {
                 div()
                     .p_4()
-                    .child(format!("Could not open this page. {error}"))
+                    .child(crate::lang::tf("Could not open this page. {}", &[&error]))
                     .into_any_element()
             } else {
                 BrowserElement(cx.entity()).into_any_element()

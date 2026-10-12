@@ -72,8 +72,8 @@ pub struct BufferSearchBar {
 
 impl BufferSearchBar {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let query = cx.new(|cx| Editor::single_line(t("Find"), cx));
-        let replacement = cx.new(|cx| Editor::single_line(t("Replace"), cx));
+        let query = cx.new(|cx| Editor::localized_field("Find", cx));
+        let replacement = cx.new(|cx| Editor::localized_field("Replace", cx));
         let subscriptions = vec![cx.subscribe_in(&query, window, |this, _, e, _, cx| {
             if let EditorEvent::Edited = e {
                 this.follow_cursor = true;

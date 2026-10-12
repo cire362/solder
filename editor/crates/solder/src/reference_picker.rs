@@ -77,7 +77,7 @@ impl ReferencePicker {
 
 impl PickerDelegate for ReferencePicker {
     fn placeholder(&self) -> SharedString {
-        format!("Pick from {}", self.title).into()
+        crate::lang::tf("Pick from {}", &[&self.title]).into()
     }
 
     fn match_count(&self) -> usize {
@@ -165,7 +165,7 @@ impl PickerDelegate for ReferencePicker {
             return div()
                 .text_size(UI_FONT_SIZE)
                 .text_color(theme.fg)
-                .child(format!("Use \u{201c}{}\u{201d}", self.typed))
+                .child(crate::lang::tf("Use \u{201c}{}\u{201d}", &[&self.typed]))
                 .into_any_element();
         }
         let Some(Ok(rows)) = &self.rows else {
@@ -191,7 +191,7 @@ impl PickerDelegate for ReferencePicker {
         match &self.rows {
             None => "Loading...".into(),
             Some(Err(e)) => e.clone(),
-            Some(Ok(_)) => "No rows. Type a value to use it.".into(),
+            Some(Ok(_)) => crate::lang::t("No rows. Type a value to use it.").into(),
         }
     }
 

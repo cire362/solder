@@ -5,6 +5,7 @@
 //! `keymap-imported.json`, under the user's `keymap.json`. The user's
 //! `settings.json` is edited key by key, so its comments stay.
 
+use crate::lang::{t, tf};
 use std::path::{Path, PathBuf};
 
 use import::{Binding, Roots, Setting, ThemeFile, jsonc};
@@ -77,17 +78,17 @@ pub fn apply(dir: &Path, choice: &Choice) -> Result<Vec<String>, String> {
             &serde_json::to_string_pretty(theme).map_err(|e| e.to_string())?,
         )?;
         text = jsonc::set_key(&text, "theme", &Value::from(theme.name.clone()));
-        done.push(format!("the theme {}", theme.name));
+        done.push(tf("the theme {}", &[&theme.name]));
     }
     if text != before {
         // Never leave a file the editor cannot read.
-        settings::parse_settings(&text).map_err(|e| format!("Not applied: {e}"))?;
+        settings::parse_settings(&text).map_err(|e| tf("Not applied: {}", &[&e]))?;
         write(&path, &text)?;
     }
     match choice.settings.len() {
         0 => {}
-        1 => done.insert(0, "1 setting".into()),
-        n => done.insert(0, format!("{n} settings")),
+        1 => done.insert(0, t("1 setting").into()),
+        n => done.insert(0, tf("{} settings", &[&n])),
     }
 
     if !choice.bindings.is_empty() {
@@ -99,8 +100,8 @@ pub fn apply(dir: &Path, choice: &Choice) -> Result<Vec<String>, String> {
         );
         write(&dir.join(settings::IMPORTED_KEYMAP), &keymap)?;
         done.push(match choice.bindings.len() {
-            1 => "1 key binding".into(),
-            n => format!("{n} key bindings"),
+            1 => t("1 key binding").into(),
+            n => tf("{} key bindings", &[&n]),
         });
     }
     Ok(done)
@@ -117,6 +118,34 @@ fn write(path: &PathBuf, text: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn russian_import_notes_keep_saved_settings_and_keys_unchanged() {
+        let dir = db::testing::dir("import-russian");
+        let choice = Choice {
+            source: "VS Code".into(),
+            settings: vec![setting("format_on_save", json!(true))],
+            bindings: vec![Binding {
+                keys: "cmd-j".into(),
+                action: "workspace::ToggleTerminal",
+                context: None,
+            }],
+            ..Default::default()
+        };
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_eq!(
+            apply(&dir, &choice).unwrap(),
+            ["1 настройка", "1 сочетание клавиш"]
+        );
+        let saved = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert!(settings::parse_settings(&saved).unwrap().format_on_save);
+        let keymap = std::fs::read_to_string(dir.join(settings::IMPORTED_KEYMAP)).unwrap();
+        assert!(keymap.starts_with("// Key bindings imported from VS Code."));
+        assert!(keymap.contains("workspace::ToggleTerminal"));
+        assert!(keymap.contains("cmd-j"));
+        crate::lang::set(crate::lang::Language::English);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn setting(key: &'static str, value: Value) -> Setting {
         Setting {

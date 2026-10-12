@@ -1,6 +1,7 @@
 //! A commit suggestion uses only staged, permitted changes and never commits.
 
 use crate::git::Repo;
+use crate::lang::t;
 use ai::tools::{StepRequest, Turn};
 
 pub struct Staged {
@@ -13,17 +14,18 @@ pub fn staged(repo: &Repo, root: &std::path::Path) -> Result<Staged, String> {
     let read_tree = || {
         repo.run(&["write-tree"])
             .map(|b| String::from_utf8_lossy(&b).trim().to_string())
-            .map_err(|e| e.0)
+            .map_err(|e| crate::git_store::error_label(&e))
     };
     let tree = read_tree()?;
-    repo.check_staged_secrets().map_err(|e| e.0)?;
+    repo.check_staged_secrets()
+        .map_err(|e| crate::git_store::error_label(&e))?;
     let paths = repo
         .run(&["diff", "--cached", "--name-only", "-z", "--"])
-        .map_err(|e| e.0)?;
+        .map_err(|e| crate::git_store::error_label(&e))?;
     let mut diff = String::new();
     let mut skipped = Vec::new();
     for path in paths.split(|b| *b == 0).filter(|p| !p.is_empty()) {
-        let path = std::str::from_utf8(path).map_err(|_| "A staged filename is not UTF-8.")?;
+        let path = std::str::from_utf8(path).map_err(|_| t("A staged filename is not UTF-8."))?;
         if !crate::ai_context::allows_path(root, &repo.workdir.join(path))? {
             skipped.push(path.into());
             continue;
@@ -39,7 +41,7 @@ pub fn staged(repo: &Repo, root: &std::path::Path) -> Result<Staged, String> {
                 "--",
                 path,
             ])
-            .map_err(|e| e.0)?;
+            .map_err(|e| crate::git_store::error_label(&e))?;
         if bytes.len() > 16_000 || diff.len() + bytes.len() > 60_000 {
             skipped.push(path.into());
             continue;
@@ -47,10 +49,10 @@ pub fn staged(repo: &Repo, root: &std::path::Path) -> Result<Staged, String> {
         diff.push_str(&String::from_utf8_lossy(&bytes));
     }
     if read_tree()? != tree {
-        return Err("Staged changes moved. Try again.".into());
+        return Err(t("Staged changes moved. Try again.").into());
     }
     if diff.trim().is_empty() {
-        return Err("No staged changes are available to the model.".into());
+        return Err(t("No staged changes are available to the model.").into());
     }
     Ok(Staged {
         tree,
@@ -71,10 +73,10 @@ pub fn subject(text: &str) -> Result<String, String> {
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty() && !l.starts_with("```"))
-        .ok_or("The model gave no commit message.")?;
+        .ok_or(t("The model gave no commit message."))?;
     let line = line.trim_matches(['\'', '"', '`']);
     if line.is_empty() || line.chars().count() > 160 || line.chars().any(char::is_control) {
-        return Err("The model did not give a short commit subject.".into());
+        return Err(t("The model did not give a short commit subject.").into());
     }
     Ok(line.into())
 }

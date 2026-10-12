@@ -16,6 +16,8 @@ use futures::{
 };
 use gpui::{AppContext, Context, EventEmitter, SharedString, Task};
 
+use crate::lang::{t, tf};
+
 type Connecting = Shared<BoxFuture<'static, Result<Session, String>>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -262,7 +264,7 @@ impl DatabaseStore {
         cx: &mut Context<Self>,
     ) -> Task<Result<QueryResult, String>> {
         let Some(session) = self.session(name, cx) else {
-            return Task::ready(Err(format!("No connection named {name}")));
+            return Task::ready(Err(tf("No connection named {}", &[&name])));
         };
         cx.background_spawn(async move { session.await?.query(query).await })
     }
@@ -275,7 +277,7 @@ impl DatabaseStore {
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
         let Some(session) = self.session(name, cx) else {
-            return Task::ready(Err(format!("No connection named {name}")));
+            return Task::ready(Err(tf("No connection named {}", &[&name])));
         };
         cx.background_spawn(async move { session.await?.apply(statements).await })
     }
@@ -288,7 +290,7 @@ impl DatabaseStore {
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
         let Some(session) = self.session(name, cx) else {
-            return Task::ready(Err(format!("No connection named {name}")));
+            return Task::ready(Err(tf("No connection named {}", &[&name])));
         };
         cx.background_spawn(async move { session.await?.apply_ddl(statements).await })
     }
@@ -412,9 +414,9 @@ pub fn confirm_unlock(
 ) {
     let answer = window.prompt(
         gpui::PromptLevel::Warning,
-        &format!("Allow changes to {name}?"),
-        Some("This connection is read-only because it looks like production. Changes stay allowed until Solder quits."),
-        &["Allow changes", "Cancel"],
+        &tf("Allow changes to {}?", &[&name]),
+        Some(t("This connection is read-only because it looks like production. Changes stay allowed until Solder quits.")),
+        &[t("Allow changes"), t("Cancel")],
         cx,
     );
     cx.spawn(async move |cx| {

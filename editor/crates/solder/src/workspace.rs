@@ -6666,7 +6666,10 @@ impl Workspace {
                 // files are plain text until the editor starts again.
                 for language in syntax::hung_grammars() {
                     parts.push(BarPart {
-                        text: format!("{language} grammar hung: no highlighting until restart"),
+                        text: tf(
+                            "{} grammar hung: no highlighting until restart",
+                            &[&language],
+                        ),
                         id: None,
                         color: Some(theme.warning),
                         action: None,
@@ -16148,8 +16151,8 @@ exports.activate = (context) => {
         // is given here, so the test needs no file of that size.
         let large = crate::document::Loaded::within(&[b'a'; 2048], 1024);
         assert_eq!(
-            large.read_only.as_deref(),
-            Some("This file is 2 KB: too large to edit. It is open for reading.")
+            large.read_only.as_ref().map(|why| why.message()),
+            Some("This file is 2 KB: too large to edit. It is open for reading.".into())
         );
         ws.update_in(cx, |w, window, cx| {
             w.add_loaded(root.join("large.txt"), &large, None, window, cx)

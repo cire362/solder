@@ -1804,12 +1804,26 @@ them.
 which it is without the setting, in English. It applies as soon as the file
 is saved.
 
-In Russian so far: every command of the palette, which is then found by its
-Russian name, the names of the docks' tabs and of what the bars say, the
-questions about unsaved files, the lists over the window, find and replace,
-the tree of files, the window a start shows, pictures and previews. The inside
-of the tool panels (Git, databases, HTTP, models, the agent, extensions,
-the debugger, tests and the rest) still reads in English.
+The palette, bars, dialogs, find and replace, file tree and tool panels
+read in the chosen language: Git and history, databases and diagrams,
+HTTP, models, chat and the agent, extensions, plugins, services, the
+debugger, tests, notebooks, Structure and Problems. Their own controls,
+statuses and notices are translated. Placeholders in fields already open
+also follow a language change.
+
+Names, file contents, terminal output, commit messages, provider responses
+and diagnostics keep their original text. Configuration parser and validation
+diagnostics also stay in their original language, including in the error
+journal. Commands, configuration keys,
+protocol data and text sent to a model do not change with the interface.
+A button keeps its icon and action in either language.
+
+The catalog tests require a translation for each literal passed to `t`,
+`tf` or the localized field constructor, reject unused entries and check
+that a translated template keeps its arguments. Another check catches
+untranslated literals passed directly to common label and button widgets;
+it does not prove that every dynamically built label is covered. The
+system's language is not selected automatically.
 
 ## When something goes wrong
 

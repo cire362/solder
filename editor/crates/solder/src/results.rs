@@ -20,6 +20,7 @@ use gpui::{
 use crate::{
     database::{self, DatabaseStore, SchemaState},
     editor::Editor,
+    lang::{t, tf},
     settings::Settings,
     theme::{ActiveTheme, Theme, UI_FONT_SIZE},
     ui,
@@ -211,7 +212,7 @@ impl ResultsView {
             new_key: false,
             key_task: None,
             history: Vec::new(),
-            filter: cx.new(|cx| Editor::single_line("Filter, e.g. status = 'paid'", cx)),
+            filter: cx.new(|cx| Editor::localized_field("Filter, e.g. status = 'paid'", cx)),
         }
     }
 
@@ -230,13 +231,12 @@ impl ResultsView {
         spec: db::browse::Browse,
         cx: &mut Context<Self>,
     ) {
-        let placeholder = if engine == db::Engine::Mongo {
-            "Filter, e.g. {status: \"paid\"}"
-        } else {
-            "Filter, e.g. status = 'paid'"
-        };
         self.filter = cx.new(|cx| {
-            let mut editor = Editor::single_line(placeholder, cx);
+            let mut editor = if engine == db::Engine::Mongo {
+                Editor::localized_field("Filter, e.g. {status: \"paid\"}", cx)
+            } else {
+                Editor::localized_field("Filter, e.g. status = 'paid'", cx)
+            };
             editor.set_text(&spec.filter, false, cx);
             editor
         });
@@ -366,7 +366,7 @@ impl ResultsView {
                             Some(query) => this.execute(connection, query, cx),
                             None => {
                                 this.state = State::Empty;
-                                this.notice = Some("Key deleted".into());
+                                this.notice = Some(t("Key deleted").into());
                                 cx.notify();
                             }
                         }
@@ -387,9 +387,9 @@ impl ResultsView {
         }
         let (key, kind) = self.shown_key(cx)?;
         let ttl = match self.key_ttl {
-            Some(-1) => "no expiry".to_string(),
-            Some(-2) => "not saved yet".to_string(),
-            Some(t) => format!("expires in {t} s"),
+            Some(-1) => t("no expiry").to_string(),
+            Some(-2) => t("not saved yet").to_string(),
+            Some(t) => tf("expires in {} s", &[&t]),
             None => String::new(),
         };
         let view = cx.entity();
@@ -409,9 +409,9 @@ impl ResultsView {
             move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
                 let answer = window.prompt(
                     gpui::PromptLevel::Warning,
-                    &format!("Delete {key}?"),
-                    Some("The key and its value are removed from Redis."),
-                    &["Delete", "Cancel"],
+                    &tf("Delete {}?", &[&key]),
+                    Some(t("The key and its value are removed from Redis.")),
+                    &[t("Delete"), t("Cancel")],
                     cx,
                 );
                 let (view, key) = (view.clone(), key.clone());
@@ -447,25 +447,31 @@ impl ResultsView {
                 .child(
                     div()
                         .text_color(theme.fg_subtle)
-                        .child(format!("{kind:?}").to_lowercase()),
+                        .child(key_kind_label(kind)),
                 )
                 .child(div().text_color(theme.fg_subtle).child(ttl))
                 .child(div().flex_1())
                 .child(ui::button(
                     "key-expire",
-                    "Expire",
+                    t("Expire"),
                     false,
                     theme,
                     prompt(KeyAction::Expire),
                 ))
                 .child(ui::button(
                     "key-rename",
-                    "Rename",
+                    t("Rename"),
                     false,
                     theme,
                     prompt(KeyAction::Rename),
                 ))
-                .child(ui::button("key-delete", "Delete key", false, theme, delete))
+                .child(ui::button(
+                    "key-delete",
+                    t("Delete key"),
+                    false,
+                    theme,
+                    delete,
+                ))
                 .into_any_element(),
         )
     }
@@ -783,17 +789,17 @@ impl ResultsView {
     /// The table these rows can be saved to, or why they cannot.
     fn edit_target(&mut self, cx: &mut Context<Self>) -> Result<EditTarget, SharedString> {
         let Some(result) = self.result().cloned() else {
-            return Err("Nothing to edit".into());
+            return Err(t("Nothing to edit").into());
         };
         let store = self.store.read(cx);
         let Some(conn) = store.connection(&self.connection) else {
-            return Err("The connection is gone".into());
+            return Err(t("The connection is gone").into());
         };
         let engine = conn.spec.engine;
         let locked = conn.locked();
         let locked_error = |this: &mut Self| -> SharedString {
             this.locked_notice = true;
-            "This connection is read-only. Allow changes to edit its rows.".into()
+            t("This connection is read-only. Allow changes to edit its rows.").into()
         };
         // Documents and keys are edited without a schema.
         if !engine.is_sql() {
@@ -815,7 +821,7 @@ impl ResultsView {
                 if locked {
                     self.locked_notice = true;
                     return Err(
-                        "This connection is read-only. Allow changes to edit its rows.".into(),
+                        t("This connection is read-only. Allow changes to edit its rows.").into(),
                     );
                 }
                 Ok(target)
@@ -824,7 +830,7 @@ impl ResultsView {
             SchemaState::NotLoaded | SchemaState::Loading => {
                 let name = self.connection.clone();
                 self.store.update(cx, |s, cx| s.ensure_schema(&name, cx));
-                Err("Reading the schema, try again in a moment".into())
+                Err(t("Reading the schema, try again in a moment").into())
             }
         }
     }
@@ -971,12 +977,12 @@ impl ResultsView {
     /// The statements the staged changes run, in order.
     pub fn statements(&mut self, cx: &mut Context<Self>) -> Result<Vec<String>, SharedString> {
         let target = self.edit_target(cx)?;
-        let result = self.result().cloned().ok_or("Nothing to edit")?;
+        let result = self.result().cloned().ok_or(t("Nothing to edit"))?;
         let engine = self
             .store
             .read(cx)
             .engine_of(&self.connection)
-            .ok_or("The connection is gone")?;
+            .ok_or(t("The connection is gone"))?;
         Ok(db::edit::statements(
             engine,
             &target,
@@ -1016,7 +1022,7 @@ impl ResultsView {
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.changes.is_empty() {
-            self.set_notice(Some("Apply or discard your changes first".into()), cx);
+            self.set_notice(Some(t("Apply or discard your changes first").into()), cx);
             return false;
         }
         let Some(b) = self.browsing.as_ref() else {
@@ -1062,7 +1068,7 @@ impl ResultsView {
         };
         if self.browsing.is_none() {
             return self.set_notice(
-                Some("Open a table from the Database tab to sort it".into()),
+                Some(t("Open a table from the Database tab to sort it").into()),
                 cx,
             );
         }
@@ -1099,7 +1105,7 @@ impl ResultsView {
         };
         let Some((_, fk)) = self.references(cx).into_iter().find(|(c, _)| *c == column) else {
             return self.set_notice(
-                Some("This column does not point at another table".into()),
+                Some(t("This column does not point at another table").into()),
                 cx,
             );
         };
@@ -1118,7 +1124,7 @@ impl ResultsView {
             return;
         };
         if !self.changes.is_empty() {
-            return self.set_notice(Some("Apply or discard your changes first".into()), cx);
+            return self.set_notice(Some(t("Apply or discard your changes first").into()), cx);
         }
         let mut spec = db::browse::Browse::of(object);
         spec.filter = db::browse::value_filter(engine, &fk.ref_columns[0], &value);
@@ -1133,7 +1139,7 @@ impl ResultsView {
 
     fn browse_back(&mut self, _: &BrowseBack, _: &mut Window, cx: &mut Context<Self>) {
         if !self.changes.is_empty() {
-            return self.set_notice(Some("Apply or discard your changes first".into()), cx);
+            return self.set_notice(Some(t("Apply or discard your changes first").into()), cx);
         }
         if let Some((connection, engine, spec)) = self.history.pop() {
             self.browse(connection, engine, spec, cx);
@@ -1182,8 +1188,8 @@ impl ResultsView {
         let rows = self.changes.len();
         let summary = match rows {
             0 => String::new(),
-            1 => "1 changed row".into(),
-            n => format!("{n} changed rows"),
+            1 => t("1 changed row").into(),
+            n => tf("{} changed rows", &[&n]),
         };
         let store = self.store.clone();
         let name = self.connection.to_string();
@@ -1214,7 +1220,7 @@ impl ResultsView {
                 .when(self.locked_notice, |d| {
                     d.child(ui::button(
                         "results-unlock",
-                        "Allow changes",
+                        t("Allow changes"),
                         false,
                         theme,
                         move |_, window, cx| {
@@ -1225,14 +1231,14 @@ impl ResultsView {
                 .when(rows > 0 && !self.reviewing, |d| {
                     d.child(ui::button(
                         "results-discard",
-                        "Discard",
+                        t("Discard"),
                         false,
                         theme,
                         |_, window, cx| window.dispatch_action(Box::new(DiscardChanges), cx),
                     ))
                     .child(ui::button(
                         "results-review",
-                        "Review",
+                        t("Review"),
                         true,
                         theme,
                         |_, window, cx| window.dispatch_action(Box::new(ReviewChanges), cx),
@@ -1241,7 +1247,7 @@ impl ResultsView {
                 .when(self.reviewing, |d| {
                     d.child(ui::button(
                         "results-back",
-                        "Back",
+                        t("Back"),
                         false,
                         theme,
                         |_, window, cx| window.dispatch_action(Box::new(CancelEdit), cx),
@@ -1249,9 +1255,9 @@ impl ResultsView {
                     .child(ui::button(
                         "results-apply",
                         if self.applying.is_some() {
-                            "Saving..."
+                            t("Saving...")
                         } else {
-                            "Apply in one transaction"
+                            t("Apply in one transaction")
                         },
                         true,
                         theme,
@@ -1272,12 +1278,12 @@ impl ResultsView {
             _ => vec![None; statements.len()],
         };
         let warning = match kind {
-            db::edit::TargetKind::Documents => Some(
+            db::edit::TargetKind::Documents => Some(t(
                 "MongoDB saves each change as it runs: if one fails, the ones before it stay saved.",
-            ),
-            db::edit::TargetKind::Key(_) => Some(
+            )),
+            db::edit::TargetKind::Key(_) => Some(t(
                 "These run as one Redis transaction (MULTI/EXEC); Redis does not undo a command that fails while running.",
-            ),
+            )),
             db::edit::TargetKind::Table => None,
         };
         div()
@@ -1383,7 +1389,7 @@ impl ResultsView {
                 .text_size(UI_FONT_SIZE)
                 .font_family(Settings::get(cx).ui_font())
                 .when(!self.history.is_empty(), |d| {
-                    d.child(ui::button("results-back-table", "Back", false, theme, {
+                    d.child(ui::button("results-back-table", t("Back"), false, theme, {
                         let view = cx.entity();
                         move |_, window, cx| {
                             view.update(cx, |this, cx| this.browse_back(&BrowseBack, window, cx))
@@ -1409,27 +1415,27 @@ impl ResultsView {
     fn render_status(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let (text, color): (SharedString, _) = match &self.state {
             State::Empty => ("".into(), theme.fg_subtle),
-            State::Running => ("Running...".into(), theme.fg_subtle),
+            State::Running => (t("Running...").into(), theme.fg_subtle),
             State::Failed(e) => (e.clone(), theme.error),
             State::Done(result) => {
-                let ms = result.elapsed.as_secs_f64() * 1000.;
+                let ms = format!("{:.0}", result.elapsed.as_secs_f64() * 1000.);
                 let text = if result.columns.is_empty() {
                     match result.affected {
-                        Some(1) => format!("1 row affected · {ms:.0} ms"),
-                        Some(n) => format!("{n} rows affected · {ms:.0} ms"),
-                        None => format!("Done · {ms:.0} ms"),
+                        Some(1) => tf("1 row affected · {} ms", &[&ms]),
+                        Some(n) => tf("{} rows affected · {} ms", &[&n, &ms]),
+                        None => tf("Done · {} ms", &[&ms]),
                     }
                 } else if let Some(b) = &self.browsing {
                     match b.total {
-                        Some(total) => format!("{} of {total} rows", result.rows.len()),
-                        None => format!("{} rows", result.rows.len()),
+                        Some(total) => tf("{} of {} rows", &[&result.rows.len(), &total]),
+                        None => tf("{} rows", &[&result.rows.len()]),
                     }
                 } else if result.truncated {
-                    format!("First {} rows · {ms:.0} ms", result.rows.len())
+                    tf("First {} rows · {} ms", &[&result.rows.len(), &ms])
                 } else if result.rows.len() == 1 {
-                    format!("1 row · {ms:.0} ms")
+                    tf("1 row · {} ms", &[&ms])
                 } else {
-                    format!("{} rows · {ms:.0} ms", result.rows.len())
+                    tf("{} rows · {} ms", &[&result.rows.len(), &ms])
                 };
                 (text.into(), theme.fg_muted)
             }
@@ -1483,7 +1489,7 @@ impl ResultsView {
                             .rounded(theme.shape.token)
                             .text_color(theme.fg_subtle)
                             .hover(|d| d.bg(theme.line).text_color(theme.fg))
-                            .child("Add row")
+                            .child(t("Add row"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 window.focus(&this.focus);
                                 this.insert_row(&InsertRow, window, cx)
@@ -1751,7 +1757,7 @@ impl Render for ResultsView {
             State::Empty => div()
                 .p_3()
                 .text_color(theme.fg_subtle)
-                .child("Run a query to see results here.")
+                .child(t("Run a query to see results here."))
                 .into_any_element(),
             _ => div().into_any_element(),
         };
@@ -1813,6 +1819,16 @@ impl Render for ResultsView {
 }
 
 /// Quotes a Redis argument for a command line.
+pub fn key_kind_label(kind: db::edit::KeyKind) -> &'static str {
+    match kind {
+        db::edit::KeyKind::String => t("string"),
+        db::edit::KeyKind::Hash => t("hash"),
+        db::edit::KeyKind::List => t("list"),
+        db::edit::KeyKind::Set => t("set"),
+        db::edit::KeyKind::SortedSet => t("sortedset"),
+    }
+}
+
 pub fn redis_arg(arg: &str) -> String {
     if !arg.is_empty() && !arg.contains(|c: char| c.is_whitespace() || c == '"' || c == '\'') {
         return arg.to_string();
@@ -1824,6 +1840,24 @@ pub fn redis_arg(arg: &str) -> String {
 mod tests {
     use super::*;
     use db::Column;
+
+    #[test]
+    fn redis_kind_labels_are_localized_without_changing_command_arguments() {
+        use crate::lang::{self, Language};
+        let language = lang::current();
+        lang::set(Language::English);
+        assert_eq!(key_kind_label(db::edit::KeyKind::SortedSet), "sortedset");
+        let argument = redis_arg("customer name");
+        lang::set(Language::Russian);
+        assert_eq!(
+            key_kind_label(db::edit::KeyKind::SortedSet),
+            "упорядоченное множество"
+        );
+        assert_eq!(key_kind_label(db::edit::KeyKind::String), "строка");
+        assert_eq!(redis_arg("customer name"), argument);
+        assert_eq!(redis_arg("set"), "set");
+        lang::set(language);
+    }
 
     #[test]
     fn widths_follow_content_within_limits() {

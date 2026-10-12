@@ -46,8 +46,8 @@ impl KeyPrompt {
 impl PickerDelegate for KeyPrompt {
     fn placeholder(&self) -> SharedString {
         match self.action {
-            KeyAction::Expire => format!("Seconds until {} expires", self.key),
-            KeyAction::Rename => format!("New name for {}", self.key),
+            KeyAction::Expire => crate::lang::tf("Seconds until {} expires", &[&self.key]),
+            KeyAction::Rename => crate::lang::tf("New name for {}", &[&self.key]),
         }
         .into()
     }
@@ -81,16 +81,20 @@ impl PickerDelegate for KeyPrompt {
                 let mut choices = Vec::new();
                 if let Ok(seconds) = self.query.parse::<u64>() {
                     choices.push((
-                        format!("Expire in {seconds} s"),
+                        crate::lang::tf("Expire in {} s", &[&seconds]),
                         format!("EXPIRE {key} {seconds}"),
                         Some(shown.clone()),
                     ));
                 }
-                choices.push(("Never expire".into(), format!("PERSIST {key}"), Some(shown)));
+                choices.push((
+                    crate::lang::t("Never expire").into(),
+                    format!("PERSIST {key}"),
+                    Some(shown),
+                ));
                 choices
             }
             KeyAction::Rename if !self.query.is_empty() && self.query != self.key => vec![(
-                format!("Rename to {}", self.query),
+                crate::lang::tf("Rename to {}", &[&self.query]),
                 format!("RENAME {key} {}", redis_arg(&self.query)),
                 Some(Self::reread(&shown, &self.key, &self.query)),
             )],
@@ -125,7 +129,7 @@ impl PickerDelegate for KeyPrompt {
     }
 
     fn empty_text(&self) -> SharedString {
-        "Type a new name".into()
+        crate::lang::t("Type a new name").into()
     }
 
     fn width(&self) -> gpui::Pixels {
@@ -134,6 +138,17 @@ impl PickerDelegate for KeyPrompt {
 }
 
 const TYPES: [&str; 5] = ["string", "hash", "list", "set", "zset"];
+
+fn type_label(kind: &str) -> &str {
+    match kind {
+        "string" => crate::lang::t("string"),
+        "hash" => crate::lang::t("hash"),
+        "list" => crate::lang::t("list"),
+        "set" => crate::lang::t("set"),
+        "zset" => crate::lang::t("zset"),
+        other => other,
+    }
+}
 
 /// Shows the Results tab once a new key opens there.
 type OnOpen = Box<dyn Fn(&mut Window, &mut gpui::App)>;
@@ -166,7 +181,7 @@ impl NewKeyPrompt {
 
 impl PickerDelegate for NewKeyPrompt {
     fn placeholder(&self) -> SharedString {
-        "Name of the new key".into()
+        crate::lang::t("Name of the new key").into()
     }
 
     fn match_count(&self) -> usize {
@@ -217,15 +232,34 @@ impl PickerDelegate for NewKeyPrompt {
         div()
             .text_size(UI_FONT_SIZE)
             .text_color(cx.theme().fg)
-            .child(format!("New {} {}", TYPES[ix], self.name))
+            .child(crate::lang::tf(
+                "New {} {}",
+                &[&type_label(TYPES[ix]), &self.name],
+            ))
             .into_any_element()
     }
 
     fn empty_text(&self) -> SharedString {
-        "Type the key's name, then pick its type".into()
+        crate::lang::t("Type the key's name, then pick its type").into()
     }
 
     fn width(&self) -> gpui::Pixels {
         px(420.)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redis_display_types_leave_commands_and_type_identifiers_unchanged() {
+        assert_eq!(type_label("zset"), "zset");
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_eq!(type_label("zset"), "упорядоченное множество");
+        assert_eq!(type_label("module-type"), "module-type");
+        assert_eq!(TYPES, ["string", "hash", "list", "set", "zset"]);
+        assert_eq!(KeyPrompt::reread("GET old", "old", "new"), "GET new");
+        crate::lang::set(crate::lang::Language::English);
     }
 }

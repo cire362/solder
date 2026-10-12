@@ -1,6 +1,7 @@
 //! Explicit discovery and runs, outside the UI thread. Runners supply the
 //! test names; source lookup is only for a jump, never for choosing a test.
 
+use crate::lang::{t, tf};
 use serde_json::Value;
 use std::{
     collections::HashSet,
@@ -56,11 +57,11 @@ impl State {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Ready => "",
-            Self::Running => "Running",
-            Self::Passed => "Passed",
-            Self::Failed => "Failed",
-            Self::Skipped => "Skipped",
-            Self::Cancelled => "Cancelled",
+            Self::Running => t("Running"),
+            Self::Passed => t("Passed"),
+            Self::Failed => t("Failed"),
+            Self::Skipped => t("Skipped"),
+            Self::Cancelled => t("Cancelled"),
         }
     }
 }
@@ -86,7 +87,7 @@ struct Output {
 
 fn output(mut command: Command, cancel: &Cancel) -> Result<Output, String> {
     if cancel.load(Ordering::Relaxed) {
-        return Err("Cancelled".into());
+        return Err(t("Cancelled").into());
     }
     command
         .stdin(Stdio::null())
@@ -130,10 +131,10 @@ fn output(mut command: Command, cancel: &Cancel) -> Result<Output, String> {
     let start = Instant::now();
     let result = loop {
         if cancel.load(Ordering::Relaxed) {
-            break Err("Cancelled".into());
+            break Err(t("Cancelled").into());
         }
         if start.elapsed() > Duration::from_secs(600) {
-            break Err("The test command timed out after 10 minutes".into());
+            break Err(t("The test command timed out after 10 minutes").into());
         }
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status.success()),
@@ -169,7 +170,7 @@ fn output(mut command: Command, cancel: &Cancel) -> Result<Output, String> {
     let mut text = format!("{stdout}\n{stderr}");
     let limited = streams.iter().any(|s| s.1);
     if limited {
-        text.push_str("\nOutput limited to 1 MB per stream.\n");
+        text.push_str(t("\nOutput limited to 1 MB per stream.\n"));
     }
     result.map(|ok| Output {
         ok,
@@ -183,7 +184,7 @@ fn output(mut command: Command, cancel: &Cancel) -> Result<Output, String> {
 fn discovery_output(command: Command, cancel: &Cancel) -> Result<Output, String> {
     let out = output(command, cancel)?;
     if out.limited {
-        return Err("Test discovery exceeded 1 MB per stream; its list is incomplete".into());
+        return Err(t("Test discovery exceeded 1 MB per stream; its list is incomplete").into());
     }
     if !out.ok {
         return Err(out.text);
@@ -219,6 +220,19 @@ pub fn python(root: &Path) -> PathBuf {
         }
     }
     PathBuf::from(if cfg!(windows) { "python" } else { "python3" })
+}
+
+fn rust_kind_label(kind: &str) -> &str {
+    match kind {
+        "lib" => t("lib"),
+        "rlib" => t("rlib"),
+        "proc-macro" => t("proc-macro"),
+        "bin" => t("bin"),
+        "test" => t("test"),
+        "example" => t("example"),
+        "bench" => t("bench"),
+        other => other,
+    }
 }
 
 pub fn discover(root: &Path, cancel: &Cancel) -> Discovery {
@@ -269,9 +283,13 @@ pub fn discover(root: &Path, cancel: &Cancel) -> Discovery {
                     .strip_prefix(root)
                     .unwrap_or(root);
                 let group = if folder.as_os_str().is_empty() {
-                    format!("Rust · {target} ({kind})")
+                    format!("Rust · {target} ({})", rust_kind_label(&kind))
                 } else {
-                    format!("Rust · {} · {target} ({kind})", folder.display())
+                    format!(
+                        "Rust · {} · {target} ({})",
+                        folder.display(),
+                        rust_kind_label(&kind)
+                    )
                 };
                 for name in listed
                     .stdout
@@ -506,7 +524,7 @@ pub fn run(root: &Path, test: &Test, cancel: &Cancel) -> Outcome {
                     "{}{}",
                     out.stderr,
                     if out.limited {
-                        "\nOutput limited to 1 MB per stream.\n"
+                        t("\nOutput limited to 1 MB per stream.\n")
                     } else {
                         ""
                     }
@@ -515,9 +533,9 @@ pub fn run(root: &Path, test: &Test, cancel: &Cancel) -> Outcome {
                 out.text
             };
             let output = if !ran && out.ok {
-                format!(
+                tf(
                     "The selected test did not run. Discover tests again.\n{}",
-                    displayed
+                    &[&displayed],
                 )
             } else {
                 displayed
@@ -538,6 +556,39 @@ pub fn run(root: &Path, test: &Test, cancel: &Cancel) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn russian_test_statuses_keep_runner_results_and_target_kinds_intact() {
+        let root = Path::new("/project");
+        let cancel = Arc::new(AtomicBool::new(true));
+        let test = Test {
+            group: "Python · unittest".into(),
+            name: "suite.Test.test_example".into(),
+            path: None,
+            line: 1,
+            runner: Runner::Python {
+                program: "unused-python".into(),
+            },
+        };
+        crate::lang::set(crate::lang::Language::Russian);
+        let outcome = run(root, &test, &cancel);
+        assert_eq!(outcome.state, State::Cancelled);
+        assert_eq!(outcome.state.label(), "Отменено");
+        assert_eq!(outcome.output, "Отменено");
+        assert_eq!(test.name, "suite.Test.test_example");
+        let result = lines(
+            "solder-test:{\"id\":\"suite.Test.test_example\",\"state\":\"skipped\"}",
+            "solder-test:",
+        )
+        .next()
+        .unwrap();
+        assert_eq!(result["state"], "skipped");
+        assert_eq!(State::Skipped.label(), "Пропущен");
+        assert_eq!(rust_kind_label("lib"), "библиотека");
+        crate::lang::set(crate::lang::Language::English);
+        assert_eq!(rust_kind_label("lib"), "lib");
+        assert_eq!(State::Cancelled.label(), "Cancelled");
+    }
     #[test]
     fn rust_lists_real_tests_and_keeps_exact_runs_and_ignored_results() {
         if Command::new("cargo").arg("--version").output().is_err() {

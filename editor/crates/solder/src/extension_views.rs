@@ -96,11 +96,27 @@ struct NodeAction {
     title: String,
     run: String,
 }
+/// The test host supplies these status names; provider labels and details are verbatim.
+fn test_mark_label(mark: &str) -> String {
+    match mark {
+        "Passed" => crate::lang::t("Passed").into(),
+        "Failed" => crate::lang::t("Failed").into(),
+        "Error" => crate::lang::t("Error").into(),
+        "Running" => crate::lang::t("Running").into(),
+        "Queued" => crate::lang::t("Queued").into(),
+        "Skipped" => crate::lang::t("Skipped").into(),
+        _ => mark.to_string(),
+    }
+}
+
 #[derive(Clone)]
 enum Row {
     View(Key, View),
     Node(Node, usize),
     Note(String),
+    Loading,
+    OpenTab,
+    Empty,
 }
 
 actions!(
@@ -371,15 +387,15 @@ impl ExtensionViews {
                 self.append(nodes, 0, &mut subtree);
                 rows.extend(subtree);
             } else if self.loading.contains(&None) {
-                rows.push(Row::Note("Loading…".into()));
+                rows.push(Row::Loading);
             }
             if view.kind == "webview" {
-                rows.push(Row::Note("Open in a tab".into()));
+                rows.push(Row::OpenTab);
             } else if self.children.get(&None).is_some_and(Vec::is_empty) {
-                rows.push(Row::Note("No items".into()));
+                rows.push(Row::Empty);
             }
             if let Some(error) = &self.error {
-                rows.push(Row::Note(error.clone()));
+                rows.push(Row::Note(crate::extension_store::error_label(error)));
             }
         }
         self.rows = rows;
@@ -399,7 +415,7 @@ impl ExtensionViews {
                 if let Some(children) = self.children.get(&Some(node.key.clone())) {
                     self.append(children, depth + 1, out);
                 } else if self.loading.contains(&Some(node.key.clone())) {
-                    out.push(Row::Note("Loading…".into()));
+                    out.push(Row::Loading);
                 }
             }
         }
@@ -538,15 +554,15 @@ impl Render for ExtensionViews {
             .child(
                 div().px_2().py_1().flex().items_center().justify_between()
                     .text_size(UI_FONT_SIZE).text_color(theme.fg_muted)
-                    .child(if self.tests_only { "Extension tests" } else { "Extension views" })
+                    .child(if self.tests_only { crate::lang::t("Extension tests") } else { crate::lang::t("Extension views") })
                     .when(self.active.is_some(), |d| d.child(ui::button(
-                        "refresh-views", "Refresh", false, &theme,
+                        "refresh-views", crate::lang::t("Refresh"), false, &theme,
                         cx.listener(|this, _, _, cx| this.refresh_provider(cx)),
                     ))),
             )
             .when(self.views.is_empty(), |d| d.child(
                 div().p_3().text_size(UI_FONT_SIZE).text_color(theme.fg_muted)
-                    .child(if self.tests_only { "Tests appear here when an enabled extension provides a controller." } else { "Views appear here when an enabled extension provides a tree, source control or tests." }),
+                    .child(if self.tests_only { crate::lang::t("Tests appear here when an enabled extension provides a controller.") } else { crate::lang::t("Views appear here when an enabled extension provides a tree, source control or tests.") }),
             ))
             .child(
                 uniform_list("extension-views", self.rows.len(), cx.processor(
@@ -563,17 +579,25 @@ impl Render for ExtensionViews {
                                     Vec::new(), None, false, None,
                                 ),
                                 Row::Node(node, depth) => {
-                                    let detail = match (&node.mark, node.description) {
+                                    let tests = this.active.as_ref().and_then(|key| this.views.get(key))
+                                        .is_some_and(|view| view.kind == "tests");
+                                    let shown_mark = node.mark.as_ref().map(|mark| {
+                                        if tests { test_mark_label(mark) } else { mark.clone() }
+                                    });
+                                    let detail = match (shown_mark, node.description) {
                                         (Some(mark), Some(description)) => Some(format!("{mark} · {description}")),
-                                        (_, description) => node.mark.clone().or(description),
+                                        (mark, description) => mark.or(description),
                                     };
                                     (node.label, detail, depth + 1,
                                         Some(if node.opens { if this.opened.contains(&node.key) { "arrow-down" } else { "arrow-right" } } else { "file" }),
                                         node.actions, node.tooltip, node.strike, node.mark)
                                 }
+                                Row::Loading => (crate::lang::t("Loading…").to_string(), None, 1, Some("spinner-gap"), Vec::new(), None, false, None),
+                                Row::OpenTab => (crate::lang::t("Open in a tab").to_string(), None, 1, None, Vec::new(), None, false, None),
+                                Row::Empty => (crate::lang::t("No items").to_string(), None, 1, None, Vec::new(), None, false, None),
                                 Row::Note(text) => {
-                                    let icon = if this.error.as_ref() == Some(&text) { Some("warning-circle") }
-                                        else if text == "Loading…" { Some("spinner-gap") } else { None };
+                                    let icon = if this.error.as_ref().is_some_and(|error| crate::extension_store::error_label(error) == text) { Some("warning-circle") }
+                                        else { None };
                                     (text, None, 1, icon, Vec::new(), None, false, None)
                                 }
                             };
@@ -612,5 +636,26 @@ impl Render for ExtensionViews {
                     },
                 )).track_scroll(self.scroll.clone()).flex_1().min_h_0(),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_status_display_keeps_the_provider_data_and_protocol_mark() {
+        let node: Node = serde_json::from_value(json!({
+            "key": "case", "label": "Passed", "description": "provider details", "mark": "Passed"
+        }))
+        .unwrap();
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_eq!(test_mark_label(node.mark.as_deref().unwrap()), "Пройден");
+        assert_eq!(node.mark.as_deref(), Some("Passed"));
+        assert_eq!(node.label, "Passed");
+        assert_eq!(node.description.as_deref(), Some("provider details"));
+        assert_eq!(test_mark_label("custom result"), "custom result");
+        crate::lang::set(crate::lang::Language::English);
+        assert_eq!(test_mark_label(node.mark.as_deref().unwrap()), "Passed");
     }
 }

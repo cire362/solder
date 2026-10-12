@@ -1,4 +1,5 @@
 use crate::git::{GitError, Repo, Result};
+use crate::lang::t;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stash {
@@ -35,13 +36,15 @@ impl Repo {
             .stashes()?
             .into_iter()
             .find(|s| s.id == id)
-            .ok_or_else(|| GitError("This stash is no longer in the list. Refresh it.".into()))?;
+            .ok_or_else(|| {
+                GitError(t("This stash is no longer in the list. Refresh it.").into())
+            })?;
         match operation {
             "apply" | "pop" => self
                 .run(&["stash", operation, "--index", &stash.reference])
                 .map(drop),
             "drop" => self.run(&["stash", "drop", &stash.reference]).map(drop),
-            _ => Err(GitError("Unknown stash action.".into())),
+            _ => Err(GitError(t("Unknown stash action.").into())),
         }
     }
     pub fn fetch(&self) -> Result<()> {

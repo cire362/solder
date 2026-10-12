@@ -151,16 +151,13 @@ something of its own unchecked or unmade adds it here.
       it had (`EventLoop::pty_read`). macOS does not report the closed end
       that way. Not fixed: it needs a patched copy of that crate or a
       terminal kept open by the editor itself, and that is to be decided
-- [ ] In Russian, the inside of these still reads in English: Git and its
-      history, databases with their tables and diagrams, HTTP, models, chat
-      and the agent, extensions and plugins, services, the debugger, tests,
-      the terminal's own controls, notebooks, Structure, Problems, the
-      import of settings, menus of the editor, and every error a store
-      reports. Nothing checks that a string shown is one given to `lang::t`:
-      the test holds the table to the strings that are. The language of the
-      system is not followed: `language` is set by hand. Numbers have one
-      form ("Курсоров: 3"), dates are not written anywhere yet, and none of
-      it was read in a real window or by a second reader
+- [ ] The system's language is not followed: `language` is set by hand.
+      Russian text has not been reviewed in a real window or by a second
+      reader, including widths in tool panels. Numbers have one form
+      ("Курсоров: 3"), dates are not written anywhere yet. The catalog and
+      direct-widget checks cover literal labels and templates, not every
+      dynamically built label. Provider, driver, parser and OS diagnostics, including configuration
+      validation in the error journal, retain their original text, as do model responses and file contents
 - [ ] A preview does not scroll with its source, and the source does not
       follow a click in it. HTML inside Markdown is shown as written.
       Footnotes, definition lists, formulas and emoji by name are plain
@@ -725,11 +722,11 @@ update. They come after phase 9, in this order unless one is needed sooner.
 - [x] Several windows, a project in each, the set restored
 - [x] Markdown shown next to its source; pictures shown as pictures
 - [x] A log of errors with rotation, and a report of a crash at the next start
-- [ ] The interface in Russian as well as English. There so far: the
-      setting, every command of the palette, the docks' and bars' names,
-      the questions, the lists over the window, find and replace, the tree
-      of files, the way in, pictures and previews. The inside of each tool
-      panel is still English only (see "Not finished")
+- [x] The interface in Russian as well as English: the setting, palette,
+      bars, dialogs, lists, find and replace, file tree, way in, previews,
+      and the controls, statuses and own notices of all tool panels.
+      Catalog tests, direct-widget checks and tests of the boundary with
+      commands, model data and external text; remaining checks are above
 
 ### Projects that are somewhere else
 - [ ] A project on a server over SSH: files, terminal, Git, search and

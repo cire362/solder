@@ -1,3 +1,4 @@
+use crate::lang::t;
 use crate::{
     git::Repo,
     git_pr::{PullRequest, State},
@@ -90,7 +91,7 @@ impl Render for PullRequestPanel {
                             .gap_1()
                             .child(ui::button(
                                 "pr-back",
-                                "Changes",
+                                t("Changes"),
                                 false,
                                 &theme,
                                 cx.listener(|_, _, _, cx| cx.emit(Close)),
@@ -98,7 +99,7 @@ impl Render for PullRequestPanel {
                             .child(
                                 ui::button(
                                     "pr-refresh",
-                                    "Refresh",
+                                    t("Refresh"),
                                     false,
                                     &theme,
                                     cx.listener(|this, _, _, cx| this.load(cx)),
@@ -114,7 +115,7 @@ impl Render for PullRequestPanel {
                     )
                     .child(ui::button(
                         "pr-create",
-                        "Create PR",
+                        t("Create PR"),
                         false,
                         &theme,
                         |_, window, cx| {
@@ -125,7 +126,7 @@ impl Render for PullRequestPanel {
                     .children(self.loading.then(|| {
                         div()
                             .text_color(theme.fg_subtle)
-                            .child("Reading pull request...")
+                            .child(t("Reading pull request..."))
                     }))
                     .children(
                         self.error
@@ -153,15 +154,15 @@ impl Render for PullRequestPanel {
                                 .text_color(theme.fg_muted)
                                 .child(format!(
                                     "{}{} · {} -> {}",
-                                    pr.state,
-                                    if pr.draft { " · Draft" } else { "" },
+                                    pr.state_label(),
+                                    if pr.draft { t(" · Draft") } else { "" },
                                     pr.head,
                                     pr.base
                                 )),
                         )
                         .child(ui::button(
                             "pr-open",
-                            "Open in browser",
+                            t("Open in browser"),
                             false,
                             &theme,
                             move |_, _, cx| cx.open_url(&url),
@@ -169,7 +170,7 @@ impl Render for PullRequestPanel {
                         .children(pr.checks.is_empty().then(|| {
                             div()
                                 .text_color(theme.fg_subtle)
-                                .child("No checks reported")
+                                .child(t("No checks reported"))
                         })),
                 )
                 .child(

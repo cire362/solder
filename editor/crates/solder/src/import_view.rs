@@ -1,6 +1,7 @@
 //! The Import settings window: the editors found on this machine and, for
 //! the one picked, what can come over, each item with a checkbox.
 
+use crate::lang::{t, tf};
 use std::{collections::HashSet, path::PathBuf};
 
 use gpui::{
@@ -64,6 +65,73 @@ pub struct ImportView {
     focus: FocusHandle,
 }
 
+fn setting_label(label: &'static str) -> &'static str {
+    match label {
+        "Font" => t("Font"),
+        "Font size" => t("Font size"),
+        "Line height" => t("Line height"),
+        "Indent" => t("Indent"),
+        "Format on save" => t("Format on save"),
+        other => other,
+    }
+}
+
+fn setting_value(setting: &import::Setting) -> String {
+    match &setting.value {
+        serde_json::Value::Bool(true) => t("on").into(),
+        serde_json::Value::Bool(false) => t("off").into(),
+        _ => setting.shown(),
+    }
+}
+
+fn appearance_label(appearance: &str) -> &str {
+    match appearance {
+        "dark" => t("dark"),
+        "light" => t("light"),
+        other => other,
+    }
+}
+
+fn preset_label(name: &'static str) -> &'static str {
+    match name {
+        "VS Code keys" => t("VS Code keys"),
+        "JetBrains keys" => t("JetBrains keys"),
+        other => other,
+    }
+}
+
+fn hint_label(hint: &'static str) -> &'static str {
+    match hint {
+        "The Git tab: changes, staging by line, commits, conflicts" => {
+            t("The Git tab: changes, staging by line, commits, conflicts")
+        }
+        "The API tab sends requests from .http files" => {
+            t("The API tab sends requests from .http files")
+        }
+        "The Services tab runs the stack and lists containers" => {
+            t("The Services tab runs the stack and lists containers")
+        }
+        "The Database tab: Postgres, MySQL, SQLite, Redis, MongoDB" => {
+            t("The Database tab: Postgres, MySQL, SQLite, Redis, MongoDB")
+        }
+        "Solder AI: completions, chat and agents, local or with your key" => {
+            t("Solder AI: completions, chat and agents, local or with your key")
+        }
+        "rust-analyzer runs when it is on your PATH" => {
+            t("rust-analyzer runs when it is on your PATH")
+        }
+        "gopls runs when it is on your PATH" => t("gopls runs when it is on your PATH"),
+        "pyright runs when it is on your PATH" => t("pyright runs when it is on your PATH"),
+        "The debugger runs JavaScript and TypeScript with js-debug" => {
+            t("The debugger runs JavaScript and TypeScript with js-debug")
+        }
+        "The debugger runs a server and its page in one session" => {
+            t("The debugger runs a server and its page in one session")
+        }
+        other => other,
+    }
+}
+
 impl ImportView {
     pub fn new(roots: Roots, target: PathBuf, cx: &mut Context<Self>) -> Self {
         let dir = target.clone();
@@ -118,55 +186,55 @@ impl ImportView {
         };
         let mut rows = Vec::new();
         if !plan.settings.is_empty() {
-            rows.push(Row::Header("SETTINGS"));
+            rows.push(Row::Header(t("SETTINGS")));
         }
         for (i, setting) in plan.settings.iter().enumerate() {
             let kept = if let Some(mine) = self.changed.get(setting.key) {
                 let mine = mine
                     .as_str()
                     .map_or_else(|| mine.to_string(), str::to_string);
-                Some(format!("kept: you set {mine}").into())
+                Some(tf("kept: you set {}", &[&mine]).into())
             } else if setting.key == "buffer_font_family"
                 && !self.fonts.iter().any(|f| f == &setting.shown())
             {
-                Some("this font is not installed".into())
+                Some(t("this font is not installed").into())
             } else {
                 None
             };
             rows.push(Row::Item {
                 item: Item::Setting(i),
-                label: setting.label.into(),
-                detail: setting.shown().into(),
+                label: setting_label(setting.label).into(),
+                detail: setting_value(setting).into(),
                 kept,
             });
         }
         if let Some(name) = &plan.theme_name {
-            rows.push(Row::Header("THEME"));
+            rows.push(Row::Header(t("THEME")));
             let kept = if plan.theme.is_none() {
-                Some("its file was not found".into())
+                Some(t("its file was not found").into())
             } else {
                 self.changed.get("theme").map(|mine| {
-                    format!("kept: you set {}", mine.as_str().unwrap_or_default()).into()
+                    tf("kept: you set {}", &[&mine.as_str().unwrap_or_default()]).into()
                 })
             };
             rows.push(Row::Item {
                 item: Item::Theme,
                 label: name.clone().into(),
                 detail: match &plan.theme {
-                    Some(theme) => theme.appearance.clone().into(),
+                    Some(theme) => appearance_label(&theme.appearance).to_string().into(),
                     None => "".into(),
                 },
                 kept,
             });
         }
         if plan.preset_name.is_some() || !plan.custom.bindings.is_empty() {
-            rows.push(Row::Header("KEYS"));
+            rows.push(Row::Header(t("KEYS")));
         }
         if let Some(name) = plan.preset_name {
             rows.push(Row::Item {
                 item: Item::Preset,
-                label: name.into(),
-                detail: format!("{} bindings", plan.preset.len()).into(),
+                label: preset_label(name).into(),
+                detail: tf("{} bindings", &[&plan.preset.len()]).into(),
                 kept: None,
             });
         }
@@ -174,25 +242,25 @@ impl ImportView {
         if bound > 0 {
             rows.push(Row::Item {
                 item: Item::Custom,
-                label: "Your own bindings".into(),
+                label: t("Your own bindings").into(),
                 detail: match skipped {
                     0 => format!("{bound}"),
-                    n => format!("{bound}, {n} have no equivalent"),
+                    n => tf("{}, {} have no equivalent", &[&bound, &n]),
                 }
                 .into(),
                 kept: None,
             });
         } else if skipped > 0 {
             rows.push(Row::Note(
-                format!("Your {skipped} own bindings have no equivalent here").into(),
+                tf("Your {} own bindings have no equivalent here", &[&skipped]).into(),
             ));
         }
         if !plan.hints.is_empty() {
-            rows.push(Row::Header("ALREADY BUILT IN"));
+            rows.push(Row::Header(t("ALREADY BUILT IN")));
         }
         for hint in &plan.hints {
             rows.push(Row::Note(
-                format!("{}: {}", hint.extension, hint.instead).into(),
+                format!("{}: {}", hint.extension, hint_label(hint.instead)).into(),
             ));
         }
         rows
@@ -258,9 +326,9 @@ impl ImportView {
                 .await;
             this.update(cx, |this, cx| {
                 this.status = Some(match done {
-                    Ok(done) if done.is_empty() => ("Nothing was picked".into(), false),
+                    Ok(done) if done.is_empty() => (t("Nothing was picked").into(), false),
                     Ok(done) => (
-                        format!("Imported from {source}: {}", done.join(", ")).into(),
+                        tf("Imported from {}: {}", &[&source, &done.join(", ")]).into(),
                         false,
                     ),
                     Err(error) => (error.into(), true),
@@ -444,7 +512,7 @@ impl Render for ImportView {
                             .mr_2()
                             .text_size(UI_FONT_SIZE)
                             .text_color(theme.fg)
-                            .child("Import settings from"),
+                            .child(t("Import settings from")),
                     )
                     .children(tabs),
             )
@@ -455,7 +523,7 @@ impl Render for ImportView {
                             .p_3()
                             .text_size(UI_FONT_SIZE)
                             .text_color(theme.fg_subtle)
-                            .child("Looking for other editors..."),
+                            .child(t("Looking for other editors...")),
                     );
                 }
                 if self.plans.is_empty() {
@@ -464,7 +532,7 @@ impl Render for ImportView {
                             .p_3()
                             .text_size(UI_FONT_SIZE)
                             .text_color(theme.fg_subtle)
-                            .child("No settings of VS Code, Cursor, Zed or a JetBrains IDE were found."),
+                            .child(t("No settings of VS Code, Cursor, Zed or a JetBrains IDE were found.")),
                     );
                 }
                 d.child(div().py_1().child(list)).child(
@@ -478,7 +546,7 @@ impl Render for ImportView {
                         .border_t(theme.shape.border)
                         .border_color(theme.line)
                         .child(
-                            ui::button("import-apply", "Import", true, &theme, {
+                            ui::button("import-apply", t("Import"), true, &theme, {
                                 let view = cx.entity();
                                 move |_, _, cx| view.update(cx, |this, cx| this.import(cx))
                             })
@@ -496,10 +564,38 @@ impl Render for ImportView {
                                 })
                                 .child(match status {
                                     Some((text, _)) => text,
-                                    None => "Adds to your settings. Nothing you changed in Solder is replaced.".into(),
+                                    None => t("Adds to your settings. Nothing you changed in Solder is replaced.").into(),
                                 }),
                         ),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod localization_tests {
+    use super::*;
+
+    #[test]
+    fn russian_import_labels_leave_setting_values_and_theme_identifiers_intact() {
+        let setting = import::Setting {
+            key: "format_on_save",
+            label: "Format on save",
+            value: serde_json::json!(true),
+        };
+        let theme = import::ThemeFile {
+            appearance: "dark".into(),
+            ..Default::default()
+        };
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_eq!(setting_label(setting.label), "Форматировать при сохранении");
+        assert_eq!(setting_value(&setting), "вкл.");
+        assert_eq!(appearance_label(&theme.appearance), "тёмная");
+        assert_eq!(setting.key, "format_on_save");
+        assert_eq!(setting.value, serde_json::json!(true));
+        assert_eq!(theme.appearance, "dark");
+        assert_eq!(setting.shown(), "on");
+        crate::lang::set(crate::lang::Language::English);
+        assert_eq!(setting_value(&setting), "on");
     }
 }

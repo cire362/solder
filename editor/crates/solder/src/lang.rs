@@ -140,6 +140,34 @@ mod tests {
         assert_eq!(tf("an open { brace", &[&"a"]), "an open { brace");
     }
 
+    fn parts(text: &str) -> Vec<usize> {
+        let mut parts = Vec::new();
+        let mut next = 0;
+        let mut rest = text;
+        while let Some(at) = rest.find('{') {
+            let Some(end) = rest[at..].find('}') else {
+                break;
+            };
+            let index = &rest[at + 1..at + end];
+            if index.is_empty() {
+                next += 1;
+                parts.push(next - 1);
+            } else if let Ok(index) = index.parse() {
+                parts.push(index);
+            }
+            rest = &rest[at + end + 1..];
+        }
+        parts.sort_unstable();
+        parts
+    }
+
+    #[test]
+    fn translating_a_template_keeps_each_argument() {
+        assert_eq!(parts("{}: {}"), parts("{1}: {0}"));
+        assert_ne!(parts("{}: {}"), parts("{0}: {0}"));
+        assert_eq!(tf("{}", &[&"{1} / \"raw\""]), "{1} / \"raw\"");
+    }
+
     /// Every string literal given to `t` or `tf` in the sources.
     fn used() -> Vec<String> {
         let mut found = Vec::new();
@@ -157,7 +185,7 @@ mod tests {
                     continue;
                 }
                 let text = std::fs::read_to_string(&path).unwrap();
-                for call in ["t(", "tf("] {
+                for call in ["t(", "tf(", "localized_field("] {
                     let mut rest = text.as_str();
                     while let Some(at) = rest.find(call) {
                         let before = rest[..at].chars().next_back();
@@ -226,10 +254,67 @@ mod tests {
         assert!(stale.is_empty(), "Russian for what is not used: {stale:#?}");
         // A part put into a string is put into its Russian too.
         for (english, russian) in ru::WORDS {
-            let parts = |text: &str| text.matches('{').count();
             assert_eq!(parts(english), parts(russian), "{english}");
             assert!(!russian.contains('\u{2014}'), "a long dash in: {russian}");
         }
+    }
+
+    #[test]
+    fn direct_widget_labels_cannot_bypass_translation() {
+        // This guards literal labels at common UI boundaries. Data from
+        // servers and user files deliberately does not pass through `t`.
+        let labels = regex::Regex::new(
+            r#"(?:\.child\(|Editor::single_line\(|\.placeholder\()\s*"((?:\\.|[^"\\])*)""#,
+        )
+        .unwrap();
+        let buttons =
+            regex::Regex::new(r#"ui::button\(\s*"(?:\\.|[^"\\])*"\s*,\s*"((?:\\.|[^"\\])*)""#)
+                .unwrap();
+        let tests = regex::Regex::new(r"#\[cfg\(test\)\]\s*mod tests").unwrap();
+        let escapes = regex::Regex::new(r#"\\u\{[0-9a-fA-F]+\}|\\[nrt0"'\\]"#).unwrap();
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut folders = vec![src];
+        let mut missed = Vec::new();
+        while let Some(folder) = folders.pop() {
+            for entry in std::fs::read_dir(folder).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    folders.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let source = tests.split(&source).next().unwrap();
+                for label in labels
+                    .captures_iter(source)
+                    .chain(buttons.captures_iter(source))
+                {
+                    let text = &label[1];
+                    if escapes
+                        .replace_all(text, "")
+                        .chars()
+                        .any(|c| c.is_ascii_alphabetic())
+                        && !matches!(
+                            text,
+                            "Solder" | "HTTP" | "SQL" | "JSON" | "PK" | "FK" | "NULL" | "ERD"
+                            // A protocol example, not an interface label.
+                            | "https://host/v1"
+                        )
+                    {
+                        missed.push(format!(
+                            "{}: {text}",
+                            path.file_name().unwrap().to_string_lossy()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "widget labels without translation: {missed:#?}"
+        );
     }
 
     #[gpui::test]

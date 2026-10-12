@@ -6,6 +6,7 @@
 //! One store for the app: breakpoints belong to files, whichever window
 //! shows them, and one run is debugged at a time.
 
+use crate::lang::{t, tf};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
@@ -42,15 +43,15 @@ impl BreakpointOptions {
                 &self.condition,
                 "supportsConditionalBreakpoints",
                 "condition",
-                "conditions",
+                t("conditions"),
             ),
             (
                 &self.hits,
                 "supportsHitConditionalBreakpoints",
                 "hitCondition",
-                "hit conditions",
+                t("hit conditions"),
             ),
-            (&self.log, "supportsLogPoints", "logMessage", "logpoints"),
+            (&self.log, "supportsLogPoints", "logMessage", t("logpoints")),
         ] {
             if text.is_empty() {
                 continue;
@@ -106,6 +107,21 @@ pub struct Paused {
 }
 
 impl Paused {
+    pub fn reason_label(&self) -> &str {
+        match self.reason.as_str() {
+            "step" => t("step"),
+            "breakpoint" => t("breakpoint"),
+            "exception" => t("exception"),
+            "pause" => t("pause"),
+            "entry" => t("entry"),
+            "goto" => t("goto"),
+            "function breakpoint" => t("function breakpoint"),
+            "data breakpoint" => t("data breakpoint"),
+            "instruction breakpoint" => t("instruction breakpoint"),
+            other => other,
+        }
+    }
+
     pub fn frame(&self) -> Option<&StackFrame> {
         self.frames.get(self.selected)
     }
@@ -189,6 +205,29 @@ const TIMELINE_LIMIT: usize = 5_000;
 
 /// Console lines kept; older ones go.
 const CONSOLE_LIMIT: usize = 5_000;
+
+/// Adapter failures are provider content; only our connection notices are localized.
+pub(crate) fn error_label(error: &dap::Error) -> String {
+    match error {
+        dap::Error::Closed => t("the debugger closed the connection").into(),
+        dap::Error::Io(text) => match text.as_str() {
+            "The debug adapter has no input or output" => {
+                t("The debug adapter has no input or output").into()
+            }
+            "The debug adapter did not start" => t("The debug adapter did not start").into(),
+            other => {
+                if let Some(rest) = other.strip_prefix("The debug adapter stopped (")
+                    && let Some((status, output)) = rest.split_once("): ")
+                {
+                    tf("The debug adapter stopped ({}): {}", &[&status, &output])
+                } else {
+                    text.clone()
+                }
+            }
+        },
+        dap::Error::Failed(text) => text.clone(),
+    }
+}
 
 impl DebugStore {
     pub fn new(data_dir: PathBuf, adapter_spec: AdapterSpec) -> Self {
@@ -342,9 +381,9 @@ impl DebugStore {
                 }
                 Err(reason) => self.log(
                     "stderr",
-                    format!(
-                        "The debugger does not support {reason}; {}:{line} was not set",
-                        path.display()
+                    tf(
+                        "The debugger does not support {}; {}:{} was not set",
+                        &[&reason, &path.display(), &line],
                     ),
                 ),
             }
@@ -380,7 +419,10 @@ impl DebugStore {
                 let body = match result {
                     Ok(body) => body,
                     Err(error) => {
-                        this.log("stderr", format!("Could not set breakpoints: {error}"));
+                        this.log(
+                            "stderr",
+                            tf("Could not set breakpoints: {}", &[&error_label(&error)]),
+                        );
                         cx.notify();
                         return;
                     }
@@ -426,6 +468,17 @@ impl DebugStore {
         self.session(id).map(|s| s.name.as_str())
     }
 
+    pub fn session_label(&self, id: usize) -> Option<String> {
+        let name = self.session_name(id)?;
+        Some(if name == BROWSER {
+            t("Browser").into()
+        } else if let Some(config) = self.config.as_ref().filter(|c| c.name == name) {
+            config.label()
+        } else {
+            name.to_string()
+        })
+    }
+
     fn session(&self, id: usize) -> Option<&Session> {
         self.sessions.iter().find(|s| s.id == id)
     }
@@ -464,13 +517,15 @@ impl DebugStore {
                         async move { crate::lsp_store::find_program("node", &root) }
                     })
                     .await
-                    .ok_or("Debugging JavaScript needs Node.js; install it from nodejs.org")?;
+                    .ok_or(t(
+                        "Debugging JavaScript needs Node.js; install it from nodejs.org",
+                    ))?;
                 let dir = data_dir.join("js-debug").join(JS_DEBUG);
                 let server = dir.join("js-debug/src/dapDebugServer.js");
                 if !server.is_file() {
                     this.update(cx, |this, cx| {
                         this.state = State::Starting(
-                            "Downloading the JavaScript debugger (1.2 MB)...".into(),
+                            t("Downloading the JavaScript debugger (1.2 MB)...").into(),
                         );
                         cx.notify();
                     })
@@ -515,7 +570,7 @@ impl DebugStore {
         self.paused = None;
         self.scopes.clear();
         self.children.clear();
-        self.state = State::Starting("Starting the debugger...".into());
+        self.state = State::Starting(t("Starting the debugger...").into());
         cx.notify();
         self.timeline.clear();
         self.timeline_task = None;
@@ -536,7 +591,7 @@ impl DebugStore {
                 cx.background_executor()
                     .spawn(async move {
                         let adapter = dap::Adapter::start(&program, &args, &root)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| error_label(&e))?;
                         // Without a timeline the program still runs.
                         Ok::<_, String>((adapter, crate::debug_timeline::prepare(&data_dir).ok()))
                     })
@@ -625,7 +680,7 @@ impl DebugStore {
         cx: &mut Context<Self>,
     ) {
         self.adapter_id = from.launch.adapter.clone();
-        self.state = State::Starting("Getting the debugger ready...".into());
+        self.state = State::Starting(t("Getting the debugger ready...").into());
         let asked = crate::extension_store::ExtensionStore::global(cx).update(cx, |store, cx| {
             let given = from.configuration.clone();
             store.debug_adapter(&from.extension, from.launch.clone(), given, &root, cx)
@@ -641,13 +696,13 @@ impl DebugStore {
                             (&adapter.command, adapter.connection)
                         {
                             let link =
-                                Connection::connect_to(host, port).map_err(|e| e.to_string())?;
+                                Connection::connect_to(host, port).map_err(|e| error_label(&e))?;
                             return Ok((None, Some(link), adapter));
                         }
                         let program = adapter
                             .command
                             .clone()
-                            .ok_or("The extension named no debug adapter to start")?;
+                            .ok_or(t("The extension named no debug adapter to start"))?;
                         let cwd = adapter.cwd.clone().map_or(root, PathBuf::from);
                         let wait = adapter.connection.and_then(|(_, _, wait)| wait);
                         let launch = dap::Launch {
@@ -659,7 +714,7 @@ impl DebugStore {
                             patience: std::time::Duration::from_millis(wait.unwrap_or(15_000)),
                         };
                         let (process, link) =
-                            dap::Adapter::launch(&launch).map_err(|e| e.to_string())?;
+                            dap::Adapter::launch(&launch).map_err(|e| error_label(&e))?;
                         Ok::<_, String>((Some(process), link, adapter))
                     })
                     .await
@@ -751,9 +806,12 @@ impl DebugStore {
         match Connection::connect_to(host, port) {
             Ok(link) => self.run_session(link, name, parent, kind, arguments, cx),
             Err(e) => {
-                self.log("stderr", format!("Could not connect to the debugger: {e}"));
+                self.log(
+                    "stderr",
+                    tf("Could not connect to the debugger: {}", &[&error_label(&e)]),
+                );
                 if parent.is_none() {
-                    self.state = State::Failed(e.to_string().into());
+                    self.state = State::Failed(error_label(&e).into());
                 }
                 cx.notify();
             }
@@ -835,9 +893,12 @@ impl DebugStore {
                         if this.run != run {
                             return;
                         }
-                        this.log("stderr", format!("The debugger did not start: {e}"));
+                        this.log(
+                            "stderr",
+                            tf("The debugger did not start: {}", &[&error_label(&e)]),
+                        );
                         if parent.is_none() {
-                            this.state = State::Failed(e.to_string().into());
+                            this.state = State::Failed(error_label(&e).into());
                             this.stop(cx);
                         }
                         cx.notify();
@@ -866,9 +927,9 @@ impl DebugStore {
             let _ = launch_sent.send(());
             if let Err(e) = launched.await {
                 this.update(cx, |this, cx| {
-                    this.log("stderr", e.to_string());
+                    this.log("stderr", error_label(&e));
                     if parent.is_none() && this.run == run {
-                        this.state = State::Failed(e.to_string().into());
+                        this.state = State::Failed(error_label(&e).into());
                     }
                     cx.notify();
                 })
@@ -975,7 +1036,7 @@ impl DebugStore {
                 "exited" => {
                     let code = body["exitCode"].as_i64().unwrap_or(0);
                     if self.session(id).is_some_and(|s| s.parent.is_none()) || code != 0 {
-                        self.log("console", format!("Exited with code {code}"));
+                        self.log("console", tf("Exited with code {}", &[&code]));
                         cx.notify();
                     }
                 }
@@ -1007,7 +1068,7 @@ impl DebugStore {
             .unwrap_or_else(|| self.root.clone());
         let profile = self.data_dir.join("chrome-profile");
         let request = crate::debug_launch::browser_request(&url, &web_root, &profile);
-        self.log("console", format!("Opening {url} in a browser"));
+        self.log("console", tf("Opening {} in a browser", &[&url]));
         self.open_session(adapter_port, BROWSER.into(), None, "launch", request, cx);
     }
 
@@ -1294,7 +1355,7 @@ impl DebugStore {
             ),
         };
         let Some(conn) = conn else {
-            self.log("stderr", "Nothing is running");
+            self.log("stderr", t("Nothing is running"));
             cx.notify();
             return;
         };
@@ -1306,7 +1367,7 @@ impl DebugStore {
         cx.spawn(async move |this, cx| {
             let line = match answer.await {
                 Ok(body) => ("result", body["result"].as_str().unwrap_or("").to_string()),
-                Err(e) => ("stderr", e.to_string()),
+                Err(e) => ("stderr", error_label(&e)),
             };
             this.update(cx, |this, cx| {
                 this.log(line.0, line.1);
@@ -1322,6 +1383,45 @@ impl DebugStore {
 #[cfg(test)]
 mod breakpoint_tests {
     use super::*;
+
+    #[test]
+    fn russian_pause_labels_do_not_change_breakpoint_requests() {
+        let paused = Paused {
+            session: 1,
+            thread: 2,
+            reason: "breakpoint".into(),
+            frames: Vec::new(),
+            selected: 0,
+        };
+        let point = BreakpointOptions {
+            condition: "value > 2".into(),
+            hits: "3".into(),
+            log: "value {value}".into(),
+        };
+        let capabilities = json!({"supportsConditionalBreakpoints": true,
+            "supportsHitConditionalBreakpoints": true, "supportsLogPoints": true});
+        let english = point.argument(7, &capabilities).unwrap();
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_eq!(paused.reason_label(), "точка останова");
+        assert_eq!(paused.reason, "breakpoint");
+        assert_eq!(point.argument(7, &capabilities).unwrap(), english);
+        assert_eq!(point.argument(7, &json!({})).unwrap_err(), "условия");
+        assert_eq!(
+            error_label(&dap::Error::Closed),
+            "отладчик закрыл подключение"
+        );
+        assert_eq!(
+            error_label(&dap::Error::Failed("Provider failure".into())),
+            "Provider failure"
+        );
+        assert_eq!(
+            error_label(&dap::Error::Io("System failure".into())),
+            "System failure"
+        );
+
+        crate::lang::set(crate::lang::Language::English);
+        assert_eq!(paused.reason_label(), "breakpoint");
+    }
     #[test]
     fn an_unsupported_setting_never_becomes_an_unconditional_breakpoint() {
         let point = BreakpointOptions {

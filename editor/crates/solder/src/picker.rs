@@ -188,6 +188,11 @@ impl<D: PickerDelegate> Focusable for Picker<D> {
 impl<D: PickerDelegate> Render for Picker<D> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        // The delegate owns the hint, including external extension text.
+        // Re-read it so a list already open follows a language change.
+        let placeholder = self.delegate.placeholder();
+        self.query
+            .update(cx, |query, cx| query.set_placeholder(placeholder, cx));
         let count = self.delegate.match_count();
         let row = crate::theme::row(ROW_HEIGHT, cx);
         let list_height = row * count.clamp(1, MAX_VISIBLE_ROWS) as f32;
@@ -350,4 +355,90 @@ pub fn format_binding(binding: &KeyBinding) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Hint(bool);
+    impl PickerDelegate for Hint {
+        fn placeholder(&self) -> SharedString {
+            if self.0 {
+                "Find".into()
+            } else {
+                t("Find").into()
+            }
+        }
+        fn match_count(&self) -> usize {
+            0
+        }
+        fn selected_index(&self) -> usize {
+            0
+        }
+        fn set_selected_index(&mut self, _: usize, _: &mut Context<Picker<Self>>) {}
+        fn update_matches(
+            &mut self,
+            _: String,
+            _: &mut Window,
+            _: &mut Context<Picker<Self>>,
+        ) -> Task<()> {
+            Task::ready(())
+        }
+        fn confirm(&mut self, _: &mut Window, _: &mut Context<Picker<Self>>) {}
+        fn render_match(
+            &self,
+            _: usize,
+            _: bool,
+            _: &mut Window,
+            _: &mut Context<Picker<Self>>,
+        ) -> AnyElement {
+            div().into_any_element()
+        }
+    }
+
+    #[gpui::test]
+    fn an_open_list_updates_its_owned_hint_but_preserves_external_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_global(crate::perf::Perf::new(std::time::Instant::now()));
+            cx.set_global(crate::theme::Theme::dark());
+            cx.set_global(crate::settings::Settings::default());
+        });
+        let (picker, cx) = cx.add_window_view(|window, cx| Picker::new(Hint(false), window, cx));
+        crate::lang::set(crate::lang::Language::Russian);
+        picker.update_in(cx, |picker, window, cx| {
+            let _ = picker.render(window, cx);
+        });
+        cx.read(|cx| {
+            assert_eq!(
+                picker
+                    .read(cx)
+                    .query
+                    .read(cx)
+                    .placeholder_text()
+                    .unwrap()
+                    .as_ref(),
+                "Найти"
+            )
+        });
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.0 = true;
+            let _ = picker.render(window, cx);
+        });
+        cx.read(|cx| {
+            assert_eq!(
+                picker
+                    .read(cx)
+                    .query
+                    .read(cx)
+                    .placeholder_text()
+                    .unwrap()
+                    .as_ref(),
+                "Find"
+            )
+        });
+        crate::lang::set(crate::lang::Language::English);
+    }
 }

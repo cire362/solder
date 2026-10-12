@@ -339,6 +339,7 @@ pub struct Editor {
     /// itself, and asks what it is in to show the cursor.
     pub(crate) fit: Option<Reveal>,
     pub(crate) placeholder: Option<SharedString>,
+    placeholder_key: Option<&'static str>,
     /// Draws the text as stars; for secrets typed into a field.
     pub(crate) masked: bool,
     focus_handle: FocusHandle,
@@ -457,6 +458,7 @@ impl Editor {
             mode: EditorMode::Full,
             fit: None,
             placeholder: None,
+            placeholder_key: None,
             masked: false,
             focus_handle: cx.focus_handle(),
             document,
@@ -509,6 +511,27 @@ impl Editor {
         editor.mode = EditorMode::SingleLine;
         editor.placeholder = Some(placeholder.into());
         editor
+    }
+
+    /// Keep an editor-owned hint as a key so an open field follows a
+    /// language change. Hints supplied by extensions remain verbatim.
+    pub fn localized_field(placeholder: &'static str, cx: &mut Context<Self>) -> Self {
+        let mut editor = Self::single_line(placeholder, cx);
+        editor.placeholder_key = Some(placeholder);
+        editor
+    }
+
+    pub(crate) fn set_placeholder(&mut self, placeholder: SharedString, cx: &mut Context<Self>) {
+        if self.placeholder_key.is_none() && self.placeholder.as_ref() != Some(&placeholder) {
+            self.placeholder = Some(placeholder);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn placeholder_text(&self) -> Option<SharedString> {
+        self.placeholder_key
+            .map(|key| crate::lang::t(key).into())
+            .or_else(|| self.placeholder.clone())
     }
 
     /// A single-line field that hides what is typed.
@@ -2706,6 +2729,29 @@ mod tests {
     use crate::theme::Theme;
     use gpui::{Entity, TestAppContext, VisualTestContext};
     use std::time::Instant;
+
+    #[gpui::test]
+    fn existing_fields_follow_language_changes_without_translating_external_hints(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_global(Perf::new(Instant::now()));
+            cx.set_global(Theme::dark());
+            cx.set_global(crate::settings::Settings::default());
+        });
+        let owned = cx.new(|cx| Editor::localized_field("Find", cx));
+        let external = cx.new(|cx| Editor::single_line(String::from("Find"), cx));
+        crate::lang::set(crate::lang::Language::Russian);
+        cx.read(|cx| {
+            assert_eq!(owned.read(cx).placeholder_text().unwrap().as_ref(), "Найти");
+            assert_eq!(
+                external.read(cx).placeholder_text().unwrap().as_ref(),
+                "Find"
+            );
+        });
+        crate::lang::set(crate::lang::Language::English);
+        cx.read(|cx| assert_eq!(owned.read(cx).placeholder_text().unwrap().as_ref(), "Find"));
+    }
 
     fn setup<'a>(
         cx: &'a mut TestAppContext,

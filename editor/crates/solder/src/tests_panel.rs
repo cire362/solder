@@ -1,5 +1,6 @@
 //! A project's test tree. Opening the panel runs no project code: discovery
 //! and each run are explicit, and only one owns its process at a time.
+use crate::lang::{t, tf};
 use crate::{
     extension_store::ExtensionStore,
     extension_views::ExtensionViews,
@@ -103,8 +104,10 @@ impl TestsPanel {
             selected: 0,
             busy: false,
             cancel: Arc::new(AtomicBool::new(false)),
-            note: "Discover runs the project's tools. Rust, Go and Python unittest are supported."
-                .into(),
+            note: t(
+                "Discover runs the project's tools. Rust, Go and Python unittest are supported.",
+            )
+            .into(),
             details: Vec::new(),
             extensions,
             extension_mode: false,
@@ -152,7 +155,7 @@ impl TestsPanel {
         }
         self.busy = true;
         self.cancel = Arc::new(AtomicBool::new(false));
-        self.note = "Discovering tests…".into();
+        self.note = t("Discovering tests…").into();
         let root = self.root.clone();
         let cancel = self.cancel.clone();
         cx.spawn(async move |this, cx| {
@@ -163,11 +166,11 @@ impl TestsPanel {
             this.update(cx, |this, cx| {
                 this.busy = false;
                 this.note = if this.cancel.load(Ordering::Relaxed) {
-                    "Discovery cancelled".into()
+                    t("Discovery cancelled").into()
                 } else if !found.errors.is_empty() {
                     found.errors.join("\n").chars().take(2000).collect()
                 } else {
-                    format!("{} tests", found.tests.len())
+                    tf("{} tests", &[&found.tests.len()])
                 };
                 this.tests = found
                     .tests
@@ -264,7 +267,7 @@ impl TestsPanel {
                 if this
                     .update(cx, |this, cx| {
                         this.tests[i].state = State::Running;
-                        this.note = format!("Running {}", test.name);
+                        this.note = tf("Running {}", &[&test.name]);
                         this.show_details();
                         cx.notify();
                     })
@@ -292,9 +295,9 @@ impl TestsPanel {
             this.update(cx, |this, cx| {
                 this.busy = false;
                 this.note = if this.cancel.load(Ordering::Relaxed) {
-                    "Run cancelled".into()
+                    t("Run cancelled").into()
                 } else {
-                    "Run finished".into()
+                    t("Run finished").into()
                 };
                 cx.notify();
             })
@@ -328,7 +331,7 @@ impl Render for TestsPanel {
                     .child(
                         ui::button(
                             "tests-project",
-                            "Project",
+                            t("Project"),
                             !self.extension_mode,
                             &theme,
                             cx.listener(|this, _, _, cx| {
@@ -342,7 +345,7 @@ impl Render for TestsPanel {
                     .child(
                         ui::button(
                             "tests-extensions",
-                            "Extensions",
+                            t("Extensions"),
                             self.extension_mode,
                             &theme,
                             cx.listener(|this, _, window, cx| {
@@ -367,7 +370,7 @@ impl Render for TestsPanel {
                             d.child(
                                 ui::button(
                                     "tests-discover",
-                                    "Discover",
+                                    t("Discover"),
                                     false,
                                     &theme,
                                     cx.listener(|this, _, _, cx| this.discover(cx)),
@@ -377,7 +380,7 @@ impl Render for TestsPanel {
                             .child(
                                 ui::button(
                                     "tests-run",
-                                    "Run",
+                                    t("Run"),
                                     true,
                                     &theme,
                                     cx.listener(|this, _, window, cx| {
@@ -389,7 +392,7 @@ impl Render for TestsPanel {
                             .child(
                                 ui::button(
                                     "tests-all",
-                                    "Run all",
+                                    t("Run all"),
                                     false,
                                     &theme,
                                     cx.listener(|this, _, _, cx| {
@@ -403,7 +406,7 @@ impl Render for TestsPanel {
                             d.child(
                                 ui::button(
                                     "tests-stop",
-                                    "Stop",
+                                    t("Stop"),
                                     false,
                                     &theme,
                                     cx.listener(|this, _, window, cx| this.stop(&Stop, window, cx)),

@@ -3,6 +3,7 @@
 //! it); the change is then applied to the database or saved as a migration
 //! in the project's own format.
 
+use crate::lang::{t, tf};
 use std::path::PathBuf;
 
 use db::{
@@ -93,10 +94,9 @@ pub struct StructureView {
     focus: FocusHandle,
 }
 
-fn field(text: &str, placeholder: &str, cx: &mut App) -> Entity<Editor> {
-    let placeholder = SharedString::from(placeholder.to_string());
+fn localized_field(placeholder: &'static str, text: &str, cx: &mut App) -> Entity<Editor> {
     cx.new(|cx| {
-        let mut editor = Editor::single_line(placeholder, cx);
+        let mut editor = Editor::localized_field(placeholder, cx);
         editor.set_text(text, false, cx);
         editor
     })
@@ -104,6 +104,88 @@ fn field(text: &str, placeholder: &str, cx: &mut App) -> Entity<Editor> {
 
 fn names(list: &[String]) -> String {
     list.join(", ")
+}
+
+fn on_delete_label(action: Option<&str>) -> String {
+    match action {
+        None | Some("NO ACTION") => t("on delete no action").into(),
+        Some("CASCADE") => t("on delete cascade").into(),
+        Some("SET NULL") => t("on delete set null").into(),
+        Some("RESTRICT") => t("on delete restrict").into(),
+        Some(other) => tf("on delete {}", &[&other.to_lowercase()]),
+    }
+}
+
+fn migration_label(tool: migrations::Tool) -> &'static str {
+    match tool {
+        migrations::Tool::UpDown => t("up/down files"),
+        migrations::Tool::Plain => t("SQL file"),
+        other => other.label(),
+    }
+}
+
+fn ddl_subject(what: &str) -> String {
+    if let Some(name) = what.strip_prefix("Index ") {
+        tf("Index {}", &[&name])
+    } else if let Some(name) = what.strip_prefix("Foreign key ") {
+        tf("Foreign key {}", &[&name])
+    } else {
+        what.to_string()
+    }
+}
+
+/// Validation comes from the database crate; SQL and server errors stay intact.
+fn ddl_notice(error: String) -> String {
+    match error.as_str() {
+        "The table needs a name" => return t("The table needs a name").into(),
+        "A table needs at least one column" => {
+            return t("A table needs at least one column").into();
+        }
+        "Every column needs a name" => return t("Every column needs a name").into(),
+        "Every index needs a name" => return t("Every index needs a name").into(),
+        "Every foreign key needs a name" => return t("Every foreign key needs a name").into(),
+        "Structure can be changed for Postgres, MySQL and SQLite" => {
+            return t("Structure can be changed for Postgres, MySQL and SQLite").into();
+        }
+        _ => {}
+    }
+    if let Some(name) = error.strip_suffix(" needs a type") {
+        return tf("{} needs a type", &[&name]);
+    }
+    if let Some(name) = error.strip_suffix(" appears twice") {
+        return tf("{} appears twice", &[&name]);
+    }
+    if let Some(what) = error.strip_suffix(" needs at least one column") {
+        return tf("{} needs at least one column", &[&ddl_subject(what)]);
+    }
+    if let Some(what) = error.strip_suffix(", which is not a column")
+        && let Some((what, column)) = what.split_once(" uses ")
+    {
+        return tf(
+            "{} uses {}, which is not a column",
+            &[&ddl_subject(what), &column],
+        );
+    }
+    if let Some(what) = error.strip_suffix(" needs a table to point at") {
+        return tf("{} needs a table to point at", &[&ddl_subject(what)]);
+    }
+    if let Some((what, count)) = error.rsplit_once(" has ")
+        && let Some((count, target)) = count.split_once(" columns but points at ")
+    {
+        return tf(
+            "{} has {} columns but points at {}",
+            &[&ddl_subject(what), &count, &target],
+        );
+    }
+    error
+}
+
+fn database_notice(error: String) -> String {
+    if let Some(name) = error.strip_prefix("No connection named ") {
+        tf("No connection named {}", &[&name])
+    } else {
+        error
+    }
 }
 
 impl StructureView {
@@ -135,9 +217,9 @@ impl StructureView {
             .iter()
             .map(|c| ColumnRow {
                 original: c.original.clone(),
-                name: field(&c.name, "name", cx),
-                type_name: field(&c.type_name, "type", cx),
-                default: field(c.default.as_deref().unwrap_or(""), "default", cx),
+                name: localized_field("name", &c.name, cx),
+                type_name: localized_field("type", &c.type_name, cx),
+                default: localized_field("default", c.default.as_deref().unwrap_or(""), cx),
                 nullable: c.nullable,
                 primary_key: c.primary_key,
                 auto: c.auto,
@@ -148,8 +230,8 @@ impl StructureView {
             .iter()
             .map(|i| IndexRow {
                 original: i.original.clone(),
-                name: field(&i.name, "name", cx),
-                columns: field(&names(&i.columns), "columns", cx),
+                name: localized_field("name", &i.name, cx),
+                columns: localized_field("columns", &names(&i.columns), cx),
                 unique: i.unique,
             })
             .collect();
@@ -158,10 +240,10 @@ impl StructureView {
             .iter()
             .map(|fk| ForeignKeyRow {
                 original: fk.original.clone(),
-                name: field(&fk.name, "name", cx),
-                columns: field(&names(&fk.columns), "columns", cx),
-                ref_table: field(&fk.ref_table, "table", cx),
-                ref_columns: field(&names(&fk.ref_columns), "columns", cx),
+                name: localized_field("name", &fk.name, cx),
+                columns: localized_field("columns", &names(&fk.columns), cx),
+                ref_table: localized_field("table", &fk.ref_table, cx),
+                ref_columns: localized_field("columns", &names(&fk.ref_columns), cx),
                 on_delete: fk.on_delete.clone(),
             })
             .collect();
@@ -170,7 +252,7 @@ impl StructureView {
             root,
             connection,
             engine,
-            name: field(&draft.name, "table name", cx),
+            name: localized_field("table name", &draft.name, cx),
             before: table,
             columns,
             indexes,
@@ -189,7 +271,7 @@ impl StructureView {
             None => {
                 let name = self.name.read(cx).text(cx);
                 if name.is_empty() {
-                    "New table".into()
+                    t("New table").into()
                 } else {
                     name
                 }
@@ -200,9 +282,9 @@ impl StructureView {
     pub fn add_column(&mut self, cx: &mut Context<Self>) {
         self.columns.push(ColumnRow {
             original: None,
-            name: field("", "name", cx),
-            type_name: field("", "type", cx),
-            default: field("", "default", cx),
+            name: localized_field("name", "", cx),
+            type_name: localized_field("type", "", cx),
+            default: localized_field("default", "", cx),
             nullable: true,
             primary_key: false,
             auto: false,
@@ -214,12 +296,12 @@ impl StructureView {
         let table = self.name.read(cx).text(cx);
         self.indexes.push(IndexRow {
             original: None,
-            name: field(
-                &format!("{table}_idx_{}", self.indexes.len() + 1),
+            name: localized_field(
                 "name",
+                &format!("{table}_idx_{}", self.indexes.len() + 1),
                 cx,
             ),
-            columns: field("", "columns", cx),
+            columns: localized_field("columns", "", cx),
             unique: false,
         });
         cx.notify();
@@ -229,10 +311,10 @@ impl StructureView {
     pub fn add_foreign_key_draft(&mut self, fk: &ForeignKeyDraft, cx: &mut Context<Self>) {
         self.foreign_keys.push(ForeignKeyRow {
             original: None,
-            name: field(&fk.name, "name", cx),
-            columns: field(&names(&fk.columns), "columns", cx),
-            ref_table: field(&fk.ref_table, "table", cx),
-            ref_columns: field(&names(&fk.ref_columns), "columns", cx),
+            name: localized_field("name", &fk.name, cx),
+            columns: localized_field("columns", &names(&fk.columns), cx),
+            ref_table: localized_field("table", &fk.ref_table, cx),
+            ref_columns: localized_field("columns", &names(&fk.ref_columns), cx),
             on_delete: fk.on_delete.clone(),
         });
         cx.notify();
@@ -242,14 +324,14 @@ impl StructureView {
         let table = self.name.read(cx).text(cx);
         self.foreign_keys.push(ForeignKeyRow {
             original: None,
-            name: field(
-                &format!("{table}_fk_{}", self.foreign_keys.len() + 1),
+            name: localized_field(
                 "name",
+                &format!("{table}_fk_{}", self.foreign_keys.len() + 1),
                 cx,
             ),
-            columns: field("", "columns", cx),
-            ref_table: field("", "table", cx),
-            ref_columns: field("id", "columns", cx),
+            columns: localized_field("columns", "", cx),
+            ref_table: localized_field("table", "", cx),
+            ref_columns: localized_field("columns", "id", cx),
             on_delete: None,
         });
         cx.notify();
@@ -365,12 +447,12 @@ impl StructureView {
         let change = self.change(cx);
         let up = match db::ddl::statements(self.engine, &change) {
             Ok(up) if up.is_empty() => {
-                self.notice = Some("Nothing changed".into());
+                self.notice = Some(t("Nothing changed").into());
                 return cx.notify();
             }
             Ok(up) => up,
             Err(e) => {
-                self.notice = Some(e.into());
+                self.notice = Some(ddl_notice(e).into());
                 return cx.notify();
             }
         };
@@ -417,7 +499,7 @@ impl StructureView {
                         this.store.update(cx, |s, cx| s.load_schema(&name, cx));
                         cx.emit(StructureEvent::Close);
                     }
-                    Err(e) => this.notice = Some(e.into()),
+                    Err(e) => this.notice = Some(database_notice(e).into()),
                 }
                 cx.notify();
             })
@@ -517,7 +599,7 @@ impl StructureView {
                 .child(Self::cell(&c.default, 180., window, theme, cx))
                 .child(ui::toggle(
                     ("required", i),
-                    "required",
+                    t("required"),
                     "",
                     !c.nullable || c.primary_key,
                     theme,
@@ -531,21 +613,28 @@ impl StructureView {
                         }
                     },
                 ))
-                .child(ui::toggle(("key", i), "key", "", c.primary_key, theme, {
-                    let view = cx.entity();
-                    move |_, _, cx| {
-                        view.update(cx, |this, cx| {
-                            this.columns[i].primary_key = !this.columns[i].primary_key;
-                            cx.notify();
-                        })
-                    }
-                }))
+                .child(ui::toggle(
+                    ("key", i),
+                    t("key"),
+                    "",
+                    c.primary_key,
+                    theme,
+                    {
+                        let view = cx.entity();
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| {
+                                this.columns[i].primary_key = !this.columns[i].primary_key;
+                                cx.notify();
+                            })
+                        }
+                    },
+                ))
                 .when(c.auto, |d| {
                     d.child(
                         div()
                             .text_size(crate::theme::text(11.))
                             .text_color(theme.fg_subtle)
-                            .child("auto"),
+                            .child(t("auto")),
                     )
                 })
                 .when(c.original.is_none(), |d| {
@@ -553,7 +642,7 @@ impl StructureView {
                         div()
                             .text_size(crate::theme::text(11.))
                             .text_color(theme.accent)
-                            .child("new"),
+                            .child(t("new")),
                     )
                 })
                 .child(div().flex_1())
@@ -574,15 +663,22 @@ impl StructureView {
                 .pb_1p5()
                 .child(Self::cell(&ix.name, 240., window, theme, cx))
                 .child(Self::cell(&ix.columns, 300., window, theme, cx))
-                .child(ui::toggle(("unique", i), "unique", "", ix.unique, theme, {
-                    let view = cx.entity();
-                    move |_, _, cx| {
-                        view.update(cx, |this, cx| {
-                            this.indexes[i].unique = !this.indexes[i].unique;
-                            cx.notify();
-                        })
-                    }
-                }))
+                .child(ui::toggle(
+                    ("unique", i),
+                    t("unique"),
+                    "",
+                    ix.unique,
+                    theme,
+                    {
+                        let view = cx.entity();
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| {
+                                this.indexes[i].unique = !this.indexes[i].unique;
+                                cx.notify();
+                            })
+                        }
+                    },
+                ))
                 .child(div().flex_1())
                 .child(
                     Self::remove_button(("remove-index", i), theme).on_click(cx.listener(
@@ -594,7 +690,7 @@ impl StructureView {
                 )
         });
         let foreign_keys = self.foreign_keys.iter().enumerate().map(|(i, fk)| {
-            let action = fk.on_delete.clone().unwrap_or_else(|| "NO ACTION".into());
+            let action = on_delete_label(fk.on_delete.as_deref());
             div()
                 .flex()
                 .items_center()
@@ -607,7 +703,7 @@ impl StructureView {
                 .child(Self::cell(&fk.ref_columns, 120., window, theme, cx))
                 .child(ui::toggle(
                     ("on-delete", i),
-                    format!("on delete {}", action.to_lowercase()),
+                    action,
                     "",
                     fk.on_delete.is_some(),
                     theme,
@@ -642,32 +738,32 @@ impl StructureView {
         div()
             .flex()
             .flex_col()
-            .child(Self::section("Columns: name, type, default", theme))
+            .child(Self::section(t("Columns: name, type, default"), theme))
             .children(columns)
             .child(
                 div()
                     .flex()
-                    .child(add("add-column", "Add column", Self::add_column)),
+                    .child(add("add-column", t("Add column"), Self::add_column)),
             )
             .child(Self::section(
-                "Indexes: name, columns separated by commas",
+                t("Indexes: name, columns separated by commas"),
                 theme,
             ))
             .children(indexes)
             .child(
                 div()
                     .flex()
-                    .child(add("add-index", "Add index", Self::add_index)),
+                    .child(add("add-index", t("Add index"), Self::add_index)),
             )
             .child(Self::section(
-                "Foreign keys: name, columns → table, columns",
+                t("Foreign keys: name, columns → table, columns"),
                 theme,
             ))
             .children(foreign_keys)
             .child(
                 div()
                     .flex()
-                    .child(add("add-fk", "Add foreign key", Self::add_foreign_key)),
+                    .child(add("add-fk", t("Add foreign key"), Self::add_foreign_key)),
             )
             .into_any_element()
     }
@@ -695,21 +791,21 @@ impl StructureView {
             .flex()
             .flex_col()
             .gap_2()
-            .child(Self::section("Runs", theme))
+            .child(Self::section(t("Runs"), theme))
             .child(statements(&review.up, theme.fg))
             .when(self.engine == Engine::MySql, |d| {
                 d.child(
                     div()
                         .text_color(theme.warning)
-                        .child("MySQL saves each structure change as it runs: if one fails, the ones before it stay applied."),
+                        .child(t("MySQL saves each structure change as it runs: if one fails, the ones before it stay applied.")),
                 )
             })
-            .child(Self::section("Undo (the migration's down step)", theme))
+            .child(Self::section(t("Undo (the migration's down step)"), theme))
             .child(statements(&review.down, theme.fg_subtle))
             .child(
                 div()
                     .text_color(theme.fg_subtle)
-                    .child(format!("Save as migration writes a {} to {target}.", review.target.tool.label())),
+                    .child(tf("Save as migration writes a {} to {}.", &[&migration_label(review.target.tool), &target])),
             )
             .into_any_element()
     }
@@ -733,19 +829,23 @@ impl Render for StructureView {
         let name_focused = self.name.focus_handle(cx).is_focused(window);
         let buttons = match (&self.review, &self.before) {
             (Some(_), _) => vec![
-                ui::button("structure-back", "Back", false, &theme, |_, window, cx| {
-                    window.dispatch_action(Box::new(CloseStructure), cx)
-                }),
-                ui::button("structure-save", "Save as migration", false, &theme, {
+                ui::button(
+                    "structure-back",
+                    t("Back"),
+                    false,
+                    &theme,
+                    |_, window, cx| window.dispatch_action(Box::new(CloseStructure), cx),
+                ),
+                ui::button("structure-save", t("Save as migration"), false, &theme, {
                     let view = view.clone();
                     move |_, _, cx| view.update(cx, |this, cx| this.save_migration(cx))
                 }),
                 ui::button(
                     "structure-apply",
                     if busy {
-                        "Applying..."
+                        t("Applying...")
                     } else {
-                        "Apply to database"
+                        t("Apply to database")
                     },
                     true,
                     &theme,
@@ -761,9 +861,9 @@ impl Render for StructureView {
                     buttons.push(ui::button(
                         "structure-drop",
                         if self.drop {
-                            "Keep table"
+                            t("Keep table")
                         } else {
-                            "Drop table"
+                            t("Drop table")
                         },
                         false,
                         &theme,
@@ -780,7 +880,7 @@ impl Render for StructureView {
                 }
                 buttons.push(ui::button(
                     "structure-review",
-                    "Review",
+                    t("Review"),
                     true,
                     &theme,
                     |_, window, cx| window.dispatch_action(Box::new(ReviewStructure), cx),
@@ -825,7 +925,7 @@ impl Render for StructureView {
                         &theme,
                     )))
                     .when(self.drop, |d| {
-                        d.child(div().text_color(theme.error).child("will be dropped"))
+                        d.child(div().text_color(theme.error).child(t("will be dropped")))
                     })
                     .child(
                         div()
@@ -847,5 +947,56 @@ impl Render for StructureView {
                     .pb_4()
                     .child(body),
             )
+    }
+}
+
+#[cfg(test)]
+mod localization_tests {
+    use super::*;
+
+    #[test]
+    fn russian_structure_labels_leave_sql_and_validation_inputs_unchanged() {
+        let draft = TableDraft {
+            name: "items".into(),
+            columns: vec![ColumnDraft {
+                name: "owner_id".into(),
+                type_name: "integer".into(),
+                ..Default::default()
+            }],
+            foreign_keys: vec![ForeignKeyDraft {
+                name: "owner_fk".into(),
+                columns: vec!["owner_id".into()],
+                ref_table: "owners".into(),
+                ref_columns: vec!["id".into()],
+                on_delete: Some("CASCADE".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let english =
+            db::ddl::statements(Engine::Postgres, &Change::Create(draft.clone())).unwrap();
+        crate::lang::set(crate::lang::Language::Russian);
+        assert_eq!(
+            on_delete_label(draft.foreign_keys[0].on_delete.as_deref()),
+            "при удалении: каскадно"
+        );
+        assert_eq!(
+            db::ddl::statements(Engine::Postgres, &Change::Create(draft.clone())).unwrap(),
+            english
+        );
+        assert!(english.join("\n").contains("ON DELETE CASCADE"));
+        let mut invalid = draft;
+        invalid.columns[0].type_name.clear();
+        let error = invalid.check().unwrap_err();
+        assert_eq!(error, "owner_id needs a type");
+        assert_eq!(ddl_notice(error), "owner_id: нужен тип");
+        assert_eq!(invalid.columns[0].name, "owner_id");
+        assert_eq!(
+            database_notice("No connection named local-db".into()),
+            "Нет подключения с именем local-db"
+        );
+        assert_eq!(database_notice("Server failure".into()), "Server failure");
+        crate::lang::set(crate::lang::Language::English);
+        assert_eq!(on_delete_label(Some("CASCADE")), "on delete cascade");
     }
 }
