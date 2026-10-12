@@ -130,9 +130,10 @@ something of its own unchecked or unmade adds it here.
       panes and model inference (`benchmarks/terminal-workflow.md` measures
       these features inactive);
       a start that puts several windows back or shows the way in, typing
-      with a preview open, a long Markdown file, a large picture, the
-      interface in Russian (`benchmarks/windows-and-way-in.md` measures
-      these features inactive)
+      with a preview open, a long Markdown file, a large picture
+      (`benchmarks/windows-and-way-in.md` measures these features inactive);
+      populated tool panels in Russian (`benchmarks/russian-interface.md`
+      measures startup and typing in both languages with tools inactive)
 - [ ] The numbers on the website (`src/components/performance.tsx`) are
       placeholders, marked so. The measurements in `benchmarks/` are local
       comparisons of a branch with main, not what the site may claim

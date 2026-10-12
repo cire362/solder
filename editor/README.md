@@ -1825,6 +1825,11 @@ untranslated literals passed directly to common label and button widgets;
 it does not prove that every dynamically built label is covered. The
 system's language is not selected automatically.
 
+Startup and typing in both languages were compared with main, with tools
+inactive, in [benchmarks/russian-interface.md](benchmarks/russian-interface.md).
+Visual checks of Russian panel widths and review by another reader remain
+in the roadmap.
+
 ## When something goes wrong
 
 An error Solder meets on its own (a file it could not write, a tab it could
