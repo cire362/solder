@@ -21,6 +21,13 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] Atomic local saves in a real window, Windows replacement/ACL behavior,
+      Linux extended attributes and ACLs, network filesystems, very large files
+      and sudden power loss. Fault injection, same-size/time external edits,
+      source aliases, independent writers, repeated saves and notebook serializer
+      failures are checked with temporary files and first-party process fixtures.
+      macOS extended attributes are checked on the filesystem. No published
+      extension or external filesystem was used for these checks
 - [ ] Native multi-window Quit, window/tab close, failed-save and notebook
       controls, and Linux/Windows. On macOS, paste, Undo/Redo, the changed mark,
       Cmd-Q, Cancel and Save All were checked in one real window; saved bytes,
@@ -305,18 +312,26 @@ something of its own unchecked or unmade adds it here.
       kinds a server gives them (read, written) are not told apart, and
       the color is the matching bracket's, there being no token of their
       own. Go to type definition and go to declaration are not there
-- [ ] Local text and container-bind saves still write directly to the file;
-      they do not guarantee an atomic replacement after a crash or IO failure.
-      Separate target namespaces and external writers can bypass duplicate-copy
-      detection; aliases of a missing destination may also escape it. Local
-      hard-link identity is checked on Unix; Windows currently checks path
-      aliases only
+- [ ] Atomic replacement does not lock independent external programs or
+      extension-host processes between the final revision check and rename. Separate remote namespaces can still
+      bypass duplicate-copy detection. Local writers in one process serialize
+      replacement, resolve parent aliases and use exclusive creation for missing
+      destinations. Files with hard links are refused on Unix rather than split;
+      Windows hard-link identities and ACL preservation are not implemented.
+      macOS/Linux metadata copying needs the system cp utility. A crash may leave
+      a sibling staging file; there is no startup cleanup of these files
+- [ ] Local crash recovery currently uses the revision read at restart, rather
+      than protecting the original revision kept with the recovery copy as remote
+      recovery does. Changes made outside Solder before restart can therefore be
+      replaced when recovered local text is saved
 - [ ] Direct system Quit bypasses the editor's question: GPUI's shutdown
       callback cannot cancel it. Keyboard/palette Quit now asks across every
       project window and waits for saves and recovery cleanup. Force Quit and
       termination cannot wait for a decision or guarantee recovery
-- [ ] Recovery does not cover notebooks. Malformed, unsupported, unreadable or
-      duplicate recovery copies are retained on disk, with no recovery-manager
+- [ ] Recovery and Save As/export to another file do not cover notebooks.
+      A refused notebook save keeps cells in the open tab, without an alternate
+      destination or a crash-recovery copy. Malformed, unsupported, unreadable or
+      duplicate text recovery copies are retained on disk, with no recovery-manager
       screen. The reader considers at most 256 copies per pass. Manually typing
       identical file bytes is conservatively dirty; undo to the saved history
       state is clean. Encoding/line-ending changes are not undone with text

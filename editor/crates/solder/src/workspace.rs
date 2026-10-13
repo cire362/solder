@@ -4719,6 +4719,40 @@ impl Workspace {
             let Ok(Ok(Some(path))) = answer.await else {
                 return false;
             };
+            let Ok((source, protected)) = document.read_with(cx, |d, _| {
+                (d.path().map(Path::to_path_buf), d.protected_save_source())
+            }) else {
+                return false;
+            };
+            let target = path.clone();
+            let current_source = source.clone();
+            let recovery_source = protected.clone();
+            let destination = cx
+                .background_executor()
+                .spawn(async move {
+                    let same_current = match current_source {
+                        Some(source) => crate::remote::same_file(&source, &target)?,
+                        None => false,
+                    };
+                    let same_recovery = match recovery_source {
+                        Some(source) => crate::remote::same_file(&source, &target)?,
+                        None => false,
+                    };
+                    let stamp = if same_current || same_recovery {
+                        None
+                    } else {
+                        crate::remote::revision(&target)?
+                    };
+                    Ok::<_, std::io::Error>((stamp, same_current, same_recovery))
+                })
+                .await;
+            let (stamp, same_current, same_recovery) = match destination {
+                Ok(destination) => destination,
+                Err(error) => {
+                    document.update(cx, |d, cx| d.save_failure(error, cx)).ok();
+                    return false;
+                }
+            };
             let protect_copies = this
                 .update(cx, |this, cx| this.closing || quit::busy(cx))
                 .unwrap_or(true);
@@ -4761,7 +4795,18 @@ impl Workspace {
                         return None;
                     }
                     Some(document.update(cx, |d, cx| {
-                        d.set_path(path.clone(), cx);
+                        if d.path().map(Path::to_path_buf) != source
+                            || d.protected_save_source() != protected
+                        {
+                            return Task::ready(false);
+                        }
+                        d.set_save_target(
+                            path.clone(),
+                            stamp.clone(),
+                            same_current,
+                            same_recovery,
+                            cx,
+                        );
                         d.save(cx)
                     }))
                 }) else {
@@ -9447,7 +9492,13 @@ mod tests {
         let (ws, cx) = setup(cx, root.clone());
         let file = root.join("a.txt");
         ws.update_in(cx, |w, window, cx| {
-            w.add_editor(Some(file.clone()), "one\ntwo\n", None, window, cx)
+            w.add_loaded(
+                file.clone(),
+                &crate::document::load(&file).unwrap(),
+                None,
+                window,
+                cx,
+            )
         });
         let editor = cx.read(|cx| ws.read(cx).active_editor().unwrap().clone());
         wait_for(cx, "diff base", &|cx| {
@@ -20957,7 +21008,13 @@ exports.activate = (context) => {
         let window = cx.update(|cx| crate::windows::open(root, cx));
         let editor = window
             .update(cx, |workspace, window, cx| {
-                workspace.add_editor(Some(path.clone()), "saved\n", None, window, cx);
+                workspace.add_loaded(
+                    path.clone(),
+                    &crate::document::load(&path).unwrap(),
+                    None,
+                    window,
+                    cx,
+                );
                 workspace.active_editor().unwrap().clone()
             })
             .unwrap();

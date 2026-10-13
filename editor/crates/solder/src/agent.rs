@@ -1201,22 +1201,42 @@ impl ToolBox {
             Ok(p) => p,
             Err(e) => return fail(call, e),
         };
-        let text = match crate::remote::read_to_string(&path) {
-            Ok(t) => t,
+        let loaded = match crate::document::load(&path) {
+            Ok(loaded) => loaded,
             Err(e) => return fail(call, format!("{rel}: {e}")),
         };
+        if let Some(why) = &loaded.read_only {
+            return fail(call, format!("{rel}: {}", why.message()));
+        }
         if old.is_empty() {
             return fail(call, "old is empty; use write_file to create a file");
         }
-        match text.matches(old).count() {
+        match loaded.text.matches(old).count() {
             0 => fail(
                 call,
                 format!("The old text is not in {rel}; read the file again"),
             ),
-            1 => match crate::remote::write(&path, text.replacen(old, new, 1)) {
-                Ok(()) => ok(call, format!("Edited {rel}")),
-                Err(e) => fail(call, e.to_string()),
-            },
+            1 => {
+                // Loaded text still has its original line endings; a buffer
+                // would normalize them before the exact match and replacement.
+                let text = loaded.text.replacen(old, new, 1);
+                let bytes = match text::encoding::encode(&text, loaded.encoding) {
+                    Ok(bytes) => bytes,
+                    Err(character) => {
+                        return fail(
+                            call,
+                            format!(
+                                "Cannot save {rel}: {} has no byte for '{character}'",
+                                loaded.encoding.name()
+                            ),
+                        );
+                    }
+                };
+                match crate::remote::write_versioned(&path, &bytes, loaded.stamp.as_ref()) {
+                    Ok(_) => ok(call, format!("Edited {rel}")),
+                    Err(e) => fail(call, e.to_string()),
+                }
+            }
             n => fail(
                 call,
                 format!("The old text is in {rel} {n} times; include more lines to make it unique"),
@@ -1228,6 +1248,212 @@ impl ToolBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edits_keep_the_original_encoding_marks_and_newline_bytes() {
+        use text::encoding::Encoding;
+        let root = db::testing::dir("agent-edit-encodings")
+            .canonicalize()
+            .unwrap();
+        let tb = ToolBox {
+            root: root.clone(),
+            sandbox: Sandbox::None,
+        };
+        let cases: &[(Encoding, &[u8], &[u8])] = &[
+            (Encoding::Utf8, b"hi\r\nold\r\nend\n", b"hi\r\nnew\r\nend\n"),
+            (
+                Encoding::Utf8Bom,
+                b"\xef\xbb\xbfhi\r\nold\r\nend\n",
+                b"\xef\xbb\xbfhi\r\nnew\r\nend\n",
+            ),
+            (
+                Encoding::Utf16Le,
+                b"\xff\xfeh\0i\0\r\0\n\0o\0l\0d\0\r\0\n\0e\0n\0d\0\n\0",
+                b"\xff\xfeh\0i\0\r\0\n\0n\0e\0w\0\r\0\n\0e\0n\0d\0\n\0",
+            ),
+            (
+                Encoding::Utf16Be,
+                b"\xfe\xff\0h\0i\0\r\0\n\0o\0l\0d\0\r\0\n\0e\0n\0d\0\n",
+                b"\xfe\xff\0h\0i\0\r\0\n\0n\0e\0w\0\r\0\n\0e\0n\0d\0\n",
+            ),
+            (
+                Encoding::Windows1251,
+                b"\xcf\xf0\xe8\xe2\xe5\xf2\r\nold\r\nend\n",
+                b"\xcf\xf0\xe8\xe2\xe5\xf2\r\nnew\r\nend\n",
+            ),
+            (
+                Encoding::Windows1252,
+                b"caf\xe9\r\nold\r\nend\n",
+                b"caf\xe9\r\nnew\r\nend\n",
+            ),
+        ];
+        for (index, (encoding, original, expected)) in cases.iter().enumerate() {
+            let rel = format!("encoded-{index}.txt");
+            let path = root.join(&rel);
+            std::fs::write(&path, original).unwrap();
+            let loaded = crate::document::load(&path).unwrap();
+            assert_eq!(loaded.encoding, *encoding);
+            assert!(loaded.text.contains("old\r\n"));
+            assert!(loaded.text.ends_with("end\n"));
+            let (message, error) = output(tb.execute(
+                &call(
+                    "edit_file",
+                    serde_json::json!({"path":rel,"old":"old\r\n","new":"new\r\n"}),
+                ),
+                Phase::Working,
+                false,
+            ));
+            assert!(!error, "{}: {message}", encoding.name());
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                *expected,
+                "{}",
+                encoding.name()
+            );
+        }
+    }
+
+    #[test]
+    fn edits_match_original_newlines_exactly_and_keep_replacement_newlines() {
+        let root = db::testing::dir("agent-edit-newlines")
+            .canonicalize()
+            .unwrap();
+        let tb = ToolBox {
+            root: root.clone(),
+            sandbox: Sandbox::None,
+        };
+        for (rel, original, wrong, old, new, expected) in [
+            (
+                "crlf.txt",
+                "before\r\nold\r\nafter\n",
+                "old\n",
+                "old\r\n",
+                "new\nadded\r\n",
+                "before\r\nnew\nadded\r\nafter\n",
+            ),
+            (
+                "lf.txt",
+                "before\nold\nafter\r\n",
+                "old\r\n",
+                "old\n",
+                "new\r\nadded\n",
+                "before\nnew\r\nadded\nafter\r\n",
+            ),
+        ] {
+            let path = root.join(rel);
+            std::fs::write(&path, original).unwrap();
+            let (message, error) = output(tb.execute(
+                &call(
+                    "edit_file",
+                    serde_json::json!({"path":rel,"old":wrong,"new":new}),
+                ),
+                Phase::Working,
+                false,
+            ));
+            assert!(error && message.contains("not in"), "{message}");
+            assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+            let (message, error) = output(tb.execute(
+                &call(
+                    "edit_file",
+                    serde_json::json!({"path":rel,"old":old,"new":new}),
+                ),
+                Phase::Working,
+                false,
+            ));
+            assert!(!error, "{message}");
+            assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn edits_change_non_utf8_letters_and_reject_unrepresentable_characters() {
+        let root = db::testing::dir("agent-edit-legacy-letters")
+            .canonicalize()
+            .unwrap();
+        let tb = ToolBox {
+            root: root.clone(),
+            sandbox: Sandbox::None,
+        };
+        let cases = [
+            (
+                "russian.txt",
+                b"\xcf\xf0\xe8\xe2\xe5\xf2\r\n".as_slice(),
+                "Привет",
+                "Пока",
+                b"\xcf\xee\xea\xe0\r\n".as_slice(),
+            ),
+            (
+                "western.txt",
+                b"caf\xe9\n".as_slice(),
+                "café",
+                "naïve",
+                b"na\xefve\n".as_slice(),
+            ),
+        ];
+        for (rel, original, old, new, expected) in cases {
+            let path = root.join(rel);
+            std::fs::write(&path, original).unwrap();
+            let (message, error) = output(tb.execute(
+                &call(
+                    "edit_file",
+                    serde_json::json!({"path":rel,"old":old,"new":new}),
+                ),
+                Phase::Working,
+                false,
+            ));
+            assert!(!error, "{message}");
+            assert_eq!(std::fs::read(&path).unwrap(), expected);
+            let (message, error) = output(tb.execute(
+                &call(
+                    "edit_file",
+                    serde_json::json!({"path":rel,"old":new,"new":"😀"}),
+                ),
+                Phase::Working,
+                false,
+            ));
+            assert!(error && message.contains("has no byte"), "{message}");
+            assert_eq!(std::fs::read(&path).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn edits_reject_binary_and_read_only_large_files_without_writing() {
+        let root = db::testing::dir("agent-edit-read-only")
+            .canonicalize()
+            .unwrap();
+        let tb = ToolBox {
+            root: root.clone(),
+            sandbox: Sandbox::None,
+        };
+        let binary = root.join("binary.txt");
+        std::fs::write(&binary, b"old\0content").unwrap();
+        let large = root.join("large.txt");
+        let file = std::fs::File::create(&large).unwrap();
+        file.set_len(crate::document::READ_LIMIT + 1).unwrap();
+        drop(file);
+        for rel in ["binary.txt", "large.txt"] {
+            let why = crate::document::load(&root.join(rel))
+                .unwrap()
+                .read_only
+                .unwrap()
+                .message();
+            let (message, error) = output(tb.execute(
+                &call(
+                    "edit_file",
+                    serde_json::json!({"path":rel,"old":"old","new":"new"}),
+                ),
+                Phase::Working,
+                false,
+            ));
+            assert!(error, "{rel} was edited");
+            assert_eq!(message, format!("{rel}: {why}"));
+        }
+        assert_eq!(std::fs::read(binary).unwrap(), b"old\0content");
+        assert_eq!(
+            std::fs::metadata(large).unwrap().len(),
+            crate::document::READ_LIMIT + 1
+        );
+    }
 
     #[test]
     fn remote_shell_routing_keeps_script_raw_and_requires_full_access() {

@@ -8,7 +8,7 @@
 // own, and what the runs put out. So this side keeps the notebook as the
 // extension sees it, and says to the editor what a run puts out.
 
-const fs = require('fs');
+const fileSave = require('./file-save');
 const { classes } = require('./types');
 const { TextDocument } = require('./documents');
 
@@ -121,6 +121,7 @@ module.exports = function buildNotebooks(core) {
   const controllers = [];
   // The notebooks the editor has open, by where their file is.
   const open = new Map();
+  const files = new WeakMap();
   const opened = new EventEmitter();
   const closed = new EventEmitter();
   const changed = new EventEmitter();
@@ -166,7 +167,7 @@ module.exports = function buildNotebooks(core) {
     cell.document.isClosed = true;
     core.docs.closed.fire(cell.document);
   }
-  function makeNotebook(uri, type, data) {
+  function makeNotebook(uri, type, data, revision) {
     const notebook = {
       uri,
       notebookType: type,
@@ -188,11 +189,12 @@ module.exports = function buildNotebooks(core) {
       },
       // Saved by the extension itself: the editor is told it is as on disk.
       async save() {
-        await asked['notebook.save']({ uri: uri.toString() });
-        core.notify('notebook.saved', { uri: uri.toString() });
+        await saveNotebook(notebook);
+        if (!notebook.isDirty) core.notify('notebook.saved', { uri: uri.toString() });
         return true;
       },
     };
+    files.set(notebook, { path: uri.fsPath, revision, saves: Promise.resolve() });
     notebook._cells = ((data && data.cells) || []).map((cell, handle) => makeCell(notebook, handle, {
       kind: cell.kind,
       language: cell.languageId,
@@ -207,13 +209,36 @@ module.exports = function buildNotebooks(core) {
   function dataOf(notebook) {
     const data = new NotebookData(notebook._cells.map((cell) => {
       const one = new NotebookCellData(cell.kind, cell.document.getText(), cell.document.languageId);
-      one.outputs = cell.outputs;
-      one.metadata = cell.metadata;
-      one.executionSummary = cell.executionSummary;
+      one.outputs = cell.outputs.map((output) => new NotebookCellOutput(
+        output.items.map((item) => new NotebookCellOutputItem(Buffer.from(item.data), item.mime)),
+        structuredClone(output.metadata),
+      ));
+      one.metadata = structuredClone(cell.metadata);
+      one.executionSummary = structuredClone(cell.executionSummary);
       return one;
     }));
-    data.metadata = notebook.metadata;
+    data.metadata = structuredClone(notebook.metadata);
     return data;
+  }
+  async function saveNotebook(notebook) {
+    const serializer = serializers.get(notebook.notebookType);
+    if (!serializer) throw new Error(`The extension writes no notebooks of the kind ${notebook.notebookType}`);
+    // A queued save owns the cells requested, not whatever a preceding
+    // serializer or write leaves in the notebook when its turn comes.
+    const data = dataOf(notebook);
+    const version = notebook.version;
+    const file = files.get(notebook);
+    const pending = file.saves.then(async () => {
+      const bytes = Buffer.from(await serializer.serializeNotebook(data, never));
+      file.revision = await fileSave.save(file.path, file.revision, bytes);
+      if (notebook.version === version) notebook.isDirty = false;
+      saved.fire(notebook);
+      return true;
+    });
+    // A refused write leaves the expected revision intact and cannot stop
+    // the next request from trying with that same revision.
+    file.saves = pending.catch(() => {});
+    return pending;
   }
   function describe(cell) {
     return {
@@ -227,6 +252,7 @@ module.exports = function buildNotebooks(core) {
   }
   function touched(notebook, event) {
     notebook.version += 1;
+    notebook.isDirty = true;
     changed.fire({ notebook, metadata: undefined, contentChanges: [], cellChanges: [], ...event });
   }
   function editorOf(notebook, selected = 0) {
@@ -400,9 +426,9 @@ module.exports = function buildNotebooks(core) {
       const where = Uri.parse(uri);
       const known = open.get(where.toString());
       if (known) return { cells: known._cells.map(describe), runner: runner(type) && String(runner(type).label) };
-      const bytes = await fs.promises.readFile(where.fsPath);
-      const data = await serializer.deserializeNotebook(bytes, never);
-      const notebook = makeNotebook(where, type, data);
+      const source = await fileSave.read(where.fsPath);
+      const data = await serializer.deserializeNotebook(source.bytes, never);
+      const notebook = makeNotebook(where, type, data, source.revision);
       open.set(where.toString(), notebook);
       opened.fire(notebook);
       const controller = runner(type);
@@ -411,14 +437,7 @@ module.exports = function buildNotebooks(core) {
     },
     // Written back by the same extension, from the cells as they are now.
     'notebook.save': async ({ uri }) => {
-      const notebook = found(uri);
-      const serializer = serializers.get(notebook.notebookType);
-      if (!serializer) throw new Error(`The extension writes no notebooks of the kind ${notebook.notebookType}`);
-      const bytes = await serializer.serializeNotebook(dataOf(notebook), never);
-      await fs.promises.writeFile(notebook.uri.fsPath, Buffer.from(bytes));
-      notebook.isDirty = false;
-      saved.fire(notebook);
-      return true;
+      return saveNotebook(found(uri));
     },
     // The cells to run, given to what the extension made to run them.
     'notebook.execute': async ({ uri, handles }) => {

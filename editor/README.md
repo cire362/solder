@@ -170,6 +170,32 @@ order. A file's successful save records the state actually written, so
 undo and typing during IO cannot make a different state appear saved.
 Encoding and line-ending changes remain changes until saved.
 
+Local text and Jupyter saves stage a complete sibling file, sync it, check
+its original revision and then replace the destination. Container bind
+files use the same path. A new file is published exclusively: a file created
+by somebody else in the meantime is kept. A failed save keeps the original
+bytes and the changed mark. Save As captures the chosen destination off the
+UI thread; an alias of the source retains the source's revision. Edits made
+by the agent preserve the original encoding and exact newline bytes too.
+
+Symlinks to existing files stay symlinks. Unix files with hard links and
+read-only files are refused. Text files can use Save As to a new path.
+The system copier preserves macOS/Linux permissions and extended metadata
+before replacement; saving fails if it cannot do so or would change the
+owner. macOS files with special flags are refused. Windows currently
+preserves basic permissions only. Independent external writers can still
+race the final check and rename; this is not an exclusive filesystem lock.
+Faults before publication are tested; sudden power loss and large-file
+save performance have not been checked. A crash may leave a staging file.
+
+Extension notebook serializers keep the revision of the bytes they read.
+Their saves also stage, sync and check before replacement, and serialize
+requests from both the editor and the extension. A save clears the changed
+mark only for the version it wrote; typing while the serializer waits stays
+unsaved. Serializer and IO errors keep the old file and its read revision.
+These checks use first-party extensions, with no new Open VSX compatibility
+claim.
+
 **Text that is not saved is kept aside** as it is typed, for a crash or
 another exit without a decision. Within a second of a change the whole
 text of the file goes to `sessions/recovery/` beside the settings; saving

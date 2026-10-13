@@ -31,6 +31,32 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Hashes a file without retaining its bytes, including partial reads and
+/// interrupted system calls. The count lets callers check its read revision.
+pub fn sha256_reader(mut reader: impl Read) -> std::io::Result<(u64, String)> {
+    let mut hash = Sha256::new();
+    let mut count = 0;
+    let mut bytes = [0; 16 * 1024];
+    loop {
+        match reader.read(&mut bytes) {
+            Ok(0) => break,
+            Ok(read) => {
+                hash.update(&bytes[..read]);
+                count += read as u64;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((
+        count,
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    ))
+}
+
 /// The llama.cpp build Solder runs. Raising it means updating every hash.
 pub const LLAMA_BUILD: &str = "b11312";
 pub const HUB: &str = "https://huggingface.co";
@@ -408,6 +434,53 @@ fn describe(e: reqwest::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn streaming_hash_counts_bytes_and_handles_interrupted_reads() {
+        struct Interrupted {
+            first: bool,
+            bytes: std::io::Cursor<Vec<u8>>,
+        }
+        impl std::io::Read for Interrupted {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                if self.first {
+                    self.first = false;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                self.bytes.read(bytes)
+            }
+        }
+        let reader = Interrupted {
+            first: true,
+            bytes: std::io::Cursor::new(b"abc".to_vec()),
+        };
+        assert_eq!(
+            super::sha256_reader(reader).unwrap(),
+            (
+                3,
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into()
+            )
+        );
+        let bytes = vec![42; 100_000];
+        assert_eq!(
+            super::sha256_reader(&bytes[..]).unwrap(),
+            (bytes.len() as u64, super::sha256_hex(&bytes))
+        );
+    }
+
+    #[test]
+    fn streaming_hash_propagates_read_failure() {
+        struct Failed;
+        impl std::io::Read for Failed {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("fixture read failed"))
+            }
+        }
+        assert_eq!(
+            super::sha256_reader(Failed).unwrap_err().to_string(),
+            "fixture read failed"
+        );
+    }
+
     use super::*;
     use std::{
         io::{BufRead, BufReader, Write},

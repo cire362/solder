@@ -921,6 +921,35 @@ pub const WORDS: &[(&str, &str)] = &[
     ),
     ("Not saved: {}", "Не сохранено: {}"),
     (
+        "The file is a dangling link. Save to another path.",
+        "Файл является повреждённой ссылкой. Сохраните по другому пути.",
+    ),
+    ("Invalid file path", "Неверный путь файла"),
+    (
+        "The destination is not a regular file",
+        "Указанный путь не является обычным файлом",
+    ),
+    (
+        "The file is read-only. Save to another path.",
+        "Файл доступен только для чтения. Сохраните по другому пути.",
+    ),
+    (
+        "The file has special flags. Save to a new file.",
+        "У файла есть специальные атрибуты. Сохраните в новый файл.",
+    ),
+    (
+        "The file has hard links. Save to a new file.",
+        "У файла есть жёсткие ссылки. Сохраните в новый файл.",
+    ),
+    (
+        "Could not preserve file attributes. Save to a new file.",
+        "Не удалось сохранить атрибуты файла. Сохраните в новый файл.",
+    ),
+    (
+        "Saving would change the file owner. Save to a new file.",
+        "Сохранение изменит владельца файла. Сохраните в новый файл.",
+    ),
+    (
         "The file path changed during save. Save again.",
         "Путь файла изменился во время сохранения. Сохраните ещё раз.",
     ),
