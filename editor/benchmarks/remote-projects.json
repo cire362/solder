@@ -1,0 +1,562 @@
+{
+  "base": "5ce3345",
+  "branch": "f8c1933",
+  "fixture_bytes": 128463,
+  "standard": {
+    "base": "cold_start_ms=128.9 (runs: 146.6 142.3 125.1 128.9 125.7)\ninput_p50_ms=12 input_p99_ms=22 frame_p50_ms=1.4 frame_p99_ms=2.0 memory_mb=156",
+    "branch": "cold_start_ms=121.4 (runs: 121.4 123.5 126.2 119.4 121.0)\ninput_p50_ms=12 input_p99_ms=21 frame_p50_ms=1.4 frame_p99_ms=2.1 memory_mb=162"
+  },
+  "startup": [
+    {
+      "round": 1,
+      "pair": 1,
+      "build": "base",
+      "ms": 134.1
+    },
+    {
+      "round": 1,
+      "pair": 1,
+      "build": "branch",
+      "ms": 123.1
+    },
+    {
+      "round": 1,
+      "pair": 2,
+      "build": "branch",
+      "ms": 120.2
+    },
+    {
+      "round": 1,
+      "pair": 2,
+      "build": "base",
+      "ms": 121.1
+    },
+    {
+      "round": 1,
+      "pair": 3,
+      "build": "base",
+      "ms": 122.0
+    },
+    {
+      "round": 1,
+      "pair": 3,
+      "build": "branch",
+      "ms": 127.5
+    },
+    {
+      "round": 1,
+      "pair": 4,
+      "build": "branch",
+      "ms": 124.8
+    },
+    {
+      "round": 1,
+      "pair": 4,
+      "build": "base",
+      "ms": 120.6
+    },
+    {
+      "round": 1,
+      "pair": 5,
+      "build": "base",
+      "ms": 122.0
+    },
+    {
+      "round": 1,
+      "pair": 5,
+      "build": "branch",
+      "ms": 128.1
+    },
+    {
+      "round": 1,
+      "pair": 6,
+      "build": "branch",
+      "ms": 123.0
+    },
+    {
+      "round": 1,
+      "pair": 6,
+      "build": "base",
+      "ms": 124.6
+    },
+    {
+      "round": 1,
+      "pair": 7,
+      "build": "base",
+      "ms": 125.6
+    },
+    {
+      "round": 1,
+      "pair": 7,
+      "build": "branch",
+      "ms": 119.1
+    },
+    {
+      "round": 1,
+      "pair": 8,
+      "build": "branch",
+      "ms": 121.8
+    },
+    {
+      "round": 1,
+      "pair": 8,
+      "build": "base",
+      "ms": 123.5
+    },
+    {
+      "round": 1,
+      "pair": 9,
+      "build": "base",
+      "ms": 123.4
+    },
+    {
+      "round": 1,
+      "pair": 9,
+      "build": "branch",
+      "ms": 132.2
+    },
+    {
+      "round": 1,
+      "pair": 10,
+      "build": "branch",
+      "ms": 120.8
+    },
+    {
+      "round": 1,
+      "pair": 10,
+      "build": "base",
+      "ms": 134.1
+    },
+    {
+      "round": 1,
+      "pair": 11,
+      "build": "base",
+      "ms": 138.1
+    },
+    {
+      "round": 1,
+      "pair": 11,
+      "build": "branch",
+      "ms": 121.7
+    },
+    {
+      "round": 1,
+      "pair": 12,
+      "build": "branch",
+      "ms": 126.6
+    },
+    {
+      "round": 1,
+      "pair": 12,
+      "build": "base",
+      "ms": 126.2
+    },
+    {
+      "round": 1,
+      "pair": 13,
+      "build": "base",
+      "ms": 135.9
+    },
+    {
+      "round": 1,
+      "pair": 13,
+      "build": "branch",
+      "ms": 124.1
+    },
+    {
+      "round": 1,
+      "pair": 14,
+      "build": "branch",
+      "ms": 128.5
+    },
+    {
+      "round": 1,
+      "pair": 14,
+      "build": "base",
+      "ms": 135.4
+    },
+    {
+      "round": 1,
+      "pair": 15,
+      "build": "base",
+      "ms": 137.3
+    },
+    {
+      "round": 1,
+      "pair": 15,
+      "build": "branch",
+      "ms": 130.1
+    },
+    {
+      "round": 1,
+      "pair": 16,
+      "build": "branch",
+      "ms": 126.3
+    },
+    {
+      "round": 1,
+      "pair": 16,
+      "build": "base",
+      "ms": 121.3
+    },
+    {
+      "round": 1,
+      "pair": 17,
+      "build": "base",
+      "ms": 126.5
+    },
+    {
+      "round": 1,
+      "pair": 17,
+      "build": "branch",
+      "ms": 135.7
+    },
+    {
+      "round": 1,
+      "pair": 18,
+      "build": "branch",
+      "ms": 142.4
+    },
+    {
+      "round": 1,
+      "pair": 18,
+      "build": "base",
+      "ms": 127.5
+    },
+    {
+      "round": 1,
+      "pair": 19,
+      "build": "base",
+      "ms": 126.3
+    },
+    {
+      "round": 1,
+      "pair": 19,
+      "build": "branch",
+      "ms": 125.6
+    },
+    {
+      "round": 1,
+      "pair": 20,
+      "build": "branch",
+      "ms": 136.4
+    },
+    {
+      "round": 1,
+      "pair": 20,
+      "build": "base",
+      "ms": 134.2
+    },
+    {
+      "round": 1,
+      "pair": 21,
+      "build": "base",
+      "ms": 129.5
+    },
+    {
+      "round": 1,
+      "pair": 21,
+      "build": "branch",
+      "ms": 129.2
+    },
+    {
+      "round": 2,
+      "pair": 1,
+      "build": "branch",
+      "ms": 127.9
+    },
+    {
+      "round": 2,
+      "pair": 1,
+      "build": "base",
+      "ms": 134.3
+    },
+    {
+      "round": 2,
+      "pair": 2,
+      "build": "base",
+      "ms": 128.6
+    },
+    {
+      "round": 2,
+      "pair": 2,
+      "build": "branch",
+      "ms": 134.7
+    },
+    {
+      "round": 2,
+      "pair": 3,
+      "build": "branch",
+      "ms": 128.9
+    },
+    {
+      "round": 2,
+      "pair": 3,
+      "build": "base",
+      "ms": 127.4
+    },
+    {
+      "round": 2,
+      "pair": 4,
+      "build": "base",
+      "ms": 149.7
+    },
+    {
+      "round": 2,
+      "pair": 4,
+      "build": "branch",
+      "ms": 130.6
+    },
+    {
+      "round": 2,
+      "pair": 5,
+      "build": "branch",
+      "ms": 133.2
+    },
+    {
+      "round": 2,
+      "pair": 5,
+      "build": "base",
+      "ms": 133.8
+    },
+    {
+      "round": 2,
+      "pair": 6,
+      "build": "base",
+      "ms": 130.2
+    },
+    {
+      "round": 2,
+      "pair": 6,
+      "build": "branch",
+      "ms": 131.6
+    },
+    {
+      "round": 2,
+      "pair": 7,
+      "build": "branch",
+      "ms": 125.9
+    },
+    {
+      "round": 2,
+      "pair": 7,
+      "build": "base",
+      "ms": 133.6
+    },
+    {
+      "round": 2,
+      "pair": 8,
+      "build": "base",
+      "ms": 129.4
+    },
+    {
+      "round": 2,
+      "pair": 8,
+      "build": "branch",
+      "ms": 149.0
+    },
+    {
+      "round": 2,
+      "pair": 9,
+      "build": "branch",
+      "ms": 134.8
+    },
+    {
+      "round": 2,
+      "pair": 9,
+      "build": "base",
+      "ms": 142.9
+    },
+    {
+      "round": 2,
+      "pair": 10,
+      "build": "base",
+      "ms": 131.3
+    },
+    {
+      "round": 2,
+      "pair": 10,
+      "build": "branch",
+      "ms": 135.4
+    },
+    {
+      "round": 2,
+      "pair": 11,
+      "build": "branch",
+      "ms": 130.0
+    },
+    {
+      "round": 2,
+      "pair": 11,
+      "build": "base",
+      "ms": 131.4
+    },
+    {
+      "round": 2,
+      "pair": 12,
+      "build": "base",
+      "ms": 137.3
+    },
+    {
+      "round": 2,
+      "pair": 12,
+      "build": "branch",
+      "ms": 129.3
+    },
+    {
+      "round": 2,
+      "pair": 13,
+      "build": "branch",
+      "ms": 131.3
+    },
+    {
+      "round": 2,
+      "pair": 13,
+      "build": "base",
+      "ms": 138.7
+    },
+    {
+      "round": 2,
+      "pair": 14,
+      "build": "base",
+      "ms": 131.4
+    },
+    {
+      "round": 2,
+      "pair": 14,
+      "build": "branch",
+      "ms": 132.4
+    },
+    {
+      "round": 2,
+      "pair": 15,
+      "build": "branch",
+      "ms": 131.1
+    },
+    {
+      "round": 2,
+      "pair": 15,
+      "build": "base",
+      "ms": 136.6
+    },
+    {
+      "round": 2,
+      "pair": 16,
+      "build": "base",
+      "ms": 137.2
+    },
+    {
+      "round": 2,
+      "pair": 16,
+      "build": "branch",
+      "ms": 134.3
+    },
+    {
+      "round": 2,
+      "pair": 17,
+      "build": "branch",
+      "ms": 145.2
+    },
+    {
+      "round": 2,
+      "pair": 17,
+      "build": "base",
+      "ms": 133.9
+    },
+    {
+      "round": 2,
+      "pair": 18,
+      "build": "base",
+      "ms": 143.2
+    },
+    {
+      "round": 2,
+      "pair": 18,
+      "build": "branch",
+      "ms": 132.1
+    },
+    {
+      "round": 2,
+      "pair": 19,
+      "build": "branch",
+      "ms": 131.8
+    },
+    {
+      "round": 2,
+      "pair": 19,
+      "build": "base",
+      "ms": 131.4
+    },
+    {
+      "round": 2,
+      "pair": 20,
+      "build": "base",
+      "ms": 133.2
+    },
+    {
+      "round": 2,
+      "pair": 20,
+      "build": "branch",
+      "ms": 132.1
+    },
+    {
+      "round": 2,
+      "pair": 21,
+      "build": "branch",
+      "ms": 131.3
+    },
+    {
+      "round": 2,
+      "pair": 21,
+      "build": "base",
+      "ms": 136.2
+    }
+  ],
+  "typing": [
+    {
+      "run": 1,
+      "build": "base",
+      "output": "input_p50_ms=12 input_p99_ms=21 frame_p50_ms=1.5 frame_p99_ms=1.8 memory_mb=168"
+    },
+    {
+      "run": 1,
+      "build": "branch",
+      "output": "input_p50_ms=12 input_p99_ms=22 frame_p50_ms=1.4 frame_p99_ms=1.9 memory_mb=156"
+    },
+    {
+      "run": 2,
+      "build": "branch",
+      "output": "input_p50_ms=12 input_p99_ms=22 frame_p50_ms=1.4 frame_p99_ms=2.2 memory_mb=154"
+    },
+    {
+      "run": 2,
+      "build": "base",
+      "output": "input_p50_ms=12 input_p99_ms=21 frame_p50_ms=1.4 frame_p99_ms=2.3 memory_mb=161"
+    },
+    {
+      "run": 3,
+      "build": "base",
+      "output": "input_p50_ms=12 input_p99_ms=22 frame_p50_ms=1.5 frame_p99_ms=2.2 memory_mb=161"
+    },
+    {
+      "run": 3,
+      "build": "branch",
+      "output": "input_p50_ms=12 input_p99_ms=22 frame_p50_ms=1.5 frame_p99_ms=2.0 memory_mb=158"
+    }
+  ],
+  "binary_bytes": {
+    "base": 53615984,
+    "branch": 54337488
+  },
+  "environment": {
+    "date": "2026-10-13",
+    "os": "arm64 macOS 26.6.2",
+    "cpu": "Apple M4",
+    "rust": "1.94.0",
+    "profile": "release, fat LTO, codegen-units=1",
+    "extensions": "none installed",
+    "remote_connections": "inactive during measurement",
+    "homes": "fresh isolated HOME for each invocation",
+    "other_programs": "user applications remained open"
+  }
+}

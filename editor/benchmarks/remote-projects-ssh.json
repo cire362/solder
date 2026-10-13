@@ -1,0 +1,17 @@
+{
+  "status": "passed",
+  "passed": [
+    "handshake",
+    "binary read",
+    "atomic CAS replacement",
+    "same-stamp hash conflict",
+    "exclusive create CAS",
+    "path and symlink escape refusal",
+    "target command cwd, argv quoting and environment",
+    "native Solder CLI opens an SSH cache file through the integrated Rust channel with fresh server bytes",
+    "external server edit reaches the open native document through project polling",
+    "native SSH window screenshot captured for visual inspection"
+  ],
+  "worker_sha256": "fc6ce60ec30993f30d2ac084abb3e5c9dc4fc903d8e1a48d79552723ee77ad52",
+  "cleanup": "launched processes reaped; temporary directory removed"
+}

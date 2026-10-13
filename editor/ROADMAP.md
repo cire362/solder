@@ -21,11 +21,16 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
-- [ ] Remote project editing in a real Solder window, an external SSH server and
-      Linux/Windows clients. The first-party helper passed seven checks through
-      real public-key SSH on macOS loopback; the integrated Rust channel, file
-      revisions and LSP mapping are checked separately with processes. An SSH
-      PTY, reconnect and connection loss have not been checked against a server
+- [ ] Typing and saving in a native remote-project window, an external SSH
+      server and Linux/Windows clients. On macOS loopback, a release Solder
+      window read fresh server bytes instead of stale cache and followed an
+      external edit through project polling. Seven helper checks also passed;
+      Rust file revisions and LSP mapping are checked separately with processes.
+      SSH PTYs, reconnect and connection loss are not checked against a server.
+      Evidence is in `benchmarks/remote-projects.md`
+- [ ] Performance with active SSH connections or containers and large remote
+      inventories. `benchmarks/remote-projects.md` compares startup and typing
+      with these features inactive
 - [ ] Devcontainer startup against a real Docker daemon. Parsing, reviewed-file
       snapshots, argv, bounded execution, cancellation and lifecycle are checked
       with executable Docker fixtures; no image was downloaded or built here
