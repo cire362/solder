@@ -85,6 +85,15 @@ Never guess a signature.
   character the encoding has no byte for stops the save and is said
   (`Document::notice`); it is not replaced. Code that edits a file on
   disk without opening it reads and writes the same way.
+  Local and container-bind writes go through `file_save.rs`: a sibling
+  staged file, sync, original-revision check and atomic publication, serialized
+  across local writers. `remote::write_versioned` with no stamp means create
+  only; never use it to replace a file which was not read. Save As captures
+  its destination revision off the UI thread and preserves the source revision
+  through aliases. `file_save::replace` is for intentionally replaced owned
+  state. Metadata copying uses the system cp on macOS/Linux; failures, changed
+  owners, read-only files and Unix hard links stop the save. Extended metadata
+  and Windows identity limitations are recorded in the roadmap.
 - Edits go through `Document::edit`/`apply_edits` with the `EntityId` of the
   **editor** that made them as `origin`. Passing the document's id made the
   editor move its own cursor twice; this bug happened once.
@@ -345,7 +354,11 @@ Never guess a signature.
   preserving metadata, attachments and output bundles. Other notebooks
   use their extension, which reads the file, runs the cells and writes it back (`host/notebooks.js`,
   which also reads and writes the file: no bytes of it cross to the
-  editor); the editor says what is typed and which cells there are, a
+  editor). `host/file-save.js` checks that notebook's original read revision
+  before atomic replacement, preserving extended metadata on macOS/Linux.
+  Saves from editor and extension share the notebook's queue and acknowledge
+  only their captured cell version; typing during serialization remains dirty.
+  The editor says what is typed and which cells there are, a
   cell by a number that stays its own. A cell is an `Editor` as tall as
   its text (`Editor::fitted`): it never scrolls up or down itself, draws
   only the rows its place in the window leaves to be seen, and asks the

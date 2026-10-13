@@ -97,44 +97,20 @@ impl File {
             serde_json::to_vec_pretty(&self.content(cells)).map_err(|e| e.to_string())?;
         bytes.push(b'\n');
         let mut stamp = self.stamp.lock().unwrap_or_else(|e| e.into_inner());
-        if crate::remote::is_remote(path) {
-            *stamp = crate::remote::write_versioned(path, &bytes, stamp.as_ref())
-                .map_err(|e| e.to_string())?;
-        } else {
-            write_atomic(path, &bytes)?;
-            *stamp = Some(crate::remote::stamp_for_bytes(path, &bytes).map_err(|e| e.to_string())?);
-        }
+        *stamp = crate::remote::write_versioned(path, &bytes, stamp.as_ref())
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 }
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
     let parent = path
         .parent()
         .ok_or(crate::lang::t("This file has no folder"))?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let temporary = parent.join(format!(
-        ".solder-save-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            file.set_permissions(metadata.permissions())?;
-        }
-        std::fs::rename(&temporary, path)
-    })();
-    let _ = std::fs::remove_file(&temporary);
-    result.map_err(|e| e.to_string())
+    crate::file_save::replace(path, bytes)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 fn multiline(value: &Value) -> Option<String> {
@@ -183,6 +159,120 @@ fn output(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn notebook_path(name: &str) -> std::path::PathBuf {
+        let path = db::testing::dir(name).join("test.ipynb");
+        let source = json!({"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[
+            {"cell_type":"code","id":"a","metadata":{},"source":"old","execution_count":null,"outputs":[]}
+        ]});
+        std::fs::write(&path, serde_json::to_vec(&source).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn notebook_save_rejects_external_edit_with_the_same_length_and_mtime() {
+        let path = notebook_path("ipynb-external-edit");
+        let (file, _) = File::read(&path).unwrap();
+        let stamp = file.stamp.lock().unwrap().clone();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let external = original.replace("old", "new");
+        assert_eq!(external.len(), original.len());
+        std::fs::write(&path, &external).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+
+        for _ in 0..2 {
+            assert!(file.save(&path, &[(0, true, "ours".into())]).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), external.as_bytes());
+            assert_eq!(*file.stamp.lock().unwrap(), stamp);
+        }
+    }
+
+    #[test]
+    fn independently_loaded_notebooks_conflict_and_success_advances_the_revision() {
+        let path = notebook_path("ipynb-independent-copies");
+        let (first, _) = File::read(&path).unwrap();
+        let (second, _) = File::read(&path).unwrap();
+        let second_stamp = second.stamp.lock().unwrap().clone();
+        first.save(&path, &[(0, true, "first".into())]).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        assert!(second.save(&path, &[(0, true, "second".into())]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        assert_eq!(*second.stamp.lock().unwrap(), second_stamp);
+
+        first.save(&path, &[(0, true, "latest".into())]).unwrap();
+        let (_, shown) = File::read(&path).unwrap();
+        assert_eq!(shown["cells"][0]["value"], "latest");
+    }
+
+    #[test]
+    fn a_notebook_without_a_read_revision_only_creates_a_new_file() {
+        let path = notebook_path("ipynb-create-only");
+        let original = std::fs::read(&path).unwrap();
+        let (file, _) = File::decode(&original).unwrap();
+        assert!(file.save(&path, &[(0, true, "ours".into())]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(file.stamp.lock().unwrap().is_none());
+
+        let created = path.with_file_name("new.ipynb");
+        file.save(&created, &[(0, true, "created".into())]).unwrap();
+        assert!(file.stamp.lock().unwrap().is_some());
+        file.save(&created, &[(0, true, "updated".into())]).unwrap();
+        let (_, shown) = File::read(&created).unwrap();
+        assert_eq!(shown["cells"][0]["value"], "updated");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_notebook_replacement_keeps_bytes_and_read_revision_for_a_retry() {
+        let path = notebook_path("ipynb-failed-replacement");
+        let original = std::fs::read(&path).unwrap();
+        let (file, _) = File::read(&path).unwrap();
+        let stamp = file.stamp.lock().unwrap().clone();
+        let linked = path.with_file_name("linked.ipynb");
+        std::fs::hard_link(&path, &linked).unwrap();
+
+        assert!(file.save(&path, &[(0, true, "ours".into())]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read(&linked).unwrap(), original);
+        assert_eq!(*file.stamp.lock().unwrap(), stamp);
+
+        std::fs::remove_file(linked).unwrap();
+        file.save(&path, &[(0, true, "ours".into())]).unwrap();
+        let (_, shown) = File::read(&path).unwrap();
+        assert_eq!(shown["cells"][0]["value"], "ours");
+    }
+
+    #[test]
+    fn state_replacement_creates_parent_folders_and_replaces_existing_bytes() {
+        let path = db::testing::dir("ipynb-state-replacement").join("nested/state.json");
+        write_atomic(&path, b"first").unwrap();
+        write_atomic(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"second");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_state_replacement_leaves_the_original_and_its_hardlink() {
+        let dir = db::testing::dir("ipynb-state-hardlink");
+        let path = dir.join("state.json");
+        let linked = dir.join("linked.json");
+        std::fs::write(&path, b"original").unwrap();
+        std::fs::hard_link(&path, &linked).unwrap();
+        assert!(write_atomic(&path, b"replacement").is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"original");
+        assert_eq!(std::fs::read(linked).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 2);
+    }
 
     #[test]
     fn localized_validation_keeps_the_jupyter_file_and_cell_identifiers() {

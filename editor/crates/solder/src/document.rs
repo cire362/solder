@@ -1280,6 +1280,46 @@ impl Document {
         }
     }
 
+    pub(crate) fn protected_save_source(&self) -> Option<PathBuf> {
+        self.recovered_remote
+            .as_ref()
+            .map(|recovered| recovered.path.clone())
+    }
+
+    pub(crate) fn save_failure(&mut self, error: std::io::Error, cx: &mut Context<Self>) {
+        self.notice = Some(SaveFailure::Io(error).message().into());
+        cx.notify();
+    }
+
+    /// A selected destination may be an alias of the source. That changes
+    /// its displayed path, not the revision which permits replacing it.
+    pub(crate) fn set_save_target(
+        &mut self,
+        path: PathBuf,
+        destination: Option<crate::remote::Stamp>,
+        same_current: bool,
+        same_recovery: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.path.as_ref() == Some(&path) {
+            return;
+        }
+        let stamp = if same_recovery {
+            self.recovered_remote
+                .as_ref()
+                .and_then(|recovered| recovered.stamp.clone())
+        } else if same_current {
+            self.stamp.clone()
+        } else {
+            destination
+        };
+        self.set_path(path.clone(), cx);
+        self.stamp = stamp;
+        if same_recovery && let Some(recovered) = self.recovered_remote.as_mut() {
+            recovered.path = path;
+        }
+    }
+
     pub fn set_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.path.as_ref() == Some(&path) {
             return;
@@ -1584,6 +1624,99 @@ mod tests {
         );
         assert!(!restored.update(cx, |doc, cx| doc.save(cx)).await);
         assert_eq!(std::fs::read(&target).unwrap(), b"today");
+    }
+
+    #[gpui::test]
+    async fn a_local_document_refuses_unknown_or_external_revisions(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let path = db::testing::dir("document-local-revisions").join("file.txt");
+        std::fs::write(&path, "before").unwrap();
+        let unknown = cx.new(|cx| Document::new(Some(path.clone()), "ours", cx));
+        assert!(!unknown.update(cx, |d, cx| d.save(cx)).await);
+        assert_eq!(std::fs::read(&path).unwrap(), b"before");
+        let loaded = load(&path).unwrap();
+        let document = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+        document.update(cx, |d, cx| {
+            d.apply_edits(vec![(0..6, "ours".into())], None, cx)
+        });
+        std::fs::write(&path, "external").unwrap();
+        assert!(!document.update(cx, |d, cx| d.save(cx)).await);
+        assert_eq!(std::fs::read(&path).unwrap(), b"external");
+        document.read_with(cx, |d, _| {
+            assert!(d.is_dirty());
+            assert_eq!(d.stamp, loaded.stamp);
+            assert!(d.notice().is_some());
+        });
+    }
+
+    #[gpui::test]
+    async fn save_as_uses_the_selected_destination_revision(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = db::testing::dir("document-local-save-as");
+        let path = dir.join("source.txt");
+        let destination = dir.join("dest.txt");
+        std::fs::write(&path, "source").unwrap();
+        std::fs::write(&destination, "before").unwrap();
+        let loaded = load(&path).unwrap();
+        let document = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+        let chosen = crate::remote::revision(&destination).unwrap();
+        document.update(cx, |d, cx| {
+            d.set_save_target(destination.clone(), chosen, false, false, cx)
+        });
+        std::fs::write(&destination, "external").unwrap();
+        assert!(!document.update(cx, |d, cx| d.save(cx)).await);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"external");
+        assert!(document.read_with(cx, |d, _| d.is_dirty()));
+        let chosen = crate::remote::revision(&destination).unwrap();
+        let second = cx.new(|cx| Document::new(None, "replacement", cx));
+        second.update(cx, |d, cx| {
+            d.set_save_target(destination.clone(), chosen, false, false, cx)
+        });
+        assert!(second.update(cx, |d, cx| d.save(cx)).await);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(&path).unwrap(), b"source");
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn save_as_source_aliases_do_not_authorize_new_external_revisions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::os::unix::fs::symlink;
+        cx.executor().allow_parking();
+        let dir = db::testing::dir("document-source-alias");
+        let path = dir.join("source.txt");
+        let alias = dir.join("alias.txt");
+        std::fs::write(&path, "before").unwrap();
+        symlink(&path, &alias).unwrap();
+        let loaded = load(&path).unwrap();
+        let document = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+        document.update(cx, |d, cx| {
+            d.apply_edits(vec![(0..6, "ours".into())], None, cx)
+        });
+        std::fs::write(&path, "external").unwrap();
+        let now = crate::remote::revision(&alias).unwrap();
+        document.update(cx, |d, cx| {
+            d.set_save_target(alias.clone(), now, true, false, cx)
+        });
+        assert!(!document.update(cx, |d, cx| d.save(cx)).await);
+        assert_eq!(std::fs::read(&path).unwrap(), b"external");
+        assert_eq!(document.read_with(cx, |d, _| d.stamp.clone()), loaded.stamp);
+        let recovered = cx.new(|cx| Document::open(path.clone(), &load(&path).unwrap(), cx));
+        recovered.update(cx, |d, cx| {
+            d.recover("legacy", None, cx);
+            d.set_path(dir.join("attempt.txt"), cx);
+            d.set_save_target(
+                alias.clone(),
+                crate::remote::revision(&alias).unwrap(),
+                false,
+                true,
+                cx,
+            );
+        });
+        assert!(!recovered.update(cx, |d, cx| d.save(cx)).await);
+        assert_eq!(std::fs::read(&path).unwrap(), b"external");
+        assert!(recovered.read_with(cx, |d, _| d.is_dirty()));
     }
 
     #[cfg(unix)]

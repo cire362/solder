@@ -898,30 +898,9 @@ pub fn write_versioned(
     expected: Option<&Stamp>,
 ) -> io::Result<Option<Stamp>> {
     match mount(path)? {
-        None => {
-            std::fs::write(path, bytes)?;
-            Ok(Some(stamp_for_bytes(path, bytes)?))
-        }
+        None => crate::file_save::write(path, bytes, expected).map(Some),
         Some(mount) if !mount.mirror => {
-            let path = mount.shared_path(path)?;
-            if let Some(expected) = expected {
-                let old = std::fs::read(&path)?;
-                let found = stamp_for_bytes(&path, &old)?;
-                if found.length != expected.length
-                    || found.mtime != expected.mtime
-                    || expected
-                        .hash
-                        .as_ref()
-                        .is_some_and(|h| found.hash.as_ref() != Some(h))
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "The file changed; reopen it before saving",
-                    ));
-                }
-            }
-            std::fs::write(&path, bytes)?;
-            Ok(Some(stamp_for_bytes(&path, bytes)?))
+            crate::file_save::write(&mount.shared_path(path)?, bytes, expected).map(Some)
         }
         Some(mount) => {
             let expected = expected
@@ -940,6 +919,14 @@ pub fn write_versioned(
     }
 }
 pub fn write(path: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> {
+    match mount(path)? {
+        None => return crate::file_save::replace(path, bytes.as_ref()).map(|_| ()),
+        Some(mount) if !mount.mirror => {
+            return crate::file_save::replace(&mount.shared_path(path)?, bytes.as_ref())
+                .map(|_| ());
+        }
+        _ => {}
+    }
     let version = mount(path)?.and_then(|m| {
         lock(&m.versions)
             .get(&m.relative(path).ok()?)
@@ -956,6 +943,50 @@ pub fn write(path: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> {
     });
     write_versioned(path, bytes.as_ref(), version.as_ref()).map(|_| ())
 }
+/// Captures an explicitly chosen Save As destination off the UI thread.
+pub fn revision(path: &Path) -> io::Result<Option<Stamp>> {
+    match mount(path)? {
+        None => crate::file_save::revision(path),
+        Some(mount) if !mount.mirror => crate::file_save::revision(&mount.shared_path(path)?),
+        Some(_) => match read_versioned(path) {
+            Ok((_, stamp)) => Ok(stamp),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+pub fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
+    if a == b {
+        return Ok(true);
+    }
+    // A disconnected virtual source cannot alias a destination outside the
+    // remote namespace. Save As must still be able to rescue its open text.
+    let ma = match mount(a) {
+        Err(error) if error.kind() == io::ErrorKind::NotConnected && !is_remote(b) => {
+            return Ok(false);
+        }
+        other => other?,
+    };
+    let (ma, mb) = (ma, mount(b)?);
+    match (ma, mb) {
+        (None, None) => crate::file_save::same_file(a, b),
+        (Some(ma), Some(mb)) if ma.mirror || mb.mirror => {
+            Ok(Arc::ptr_eq(&ma, &mb) && ma.relative(a)? == mb.relative(b)?)
+        }
+        (Some(ma), Some(mb)) => {
+            crate::file_save::same_file(&ma.shared_path(a)?, &mb.shared_path(b)?)
+        }
+        (Some(mount), None) if !mount.mirror => {
+            crate::file_save::same_file(&mount.shared_path(a)?, b)
+        }
+        (None, Some(mount)) if !mount.mirror => {
+            crate::file_save::same_file(a, &mount.shared_path(b)?)
+        }
+        _ => Ok(false),
+    }
+}
+
 pub fn metadata(path: &Path) -> io::Result<Metadata> {
     match mount(path)? {
         None => {
@@ -1245,6 +1276,28 @@ mod tests {
         assert!(is_remote(&path));
         assert_eq!(read(&path).unwrap_err().kind(), io::ErrorKind::NotConnected);
         assert!(write(&path, b"local fallback").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_disconnected_source_does_not_prevent_saving_as_a_local_file() {
+        let folder = Folder::new();
+        let source = folder.0.join("server");
+        let cache = folder.0.join("cache");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("file.txt"), "source").unwrap();
+        let mount = fixture(&source, &cache);
+        let path = cache.join("file.txt");
+        read_versioned(&path).unwrap();
+        drop(mount);
+        let target = folder.0.join("local.txt");
+        assert!(is_remote(&path));
+        assert!(!same_file(&path, &target).unwrap());
+        assert!(same_file(&path, &path).unwrap());
+        let stamp = revision(&target).unwrap();
+        write_versioned(&target, b"rescued", stamp.as_ref()).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"rescued");
+        assert!(read(&path).is_err());
     }
 
     #[cfg(unix)]

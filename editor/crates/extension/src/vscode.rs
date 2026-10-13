@@ -42,6 +42,7 @@ const HOST: &[(&str, &str)] = &[
     ("views.js", include_str!("../host/views.js")),
     ("webviews.js", include_str!("../host/webviews.js")),
     ("notebooks.js", include_str!("../host/notebooks.js")),
+    ("file-save.js", include_str!("../host/file-save.js")),
 ];
 
 /// Puts the host where Node can read it, under `dir`. A file is written
@@ -1729,6 +1730,512 @@ exports.activate = () => {
         assert_eq!(run("counter.received", json!([])), json!([{"count":2}]));
         host.notify("notebook.renderer.closed", json!({"id":"one"}));
         assert_eq!(run("counter.send", json!([{"count":3}])), json!(false));
+    }
+
+    // First-party serializer with explicit gates, so a test can edit or
+    // issue another save while the host is waiting without a timed race.
+    const NOTEBOOK_SAVE_FIXTURE: &str = r#"
+const v = require('vscode');
+const fs = require('fs');
+const crypto = require('crypto');
+const childProcess = require('child_process');
+const calls = [], releases = [], saves = [];
+let mode = {};
+const book = () => v.workspace.notebookDocuments[0];
+const pause = () => new Promise((resolve) => releases.push(resolve));
+const hash = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
+exports.activate = (context) => {
+  context.subscriptions.push(
+    v.workspace.registerNotebookSerializer('save-book', {
+      async deserializeNotebook(bytes) {
+        if (mode.openHold) await pause();
+        return new v.NotebookData([new v.NotebookCellData(v.NotebookCellKind.Code, Buffer.from(bytes).toString(), 'plaintext')]);
+      },
+      async serializeNotebook(data) {
+        calls.push(data.cells[0].value);
+        if (mode.hold) await pause();
+        if (mode.fail) throw new Error('fixture serializer failed');
+        return Buffer.from(data.cells[0].value);
+      },
+    }),
+    v.workspace.onDidSaveNotebookDocument((notebook) => saves.push({
+      bytes: fs.readFileSync(notebook.uri.fsPath, 'utf8'), dirty: notebook.isDirty,
+    })),
+    v.commands.registerCommand('demo.mode', (value) => { mode = value; }),
+    v.commands.registerCommand('demo.release', () => { releases.shift()(); }),
+    v.commands.registerCommand('demo.save', () => book().save()),
+    v.commands.registerCommand('demo.state', () => ({
+      calls, saves, waiting: releases.length, dirty: book() && book().isDirty,
+    })),
+    v.commands.registerCommand('demo.time', (file) => fs.utimesSync(file, 1234567890, 1234567890)),
+    v.commands.registerCommand('demo.external', (value) => {
+      const file = book().uri.fsPath;
+      const before = fs.statSync(file, { bigint: true });
+      const original = fs.readFileSync(file);
+      fs.writeFileSync(file, value);
+      fs.utimesSync(file, Number(before.atimeNs) / 1e9, Number(before.mtimeNs) / 1e9);
+      const after = fs.statSync(file, { bigint: true });
+      return { sameSize: before.size === after.size, sameTime: before.mtimeNs === after.mtimeNs,
+        sameHash: hash(original) === hash(fs.readFileSync(file)) };
+    }),
+    v.commands.registerCommand('demo.renameFailure', () => {
+      const rename = fs.promises.rename;
+      fs.promises.rename = async (...args) => {
+        fs.promises.rename = rename;
+        throw new Error('fixture rename failed');
+      };
+    }),
+    v.commands.registerCommand('demo.stageHold', () => {
+      const open = fs.promises.open;
+      fs.promises.open = async (...args) => {
+        const handle = await open(...args);
+        if (args[1] === 'wx') {
+          fs.promises.open = open;
+          const sync = handle.sync.bind(handle);
+          handle.sync = async () => { await sync(); await pause(); };
+        }
+        return handle;
+      };
+    }),
+    v.commands.registerCommand('demo.collision', () => {
+      const randomBytes = crypto.randomBytes;
+      crypto.randomBytes = () => {
+        crypto.randomBytes = randomBytes;
+        return Buffer.alloc(16);
+      };
+    }),
+    v.commands.registerCommand('demo.copyFailure', () => {
+      const execFile = childProcess.execFile;
+      childProcess.execFile = (...args) => {
+        childProcess.execFile = execFile;
+        process.nextTick(() => args[args.length - 1](new Error('fixture metadata copy failed')));
+      };
+    }),
+    v.commands.registerCommand('demo.xattr', (name, value) => {
+      childProcess.execFileSync('/usr/bin/xattr', ['-w', name, value, book().uri.fsPath]);
+    }),
+  );
+};
+"#;
+
+    fn notebook_command(host: &VsHost, id: &str, args: Value) -> Value {
+        host.request("executeCommand", json!({ "id": id, "args": args }), SOON)
+            .unwrap()
+    }
+
+    fn notebook_open(host: &VsHost, file: &Path) -> String {
+        let uri = format!("file://{}", file.display());
+        host.request(
+            "notebook.open",
+            json!({ "type": "save-book", "uri": uri }),
+            SOON,
+        )
+        .unwrap();
+        uri
+    }
+
+    fn notebook_fixture(name: &str) -> Option<(VsHost, PathBuf, String)> {
+        let (host, _told, dir) = hosted(name, NOTEBOOK_SAVE_FIXTURE)?;
+        host.request("activate", json!({}), SOON).unwrap();
+        let file = dir.join("save.book");
+        std::fs::write(&file, "aaaa").unwrap();
+        notebook_command(&host, "demo.time", json!([file.to_string_lossy()]));
+        let uri = notebook_open(&host, &file);
+        Some((host, file, uri))
+    }
+
+    fn notebook_edit(host: &VsHost, uri: &str, value: &str) {
+        host.notify(
+            "notebook.cell",
+            json!({ "uri": uri, "handle": 0, "value": value }),
+        );
+    }
+
+    fn notebook_waiting(host: &VsHost, calls: usize) {
+        let until = std::time::Instant::now() + SOON;
+        loop {
+            let state = notebook_command(host, "demo.state", json!([]));
+            if state["waiting"] == 1 && state["calls"].as_array().unwrap().len() == calls {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "serializer did not wait: {state}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn notebook_no_staging(file: &Path) {
+        assert!(
+            std::fs::read_dir(file.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".solder-"))
+        );
+    }
+
+    #[test]
+    fn notebook_failed_serializer_and_rename_keep_bytes_revision_and_dirty() {
+        let Some((host, file, uri)) = notebook_fixture("notebook-save-failed") else {
+            return;
+        };
+        notebook_edit(&host, &uri, "mine");
+        notebook_command(&host, "demo.mode", json!([{ "fail": true }]));
+        let save = || host.request("notebook.save", json!({ "uri": uri }), SOON);
+        assert!(save().unwrap_err().contains("fixture serializer failed"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "aaaa");
+        assert_eq!(
+            notebook_command(&host, "demo.state", json!([]))["dirty"],
+            true
+        );
+        notebook_no_staging(&file);
+
+        notebook_command(&host, "demo.mode", json!([{}]));
+        notebook_command(&host, "demo.renameFailure", json!([]));
+        assert!(save().unwrap_err().contains("fixture rename failed"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "aaaa");
+        let state = notebook_command(&host, "demo.state", json!([]));
+        assert_eq!(state["dirty"], true);
+        assert_eq!(state["saves"], json!([]));
+        notebook_no_staging(&file);
+        assert_eq!(save(), Ok(json!(true)));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "mine");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn notebook_failed_metadata_copy_keeps_source_and_cleans_staging() {
+        let Some((host, file, uri)) = notebook_fixture("notebook-save-copy-failed") else {
+            return;
+        };
+        notebook_edit(&host, &uri, "mine");
+        notebook_command(&host, "demo.copyFailure", json!([]));
+        let error = host
+            .request("notebook.save", json!({ "uri": uri }), SOON)
+            .unwrap_err();
+        assert!(error.contains("fixture metadata copy failed"), "{error}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "aaaa");
+        assert_eq!(
+            notebook_command(&host, "demo.state", json!([]))["dirty"],
+            true
+        );
+        notebook_no_staging(&file);
+        assert_eq!(notebook_command(&host, "demo.save", json!([])), true);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "mine");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn notebook_atomic_saves_preserve_extended_attributes() {
+        if !Path::new("/usr/bin/xattr").is_file() {
+            return;
+        }
+        let Some((host, file, uri)) = notebook_fixture("notebook-save-xattr") else {
+            return;
+        };
+        let name = "com.solder.save-test";
+        notebook_command(&host, "demo.xattr", json!([name, "kept"]));
+        for value in ["mine", "again"] {
+            notebook_edit(&host, &uri, value);
+            assert_eq!(notebook_command(&host, "demo.save", json!([])), true);
+            let output = Command::new("/usr/bin/xattr")
+                .args(["-p", name])
+                .arg(&file)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "kept");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), value);
+        }
+        notebook_no_staging(&file);
+    }
+
+    #[test]
+    fn notebook_save_refuses_changed_hash_even_with_same_size_and_mtime() {
+        let Some((host, file, uri)) = notebook_fixture("notebook-save-hash") else {
+            return;
+        };
+        notebook_edit(&host, &uri, "mine");
+        assert_eq!(
+            notebook_command(&host, "demo.external", json!(["bbbb"])),
+            json!({ "sameSize": true, "sameTime": true, "sameHash": false })
+        );
+        for _ in 0..2 {
+            let error = host
+                .request("notebook.save", json!({ "uri": uri }), SOON)
+                .unwrap_err();
+            assert!(error.contains("changed on disk"), "{error}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "bbbb");
+            assert_eq!(
+                notebook_command(&host, "demo.state", json!([]))["dirty"],
+                true
+            );
+            notebook_no_staging(&file);
+        }
+        // A refused save must not adopt the conflicting file's revision.
+        notebook_command(&host, "demo.external", json!(["aaaa"]));
+        assert_eq!(
+            host.request("notebook.save", json!({ "uri": uri }), SOON),
+            Ok(json!(true))
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "mine");
+    }
+
+    #[test]
+    fn notebook_save_rechecks_source_after_staging_and_removes_only_its_temp() {
+        let Some((host, file, uri)) = notebook_fixture("notebook-save-final-check") else {
+            return;
+        };
+        notebook_edit(&host, &uri, "mine");
+        notebook_command(&host, "demo.stageHold", json!([]));
+        let (tx, saved) = mpsc::channel();
+        host.ask("notebook.save", json!({ "uri": uri }), move |answer| {
+            tx.send(answer).unwrap();
+        });
+        notebook_waiting(&host, 1);
+        assert_eq!(
+            notebook_command(&host, "demo.external", json!(["bbbb"])),
+            json!({ "sameSize": true, "sameTime": true, "sameHash": false })
+        );
+        notebook_command(&host, "demo.release", json!([]));
+        assert!(
+            saved
+                .recv_timeout(SOON)
+                .unwrap()
+                .unwrap_err()
+                .contains("changed on disk")
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "bbbb");
+        assert_eq!(
+            notebook_command(&host, "demo.state", json!([]))["dirty"],
+            true
+        );
+        notebook_no_staging(&file);
+        notebook_command(&host, "demo.external", json!(["aaaa"]));
+        assert_eq!(notebook_command(&host, "demo.save", json!([])), true);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "mine");
+    }
+
+    #[test]
+    fn notebook_editor_and_extension_saves_queue_snapshots_and_keep_later_edits_dirty() {
+        let Some((host, file, uri)) = notebook_fixture("notebook-save-queue") else {
+            return;
+        };
+        notebook_edit(&host, &uri, "first");
+        notebook_command(&host, "demo.mode", json!([{ "hold": true }]));
+        let (tx, first) = mpsc::channel();
+        host.ask("notebook.save", json!({ "uri": uri }), move |answer| {
+            tx.send(answer).unwrap();
+        });
+        notebook_waiting(&host, 1);
+        notebook_edit(&host, &uri, "second");
+        let (tx, second) = mpsc::channel();
+        host.ask(
+            "executeCommand",
+            json!({ "id": "demo.save" }),
+            move |answer| {
+                tx.send(answer).unwrap();
+            },
+        );
+        // This command is a barrier: the second save has captured its cells.
+        let state = notebook_command(&host, "demo.state", json!([]));
+        assert_eq!(state["calls"], json!(["first"]));
+        notebook_edit(&host, &uri, "third");
+        notebook_command(&host, "demo.release", json!([]));
+        assert_eq!(first.recv_timeout(SOON).unwrap(), Ok(json!(true)));
+        notebook_waiting(&host, 2);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "first");
+        assert_eq!(
+            notebook_command(&host, "demo.state", json!([]))["dirty"],
+            true
+        );
+        notebook_command(&host, "demo.release", json!([]));
+        assert_eq!(second.recv_timeout(SOON).unwrap(), Ok(json!(true)));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "second");
+        let state = notebook_command(&host, "demo.state", json!([]));
+        assert_eq!(state["dirty"], true);
+        assert_eq!(state["calls"], json!(["first", "second"]));
+        assert_eq!(
+            state["saves"],
+            json!([
+                { "bytes": "first", "dirty": true }, { "bytes": "second", "dirty": true },
+            ])
+        );
+        notebook_command(&host, "demo.mode", json!([{}]));
+        assert_eq!(notebook_command(&host, "demo.save", json!([])), true);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "third");
+        assert_eq!(
+            notebook_command(&host, "demo.state", json!([]))["dirty"],
+            false
+        );
+        notebook_no_staging(&file);
+    }
+
+    #[test]
+    fn notebook_successive_saves_advance_the_expected_revision() {
+        let Some((host, file, uri)) = notebook_fixture("notebook-save-repeat") else {
+            return;
+        };
+        for value in ["one", "two", "three"] {
+            notebook_edit(&host, &uri, value);
+            assert_eq!(notebook_command(&host, "demo.save", json!([])), true);
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), value);
+            assert_eq!(
+                notebook_command(&host, "demo.state", json!([]))["dirty"],
+                false
+            );
+            notebook_no_staging(&file);
+        }
+    }
+
+    #[test]
+    fn notebook_source_revision_is_captured_before_async_deserialization() {
+        let Some((host, _told, dir)) = hosted("notebook-open-revision", NOTEBOOK_SAVE_FIXTURE)
+        else {
+            return;
+        };
+        host.request("activate", json!({}), SOON).unwrap();
+        notebook_command(&host, "demo.mode", json!([{ "openHold": true }]));
+        let file = dir.join("save.book");
+        std::fs::write(&file, "aaaa").unwrap();
+        let uri = format!("file://{}", file.display());
+        let (tx, opened) = mpsc::channel();
+        host.ask(
+            "notebook.open",
+            json!({ "type": "save-book", "uri": uri }),
+            move |answer| {
+                tx.send(answer).unwrap();
+            },
+        );
+        notebook_waiting(&host, 0);
+        std::fs::write(&file, "bbbb").unwrap();
+        notebook_command(&host, "demo.release", json!([]));
+        assert_eq!(
+            opened.recv_timeout(SOON).unwrap().unwrap()["cells"][0]["value"],
+            "aaaa"
+        );
+        notebook_edit(&host, &uri, "mine");
+        assert!(
+            host.request("notebook.save", json!({ "uri": uri }), SOON)
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "bbbb");
+        assert_eq!(
+            notebook_command(&host, "demo.state", json!([]))["dirty"],
+            true
+        );
+    }
+
+    #[test]
+    fn notebook_temp_collision_does_not_delete_an_unowned_file() {
+        let Some((host, file, uri)) = notebook_fixture("notebook-save-collision") else {
+            return;
+        };
+        let other = file
+            .parent()
+            .unwrap()
+            .join(".save.book.solder-00000000000000000000000000000000.tmp");
+        std::fs::write(&other, "not ours").unwrap();
+        notebook_edit(&host, &uri, "mine");
+        notebook_command(&host, "demo.collision", json!([]));
+        assert!(
+            host.request("notebook.save", json!({ "uri": uri }), SOON)
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "aaaa");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "not ours");
+        assert_eq!(
+            notebook_command(&host, "demo.state", json!([]))["dirty"],
+            true
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notebook_saves_preserve_basic_mode_and_refuse_readonly_and_hardlinks() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let Some((host, file, uri)) = notebook_fixture("notebook-save-mode") else {
+            return;
+        };
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let owner = std::fs::metadata(&file).unwrap();
+        notebook_edit(&host, &uri, "mine");
+        assert_eq!(notebook_command(&host, "demo.save", json!([])), true);
+        assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o777, 0o640);
+        assert_eq!(std::fs::metadata(&file).unwrap().uid(), owner.uid());
+        assert_eq!(std::fs::metadata(&file).unwrap().gid(), owner.gid());
+        let inode = std::fs::metadata(&file).unwrap().ino();
+        notebook_edit(&host, &uri, "next");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o440)).unwrap();
+        let error = host
+            .request("notebook.save", json!({ "uri": uri }), SOON)
+            .unwrap_err();
+        assert!(error.contains("read-only"), "{error}");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let alias = file.with_extension("alias");
+        std::fs::hard_link(&file, &alias).unwrap();
+        let error = host
+            .request("notebook.save", json!({ "uri": uri }), SOON)
+            .unwrap_err();
+        assert!(error.contains("hard links"), "{error}");
+        assert_eq!(std::fs::metadata(&file).unwrap().ino(), inode);
+        assert_eq!(std::fs::metadata(&alias).unwrap().ino(), inode);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "mine");
+        assert_eq!(std::fs::read_to_string(&alias).unwrap(), "mine");
+        assert_eq!(
+            notebook_command(&host, "demo.state", json!([]))["dirty"],
+            true
+        );
+        notebook_no_staging(&file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notebook_saves_follow_original_symlink_target_and_refuse_retargeting() {
+        use std::os::unix::fs::symlink;
+        let Some((host, _told, dir)) = hosted("notebook-save-symlink", NOTEBOOK_SAVE_FIXTURE)
+        else {
+            return;
+        };
+        host.request("activate", json!({}), SOON).unwrap();
+        let file = dir.join("save.book");
+        let original = dir.join("original.book");
+        let other = dir.join("other.book");
+        std::fs::write(&original, "aaaa").unwrap();
+        std::fs::write(&other, "mine").unwrap();
+        symlink(&original, &file).unwrap();
+        let uri = notebook_open(&host, &file);
+        notebook_edit(&host, &uri, "mine");
+        assert_eq!(notebook_command(&host, "demo.save", json!([])), true);
+        assert!(
+            std::fs::symlink_metadata(&file)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&original).unwrap(), "mine");
+        std::fs::remove_file(&file).unwrap();
+        symlink(&other, &file).unwrap();
+        notebook_edit(&host, &uri, "next");
+        let error = host
+            .request("notebook.save", json!({ "uri": uri }), SOON)
+            .unwrap_err();
+        assert!(error.contains("changed on disk"), "{error}");
+        assert_eq!(std::fs::read_to_string(&original).unwrap(), "mine");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "mine");
+        assert_eq!(
+            notebook_command(&host, "demo.state", json!([]))["dirty"],
+            true
+        );
+        notebook_no_staging(&file);
     }
 
     /// A notebook is read and written by its extension, which also runs
