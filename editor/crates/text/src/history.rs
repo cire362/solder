@@ -17,6 +17,7 @@ pub(crate) struct Transaction {
     pub before: Vec<Selection>,
     pub after: Vec<Selection>,
     last_edit_at: Instant,
+    state: u64,
 }
 
 /// Undo stack with time-based grouping, so a burst of typing undoes as one step.
@@ -25,12 +26,23 @@ pub struct History {
     undo: Vec<Transaction>,
     redo: Vec<Transaction>,
     sealed: bool,
+    next_state: u64,
 }
 
 impl History {
     pub const GROUP_INTERVAL: Duration = Duration::from_millis(300);
 
+    /// Identifies the applied text independently of undo depth and edit version.
+    pub(crate) fn state(&self) -> u64 {
+        self.undo.last().map_or(0, |tx| tx.state)
+    }
+
     pub(crate) fn push(&mut self, changes: Vec<Change>, before: &[Selection], now: Instant) {
+        // A branch must not reuse the identity of the redo states it discards.
+        self.next_state = self
+            .next_state
+            .checked_add(1)
+            .expect("text history state overflow");
         self.redo.clear();
         if !self.sealed
             && let Some(last) = self.undo.last_mut()
@@ -38,6 +50,7 @@ impl History {
         {
             last.changes.extend(changes);
             last.last_edit_at = now;
+            last.state = self.next_state;
             return;
         }
         self.sealed = false;
@@ -46,6 +59,7 @@ impl History {
             before: before.to_vec(),
             after: Vec::new(),
             last_edit_at: now,
+            state: self.next_state,
         });
     }
 
