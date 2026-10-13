@@ -4,14 +4,16 @@
 use crate::lang::{t, tf};
 use std::{
     collections::HashSet,
+    io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
     MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, ScrollStrategy, SharedString,
-    Subscription, UniformListScrollHandle, Window, actions, anchored, deferred, div, prelude::*,
-    px, uniform_list,
+    Subscription, Task, UniformListScrollHandle, Window, actions, anchored, deferred, div,
+    prelude::*, px, uniform_list,
 };
 
 use crate::{
@@ -84,6 +86,7 @@ enum EditKind {
 }
 
 struct EditState {
+    revision: u64,
     kind: EditKind,
     /// The renamed entry, or the directory a new entry goes into.
     target: PathBuf,
@@ -103,14 +106,20 @@ pub struct ProjectPanel {
     _edit_subscription: Option<Subscription>,
     tints: std::collections::HashMap<PathBuf, crate::git_store::Tint>,
     _decorations: Option<Subscription>,
+    expanded: HashSet<PathBuf>,
+    tree_revision: u64,
+    tree_task: Option<Task<()>>,
+    scroll_to_selected: bool,
+    edit_revision: u64,
+    mutating: bool,
+    error: Option<String>,
+    tree_error: Option<String>,
 }
 
 const ROW: Pixels = px(24.);
 
-fn read_dir(dir: &Path, depth: usize) -> Vec<Entry> {
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
+fn read_dir(dir: &Path, depth: usize, mirror: bool) -> io::Result<Vec<Entry>> {
+    let read = std::fs::read_dir(dir)?;
     let mut entries: Vec<Entry> = read
         .filter_map(Result::ok)
         .filter_map(|e| {
@@ -119,9 +128,13 @@ fn read_dir(dir: &Path, depth: usize) -> Vec<Entry> {
                 return None;
             }
             // Follow symlinks so a linked folder expands like a folder.
-            let is_dir = std::fs::metadata(e.path())
-                .map(|m| m.is_dir())
-                .unwrap_or(false);
+            let is_dir = if mirror {
+                e.file_type()
+            } else {
+                std::fs::metadata(e.path()).map(|m| m.file_type())
+            }
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
             Some(Entry {
                 path: e.path(),
                 name: name.into(),
@@ -136,12 +149,137 @@ fn read_dir(dir: &Path, depth: usize) -> Vec<Entry> {
             .cmp(&a.is_dir)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    entries
+    Ok(entries)
+}
+
+fn read_tree(root: &Path, expanded: &HashSet<PathBuf>) -> io::Result<Vec<Entry>> {
+    // SSH cache entries describe names and kinds only. Never inspect their bytes
+    // or try a local tree when the registered connection is gone.
+    let mount = crate::remote::mount(root)?;
+    let mirror = mount.as_ref().is_some_and(|mount| mount.is_mirror());
+    fn walk(
+        dir: &Path,
+        depth: usize,
+        expanded: &HashSet<PathBuf>,
+        mirror: bool,
+        out: &mut Vec<Entry>,
+    ) -> io::Result<()> {
+        for mut entry in read_dir(dir, depth, mirror)? {
+            let open = entry.is_dir && expanded.contains(&entry.path);
+            entry.expanded = open;
+            let path = entry.path.clone();
+            out.push(entry);
+            if open {
+                match walk(&path, depth + 1, expanded, mirror, out) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    result => result?,
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(root, 0, expanded, mirror, &mut out)?;
+    Ok(out)
+}
+
+fn valid_name(name: &str, kind: EditKind) -> bool {
+    if name.is_empty()
+        || name.contains('\0')
+        || kind == EditKind::Rename && name.contains(['/', '\\'])
+    {
+        return false;
+    }
+    name.split(['/', '\\'])
+        .all(|part| !part.is_empty() && !matches!(part, "." | ".."))
+}
+
+fn same_environment(root: &Path, expected: &Option<Arc<crate::remote::Mount>>) -> io::Result<()> {
+    match (crate::remote::mount(root)?, expected) {
+        (None, None) => Ok(()),
+        (Some(found), Some(expected)) if Arc::ptr_eq(&found, expected) => Ok(()),
+        _ => Err(io::ErrorKind::NotConnected.into()),
+    }
+}
+
+/// Blocking file operations. Existence checks must use the target, since an
+/// unopened SSH file in the inventory can still be an empty placeholder.
+fn apply_edit(
+    root: &Path,
+    kind: EditKind,
+    target: &Path,
+    name: &str,
+) -> io::Result<Option<PathBuf>> {
+    if !valid_name(name, kind)
+        || target.strip_prefix(root).map_or(true, |relative| {
+            relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        })
+        || kind == EditKind::Rename && target == root
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid project entry",
+        ));
+    }
+    let mount = crate::remote::mount(target)?;
+    let path = if kind == EditKind::Rename {
+        target.with_file_name(name)
+    } else {
+        target.join(name.replace('\\', "/"))
+    };
+    if kind == EditKind::Rename && path == target {
+        return Ok(None);
+    }
+    match crate::remote::metadata(&path) {
+        Ok(_) if kind != EditKind::NewFolder => return Err(io::ErrorKind::AlreadyExists.into()),
+        Ok(metadata) if !metadata.is_dir() => return Err(io::ErrorKind::AlreadyExists.into()),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match kind {
+        EditKind::NewFile => {
+            if let Some(parent) = path.parent() {
+                crate::remote::create_dir_all(parent)?;
+            }
+            if mount.as_ref().is_some_and(|mount| mount.is_mirror()) {
+                crate::remote::write_versioned(&path, b"", None)?;
+            } else {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?;
+            }
+        }
+        EditKind::NewFolder => crate::remote::create_dir_all(&path)?,
+        EditKind::Rename => crate::remote::rename(target, &path)?,
+    }
+    Ok(Some(path))
+}
+
+fn delete_entry(path: &Path, permanent: bool) -> io::Result<()> {
+    let mount = crate::remote::mount(path)?;
+    if mount.as_ref().is_some_and(|mount| mount.is_mirror()) {
+        if !permanent {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        if crate::remote::metadata(path)?.is_dir() {
+            crate::remote::remove_dir_all(path)
+        } else {
+            crate::remote::remove_file(path)
+        }
+    } else if permanent {
+        // The environment changed after the confirmation was displayed.
+        Err(io::ErrorKind::NotConnected.into())
+    } else {
+        trash::delete(path).map_err(io::Error::other)
+    }
 }
 
 impl ProjectPanel {
     pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
-        let entries = read_dir(&root, 0);
         let decorations = crate::extension_store::ExtensionStore::try_global(cx).map(|store| {
             cx.subscribe(&store, |_, _, event, cx| {
                 if matches!(event, crate::extension_api::ExtensionEvent::Files) {
@@ -149,10 +287,10 @@ impl ProjectPanel {
                 }
             })
         });
-        Self {
+        let mut panel = Self {
             root,
             focus_handle: cx.focus_handle(),
-            entries,
+            entries: Vec::new(),
             selected: None,
             scroll: UniformListScrollHandle::new(),
             menu: None,
@@ -160,7 +298,17 @@ impl ProjectPanel {
             _edit_subscription: None,
             tints: Default::default(),
             _decorations: decorations,
-        }
+            expanded: HashSet::new(),
+            tree_revision: 0,
+            tree_task: None,
+            scroll_to_selected: false,
+            edit_revision: 0,
+            mutating: false,
+            error: None,
+            tree_error: None,
+        };
+        panel.refresh(cx);
+        panel
     }
 
     /// Git colors for changed files and the folders that contain them.
@@ -178,27 +326,37 @@ impl ProjectPanel {
     /// Re-reads every expanded directory, keeping expansion and selection.
     /// Called when files change on disk.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        let expanded: HashSet<PathBuf> = self
-            .entries
-            .iter()
-            .filter(|e| e.expanded)
-            .map(|e| e.path.clone())
-            .collect();
-        let mut out = Vec::new();
-        fn walk(dir: &Path, depth: usize, expanded: &HashSet<PathBuf>, out: &mut Vec<Entry>) {
-            for mut entry in read_dir(dir, depth) {
-                let open = entry.is_dir && expanded.contains(&entry.path);
-                entry.expanded = open;
-                let path = entry.path.clone();
-                out.push(entry);
-                if open {
-                    walk(&path, depth + 1, expanded, out);
+        self.tree_revision = self.tree_revision.wrapping_add(1);
+        let revision = self.tree_revision;
+        let (root, expanded) = (self.root.clone(), self.expanded.clone());
+        self.tree_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { read_tree(&root, &expanded) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.tree_revision != revision {
+                    return;
                 }
-            }
-        }
-        walk(&self.root, 0, &expanded, &mut out);
-        self.entries = out;
-        cx.notify();
+                match result {
+                    Ok(entries) => {
+                        this.tree_error = None;
+                        this.entries = entries;
+                        if this.scroll_to_selected
+                            && let Some(ix) = this.selected_index()
+                        {
+                            this.scroll.scroll_to_item(ix, ScrollStrategy::Center);
+                            this.scroll_to_selected = false;
+                        }
+                    }
+                    Err(error) => {
+                        this.tree_error = Some(tf("Could not refresh files: {}", &[&error]))
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// Expands the ancestors of `path` and selects it.
@@ -210,19 +368,19 @@ impl ProjectPanel {
         let components: Vec<_> = rel.components().collect();
         for c in components.iter().take(components.len().saturating_sub(1)) {
             dir.push(c);
-            if let Some(ix) = self.index_of(&dir)
-                && !self.entries[ix].expanded
-            {
-                self.expand(ix);
-            }
+            self.expanded.insert(dir.clone());
         }
         self.select_path(path, cx);
+        self.refresh(cx);
     }
 
     pub fn select_path(&mut self, path: &Path, cx: &mut Context<Self>) {
         self.selected = Some(path.to_path_buf());
         if let Some(ix) = self.index_of(path) {
             self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
+            self.scroll_to_selected = false;
+        } else {
+            self.scroll_to_selected = true;
         }
         cx.notify();
     }
@@ -235,17 +393,17 @@ impl ProjectPanel {
         self.selected.as_deref().and_then(|p| self.index_of(p))
     }
 
-    fn expand(&mut self, ix: usize) {
+    fn expand(&mut self, ix: usize, cx: &mut Context<Self>) {
         let entry = &self.entries[ix];
         if !entry.is_dir || entry.expanded {
             return;
         }
-        let children = read_dir(&entry.path, entry.depth + 1);
-        self.entries.splice(ix + 1..ix + 1, children);
+        self.expanded.insert(entry.path.clone());
         self.entries[ix].expanded = true;
+        self.refresh(cx);
     }
 
-    fn collapse(&mut self, ix: usize) {
+    fn collapse(&mut self, ix: usize, cx: &mut Context<Self>) {
         let depth = self.entries[ix].depth;
         if !self.entries[ix].expanded {
             return;
@@ -256,6 +414,10 @@ impl ProjectPanel {
             .map_or(self.entries.len(), |p| ix + 1 + p);
         self.entries.drain(ix + 1..end);
         self.entries[ix].expanded = false;
+        let path = self.entries[ix].path.clone();
+        self.expanded.retain(|entry| !entry.starts_with(&path));
+        // Invalidate a directory read that began before the collapse.
+        self.refresh(cx);
     }
 
     fn activate(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -265,9 +427,9 @@ impl ProjectPanel {
         self.selected = Some(entry.path.clone());
         if entry.is_dir {
             if entry.expanded {
-                self.collapse(ix);
+                self.collapse(ix, cx);
             } else {
-                self.expand(ix);
+                self.expand(ix, cx);
             }
         } else {
             cx.emit(ProjectPanelEvent::OpenFile(entry.path.clone()));
@@ -297,7 +459,7 @@ impl ProjectPanel {
 
     fn expand_selected(&mut self, _: &Expand, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.selected_index() {
-            self.expand(ix);
+            self.expand(ix, cx);
             cx.notify();
         }
     }
@@ -307,7 +469,7 @@ impl ProjectPanel {
             return;
         };
         if self.entries[ix].expanded {
-            self.collapse(ix);
+            self.collapse(ix, cx);
         } else if let Some(parent) = self.entries[ix].path.parent().map(Path::to_path_buf) {
             // Already collapsed: jump to the parent folder.
             if parent != self.root {
@@ -328,7 +490,11 @@ impl ProjectPanel {
     /// The folder new entries go into: the selection, or its parent for a file.
     fn target_dir(&self, path: Option<&Path>) -> PathBuf {
         match path {
-            Some(p) if p.is_dir() => p.to_path_buf(),
+            Some(p)
+                if p == self.root || self.index_of(p).is_some_and(|ix| self.entries[ix].is_dir) =>
+            {
+                p.to_path_buf()
+            }
             Some(p) => p.parent().map_or(self.root.clone(), Path::to_path_buf),
             None => self.root.clone(),
         }
@@ -352,7 +518,7 @@ impl ProjectPanel {
         if kind != EditKind::Rename
             && let Some(ix) = self.index_of(&target)
         {
-            self.expand(ix);
+            self.expand(ix, cx);
         }
         let editor = cx.new(|cx| {
             let mut e = Editor::single_line(
@@ -381,7 +547,10 @@ impl ProjectPanel {
                     }
                 }),
             );
+        self.edit_revision = self.edit_revision.wrapping_add(1);
+        self.error = None;
         self.edit = Some(EditState {
+            revision: self.edit_revision,
             kind,
             target,
             editor,
@@ -407,78 +576,109 @@ impl ProjectPanel {
     }
 
     fn confirm_edit(&mut self, _: &ConfirmEdit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mutating {
+            return;
+        }
         let Some(edit) = self.edit.as_mut() else {
             return;
         };
         let name = edit.editor.read(cx).text(cx).trim().to_string();
-        if name.is_empty() || name.contains(['/', '\\']) && edit.kind == EditKind::Rename {
+        if !valid_name(&name, edit.kind) {
             edit.error = Some(t("Enter a valid name").into());
             cx.notify();
             return;
         }
-        let result = match edit.kind {
-            EditKind::NewFile => {
-                let path = edit.target.join(&name);
-                if path.exists() {
-                    Err(tf("{} already exists", &[&name]))
-                } else {
-                    path.parent()
-                        .map_or(Ok(()), std::fs::create_dir_all)
-                        .and_then(|_| std::fs::write(&path, ""))
-                        .map(|_| Some(path))
-                        .map_err(|e| e.to_string())
+        let (revision, kind, target) = (edit.revision, edit.kind, edit.target.clone());
+        edit.error = None;
+        self.mutating = true;
+        let root = self.root.clone();
+        let environment = crate::remote::mount(&root);
+        cx.spawn_in(window, async move |this, cx| {
+            let environment = match environment {
+                Ok(environment) => environment,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.mutating = false;
+                        this.error = Some(tf("Could not change files: {}", &[&error]));
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
                 }
-            }
-            EditKind::NewFolder => {
-                let path = edit.target.join(&name);
-                std::fs::create_dir_all(&path)
-                    .map(|_| Some(path))
-                    .map_err(|e| e.to_string())
-            }
-            EditKind::Rename => {
-                let from = edit.target.clone();
-                let to = from.with_file_name(&name);
-                if to == from {
-                    Ok(None)
-                } else if to.exists() {
-                    Err(tf("{} already exists", &[&name]))
-                } else {
-                    std::fs::rename(&from, &to)
-                        .map(|_| {
-                            cx.emit(ProjectPanelEvent::Renamed {
-                                from,
-                                to: to.clone(),
-                            });
-                            Some(to)
-                        })
-                        .map_err(|e| e.to_string())
-                }
-            }
-        };
-        match result {
-            Ok(path) => {
-                let kind = edit.kind;
-                self.edit = None;
-                self._edit_subscription = None;
-                self.refresh(cx);
-                if let Some(path) = path {
-                    self.reveal(&path, cx);
-                    if kind == EditKind::NewFile {
-                        cx.emit(ProjectPanelEvent::OpenFile(path));
-                    } else {
-                        window.focus(&self.focus_handle);
+            };
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let (root, target, name, environment) = (
+                        root.clone(),
+                        target.clone(),
+                        name.clone(),
+                        environment.clone(),
+                    );
+                    async move {
+                        same_environment(&root, &environment)?;
+                        apply_edit(&root, kind, &target, &name)
                     }
-                } else {
-                    window.focus(&self.focus_handle);
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.mutating = false;
+                if same_environment(&this.root, &environment).is_err() {
+                    this.refresh(cx);
+                    return;
                 }
-            }
-            Err(err) => {
-                if let Some(edit) = self.edit.as_mut() {
-                    edit.error = Some(err);
+                // The operation already happened. Open tabs must follow a rename,
+                // even if focus loss cancelled its inline field while IO ran.
+                if let Ok(Some(to)) = &result
+                    && kind == EditKind::Rename
+                {
+                    cx.emit(ProjectPanelEvent::Renamed {
+                        from: target,
+                        to: to.clone(),
+                    });
+                }
+                this.refresh(cx);
+                if this
+                    .edit
+                    .as_ref()
+                    .is_none_or(|edit| edit.revision != revision)
+                {
+                    if let Err(error) = result {
+                        this.error = Some(tf("Could not change files: {}", &[&error]));
+                    }
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok(path) => {
+                        this.edit = None;
+                        this._edit_subscription = None;
+                        if let Some(path) = path {
+                            this.reveal(&path, cx);
+                            if kind == EditKind::NewFile {
+                                cx.emit(ProjectPanelEvent::OpenFile(path));
+                            } else {
+                                window.focus(&this.focus_handle);
+                            }
+                        } else {
+                            window.focus(&this.focus_handle);
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(edit) = this.edit.as_mut() {
+                            edit.error = Some(if error.kind() == io::ErrorKind::AlreadyExists {
+                                tf("{} already exists", &[&name])
+                            } else {
+                                tf("Could not change files: {}", &[&error])
+                            });
+                        }
+                    }
                 }
                 cx.notify();
-            }
-        }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn cancel_edit(&mut self, _: &CancelEdit, window: &mut Window, cx: &mut Context<Self>) {
@@ -495,38 +695,75 @@ impl ProjectPanel {
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mutating {
+            return;
+        }
         let Some(path) = self.selected.clone() else {
             return;
         };
         self.menu = None;
+        self.error = None;
+        self.mutating = true;
+        // A closed SSH namespace still requires the permanent-delete wording;
+        // the background wrapper will report the connection error.
+        let permanent = self.is_mirror();
+        let environment = crate::remote::mount(&self.root);
+        let root = self.root.clone();
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let message = if permanent {
+            tf("Permanently delete \u{201c}{}\u{201d}?", &[&name])
+        } else {
+            tf("Move \u{201c}{}\u{201d} to the Trash?", &[&name])
+        };
         let answer = window.prompt(
             PromptLevel::Warning,
-            &tf("Move \u{201c}{}\u{201d} to the Trash?", &[&name]),
-            Some(t("You can restore it from the Trash.")),
-            &[t("Move to Trash"), t("Cancel")],
+            &message,
+            Some(if permanent {
+                t("This cannot be undone.")
+            } else {
+                t("You can restore it from the Trash.")
+            }),
+            &[
+                if permanent {
+                    t("Delete permanently")
+                } else {
+                    t("Move to Trash")
+                },
+                t("Cancel"),
+            ],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
             if answer.await.ok() != Some(0) {
+                this.update(cx, |this, cx| {
+                    this.mutating = false;
+                    cx.notify();
+                })
+                .ok();
                 return;
             }
             let result = cx
                 .background_executor()
                 .spawn({
                     let path = path.clone();
-                    async move { trash::delete(&path) }
+                    async move {
+                        let environment = environment?;
+                        same_environment(&root, &environment)?;
+                        delete_entry(&path, permanent)
+                    }
                 })
                 .await;
             this.update(cx, |this, cx| {
+                this.mutating = false;
                 if let Err(err) = result {
                     crate::journal::error(format_args!(
-                        "could not move {} to trash: {err}",
+                        "could not delete {}: {err}",
                         path.display()
                     ));
+                    this.error = Some(tf("Could not delete {}: {}", &[&name, &err]));
                 }
                 this.refresh(cx);
             })
@@ -537,13 +774,25 @@ impl ProjectPanel {
 
     fn copy_path(&mut self, _: &CopyPath, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = &self.selected {
-            cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
+            match crate::remote::mount(path) {
+                Ok(Some(mount)) => match mount.remote_path(path) {
+                    Ok(path) => cx.write_to_clipboard(ClipboardItem::new_string(path)),
+                    Err(error) => self.error = Some(tf("Could not copy path: {}", &[&error])),
+                },
+                Ok(None) => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()))
+                }
+                Err(error) => self.error = Some(tf("Could not copy path: {}", &[&error])),
+            }
         }
         self.menu = None;
         cx.notify();
     }
 
     fn reveal_in_finder(&mut self, _: &RevealInFinder, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_mirror() {
+            return;
+        }
         let path = self.selected.clone().unwrap_or_else(|| self.root.clone());
         cx.reveal_path(&path);
         self.menu = None;
@@ -569,6 +818,7 @@ impl ProjectPanel {
         let (position, path) = self.menu.clone()?;
         let theme = cx.theme().clone();
         let has_target = path.is_some();
+        let mirror = self.is_mirror();
         let item = |id: &'static str,
                     label: &'static str,
                     action: Box<dyn gpui::Action>,
@@ -611,7 +861,12 @@ impl ProjectPanel {
                 ("resourceFilename", part(path.file_name()).into()),
                 ("resourceExtname", ending.into()),
                 ("resourceScheme", "file".into()),
-                ("explorerResourceIsFolder", path.is_dir().into()),
+                (
+                    "explorerResourceIsFolder",
+                    self.index_of(path)
+                        .is_some_and(|ix| self.entries[ix].is_dir)
+                        .into(),
+                ),
             ] {
                 facts.insert(name.into(), value);
             }
@@ -666,7 +921,11 @@ impl ProjectPanel {
                     .child(item("m-rename", t("Rename"), Box::new(Rename), has_target))
                     .child(item(
                         "m-delete",
-                        t("Move to Trash"),
+                        if mirror {
+                            t("Delete permanently")
+                        } else {
+                            t("Move to Trash")
+                        },
                         Box::new(Delete),
                         has_target,
                     ))
@@ -681,7 +940,7 @@ impl ProjectPanel {
                         "m-reveal",
                         t("Reveal in Finder"),
                         Box::new(RevealInFinder),
-                        true,
+                        !mirror,
                     ))
                     .when(!theirs.is_empty(), |d| d.child(separator()))
                     .children(theirs),
@@ -703,6 +962,14 @@ impl ProjectPanel {
             rows.insert(at, None);
         }
         rows
+    }
+
+    fn is_mirror(&self) -> bool {
+        match crate::remote::mount(&self.root) {
+            Ok(Some(mount)) => mount.is_mirror(),
+            Ok(None) => false,
+            Err(_) => true,
+        }
     }
 }
 
@@ -944,20 +1211,148 @@ impl Render for ProjectPanel {
                 .track_scroll(self.scroll.clone())
                 .flex_1(),
             )
-            .children(self.edit.as_ref().and_then(|e| e.error.clone()).map(|err| {
-                div()
-                    .mx_2()
-                    .mb_2()
-                    .px_2()
-                    .py_1()
-                    .rounded(theme.shape.control)
-                    .bg(theme.bg_elev)
-                    .border(theme.shape.border)
-                    .border_color(theme.error)
-                    .text_size(crate::theme::text(11.5))
-                    .text_color(theme.error)
-                    .child(err)
-            }))
+            .children(
+                self.edit
+                    .as_ref()
+                    .and_then(|e| e.error.clone())
+                    .or_else(|| self.error.clone())
+                    .or_else(|| self.tree_error.clone())
+                    .map(|err| {
+                        div()
+                            .mx_2()
+                            .mb_2()
+                            .px_2()
+                            .py_1()
+                            .rounded(theme.shape.control)
+                            .bg(theme.bg_elev)
+                            .border(theme.shape.border)
+                            .border_color(theme.error)
+                            .text_size(crate::theme::text(11.5))
+                            .text_color(theme.error)
+                            .child(err)
+                    }),
+            )
             .children(self.render_menu(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_operations_refuse_parent_paths_and_preserve_existing_contents() {
+        let root = db::testing::dir("tree-file-ops");
+        std::fs::write(root.join("keep.txt"), "keep").unwrap();
+        assert_eq!(
+            apply_edit(&root, EditKind::NewFile, &root, "keep.txt")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(apply_edit(&root, EditKind::NewFolder, &root, "keep.txt").is_err());
+        for name in [
+            "../outside",
+            "a/../outside",
+            "/outside",
+            "a/./b",
+            "a\\..\\outside",
+        ] {
+            assert!(apply_edit(&root, EditKind::NewFile, &root, name).is_err());
+        }
+        let from = apply_edit(&root, EditKind::NewFile, &root, "notes/a.txt")
+            .unwrap()
+            .unwrap();
+        assert!(from.exists());
+        let to = apply_edit(&root, EditKind::Rename, &from, "b.txt")
+            .unwrap()
+            .unwrap();
+        assert!(!from.exists() && to.exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("keep.txt")).unwrap(),
+            "keep"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn queued_mutations_refuse_a_replaced_environment() {
+        let root = db::testing::dir("tree-environment-guard")
+            .canonicalize()
+            .unwrap();
+        let connect = |id: &str| {
+            crate::remote::Mount::connect(
+                crate::remote::Target {
+                    endpoint: crate::remote::Endpoint::Container {
+                        program: "docker-not-run".into(),
+                        id: id.into(),
+                        user: None,
+                        env: Vec::new(),
+                    },
+                    path: "/workspace/project".into(),
+                },
+                root.clone(),
+                false,
+            )
+            .unwrap()
+        };
+        let first = connect("first");
+        assert!(same_environment(&root, &None).is_err());
+        let expected = Some(first.clone());
+        assert!(same_environment(&root, &expected).is_ok());
+        let second = connect("second");
+        assert!(same_environment(&root, &expected).is_err());
+        assert!(same_environment(&root, &Some(second.clone())).is_ok());
+        drop(expected);
+        drop(first);
+        drop(second);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_tree_mutates_the_target_and_requires_permanent_delete_consent() {
+        let root = db::testing::dir("tree-remote-ops").canonicalize().unwrap();
+        let source = root.join("server");
+        let cache = root.join("cache");
+        std::fs::create_dir(&source).unwrap();
+        let mount = crate::remote::fixture(&source, &cache);
+        apply_edit(&cache, EditKind::NewFolder, &cache, "notes").unwrap();
+        let from = apply_edit(&cache, EditKind::NewFile, &cache, "notes/a.txt")
+            .unwrap()
+            .unwrap();
+        crate::remote::write(&from, "server content").unwrap();
+        let to = apply_edit(&cache, EditKind::Rename, &from, "b.txt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(source.join("notes/b.txt")).unwrap(),
+            b"server content"
+        );
+        assert!(!source.join("notes/a.txt").exists());
+        // A cache miss is not permission to overwrite an existing remote file.
+        std::fs::write(source.join("external.txt"), "keep").unwrap();
+        assert_eq!(
+            apply_edit(&cache, EditKind::NewFile, &cache, "external.txt")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            delete_entry(&to, false).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(source.join("notes/b.txt").exists());
+        delete_entry(&cache.join("notes"), true).unwrap();
+        assert!(!source.join("notes").exists() && !cache.join("notes").exists());
+        mount.refresh(&cache).unwrap();
+        assert_eq!(read_tree(&cache, &HashSet::new()).unwrap().len(), 1);
+        drop(mount);
+        assert!(read_tree(&cache, &HashSet::new()).is_err());
+        assert!(apply_edit(&cache, EditKind::NewFile, &cache, "local-fallback.txt").is_err());
+        assert!(delete_entry(&cache.join("external.txt"), false).is_err());
+        assert!(delete_entry(&cache.join("external.txt"), true).is_err());
+        assert_eq!(std::fs::read(source.join("external.txt")).unwrap(), b"keep");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

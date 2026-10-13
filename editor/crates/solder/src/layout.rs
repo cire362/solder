@@ -239,6 +239,8 @@ pub struct Low {
 pub enum Item {
     /// The project's name.
     Project,
+    /// SSH or container context, and its connection status.
+    Environment,
     /// What is in front: the file, or the view that took its place.
     File,
     /// Where the cursor is: the file's path, and the symbols it is in.
@@ -295,8 +297,9 @@ impl<'de> Deserialize<'de> for Item {
 }
 
 impl Item {
-    pub const ALL: [Item; 14] = [
+    pub const ALL: [Item; 15] = [
         Item::Project,
+        Item::Environment,
         Item::File,
         Item::Breadcrumbs,
         Item::Branch,
@@ -315,6 +318,7 @@ impl Item {
     pub fn label(&self) -> &str {
         match self {
             Item::Project => t("Project"),
+            Item::Environment => t("Environment"),
             Item::File => t("File"),
             Item::Breadcrumbs => t("Breadcrumbs"),
             Item::Branch => t("Branch"),
@@ -336,6 +340,7 @@ impl Item {
     pub fn id(&self) -> &str {
         match self {
             Item::Project => "project",
+            Item::Environment => "environment",
             Item::File => "file",
             Item::Breadcrumbs => "breadcrumbs",
             Item::Branch => "branch",
@@ -426,7 +431,7 @@ impl BarEnd {
 }
 
 /// The items of the bars as they come. `file` and `branch` are in none.
-const TITLE_LEFT: &[Item] = &[Item::Project, Item::Breadcrumbs];
+const TITLE_LEFT: &[Item] = &[Item::Project, Item::Environment, Item::Breadcrumbs];
 const TITLE_RIGHT: &[Item] = &[];
 const STATUS_LEFT: &[Item] = &[
     Item::Position,
@@ -1655,7 +1660,10 @@ mod tests {
         use Item::*;
         // As they come.
         let standard = Layout::default();
-        assert_eq!(standard.title_bar.left(), [Project, Breadcrumbs]);
+        assert_eq!(
+            standard.title_bar.left(),
+            [Project, Environment, Breadcrumbs]
+        );
         assert!(standard.title_bar.right().is_empty());
         assert_eq!(
             standard.status_bar.left(),
@@ -1702,7 +1710,7 @@ mod tests {
         )
         .unwrap();
         assert!(bare.status_bar.left().is_empty() && bare.status_bar.right().is_empty());
-        assert_eq!(bare.title_bar.left(), [Project, Breadcrumbs]);
+        assert_eq!(bare.title_bar.left(), [Project, Environment, Breadcrumbs]);
         assert_eq!(bare.tab_bar.place, TabsAt::None);
         // A name that is no item is a mistake, said with the file's name.
         let error = parse(r#"{ "status_bar": { "left": ["clock"] } }"#).unwrap_err();
@@ -1829,7 +1837,7 @@ mod tests {
             .moved_item(Language, TitleLeft, None)
             .moved_item(File, TitleRight, None)
             .moved_item(Position, StatusLeft, Some(Indent));
-        assert_eq!(moved.title_bar.left(), [Breadcrumbs, Language]);
+        assert_eq!(moved.title_bar.left(), [Environment, Breadcrumbs, Language]);
         assert_eq!(moved.title_bar.right(), [File]);
         assert_eq!(
             moved.status_bar.right(),

@@ -14,6 +14,7 @@ mod buffer_search;
 mod chat_panel;
 mod command_palette;
 mod completion;
+mod container_ui;
 mod context_prompts;
 mod database;
 mod database_panel;
@@ -21,6 +22,7 @@ mod debug;
 mod debug_launch;
 mod debug_panel;
 mod debug_timeline;
+mod devcontainer;
 mod document;
 mod editor;
 mod editor_git;
@@ -80,6 +82,8 @@ mod project_panel;
 mod project_search;
 mod python_debug;
 mod reference_picker;
+mod remote;
+mod remote_ui;
 mod response;
 mod results;
 mod search;
@@ -140,7 +144,14 @@ fn main() {
         };
         // Read the file before the window exists, so the first frame is
         // already an editable file rather than an empty workspace.
-        let initial = file.and_then(|path| {
+        let cached_root = remote::cache_root(&root);
+        let cached = cached_root.is_some();
+        let root = cached_root.unwrap_or(root);
+        let remote_file = cached.then(|| file.clone()).flatten();
+        if cached {
+            remote::mark_closed(root.clone());
+        }
+        let initial = file.filter(|_| !cached).and_then(|path| {
             // A notebook and a picture are not read as text.
             if !opens_as_text(&path) {
                 let nothing = document::Loaded::of(&[]);
@@ -149,7 +160,7 @@ fn main() {
             let loaded = document::load(&path).ok()?;
             Some((path, loaded))
         });
-        (root, initial)
+        (root, initial, remote_file)
     });
     // Nothing is kept of a benchmark's windows, and it is shown none of
     // an earlier run's.
@@ -170,11 +181,16 @@ fn main() {
             windows::init(kept_in.clone(), cx);
 
             let window = match named {
-                Some((root, initial)) => {
+                Some((root, initial, remote_file)) => {
                     // The projects opened before are not needed to show
                     // this one: they are read while it is drawn.
                     windows::learn_from(kept_in, cx);
-                    Some(open_workspace_window(windows::Place::of(root), initial, cx))
+                    if workspace::remote_workspace::own_cache_root(&root) {
+                        windows::open_cached_file(windows::Place::of(root), remote_file, cx);
+                        None
+                    } else {
+                        Some(open_workspace_window(windows::Place::of(root), initial, cx))
+                    }
                 }
                 None => {
                     let kept = kept.unwrap_or_default();
@@ -257,6 +273,8 @@ pub fn open_workspace_window(
                 let root = root.clone();
                 move |window, cx| {
                     ensure_theme(window, cx);
+                    let unavailable =
+                        remote::is_remote(&root) && remote::mount(&root).ok().flatten().is_none();
                     let workspace = cx.new(|cx| Workspace::new(root, window, cx));
                     if let Some((path, loaded)) = initial {
                         workspace.update(cx, |w, cx| {
@@ -267,7 +285,9 @@ pub fn open_workspace_window(
                             }
                         });
                     }
-                    workspace.update(cx, |w, cx| w.start_session(window, cx));
+                    if !unavailable {
+                        workspace.update(cx, |w, cx| w.start_session(window, cx));
+                    }
                     workspace
                 }
             },

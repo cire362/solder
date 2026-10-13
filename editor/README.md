@@ -1930,6 +1930,40 @@ there is around things, as a number to multiply by: 1 is what Solder comes
 with, 0.75 the tightest and 1.5 the airiest. It widens gaps and paddings and
 leaves the text the size `ui_font_size` gives it.
 
+## Remote projects
+
+The start window's "Connect to an SSH project" entry and
+`Remote ui: Connect ssh` in the palette accept `alias:/absolute/project`
+or `ssh://user@host:port/absolute/project`. It uses the installed OpenSSH
+client and its existing keys/configuration; a host must already be trusted.
+The target needs POSIX, Python 3.9+, Git and ripgrep for search. No helper is
+installed: Solder passes its own Python source over the authenticated channel,
+with Python isolated from project modules and PYTHONPATH.
+Files retain their encoding, and saves reject an opened revision that changed.
+The cached path is a namespace for tabs, never a fallback when disconnected.
+Git, terminals, agent commands and process language servers run on the target.
+Server URI fields map to the local namespace; command arguments stay opaque,
+except schemas the editor itself interprets, such as rust-analyzer runnables.
+SSH projects reconnect before saved tabs are loaded. An unsuccessful reconnect
+keeps their session and unsaved recovery untouched.
+
+`Container ui: Open dev container` reviews `.devcontainer/devcontainer.json`
+or `.devcontainer.json` before Docker runs. It supports an already cached image,
+a Dockerfile and restricted Compose. The review shows mounts and lifecycle
+commands and masks environment/build values; changed execution files require
+another review. One inspected writable bind shares the whole host project at
+workspaceFolder. A temporary file probe verifies that the daemon and client
+actually share the same bytes before activation, so images do not need Python. Activation preserves open tabs
+and unsaved text, restarts language servers and routes new terminals, services
+and agent commands into the container. Commands from the agent require full
+access approval for each call in either remote environment.
+
+Containers belong to a fresh Solder instance. Creation/update/start/attach
+hooks run in order, and shutdownAction controls stopping on window release.
+Solder does not delete containers or volumes. Image pulls, environment reuse,
+port forwarding and unsupported specification options are listed, along with
+unverified platform and live-window behavior, in [ROADMAP.md](ROADMAP.md).
+
 ## Measured so far
 
 Apple M4, 16 GB, built-in 60 Hz display, release build.

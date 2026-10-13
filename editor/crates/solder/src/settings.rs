@@ -551,6 +551,7 @@ pub(crate) fn parse_keymap(file: &str, source: &str, cx: &App) -> (Vec<KeyBindin
 pub fn bind_defaults(cx: &mut App) {
     crate::editor::bind_keys(cx);
     crate::workspace::bind_keys(cx);
+    crate::container_ui::bind_keys(cx);
     crate::picker::bind_keys(cx);
     crate::buffer_search::bind_keys(cx);
     crate::project_search::bind_keys(cx);

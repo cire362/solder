@@ -3,6 +3,13 @@
 
 /// The commands of the palette, by the names the palette makes for them.
 pub const COMMANDS: &[(&str, &str)] = &[
+    ("Container ui: Cancel", "Контейнер: отменить"),
+    ("Container ui: Approve", "Контейнер: одобрить"),
+    (
+        "Container ui: Open dev container",
+        "Контейнер: открыть проект",
+    ),
+    ("Remote ui: Connect ssh", "SSH: подключиться к проекту"),
     ("Agent: Submit", "Агент: отправить"),
     ("Ai panel: Add model", "Модели: добавить модель"),
     ("Ai panel: Add provider", "Модели: добавить провайдера"),
@@ -410,6 +417,200 @@ pub const COMMANDS: &[(&str, &str)] = &[
 
 /// What is given to `t` and `tf` in the code.
 pub const WORDS: &[(&str, &str)] = &[
+    ("Connect to an SSH project", "Подключиться к проекту по SSH"),
+    (
+        "The container does not share the host project files",
+        "Файлы проекта на хосте недоступны в контейнере",
+    ),
+    ("Delete permanently", "Удалить безвозвратно"),
+    ("This cannot be undone.", "Это действие нельзя отменить."),
+    ("Permanently delete “{}”?", "Удалить «{}» безвозвратно?"),
+    (
+        "Could not search files: {}",
+        "Не удалось выполнить поиск по файлам: {}",
+    ),
+    ("Could not copy path: {}", "Не удалось скопировать путь: {}"),
+    (
+        "Could not change files: {}",
+        "Не удалось изменить файлы: {}",
+    ),
+    (
+        "Could not refresh files: {}",
+        "Не удалось обновить список файлов: {}",
+    ),
+    ("{} = [hidden]", "{} = [скрыто]"),
+    (
+        "Workspace mount is read only",
+        "Проект смонтирован только для чтения",
+    ),
+    (
+        "Workspace mount allows writes",
+        "Проект смонтирован с правом записи",
+    ),
+    (
+        "Workspace access requires an inspected bind mount to an existing project directory. Named volumes are not supported.",
+        "Для доступа к проекту требуется проверенное bind-монтирование существующего каталога проекта. Именованные тома не поддерживаются.",
+    ),
+    ("Workspace", "Проект"),
+    (
+        "Use valid percent escapes and UTF-8 in the URI path",
+        "Используйте верные коды % и UTF-8 в пути URI",
+    ),
+    (
+        "Use ssh://user@host:port/path or alias:/path",
+        "Используйте ssh://user@host:port/path или alias:/path",
+    ),
+    (
+        "Use one writable bind mount from the project root to workspaceFolder",
+        "Используйте одно bind-монтирование корня проекта в workspaceFolder с правом записи",
+    ),
+    ("Starting dev container", "Запуск контейнера разработки"),
+    (
+        "SSH connection: ssh://user@host:port/path or alias:/path",
+        "Подключение SSH: ssh://user@host:port/path или alias:/path",
+    ),
+    ("SSH connection failed: {}", "Ошибка подключения SSH: {}"),
+    ("Review dev container", "Проверка контейнера разработки"),
+    (
+        "Remove control characters from the connection",
+        "Удалите управляющие символы из адреса подключения",
+    ),
+    (
+        "Reading devcontainer configuration",
+        "Чтение конфигурации devcontainer",
+    ),
+    (
+        "Open a local project to use a dev container",
+        "Откройте локальный проект для работы в контейнере разработки",
+    ),
+    (
+        "Only project-local existing host paths; no Docker socket, external volumes or external networks",
+        "Только существующие пути внутри проекта на хосте; без сокета Docker, внешних томов и сетей",
+    ),
+    ("No lifecycle commands", "Команд жизненного цикла нет"),
+    (
+        "No devcontainer configuration found",
+        "Конфигурация devcontainer не найдена",
+    ),
+    (
+        "No container environment overrides",
+        "Окружение контейнера не переопределено",
+    ),
+    (
+        "No UID/GID rewriting or user shell environment probing, including their specification defaults",
+        "Нет смены UID/GID и чтения окружения оболочки пользователя, в том числе по умолчанию согласно спецификации",
+    ),
+    (
+        "No Features, extra mounts, port forwarding, customizations, image metadata or host lifecycle commands",
+        "Не поддерживаются Features, дополнительные монтирования, проброс портов, customizations, метаданные образа и команды жизненного цикла на хосте",
+    ),
+    ("Mount source", "Источник монтирования"),
+    ("Mount destination", "Путь монтирования"),
+    ("Limitations", "Ограничения"),
+    (
+        "Lifecycle commands run in order when the container is created, updated, started or attached.",
+        "Команды жизненного цикла выполняются по порядку при создании, обновлении, запуске контейнера и подключении к нему.",
+    ),
+    ("Lifecycle commands", "Команды жизненного цикла"),
+    (
+        "Extra container mounts are not supported",
+        "Дополнительные монтирования контейнера не поддерживаются",
+    ),
+    (
+        "Environment and build argument values are hidden.",
+        "Значения переменных окружения и аргументов сборки скрыты.",
+    ),
+    (
+        "Enter an absolute project path beginning with /",
+        "Введите абсолютный путь к проекту, начиная с /",
+    ),
+    (
+        "Enter an SSH connection and an absolute project path",
+        "Введите адрес SSH и абсолютный путь к проекту",
+    ),
+    ("Enter a port from 1 to 65535", "Введите порт от 1 до 65535"),
+    (
+        "Enter a host or SSH alias without passwords or options",
+        "Введите хост или псевдоним SSH без паролей и параметров",
+    ),
+    (
+        "Devcontainer configuration changed. Review it again.",
+        "Конфигурация devcontainer изменилась. Проверьте её ещё раз.",
+    ),
+    (
+        "Dev container failed: {}",
+        "Ошибка контейнера разработки: {}",
+    ),
+    ("Container environment", "Окружение контейнера"),
+    ("Connecting to SSH", "Подключение по SSH"),
+    ("Connect to {}:{}: {}", "Подключиться к {}:{}: {}"),
+    ("Configuration file", "Файл конфигурации"),
+    (
+        "Compose requires config --format json; service scaling, profiles and runtime overrides are unsupported",
+        "Compose требует config --format json; масштабирование сервисов, профили и переопределения при запуске не поддерживаются",
+    ),
+    (
+        "Compose defines the workspace mount. It is resolved after approval.",
+        "Монтирование проекта задано в Compose. Оно будет определено после одобрения.",
+    ),
+    ("Approve and continue", "Одобрить и продолжить"),
+    (
+        "Approval may build an image, create and start containers, and run project commands.",
+        "Одобрение разрешает сборку образа, создание и запуск контейнеров и выполнение команд проекта.",
+    ),
+    (
+        "Approval applies to this configuration. Changes require another review.",
+        "Одобрение действует для этой конфигурации. После изменений нужна новая проверка.",
+    ),
+    (
+        "All Compose services may be created and started.",
+        "Могут быть созданы и запущены все сервисы Compose.",
+    ),
+    (
+        "A remote environment is already active",
+        "Удалённое окружение уже активно",
+    ),
+    ("Remote project failed: {}", "Ошибка удалённого проекта: {}"),
+    (
+        "The file changed on the target. Reopen it before saving.",
+        "Файл в целевой среде изменился. Откройте его заново перед сохранением.",
+    ),
+    (
+        "Target ports are not forwarded. Port forwarding is not supported yet.",
+        "Порты целевой среды не перенаправлены. Перенаправление портов пока не поддерживается.",
+    ),
+    (
+        "Service {} must run inside the target project",
+        "Сервис {} должен запускаться внутри проекта в целевой среде",
+    ),
+    (
+        "Could not read target services: {}",
+        "Не удалось прочитать сервисы в целевой среде: {}",
+    ),
+    ("Logs: {}", "Логи: {}"),
+    (
+        "Remote commands have no sandbox and require full access approval for each call.",
+        "Удалённые команды выполняются без песочницы. Каждый запуск требует разрешения на полный доступ.",
+    ),
+    (
+        "Remote commands require full access approval for each call.",
+        "Каждый запуск удалённой команды требует разрешения на полный доступ.",
+    ),
+    (
+        "Cannot map the remote repository path.",
+        "Не удалось сопоставить путь удалённого репозитория.",
+    ),
+    (
+        "Remote server {} failed to start: {}. Check the target program in language_servers.{}.command",
+        "Не удалось запустить удалённый сервер {}: {}. Проверьте программу в language_servers.{}.command",
+    ),
+    (
+        "Set language_servers.{}.command to a program on the target",
+        "Укажите в language_servers.{}.command программу в целевой среде",
+    ),
+    ("Environment", "Среда"),
+    ("SSH: {}", "SSH: {}"),
+    ("Container: {}", "Контейнер: {}"),
     // The way in, pictures and previews.
     ("Open a folder", "Открыть папку"),
     (
@@ -703,6 +904,10 @@ pub const WORDS: &[(&str, &str)] = &[
         "Не сохранено: символ {} недоступен в {}. Выберите другую кодировку.",
     ),
     ("Not saved: {}", "Не сохранено: {}"),
+    (
+        "The file path changed during save. Save again.",
+        "Путь файла изменился во время сохранения. Сохраните ещё раз.",
+    ),
     ("Starting {}...", "Запуск {}..."),
     ("Getting {} ready...", "Подготовка {}..."),
     (

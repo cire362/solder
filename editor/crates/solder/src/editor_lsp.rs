@@ -130,7 +130,15 @@ fn runnable(
         _ => return None,
     };
     let folder = args["cwd"].as_str().or(args["workspaceRoot"].as_str());
-    let cwd = folder.map(PathBuf::from).or(beside.map(PathBuf::from))?;
+    let cwd = if let Some(beside) = beside.filter(|path| crate::remote::is_remote(path)) {
+        let mount = crate::remote::mount(beside).ok().flatten()?;
+        match folder {
+            Some(target) => mount.local_path(target)?,
+            None => beside.to_path_buf(),
+        }
+    } else {
+        folder.map(PathBuf::from).or(beside.map(PathBuf::from))?
+    };
     let env = args["environment"].as_object().into_iter().flatten();
     Some(crate::terminal::TerminalCommand {
         program: Some(program),
@@ -1247,6 +1255,25 @@ pub fn status_text(errors: usize, warnings: usize) -> Option<SharedString> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_runnable_keeps_its_program_and_maps_its_target_cwd() {
+        let directory = db::testing::dir("remote-runnable").canonicalize().unwrap();
+        let source = directory.join("server");
+        let cache = directory.join("cache");
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        let mount = crate::remote::fixture(&source, &cache);
+        let what = serde_json::json!({"kind":"cargo", "args":{"cwd":source.join("src"), "overrideCargo":"/target/bin/cargo", "cargoArgs":["test"]}});
+        let command = runnable(&what, Some(&cache)).unwrap();
+        assert_eq!(command.cwd, mount.root.join("src"));
+        assert_eq!(command.program.as_deref(), Some("/target/bin/cargo"));
+        assert_eq!(command.args, ["test"]);
+        let outside = serde_json::json!({"kind":"cargo", "args":{"cwd":"/not-the-project"}});
+        assert!(runnable(&outside, Some(&cache)).is_none());
+        drop(mount);
+        assert!(runnable(&what, Some(&cache)).is_none());
+    }
+
     #[test]
     fn what_rust_analyzer_says_can_be_run_is_a_command() {
         let test = serde_json::json!({
@@ -1564,7 +1591,20 @@ impl Editor {
         match lens.command.as_str() {
             "editor.action.showReferences" | "rust-analyzer.showReferences" => {
                 let places = lens.arguments.get(2).cloned().unwrap_or_default();
-                let places: Vec<lt::Location> = serde_json::from_value(places).unwrap_or_default();
+                let mut places: Vec<lt::Location> =
+                    serde_json::from_value(places).unwrap_or_default();
+                if let Some(path) = self.path(cx).filter(|path| crate::remote::is_remote(path)) {
+                    let Some(map) = crate::remote::mount(path)
+                        .ok()
+                        .flatten()
+                        .and_then(|mount| lsp::PathMap::new(&mount.root, &mount.target.path).ok())
+                    else {
+                        return;
+                    };
+                    for place in &mut places {
+                        place.uri = map.to_local_uri(&place.uri);
+                    }
+                }
                 let found = locations(
                     Some(lt::GotoDefinitionResponse::Array(places)),
                     lens.encoding,

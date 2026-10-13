@@ -95,31 +95,91 @@ pub struct Repo {
     pub workdir: PathBuf,
 }
 
+/// Build at the checkout, so the transport sets cwd and environment on
+/// the target rather than passing a virtual cache path to `git -C`.
+pub(crate) fn command(dir: &Path, args: &[&str]) -> std::io::Result<Command> {
+    command_with(dir, args, crate::remote::command)
+}
+
+fn command_with(
+    dir: &Path,
+    args: &[&str],
+    launch: impl FnOnce(&Path, &str, &[String], &[(String, String)]) -> std::io::Result<Command>,
+) -> std::io::Result<Command> {
+    let mut argv = vec!["-c".into(), "core.quotepath=off".into()];
+    argv.extend(args.iter().map(|arg| (*arg).to_string()));
+    launch(
+        dir,
+        "git",
+        &argv,
+        &[
+            ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+            ("GIT_EDITOR".into(), "true".into()),
+        ],
+    )
+}
+
+/// Only outputs known to be absolute paths pass through this mapping.
+pub(crate) fn workdir(dir: &Path, output: &str) -> Option<PathBuf> {
+    workdir_with(
+        dir,
+        output,
+        crate::remote::is_remote(dir),
+        crate::remote::local_path,
+    )
+}
+
+fn workdir_with(
+    dir: &Path,
+    output: &str,
+    remote: bool,
+    local: impl FnOnce(&Path, &str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if remote {
+        // Git adds one newline. Spaces and newlines in the path stay raw.
+        local(dir, output.strip_suffix('\n').unwrap_or(output))
+    } else {
+        Some(PathBuf::from(output.trim()))
+    }
+}
+
+pub(crate) fn command_path(dir: &Path, path: &Path) -> std::io::Result<String> {
+    command_path_with(path, crate::remote::is_remote(dir), |path| {
+        crate::remote::remote_path(path)
+            .filter(|target| crate::remote::local_path(dir, target).as_deref() == Some(path))
+    })
+}
+
+fn command_path_with(
+    path: &Path,
+    remote: bool,
+    target: impl FnOnce(&Path) -> Option<String>,
+) -> std::io::Result<String> {
+    if remote {
+        return target(path).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                crate::lang::t("Cannot map the remote repository path."),
+            )
+        });
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
 impl Repo {
     /// The repository containing `path`, if any.
     pub fn discover(path: &Path) -> Option<Repo> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["rev-parse", "--show-toplevel"])
+        let out = command(path, &["rev-parse", "--show-toplevel"])
+            .ok()?
             .stderr(Stdio::null())
             .output()
             .ok()?;
-        out.status.success().then(|| Repo {
-            workdir: PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()),
+        if !out.status.success() {
+            return None;
+        }
+        Some(Repo {
+            workdir: workdir(path, &String::from_utf8_lossy(&out.stdout))?,
         })
-    }
-
-    fn command(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new("git");
-        cmd.arg("-C")
-            .arg(&self.workdir)
-            // Never wait for an editor or a credential prompt.
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_EDITOR", "true")
-            .args(["-c", "core.quotepath=off"])
-            .args(args);
-        cmd
     }
 
     pub(crate) fn run(&self, args: &[&str]) -> Result<Vec<u8>> {
@@ -127,8 +187,8 @@ impl Repo {
     }
 
     pub(crate) fn run_with_input(&self, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
-        let mut child = self
-            .command(args)
+        let mut child = command(&self.workdir, args)
+            .map_err(|e| GitError(format!("git: {e}")))?
             .stdin(if input.is_some() {
                 Stdio::piped()
             } else {
@@ -245,7 +305,7 @@ impl Repo {
             DiffScope::Working => {
                 let new = match working_text {
                     Some(text) => decode(text.into_bytes())?,
-                    None => match std::fs::read(self.workdir.join(rel)) {
+                    None => match crate::remote::read(&self.workdir.join(rel)) {
                         Ok(bytes) => decode(bytes)?,
                         Err(error)
                             if error.kind() == std::io::ErrorKind::NotFound
@@ -264,7 +324,12 @@ impl Repo {
             path: rel.to_string(),
             old,
             new,
-            can_open: self.workdir.join(rel).is_file(),
+            can_open: if crate::remote::is_remote(&self.workdir) {
+                crate::remote::metadata(&self.workdir.join(rel))
+                    .is_ok_and(|metadata| metadata.is_file() && !metadata.is_symlink())
+            } else {
+                self.workdir.join(rel).is_file()
+            },
         })
     }
 
@@ -533,12 +598,42 @@ pub fn clone(
 ) -> Result<()> {
     use std::io::Read;
     use std::sync::atomic::Ordering;
-    let mut child = Command::new("git")
-        // Never wait for a name or a password nobody can type.
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args(["clone", "--progress", "--"])
-        .arg(address)
-        .arg(into)
+    let remote = crate::remote::is_remote(into);
+    let cwd = if remote {
+        into.parent()
+            .ok_or_else(|| {
+                GitError(crate::lang::t("Cannot map the remote repository path.").into())
+            })?
+            .to_path_buf()
+    } else {
+        std::env::current_dir().map_err(|e| GitError(format!("git: {e}")))?
+    };
+    if remote && !crate::remote::is_remote(&cwd) {
+        return Err(GitError(
+            crate::lang::t("Cannot map the remote repository path.").into(),
+        ));
+    }
+    let mut args = vec![
+        "clone".into(),
+        "--progress".into(),
+        "--".into(),
+        address.into(),
+    ];
+    if remote {
+        args.push(command_path(&cwd, into).map_err(|e| GitError(format!("git: {e}")))?);
+    }
+    let mut cmd = crate::remote::command(
+        &cwd,
+        "git",
+        &args,
+        &[("GIT_TERMINAL_PROMPT".into(), "0".into())],
+    )
+    .map_err(|e| GitError(format!("git: {e}")))?;
+    if !remote {
+        // Keep native, possibly non-UTF-8, local destination paths.
+        cmd.arg(into);
+    }
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -618,6 +713,95 @@ pub fn clone(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_path_arguments_are_explicit_and_never_fall_back_to_cache() {
+        let path = Path::new("/virtual/cache/repo/.solder/worktrees/a task");
+        let target = "/srv/repo/.solder/worktrees/a task";
+        assert_eq!(
+            command_path_with(path, true, |value| {
+                assert_eq!(value, path);
+                Some(target.into())
+            })
+            .unwrap(),
+            target
+        );
+        assert!(command_path_with(path, true, |_| None).is_err());
+        assert_eq!(
+            command_path_with(path, false, |_| panic!("local path mapping")).unwrap(),
+            path.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn routing_keeps_commit_text_and_file_arguments_raw() {
+        let cwd = Path::new("/virtual/cache/repo");
+        let message = "Keep /virtual/cache/repo and $(literal)\nSecond line 'quoted'";
+        let built = command_with(
+            cwd,
+            &["commit", "-m", message],
+            |dir, program, args, env| {
+                assert_eq!(dir, cwd);
+                assert_eq!(program, "git");
+                assert_eq!(args, &["-c", "core.quotepath=off", "commit", "-m", message]);
+                assert_eq!(
+                    env,
+                    &[
+                        ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+                        ("GIT_EDITOR".into(), "true".into())
+                    ]
+                );
+                let mut fake = Command::new("fake-ssh");
+                fake.args(args);
+                Ok(fake)
+            },
+        )
+        .unwrap();
+        assert_eq!(built.get_program(), "fake-ssh");
+        assert_eq!(built.get_args().last().unwrap(), message);
+        command_with(
+            cwd,
+            &["show", "HEAD:literal /virtual/cache/repo"],
+            |_, _, args, _| {
+                assert_eq!(args.last().unwrap(), "HEAD:literal /virtual/cache/repo");
+                Ok(Command::new("fake-docker"))
+            },
+        )
+        .unwrap();
+        assert!(
+            command_with(cwd, &["status"], |_, _, _, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "closed mount",
+                ))
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn discovery_maps_only_the_root_and_preserves_path_whitespace() {
+        let cache = Path::new("/virtual/cache/repo");
+        let target = "/srv/a repo \n";
+        let output = format!("{target}\n");
+        assert_eq!(
+            workdir_with(cache, &output, true, |root, value| {
+                assert_eq!(root, cache);
+                assert_eq!(value, target);
+                Some(cache.to_path_buf())
+            })
+            .as_deref(),
+            Some(cache)
+        );
+        assert!(workdir_with(cache, "/outside\n", true, |_, _| None).is_none());
+        assert_eq!(
+            workdir_with(cache, " /local/repo\n", false, |_, _| panic!(
+                "local path must stay local"
+            ))
+            .unwrap(),
+            Path::new("/local/repo")
+        );
+    }
 
     #[test]
     fn an_address_is_told_from_a_name() {

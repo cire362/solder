@@ -397,6 +397,82 @@ pub fn open(root: PathBuf, cx: &mut App) -> WindowHandle<Workspace> {
     crate::open_workspace_window(Place::of(root), None, cx)
 }
 
+/// Recent SSH projects reconnect before any tab or recovery file is read.
+/// A local project takes the existing path without probing for metadata.
+pub fn open_project(root: PathBuf, cx: &mut App) {
+    if let Some(root) = crate::remote::cache_root(&root) {
+        open_cached(Place::of(root), cx);
+    } else {
+        open(root, cx);
+    }
+}
+
+pub(crate) fn open_cached(place: Place, cx: &mut App) {
+    open_cached_file(place, None, cx);
+}
+
+/// Make the destination before closing a standalone entry window. A blocked
+/// window owns neither session reads nor recovery writes while SSH connects.
+pub(crate) fn cached_window(
+    place: Place,
+    file: &Option<PathBuf>,
+    cx: &mut App,
+) -> (WindowHandle<Workspace>, bool) {
+    let connected = crate::remote::mount(&place.root)
+        .ok()
+        .flatten()
+        .is_some_and(|mount| mount.is_connected());
+    if !connected {
+        crate::remote::mark_closed(place.root.clone());
+    }
+    let window =
+        window_of(&place.root, cx).unwrap_or_else(|| crate::open_workspace_window(place, None, cx));
+    window
+        .update(cx, |workspace, window, cx| {
+            window.activate_window();
+            if connected {
+                if let Some(file) = file {
+                    workspace.open_path(file.clone(), None, window, cx);
+                }
+            } else {
+                workspace.show_remote_error(crate::lang::t("Connecting to SSH").into(), cx);
+            }
+        })
+        .ok();
+    (window, !connected)
+}
+
+pub(crate) fn open_cached_file(place: Place, file: Option<PathBuf>, cx: &mut App) {
+    let root = place.root.clone();
+    let (window, reconnect) = cached_window(place, &file, cx);
+    if !reconnect {
+        return;
+    }
+    cx.spawn(async move |cx| {
+        let prepared = cx
+            .background_executor()
+            .spawn(async move { crate::workspace::remote_workspace::prepare_cached(&root) })
+            .await;
+        // The original window may have been closed while connecting. A reply
+        // must never bring it back or create a second destination.
+        window
+            .update(cx, |workspace, window, cx| match prepared {
+                Ok(Some(mount)) => {
+                    workspace.retain_remote(mount, cx);
+                    workspace.resume_remote_session(window, cx);
+                    if let Some(file) = file {
+                        workspace.open_path(file, None, window, cx);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => workspace
+                    .show_remote_error(crate::lang::tf("SSH connection failed: {}", &[&error]), cx),
+            })
+            .ok();
+    })
+    .detach();
+}
+
 /// Opens the windows an earlier run was left with, the ones whose
 /// folders are still there, and says how many that was.
 pub fn restore(kept: &Kept, cx: &mut App) -> usize {
@@ -404,8 +480,13 @@ pub fn restore(kept: &Kept, cx: &mut App) -> usize {
     for place in &kept.open {
         // Asked before a window is on screen, like the file named on the
         // command line: this is what the first frame shows.
-        if place.root.is_dir() && !opened.contains(&place.root) {
-            crate::open_workspace_window(place.clone(), None, cx);
+        let cached = crate::workspace::remote_workspace::own_cache_root(&place.root);
+        if (cached || place.root.is_dir()) && !opened.contains(&place.root) {
+            if crate::workspace::remote_workspace::own_cache_root(&place.root) {
+                open_cached(place.clone(), cx);
+            } else {
+                crate::open_workspace_window(place.clone(), None, cx);
+            }
             opened.push(place.root.clone());
         }
     }

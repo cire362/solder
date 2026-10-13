@@ -189,6 +189,22 @@ Never guess a signature.
   `LspStore::problems`, for every file a server names, open or not, as
   the server said it (its own positions and encoding). The Problems
   panel reads the second and only while its tab is in front.
+- Remote project paths belong to `remote.rs`: a cache namespace for SSH, a
+  physical bind for Docker. File and command wrappers there resolve the target;
+  a closed SSH namespace never falls back to local cache bytes. All IO blocks
+  and runs off the UI thread. A document keeps its own read revision for saves,
+  rather than borrowing the last read made by another view. Project polling
+  drains retained change notifications; other inventories cannot consume them.
+  Process language servers use `lsp::PathMap` at their protocol boundary, never
+  a global string replacement. Opaque arguments stay opaque, with schema-aware
+  adapters only where the editor itself interprets them. Remote edits and
+  locations are still checked against the project root after mapping.
+  `workspace::remote_workspace` connects SSH and reviews devcontainer snapshots
+  before any Docker operation. Project/Workspace retain the mount; changing a
+  process environment preserves documents and restarts scoped servers. SSH
+  windows reconnect before session/recovery reads; failed reconnects keep both
+  untouched. Remote agent shell commands always need full-access approval:
+  the local sandbox cannot confine a target command.
 - Git goes through `git.rs`, which shells out to `git` with stable
   `--porcelain=v2 -z` formats. Everything in it blocks: call it from
   `cx.background_executor()`.

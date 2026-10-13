@@ -4,7 +4,7 @@
 //! `package.json`, `main` packages in Go modules, binaries in Cargo crates,
 //! Django and FastAPI entry points, and services in compose files. A
 //! `.solder/services.json` file adds or overrides entries. Everything here
-//! touches the disk: callers run it on the background executor.
+//! touches the disk or project connection: callers run it on the background executor.
 
 use std::{
     collections::BTreeMap,
@@ -46,8 +46,8 @@ pub struct ServiceSpec {
     /// Unique within the project.
     pub name: String,
     pub kind: ServiceKind,
-    /// Shell command, run through the user's login shell so version managers
-    /// (nvm, asdf, pyenv) resolve the same way they do in a terminal.
+    /// Shell command. Local projects use the user's login shell; remote
+    /// terminals choose the target's /bin/sh instead.
     pub command: String,
     /// Relative to the project root.
     pub dir: PathBuf,
@@ -68,6 +68,46 @@ fn skip_dir(name: &str) -> bool {
 
 /// Manifests up to `depth` folders below the root, in a stable order.
 pub(crate) fn find_files(root: &Path, names: &[&str], depth: usize) -> Vec<PathBuf> {
+    match crate::remote::mount(root) {
+        Ok(Some(mount)) if mount.is_mirror() => {
+            let scope = mount
+                .remote_path(root)
+                .ok()
+                .and_then(|path| mount.local_path(&path));
+            let Some(scope) = scope else {
+                return Vec::new();
+            };
+            let mut found: Vec<_> = mount
+                .files(&scope)
+                .into_iter()
+                .filter_map(|path| {
+                    path.strip_prefix(&scope)
+                        .ok()
+                        .map(|relative| root.join(relative))
+                })
+                .filter(|path| {
+                    let Ok(relative) = path.strip_prefix(root) else {
+                        return false;
+                    };
+                    let parts: Vec<_> = relative.components().collect();
+                    parts.len() <= depth + 1
+                        && path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| names.contains(&name))
+                        && parts[..parts.len().saturating_sub(1)].iter().all(|part| {
+                            part.as_os_str()
+                                .to_str()
+                                .is_some_and(|name| !skip_dir(name))
+                        })
+                })
+                .collect();
+            found.sort();
+            return found;
+        }
+        Err(_) => return Vec::new(),
+        _ => {}
+    }
     let mut found = Vec::new();
     let mut dirs = vec![(root.to_path_buf(), 0)];
     while let Some((dir, level)) = dirs.pop() {
@@ -108,20 +148,28 @@ fn dir_name(root: &Path, dir: &Path) -> String {
 /// The package manager a folder uses, judged by the nearest lockfile.
 pub(crate) fn node_manager(dir: &Path, root: &Path) -> &'static str {
     for d in dir.ancestors() {
-        if d.join("pnpm-lock.yaml").exists() {
+        if exists(&d.join("pnpm-lock.yaml")) {
             return "pnpm";
         }
-        if d.join("yarn.lock").exists() {
+        if exists(&d.join("yarn.lock")) {
             return "yarn";
         }
-        if d.join("bun.lockb").exists() || d.join("bun.lock").exists() {
+        if exists(&d.join("bun.lockb")) || exists(&d.join("bun.lock")) {
             return "bun";
         }
-        if d.join("package-lock.json").exists() || d == root {
+        if exists(&d.join("package-lock.json")) || d == root {
             break;
         }
     }
     "npm"
+}
+
+fn exists(path: &Path) -> bool {
+    if crate::remote::is_remote(path) {
+        crate::remote::metadata(path).is_ok()
+    } else {
+        path.exists()
+    }
 }
 
 fn detect_node(root: &Path, out: &mut Vec<ServiceSpec>) {
@@ -132,7 +180,7 @@ fn detect_node(root: &Path, out: &mut Vec<ServiceSpec>) {
         scripts: BTreeMap<String, String>,
     }
     for manifest in find_files(root, &["package.json"], 3) {
-        let Ok(text) = std::fs::read_to_string(&manifest) else {
+        let Ok(text) = crate::remote::read_to_string(&manifest) else {
             continue;
         };
         let Ok(package) = serde_json::from_str::<Package>(&text) else {
@@ -169,21 +217,40 @@ fn detect_go(root: &Path, out: &mut Vec<ServiceSpec>) {
     for manifest in find_files(root, &["go.mod"], 3) {
         let dir = manifest.parent().unwrap_or(root);
         let is_main = |d: &Path| {
-            std::fs::read_to_string(d.join("main.go"))
+            crate::remote::read_to_string(&d.join("main.go"))
                 .is_ok_and(|t| t.lines().any(|l| l.trim() == "package main"))
         };
         let mut targets: Vec<(String, String)> = Vec::new();
         if is_main(dir) {
             targets.push((dir_name(root, dir), ".".into()));
         }
-        if let Ok(entries) = std::fs::read_dir(dir.join("cmd")) {
-            let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
-            entries.sort_by_key(|e| e.file_name());
-            for entry in entries {
-                if is_main(&entry.path()) {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    targets.push((name.clone(), format!("./cmd/{name}")));
-                }
+        let cmd_dir = dir.join("cmd");
+        let mut entries: Vec<PathBuf> = if crate::remote::is_remote(dir) {
+            find_files(&cmd_dir, &["main.go"], 1)
+                .into_iter()
+                .filter_map(|main| {
+                    main.parent()
+                        .filter(|entry| *entry != cmd_dir)
+                        .map(Path::to_path_buf)
+                })
+                .collect()
+        } else {
+            std::fs::read_dir(&cmd_dir)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .collect()
+        };
+        entries.sort();
+        for entry in entries {
+            if is_main(&entry) {
+                let name = entry
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                targets.push((name.clone(), format!("./cmd/{name}")));
             }
         }
         for (name, target) in targets {
@@ -221,13 +288,13 @@ fn cargo_package_name(manifest: &str) -> Option<String> {
 fn detect_rust(root: &Path, out: &mut Vec<ServiceSpec>) {
     for manifest in find_files(root, &["Cargo.toml"], 3) {
         let dir = manifest.parent().unwrap_or(root);
-        let Ok(text) = std::fs::read_to_string(&manifest) else {
+        let Ok(text) = crate::remote::read_to_string(&manifest) else {
             continue;
         };
         let Some(name) = cargo_package_name(&text) else {
             continue;
         };
-        let has_binary = dir.join("src/main.rs").exists() || text.contains("[[bin]]");
+        let has_binary = exists(&dir.join("src/main.rs")) || text.contains("[[bin]]");
         if !has_binary {
             continue;
         }
@@ -246,7 +313,7 @@ fn detect_python(root: &Path, out: &mut Vec<ServiceSpec>) {
     for marker in find_files(root, &["manage.py", "main.py", "app.py"], 2) {
         let dir = marker.parent().unwrap_or(root);
         let file = marker.file_name().unwrap_or_default().to_string_lossy();
-        let Ok(text) = std::fs::read_to_string(&marker) else {
+        let Ok(text) = crate::remote::read_to_string(&marker) else {
             continue;
         };
         let command = if file == "manage.py" {
@@ -343,7 +410,7 @@ fn detect_compose(root: &Path, out: &mut Vec<ServiceSpec>) {
         "docker-compose.yml",
     ];
     for file in find_files(root, &names, 1) {
-        let Ok(text) = std::fs::read_to_string(&file) else {
+        let Ok(text) = crate::remote::read_to_string(&file) else {
             continue;
         };
         let dir = file.parent().unwrap_or(root);
@@ -384,6 +451,33 @@ pub const CUSTOM_FILE: &str = ".solder/services.json";
 /// All services of a project. Custom entries replace detected ones with the
 /// same name. Names are made unique by suffixing the folder.
 pub fn detect(root: &Path) -> (Vec<ServiceSpec>, Option<String>) {
+    let mount = match crate::remote::mount(root) {
+        Ok(mount) => mount,
+        Err(error) => {
+            return (
+                Vec::new(),
+                Some(tf("Could not read target services: {}", &[&error])),
+            );
+        }
+    };
+    // A macOS temp directory can have both /var and /private/var names.
+    // Refresh validates returned physical paths against its scope, so use the
+    // mount's physical spelling while keeping callers' logical paths below.
+    let refresh = (|| match &mount {
+        Some(mount) => {
+            let scope = mount.local_path(&mount.remote_path(root)?).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid project scope")
+            })?;
+            crate::remote::sync_tree(&scope)
+        }
+        None => Ok(()),
+    })();
+    if let Err(error) = refresh {
+        return (
+            Vec::new(),
+            Some(tf("Could not read target services: {}", &[&error])),
+        );
+    }
     let mut found = Vec::new();
     detect_node(root, &mut found);
     detect_go(root, &mut found);
@@ -392,7 +486,7 @@ pub fn detect(root: &Path) -> (Vec<ServiceSpec>, Option<String>) {
     detect_compose(root, &mut found);
 
     let mut error = None;
-    if let Ok(text) = std::fs::read_to_string(root.join(CUSTOM_FILE)) {
+    if let Ok(text) = crate::remote::read_to_string(&root.join(CUSTOM_FILE)) {
         match serde_json::from_str::<CustomFile>(&text) {
             Ok(custom) => {
                 for c in custom.services {
@@ -409,6 +503,40 @@ pub fn detect(root: &Path) -> (Vec<ServiceSpec>, Option<String>) {
             }
             Err(e) => error = Some(format!("{CUSTOM_FILE}: {e}")),
         }
+    }
+
+    if let Some(mount) = mount {
+        found.retain_mut(|spec| {
+            if spec.dir.is_absolute() {
+                let local = spec.dir.to_str().and_then(|path| mount.local_path(path));
+                let scope = mount
+                    .remote_path(root)
+                    .ok()
+                    .and_then(|path| mount.local_path(&path));
+                match local.and_then(|path| {
+                    path.strip_prefix(scope.as_ref()?)
+                        .ok()
+                        .map(Path::to_path_buf)
+                }) {
+                    Some(dir) => spec.dir = dir,
+                    None => {
+                        error = Some(tf(
+                            "Service {} must run inside the target project",
+                            &[&spec.name],
+                        ));
+                        return false;
+                    }
+                }
+            }
+            if mount.remote_path(&root.join(&spec.dir)).is_err() {
+                error = Some(tf(
+                    "Service {} must run inside the target project",
+                    &[&spec.name],
+                ));
+                return false;
+            }
+            true
+        });
     }
 
     // Two packages called "web" in different folders become "web (apps/web)".
@@ -474,9 +602,8 @@ pub fn parse_docker_ps(out: &str) -> Vec<Container> {
 }
 
 /// Lists containers. `Err` carries a short reason (no Docker, daemon off).
-pub fn list_containers() -> Result<Vec<Container>, String> {
-    let out = std::process::Command::new(docker_path().ok_or(t("Docker is not installed"))?)
-        .args(["ps", "-a", "--format", "{{json .}}"])
+pub fn list_containers(root: &Path) -> Result<Vec<Container>, String> {
+    let out = docker_command(root, &["ps", "-a", "--format", "{{json .}}"])?
         .output()
         .map_err(|e| e.to_string())?;
     if !out.status.success() {
@@ -506,9 +633,8 @@ fn docker_error(stderr: &str) -> String {
     tf("{} is not running", &[&runtime])
 }
 
-pub fn container_action(id: &str, action: &str) -> Result<(), String> {
-    let out = std::process::Command::new(docker_path().ok_or(t("Docker is not installed"))?)
-        .args([action, id])
+pub fn container_action(root: &Path, id: &str, action: &str) -> Result<(), String> {
+    let out = docker_command(root, &[action, id])?
         .output()
         .map_err(|e| e.to_string())?;
     if out.status.success() {
@@ -520,6 +646,31 @@ pub fn container_action(id: &str, action: &str) -> Result<(), String> {
             .unwrap_or(t("docker failed"))
             .to_string())
     }
+}
+
+fn docker_command(root: &Path, args: &[&str]) -> Result<std::process::Command, String> {
+    // Docker on an SSH host (or inside a container) belongs to that target.
+    // A missing target tool is reported by the transport, never installed here.
+    let program = if crate::remote::is_remote(root) {
+        "docker".into()
+    } else {
+        docker_path()
+            .ok_or(t("Docker is not installed"))?
+            .display()
+            .to_string()
+    };
+    crate::remote::command(
+        root,
+        &program,
+        &args.iter().map(|arg| (*arg).into()).collect::<Vec<_>>(),
+        &[],
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Only local listeners are reachable through this machine's localhost.
+pub fn port_url(root: &Path, port: u16) -> Option<String> {
+    (!crate::remote::is_remote(root)).then(|| format!("http://localhost:{port}"))
 }
 
 /// The docker binary. Apps started from the Dock get a minimal `PATH`, so
@@ -579,6 +730,112 @@ mod tests {
             .into_iter()
             .map(|s| (s.name, s.command, s.dir.display().to_string()))
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_detection_reads_target_manifests_and_refreshes_placeholder_inventory() {
+        let source = project(
+            "remote-detect-target",
+            &[
+                ("pnpm-lock.yaml", ""),
+                (
+                    "apps/web/package.json",
+                    r#"{"name":"web","scripts":{"dev":"next dev"}}"#,
+                ),
+                ("api/go.mod", "module api"),
+                ("api/cmd/server/main.go", "package main"),
+                ("worker/Cargo.toml", "[package]\nname = \"worker\"\n"),
+                ("worker/src/main.rs", "fn main() {}"),
+                ("ml/app.py", "app = Flask()"),
+                (
+                    "compose.yaml",
+                    "services:\n  db:\n    ports:\n      - \"5432:5432\"\n",
+                ),
+                (
+                    CUSTOM_FILE,
+                    r#"{"services":[{"name":"custom","command":"target-tool --serve","dir":"apps/web","env":{"CHECK":"target"},"ports":[9000]}]}"#,
+                ),
+            ],
+        );
+        let cache = db::testing::dir("svc-remote-detect-cache");
+        let mount = crate::remote::fixture(&source, &cache);
+        std::fs::write(
+            cache.join("apps/web/package.json"),
+            r#"{"name":"local-only","scripts":{"dev":"wrong"}}"#,
+        )
+        .unwrap();
+        let (specs, error) = detect(&cache);
+        assert!(error.is_none(), "{error:?}");
+        let expected = detect(&source).0;
+        assert_eq!(specs, expected);
+        assert_eq!(specs[0].command, "pnpm run dev");
+        assert!(specs.iter().all(|spec| spec.name != "local-only"));
+        assert_eq!(specs.last().unwrap().env["CHECK"], "target");
+        assert_eq!(port_url(&cache, 9000), None);
+        assert_eq!(
+            port_url(&source, 9000),
+            Some("http://localhost:9000".into())
+        );
+
+        std::fs::remove_file(source.join("apps/web/package.json")).unwrap();
+        std::fs::write(source.join("ml/main.py"), "app = FastAPI()").unwrap();
+        let (specs, error) = detect(&cache);
+        assert!(error.is_none(), "{error:?}");
+        assert!(!specs.iter().any(|spec| spec.name == "web"));
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.command == "uvicorn main:app --reload")
+        );
+        drop(mount);
+        assert!(
+            detect(&cache)
+                .1
+                .unwrap()
+                .starts_with("Could not read target services:")
+        );
+        assert_eq!(port_url(&cache, 9000), None);
+        std::fs::remove_dir_all(source).unwrap();
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_service_dirs_and_docker_commands_stay_on_the_target() {
+        let source = project("remote-command-target", &[("sub/file", "")]);
+        let cache = db::testing::dir("svc-remote-command-cache");
+        let mount = crate::remote::fixture(&source, &cache);
+        let custom = serde_json::json!({"services": [
+            {"name":"target", "command":"serve", "dir":format!("{}/sub", mount.target.path)},
+            {"name":"outside", "command":"serve", "dir":"/outside"},
+            {"name":"escape", "command":"serve", "dir":"../outside"}
+        ]});
+        std::fs::create_dir_all(source.join(".solder")).unwrap();
+        std::fs::write(
+            source.join(CUSTOM_FILE),
+            serde_json::to_vec(&custom).unwrap(),
+        )
+        .unwrap();
+        let (specs, error) = detect(&cache);
+        assert!(
+            error
+                .unwrap()
+                .contains("must run inside the target project")
+        );
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].dir, PathBuf::from("sub"));
+        let command = docker_command(&cache.join(&specs[0].dir), &["ps", "-a"]).unwrap();
+        assert_eq!(command.get_program(), "docker");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["ps", "-a"]);
+        assert_eq!(
+            command.get_current_dir(),
+            Some(Path::new(&mount.target.path).join("sub").as_path())
+        );
+        drop(mount);
+        assert!(docker_command(&cache, &["ps"]).is_err());
+        std::fs::remove_dir_all(source).unwrap();
+        std::fs::remove_dir_all(cache).unwrap();
     }
 
     #[test]

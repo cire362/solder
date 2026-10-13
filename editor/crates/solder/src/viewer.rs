@@ -319,11 +319,13 @@ impl Viewer {
         };
         let (path, format) = (self.path.clone(), picture.format);
         let read = cx.background_executor().spawn(async move {
-            let length = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+            let length = crate::remote::metadata(&path)
+                .map_err(|e| e.to_string())?
+                .len();
             if length > PICTURE_LIMIT {
                 return Err(t("This picture is too large to show").to_string());
             }
-            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            let bytes = crate::remote::read(&path).map_err(|e| e.to_string())?;
             Ok((picture_size(format, &bytes), bytes))
         });
         self.work = Some(cx.spawn(async move |this, cx| {
@@ -469,6 +471,13 @@ fn local(base: &Path, from: &str) -> Option<PathBuf> {
 fn size_of_file(path: &Path) -> Option<(u32, u32)> {
     use std::io::Read;
     let format = picture_format(path)?;
+    if crate::remote::is_remote(path) {
+        if crate::remote::metadata(path).ok()?.len() > PICTURE_LIMIT {
+            return None;
+        }
+        let bytes = crate::remote::read(path).ok()?;
+        return picture_size(format, &bytes);
+    }
     let mut head = Vec::new();
     std::fs::File::open(path)
         .ok()?

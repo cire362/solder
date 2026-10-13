@@ -2,11 +2,13 @@
 //! worktree of its own, on its own branch, until the task is done. The
 //! user's checkout is never touched until they merge.
 //!
-//! Commands run in a sandbox: no network beyond this machine and no writes
+//! Local commands run in a sandbox: no network beyond this machine and no writes
 //! outside the worktree and temporary folders (`sandbox-exec` on macOS,
 //! `bwrap` on Linux). A command that needs the network or the rest of the
 //! disk says so and waits for the user. Without a sandbox, every command
-//! waits. Everything here blocks: call it from a background executor.
+//! waits. Remote commands always ask for full access; a local sandbox
+//! cannot confine SSH or Docker's target. Everything here blocks: call it
+//! from a background executor.
 
 use std::{
     io::Read,
@@ -29,13 +31,8 @@ const MAX_TIMEOUT: u64 = 600;
 // ------------------------------------------------------------------ git
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_EDITOR", "true")
-        .args(["-c", "core.quotepath=off"])
-        .args(args)
+    let out = crate::git::command(dir, args)
+        .map_err(|e| format!("git: {e}"))?
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("git: {e}"))?;
@@ -92,7 +89,10 @@ pub struct Change {
 impl Worktree {
     /// A new branch from the user's last commit, checked out under `dir`.
     pub fn create(repo: &Path, dir: &Path, task: &str) -> Result<Self, String> {
-        let repo = PathBuf::from(git(repo, &["rev-parse", "--show-toplevel"])?.trim());
+        let top = git(repo, &["rev-parse", "--show-toplevel"])?;
+        let repo = crate::git::workdir(repo, &top)
+            .ok_or_else(|| crate::lang::t("Cannot map the remote repository path.").to_string())?;
+        let dir = worktree_directory(&repo, dir, crate::remote::is_remote(&repo));
         let base = git(&repo, &["rev-parse", "HEAD"])
             .map_err(|_| {
                 crate::lang::t("The project needs at least one commit for an agent to branch from")
@@ -104,7 +104,7 @@ impl Worktree {
         let project = repo
             .file_name()
             .map_or("project".into(), |n| slug(&n.to_string_lossy()));
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        crate::remote::create_dir_all(&dir).map_err(|e| e.to_string())?;
         // Never reuse a branch or folder of an earlier task.
         let mut n = 1;
         let (branch, path) = loop {
@@ -125,22 +125,29 @@ impl Worktree {
                 ],
             )
             .is_ok();
-            if !taken && !path.exists() {
+            let exists = if crate::remote::is_remote(&repo) {
+                match crate::remote::metadata(&path) {
+                    Ok(_) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error.to_string()),
+                }
+            } else {
+                path.exists()
+            };
+            if !taken && !exists {
                 break (branch, path);
             }
             n += 1;
         };
-        git(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &branch,
-                &path.to_string_lossy(),
-                &base,
-            ],
-        )?;
+        let target = crate::git::command_path(&repo, &path).map_err(|e| e.to_string())?;
+        git(&repo, &["worktree", "add", "-b", &branch, &target, &base])?;
+        if crate::remote::is_remote(&repo)
+            && let Err(error) = crate::remote::sync_tree(&path)
+        {
+            let _ = git(&repo, &["worktree", "remove", "--force", &target]);
+            let _ = git(&repo, &["branch", "-D", &branch]);
+            return Err(error.to_string());
+        }
         Ok(Self {
             repo,
             path,
@@ -174,7 +181,7 @@ impl Worktree {
     }
 
     pub fn file_now(&self, rel: &str) -> Option<String> {
-        std::fs::read_to_string(self.path.join(rel)).ok()
+        crate::remote::read_to_string(&self.path.join(rel)).ok()
     }
 
     /// Commits what the agent changed; false when nothing did.
@@ -207,44 +214,79 @@ impl Worktree {
 
     /// Deletes the worktree and its branch.
     pub fn remove(&self) {
-        let _ = git(
-            &self.repo,
-            &[
-                "worktree",
-                "remove",
-                "--force",
-                &self.path.to_string_lossy(),
-            ],
-        );
+        let Ok(target) = crate::git::command_path(&self.repo, &self.path) else {
+            return;
+        };
+        let _ = git(&self.repo, &["worktree", "remove", "--force", &target]);
         let _ = git(&self.repo, &["branch", "-D", &self.branch]);
-        let _ = std::fs::remove_dir_all(&self.path);
+        let _ = crate::remote::remove_dir_all(&self.path);
+        if crate::remote::is_remote(&self.repo) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 }
 
 /// Worktrees earlier tasks left under `trees` for this repository: tasks do
 /// not outlive the editor, their branches do until removed.
 pub fn leftovers(repo: &Path, trees: &Path) -> Vec<Worktree> {
-    let Ok(repo) = git(repo, &["rev-parse", "--show-toplevel"]).map(|r| PathBuf::from(r.trim()))
-    else {
+    let Ok(top) = git(repo, &["rev-parse", "--show-toplevel"]) else {
         return Vec::new();
     };
-    let trees = trees.canonicalize().unwrap_or_else(|_| trees.to_path_buf());
-    let Ok(list) = git(&repo, &["worktree", "list", "--porcelain"]) else {
+    let Some(repo) = crate::git::workdir(repo, &top) else {
         return Vec::new();
     };
-    list.split("\n\n")
+    let remote = crate::remote::is_remote(&repo);
+    let trees = worktree_directory(&repo, trees, remote);
+    let trees = if remote {
+        trees
+    } else {
+        trees.canonicalize().unwrap_or(trees)
+    };
+    let Ok(list) = git(&repo, &["worktree", "list", "--porcelain", "-z"]) else {
+        return Vec::new();
+    };
+    listed_worktrees(&repo, &trees, &list, remote, crate::remote::local_path)
+}
+
+fn worktree_directory(repo: &Path, trees: &Path, remote: bool) -> PathBuf {
+    if remote {
+        repo.join(".solder/worktrees")
+    } else {
+        trees.to_path_buf()
+    }
+}
+
+fn listed_worktrees(
+    repo: &Path,
+    trees: &Path,
+    list: &str,
+    remote: bool,
+    local: impl Fn(&Path, &str) -> Option<PathBuf>,
+) -> Vec<Worktree> {
+    list.split("\0\0")
         .filter_map(|block| {
-            let path = PathBuf::from(block.lines().find_map(|l| l.strip_prefix("worktree "))?);
+            let target = block
+                .split('\0')
+                .find_map(|l| l.strip_prefix("worktree "))?;
+            let path = if remote {
+                local(repo, target)?
+            } else {
+                PathBuf::from(target)
+            };
             let branch = block
-                .lines()
+                .split('\0')
                 .find_map(|l| l.strip_prefix("branch refs/heads/"))?
                 .to_string();
-            let inside = path
-                .canonicalize()
-                .unwrap_or_else(|_| path.clone())
-                .starts_with(&trees);
+            let inside = if remote {
+                path.starts_with(trees)
+                    && !path.components().any(|c| matches!(c, Component::ParentDir))
+            } else {
+                path.canonicalize()
+                    .unwrap_or_else(|_| path.clone())
+                    .starts_with(trees)
+            };
             (inside && branch.starts_with("solder/agent/")).then(|| Worktree {
-                repo: repo.clone(),
+                repo: repo.to_path_buf(),
                 path,
                 branch,
                 base: String::new(),
@@ -375,6 +417,39 @@ pub struct CommandOutput {
     pub timed_out: bool,
 }
 
+fn remote_shell_command_with(
+    dir: &Path,
+    command: &str,
+    access: Access,
+    launch: impl FnOnce(&Path, &str, &[String], &[(String, String)]) -> std::io::Result<Command>,
+) -> Result<Command, String> {
+    if access != Access::Full {
+        return Err(
+            crate::lang::t("Remote commands require full access approval for each call.").into(),
+        );
+    }
+    // The target owns its PATH. A desktop application's search path names
+    // folders on the client and must not replace it.
+    launch(
+        dir,
+        "sh",
+        &["-c".into(), command.into()],
+        &[("CI".into(), "1".into())],
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn command_access(remote: bool, sandbox: Sandbox, requested: Access) -> (Access, bool) {
+    if remote {
+        (Access::Full, true)
+    } else {
+        (
+            requested,
+            requested != Access::Sandboxed || sandbox == Sandbox::None,
+        )
+    }
+}
+
 /// Runs `command` with `sh -c` in `dir`, limited by `access`.
 pub fn run_command(
     sandbox: Sandbox,
@@ -383,6 +458,23 @@ pub fn run_command(
     access: Access,
     timeout: Duration,
 ) -> Result<CommandOutput, String> {
+    let mut cmd = if crate::remote::is_remote(dir) {
+        remote_shell_command_with(dir, command, access, crate::remote::command)?
+    } else {
+        local_shell_command(sandbox, dir, command, access)?
+    };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    run_built_command(cmd, timeout)
+}
+
+fn local_shell_command(
+    sandbox: Sandbox,
+    dir: &Path,
+    command: &str,
+    access: Access,
+) -> Result<Command, String> {
     let dir = dir.canonicalize().map_err(|e| e.to_string())?;
     let mut writable = vec![dir.clone()];
     writable.extend(temp_dirs());
@@ -426,11 +518,13 @@ pub fn run_command(
     };
     cmd.current_dir(&dir)
         .env("PATH", search_path())
-        .env("CI", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Its own process group, so a timeout stops what it started too.
+        .env("CI", "1");
+    Ok(cmd)
+}
+
+fn run_built_command(mut cmd: Command, timeout: Duration) -> Result<CommandOutput, String> {
+    // Stop the launcher and its local children together. Terminating
+    // processes on a remote target is the transport's responsibility.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -641,6 +735,18 @@ pub fn specs(phase: Phase) -> Vec<ToolSpec> {
     out
 }
 
+pub(crate) fn specs_for(phase: Phase, root: Option<&Path>) -> Vec<ToolSpec> {
+    specs_for_remote(phase, root.is_some_and(crate::remote::is_remote))
+}
+
+fn specs_for_remote(phase: Phase, remote: bool) -> Vec<ToolSpec> {
+    let mut tools = specs(phase);
+    if remote && let Some(run) = tools.iter_mut().find(|tool| tool.name == "run") {
+        run.description = "Run a shell command on the remote target in the project root. There is no remote sandbox. Every call requires the user's explicit full access approval.".into();
+    }
+    tools
+}
+
 pub struct ToolBox {
     pub root: PathBuf,
     pub sandbox: Sandbox,
@@ -684,11 +790,19 @@ impl ToolBox {
                 "{rel} is outside the project; use a path relative to its root"
             ));
         }
-        let full = self.root.join(p);
-        if rel != "." && !crate::ai_context::allows_path(&self.root, &full).unwrap_or(false) {
+        let full = crate::ai_context::checked_path(&self.root, &self.root.join(p))?;
+        if rel != "." && !crate::ai_context::allows_path(&self.root, &full)? {
             // `.env` files and what `.solderignore` lists stay private.
-            let exists = full.exists();
-            if exists || !ai::context::allows_file(p) {
+            let exists = if crate::remote::is_remote(&full) {
+                match crate::remote::metadata(&full) {
+                    Ok(_) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error.to_string()),
+                }
+            } else {
+                full.exists()
+            };
+            if crate::remote::is_remote(&full) || exists || !ai::context::allows_file(p) {
                 return Err(format!("{rel} is excluded from AI"));
             }
         }
@@ -754,10 +868,12 @@ impl ToolBox {
             }
             "write_file" => match self.resolve(s("path")) {
                 Ok(path) => {
-                    if let Some(dir) = path.parent() {
-                        let _ = std::fs::create_dir_all(dir);
+                    if let Some(dir) = path.parent()
+                        && let Err(error) = crate::remote::create_dir_all(dir)
+                    {
+                        return fail(call, error.to_string());
                     }
-                    match std::fs::write(&path, s("content")) {
+                    match crate::remote::write(&path, s("content")) {
                         Ok(()) => ok(
                             call,
                             format!(
@@ -777,17 +893,29 @@ impl ToolBox {
                 if command.is_empty() {
                     return fail(call, "No command");
                 }
-                let access = match s("access") {
+                let requested = match s("access") {
                     "network" => Access::Network,
                     "full" => Access::Full,
                     _ => Access::Sandboxed,
                 };
-                let needs_user = access != Access::Sandboxed || self.sandbox == Sandbox::None;
+                let remote = crate::remote::is_remote(&self.root);
+                let (access, needs_user) = command_access(remote, self.sandbox, requested);
                 if needs_user && !approved {
                     return Outcome::NeedsApproval {
                         command: command.to_string(),
                         access,
-                        reason: s("reason").to_string(),
+                        reason: if remote {
+                            let why = crate::lang::t(
+                                "Remote commands have no sandbox and require full access approval for each call.",
+                            );
+                            if s("reason").is_empty() {
+                                why.to_string()
+                            } else {
+                                format!("{why}\n{}", s("reason"))
+                            }
+                        } else {
+                            s("reason").to_string()
+                        },
                     };
                 }
                 let timeout = input["timeout_seconds"]
@@ -835,6 +963,50 @@ impl ToolBox {
             Ok(d) => d,
             Err(e) => return fail(call, e),
         };
+        if crate::remote::is_remote(&self.root) {
+            let entries = match crate::ai_context::remote_entries(
+                &self.root,
+                &dir,
+                depth.max(1),
+                20_000,
+                false,
+                &std::sync::atomic::AtomicBool::new(false),
+            ) {
+                Ok((entries, limited)) => {
+                    let mut lines: Vec<_> = entries
+                        .into_iter()
+                        .filter_map(|entry| {
+                            let rel = entry.path.strip_prefix(&self.root).ok()?;
+                            if rel
+                                .components()
+                                .any(|part| skipped(&part.as_os_str().to_string_lossy()))
+                            {
+                                return None;
+                            }
+                            Some(format!(
+                                "{}{}",
+                                rel.to_string_lossy(),
+                                if entry.directory { "/" } else { "" }
+                            ))
+                        })
+                        .take(500)
+                        .collect();
+                    if limited {
+                        lines.push("[listing stopped at the scan limit]".into());
+                    }
+                    lines
+                }
+                Err(error) => return fail(call, error),
+            };
+            return ok(
+                call,
+                if entries.is_empty() {
+                    "(empty)".into()
+                } else {
+                    entries.join("\n")
+                },
+            );
+        }
         let mut lines = Vec::new();
         fn walk(tb: &ToolBox, dir: &Path, prefix: &str, depth: usize, lines: &mut Vec<String>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -879,7 +1051,7 @@ impl ToolBox {
             Ok(p) => p,
             Err(e) => return fail(call, e),
         };
-        let text = match std::fs::read(&path) {
+        let text = match crate::remote::read(&path) {
             Ok(bytes) if bytes.contains(&0) => {
                 return fail(call, format!("{rel} is not a text file"));
             }
@@ -922,6 +1094,64 @@ impl ToolBox {
             Err(e) => return fail(call, e),
         };
         let mut hits = Vec::new();
+        if crate::remote::is_remote(&self.root) {
+            let (entries, limited) = match crate::ai_context::remote_entries(
+                &self.root,
+                &dir,
+                usize::MAX,
+                20_000,
+                true,
+                &std::sync::atomic::AtomicBool::new(false),
+            ) {
+                Ok(entries) => entries,
+                Err(error) => return fail(call, error),
+            };
+            for entry in entries.into_iter().filter(|entry| !entry.directory) {
+                let Ok(rel) = entry.path.strip_prefix(&self.root) else {
+                    continue;
+                };
+                if rel
+                    .components()
+                    .any(|part| skipped(&part.as_os_str().to_string_lossy()))
+                {
+                    continue;
+                }
+                let Ok(path) = self.resolve(&rel.to_string_lossy()) else {
+                    continue;
+                };
+                let Ok(text) = crate::remote::read_to_string(&path) else {
+                    continue;
+                };
+                for (i, line) in text.lines().enumerate() {
+                    if re.is_match(line) {
+                        let line: String = line.chars().take(200).collect();
+                        hits.push(format!(
+                            "{}:{}: {}",
+                            rel.to_string_lossy(),
+                            i + 1,
+                            line.trim()
+                        ));
+                        if hits.len() >= SEARCH_LIMIT {
+                            break;
+                        }
+                    }
+                }
+                if hits.len() >= SEARCH_LIMIT {
+                    break;
+                }
+            }
+            if limited {
+                hits.push("[search stopped at the scan limit]".into());
+            }
+            return ok(
+                call,
+                if hits.is_empty() {
+                    "No matches".into()
+                } else {
+                    hits.join("\n")
+                },
+            );
+        }
         let walker = ignore::WalkBuilder::new(&dir)
             .hidden(false)
             .require_git(false)
@@ -943,7 +1173,7 @@ impl ToolBox {
             if self.resolve(&rel).is_err() {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(path) else {
+            let Ok(text) = crate::remote::read_to_string(path) else {
                 continue;
             };
             for (i, line) in text.lines().enumerate() {
@@ -971,7 +1201,7 @@ impl ToolBox {
             Ok(p) => p,
             Err(e) => return fail(call, e),
         };
-        let text = match std::fs::read_to_string(&path) {
+        let text = match crate::remote::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => return fail(call, format!("{rel}: {e}")),
         };
@@ -983,7 +1213,7 @@ impl ToolBox {
                 call,
                 format!("The old text is not in {rel}; read the file again"),
             ),
-            1 => match std::fs::write(&path, text.replacen(old, new, 1)) {
+            1 => match crate::remote::write(&path, text.replacen(old, new, 1)) {
                 Ok(()) => ok(call, format!("Edited {rel}")),
                 Err(e) => fail(call, e.to_string()),
             },
@@ -998,6 +1228,102 @@ impl ToolBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_shell_routing_keeps_script_raw_and_requires_full_access() {
+        let cwd = Path::new("/virtual/cache/repo/.solder/worktrees/task");
+        let script = "printf '%s' '/virtual/cache/repo'\nprintf '%s' \"$HOME\"";
+        let command =
+            remote_shell_command_with(cwd, script, Access::Full, |dir, program, args, env| {
+                assert_eq!(dir, cwd);
+                assert_eq!(program, "sh");
+                assert_eq!(args, &["-c", script]);
+                assert_eq!(env, &[("CI".into(), "1".into())]);
+                Ok(Command::new("fake-docker"))
+            })
+            .unwrap();
+        assert_eq!(command.get_program(), "fake-docker");
+        for access in [Access::Sandboxed, Access::Network] {
+            assert!(
+                remote_shell_command_with(cwd, script, access, |_, _, _, _| panic!(
+                    "unapproved remote launch"
+                ))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn every_remote_shell_call_needs_full_approval_with_any_local_sandbox() {
+        for sandbox in [Sandbox::MacOs, Sandbox::Bwrap, Sandbox::None] {
+            for access in [Access::Sandboxed, Access::Network, Access::Full] {
+                assert_eq!(command_access(true, sandbox, access), (Access::Full, true));
+            }
+        }
+        assert_eq!(
+            command_access(false, Sandbox::MacOs, Access::Sandboxed),
+            (Access::Sandboxed, false)
+        );
+        assert_eq!(
+            command_access(false, Sandbox::None, Access::Sandboxed),
+            (Access::Sandboxed, true)
+        );
+        let specs = specs_for_remote(Phase::Working, true);
+        let run = specs.iter().find(|tool| tool.name == "run").unwrap();
+        assert!(
+            run.description.contains("no remote sandbox") && run.description.contains("Every call")
+        );
+    }
+
+    #[test]
+    fn remote_worktrees_are_inside_the_repo_and_only_path_fields_are_mapped() {
+        let repo = Path::new("/virtual/cache/repo");
+        let external = Path::new("/home/user/.config/solder/worktrees");
+        let trees = worktree_directory(repo, external, true);
+        assert_eq!(trees, repo.join(".solder/worktrees"));
+        assert_eq!(worktree_directory(repo, external, false), external);
+        let target = "/srv/repo/.solder/worktrees/a task\n";
+        let branch = "solder/agent/virtual-cache-repo";
+        let list = format!(
+            "worktree {target}\0HEAD abc\0branch refs/heads/{branch}\0\0worktree /outside\0branch refs/heads/solder/agent/outside\0\0"
+        );
+        let found = listed_worktrees(repo, &trees, &list, true, |root, value| {
+            assert_eq!(root, repo);
+            if value == target {
+                Some(trees.join("a task\n"))
+            } else {
+                None
+            }
+        });
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, trees.join("a task\n"));
+        assert_eq!(found[0].branch, branch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonexistent_files_cannot_escape_through_symlinked_parents() {
+        let root = repo("agent-missing-link");
+        let outside = db::testing::dir("agent-missing-link-outside");
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("absent"), root.join("dangling")).unwrap();
+        let tb = ToolBox {
+            root,
+            sandbox: Sandbox::None,
+        };
+        for path in ["link/new.txt", "dangling/new.txt"] {
+            let (_, error) = output(tb.execute(
+                &call(
+                    "write_file",
+                    serde_json::json!({"path": path, "content": "outside"}),
+                ),
+                Phase::Working,
+                false,
+            ));
+            assert!(error);
+        }
+        assert!(!outside.join("new.txt").exists());
+    }
 
     fn repo(name: &str) -> PathBuf {
         let dir = db::testing::dir(name);
