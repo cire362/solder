@@ -31,6 +31,12 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+mod path_map;
+pub use path_map::PathMap;
+
+#[cfg(test)]
+mod process_tests;
+
 #[derive(Debug, Clone)]
 pub enum Error {
     /// The server process could not be started or its pipes broke.
@@ -87,6 +93,7 @@ pub struct LanguageServer {
     configuration: Arc<Mutex<Value>>,
     /// The process, for a server that is one.
     child: Mutex<Option<Child>>,
+    path_map: Option<PathMap>,
 }
 
 /// The other end of a server that is not a process: what it says comes in
@@ -107,6 +114,7 @@ impl Link {
             &self.notifications,
             &self.outgoing,
             &self.configuration,
+            None,
         );
     }
 }
@@ -131,6 +139,26 @@ impl LanguageServer {
         name: impl Into<String>,
         command: &ServerCommand,
         root: &Path,
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Notification>)> {
+        Self::spawn_with_map(name, command, root, None)
+    }
+
+    /// Starts a wrapped remote server in a local working directory. The
+    /// app continues to use local URIs; only protocol messages are mapped.
+    pub fn spawn_mapped(
+        name: impl Into<String>,
+        command: &ServerCommand,
+        local_working_dir: &Path,
+        path_map: PathMap,
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Notification>)> {
+        Self::spawn_with_map(name, command, local_working_dir, Some(path_map))
+    }
+
+    fn spawn_with_map(
+        name: impl Into<String>,
+        command: &ServerCommand,
+        root: &Path,
+        path_map: Option<PathMap>,
     ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Notification>)> {
         let mut child = Command::new(&command.program)
             .args(&command.args)
@@ -157,9 +185,10 @@ impl LanguageServer {
             let pending = pending.clone();
             let out_tx = out_tx.clone();
             let configuration = configuration.clone();
+            let path_map = path_map.clone();
             std::thread::Builder::new()
                 .name("lsp-reader".into())
-                .spawn(move || read_loop(stdout, pending, note_tx, out_tx, configuration))
+                .spawn(move || read_loop(stdout, pending, note_tx, out_tx, configuration, path_map))
                 .map_err(|e| Error::Io(e.to_string()))?;
         }
 
@@ -172,6 +201,7 @@ impl LanguageServer {
             encoding: Mutex::new(Encoding::Utf16),
             configuration,
             child: Mutex::new(Some(child)),
+            path_map,
         });
         Ok((server, note_rx))
     }
@@ -213,6 +243,7 @@ impl LanguageServer {
             encoding: Mutex::new(Encoding::Utf16),
             configuration,
             child: Mutex::new(None),
+            path_map: None,
         });
         Ok((server, link, note_rx))
     }
@@ -245,6 +276,10 @@ impl LanguageServer {
         let params = InitializeParams {
             process_id: Some(std::process::id()),
             root_uri: Some(root_uri.clone()),
+            root_path: self
+                .path_map
+                .as_ref()
+                .map(|_| root.to_string_lossy().into_owned()),
             initialization_options: options,
             capabilities: client_capabilities(),
             workspace_folders: Some(vec![WorkspaceFolder {
@@ -311,7 +346,15 @@ impl LanguageServer {
     }
 
     fn send(&self, message: &impl Serialize) -> Result<()> {
-        let body = serde_json::to_vec(message).map_err(|e| Error::Parse(e.to_string()))?;
+        let body = if let Some(path_map) = &self.path_map {
+            let mut message =
+                serde_json::to_value(message).map_err(|e| Error::Parse(e.to_string()))?;
+            path_map.outgoing_message(&mut message);
+            serde_json::to_vec(&message)
+        } else {
+            serde_json::to_vec(message)
+        }
+        .map_err(|e| Error::Parse(e.to_string()))?;
         self.outgoing.send(body).map_err(|_| Error::Closed)
     }
 
@@ -352,13 +395,21 @@ fn read_loop(
     notifications: mpsc::UnboundedSender<Notification>,
     outgoing: std_mpsc::Sender<Vec<u8>>,
     configuration: Arc<Mutex<Value>>,
+    path_map: Option<PathMap>,
 ) {
     let mut reader = BufReader::new(stdout);
     while let Some(message) = read_message(&mut reader) {
         let Ok(value) = serde_json::from_slice::<Value>(&message) else {
             continue;
         };
-        dispatch(value, &pending, &notifications, &outgoing, &configuration);
+        dispatch(
+            value,
+            &pending,
+            &notifications,
+            &outgoing,
+            &configuration,
+            path_map.as_ref(),
+        );
     }
     // The server is gone: fail everything still waiting.
     for (_, tx) in pending.lock().drain() {
@@ -370,12 +421,16 @@ fn read_loop(
 /// request the app has to see and a notification go to the app, and the
 /// rest get the answers every client gives.
 fn dispatch(
-    value: Value,
+    mut value: Value,
     pending: &Pending,
     notifications: &mpsc::UnboundedSender<Notification>,
     outgoing: &std_mpsc::Sender<Vec<u8>>,
     configuration: &Mutex<Value>,
+    path_map: Option<&PathMap>,
 ) {
+    if let Some(path_map) = path_map {
+        path_map.incoming_message(&mut value);
+    }
     let id = value.get("id").filter(|id| !id.is_null()).cloned();
     let method = value
         .get("method")
@@ -429,7 +484,10 @@ fn dispatch(
                 }
                 _ => Value::Null,
             };
-            let reply = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            let mut reply = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            if let Some(path_map) = path_map {
+                path_map.outgoing_message(&mut reply);
+            }
             if let Ok(body) = serde_json::to_vec(&reply) {
                 let _ = outgoing.send(body);
             }

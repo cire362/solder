@@ -164,10 +164,11 @@ impl ServicesPanel {
     }
 
     pub fn refresh_containers(&mut self, cx: &mut Context<Self>) {
+        let root = self.root.clone();
         self.containers_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { services::list_containers() })
+                .spawn(async move { services::list_containers(&root) })
                 .await;
             this.update(cx, |this, cx| {
                 match result {
@@ -226,6 +227,9 @@ impl ServicesPanel {
 
     /// Ports of services that are running now, first started first.
     pub fn running_ports(&self, cx: &App) -> Vec<u16> {
+        if crate::remote::is_remote(&self.root) {
+            return Vec::new();
+        }
         let mut names: Vec<&String> = self.runs.keys().collect();
         names.sort();
         names
@@ -356,10 +360,11 @@ impl ServicesPanel {
     }
 
     fn container_action(&mut self, id: String, action: &'static str, cx: &mut Context<Self>) {
+        let root = self.root.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { services::container_action(&id, action) })
+                .spawn(async move { services::container_action(&root, &id, action) })
                 .await;
             this.update(cx, |this, cx| {
                 this.containers_error = result.err().map(Into::into);
@@ -384,6 +389,11 @@ impl ServicesPanel {
             ));
         }
         rows.extend((0..self.specs.len()).map(Row::Service));
+        if crate::remote::is_remote(&self.root) {
+            rows.push(Row::Note(
+                t("Target ports are not forwarded. Port forwarding is not supported yet.").into(),
+            ));
+        }
         rows.push(Row::Header(t("Containers")));
         if let Some(e) = &self.containers_error {
             rows.push(Row::Note(e.clone()));
@@ -417,11 +427,11 @@ impl ServicesPanel {
             .on_click(on_click)
     }
 
-    fn port_chips(ports: &[u16], theme: &Theme) -> Vec<gpui::AnyElement> {
+    fn port_chips(&self, ports: &[u16], theme: &Theme) -> Vec<gpui::AnyElement> {
         ports
             .iter()
             .map(|port| {
-                let url = format!("http://localhost:{port}");
+                let url = services::port_url(&self.root, *port);
                 div()
                     .id(("port", *port as usize))
                     .flex_none()
@@ -429,10 +439,16 @@ impl ServicesPanel {
                     .rounded(theme.shape.token)
                     .bg(theme.bg_elev)
                     .text_size(crate::theme::text(11.))
-                    .text_color(theme.accent)
-                    .hover(|d| d.bg(theme.accent_soft))
+                    .text_color(if url.is_some() {
+                        theme.accent
+                    } else {
+                        theme.fg_subtle
+                    })
+                    .when(url.is_some(), |d| d.hover(|d| d.bg(theme.accent_soft)))
                     .child(format!(":{port}"))
-                    .on_click(move |_, _, cx| cx.open_url(&url))
+                    .when_some(url, |chip, url| {
+                        chip.on_click(move |_, _, cx| cx.open_url(&url))
+                    })
                     .into_any_element()
             })
             .collect()
@@ -505,7 +521,7 @@ impl ServicesPanel {
                             .text_color(theme.fg_subtle)
                             .child(label),
                     )
-                    .children(Self::port_chips(self.ports(&spec.name), theme))
+                    .children(self.port_chips(self.ports(&spec.name), theme))
                     .child(div().flex_1());
                 if let Some(terminal) = terminal {
                     row = row.child(Self::icon_button(("logs", *i), t("Logs"), theme, {
@@ -555,7 +571,26 @@ impl ServicesPanel {
                     let entity = cx.entity();
                     let c = self.containers[*i].clone();
                     move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                        entity.update(cx, |_, cx| cx.emit(ServicesEvent::ContainerLogs(c.clone())))
+                        entity.update(cx, |this, cx| {
+                            if crate::remote::is_remote(&this.root) {
+                                // The workspace's ContainerLogs handler resolves a local
+                                // Docker path. A raw target command uses the terminal's
+                                // one transport boundary instead.
+                                cx.emit(ServicesEvent::Start(ServiceSpec {
+                                    name: tf("Logs: {}", &[&c.name]),
+                                    kind: services::ServiceKind::Custom,
+                                    command: format!(
+                                        "docker logs -f --tail 200 {}",
+                                        crate::remote::quoted(&c.id)
+                                    ),
+                                    dir: PathBuf::new(),
+                                    env: Default::default(),
+                                    ports: Vec::new(),
+                                }));
+                            } else {
+                                cx.emit(ServicesEvent::ContainerLogs(c.clone()));
+                            }
+                        })
                     }
                 };
                 let c = &self.containers[*i];

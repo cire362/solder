@@ -4,7 +4,14 @@ pub mod failure;
 mod search;
 mod shell;
 
-use std::{borrow::Cow, cell::RefCell, collections::HashMap, ops::Range, path::PathBuf, sync::Arc};
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    collections::HashMap,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use alacritty_terminal::{
     event::{Event as TermEvent, EventListener, WindowSize},
@@ -127,29 +134,166 @@ pub struct StartedTerminal {
     integration: Option<shell::Integration>,
 }
 
-impl Terminal {
-    /// Starts the shell (or `command.program`) in a new PTY.
-    pub fn start(mut command: TerminalCommand) -> std::io::Result<StartedTerminal> {
-        let integration = shell::prepare(&mut command).unwrap_or_else(|error| {
-            crate::journal::error(format_args!("Could not prepare shell integration: {error}"));
-            None
-        });
-        let (tx, rx) = futures::channel::mpsc::unbounded();
-        let mut env = command.env.clone();
-        env.insert("TERM".into(), "xterm-256color".into());
-        env.insert("COLORTERM".into(), "truecolor".into());
-        env.insert("TERM_PROGRAM".into(), "Solder".into());
-        let options = tty::Options {
+fn terminal_env(command: &TerminalCommand) -> HashMap<String, String> {
+    let mut env = command.env.clone();
+    env.insert("TERM".into(), "xterm-256color".into());
+    env.insert("COLORTERM".into(), "truecolor".into());
+    env.insert("TERM_PROGRAM".into(), "Solder".into());
+    env
+}
+
+/// The workspace still supplies its local login shell for service commands.
+/// Choose the target's POSIX shell before constructing the transport argv.
+fn target_program(command: &TerminalCommand) -> (String, Vec<String>) {
+    let Some(program) = &command.program else {
+        return ("/bin/sh".into(), vec!["-l".into()]);
+    };
+    let shell = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str());
+    if matches!(shell, Some("sh" | "bash" | "zsh" | "fish" | "ksh" | "dash")) {
+        if command.args.len() == 2
+            && matches!(command.args[0].as_str(), "-c" | "-lc" | "-lic" | "-ic")
+        {
+            return (
+                "/bin/sh".into(),
+                vec!["-lc".into(), command.args[1].clone()],
+            );
+        }
+        if command.args.iter().all(|arg| {
+            arg == "--login"
+                || arg.strip_prefix('-').is_some_and(|flags| {
+                    !flags.is_empty() && flags.chars().all(|flag| matches!(flag, 'l' | 'i'))
+                })
+        }) {
+            return ("/bin/sh".into(), vec!["-l".into()]);
+        }
+    }
+    (program.clone(), command.args.clone())
+}
+
+fn target_pty_options(
+    command: &TerminalCommand,
+    endpoint: &crate::remote::Endpoint,
+    target_cwd: &str,
+    transport_root: &Path,
+) -> std::io::Result<tty::Options> {
+    let (program, args) = target_program(command);
+    let mut env = terminal_env(command);
+    // Paths and hooks from this machine have no meaning on the target. The
+    // transport itself inherits the local PATH to find ssh/docker as usual.
+    env.retain(|key, _| key != "PATH" && key != "ZDOTDIR" && !key.starts_with("SOLDER_SHELL_"));
+    let mut env: Vec<_> = env.into_iter().collect();
+    env.sort();
+    let transport = endpoint.command(target_cwd, &program, &args, &env, true)?;
+    let utf8 = |value: &std::ffi::OsStr| {
+        value.to_str().map(str::to_owned).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Transport argv is not UTF-8",
+            )
+        })
+    };
+    let program = utf8(transport.get_program())?;
+    let args = transport.get_args().map(utf8).collect::<Result<_, _>>()?;
+    let env = transport
+        .get_envs()
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+        .map(|(key, value)| Ok((utf8(key)?, utf8(value)?)))
+        .collect::<std::io::Result<_>>()?;
+    Ok(tty::Options {
+        shell: Some(tty::Shell::new(program, args)),
+        working_directory: Some(
+            transport
+                .get_current_dir()
+                .unwrap_or(transport_root)
+                .to_path_buf(),
+        ),
+        drain_on_exit: true,
+        env,
+        #[cfg(target_os = "windows")]
+        escape_args: true,
+    })
+}
+
+fn pty_options(
+    mut command: TerminalCommand,
+) -> std::io::Result<(tty::Options, Option<shell::Integration>)> {
+    if let Some(mount) = crate::remote::mount(&command.cwd)? {
+        let options = target_pty_options(
+            &command,
+            &mount.target.endpoint,
+            &mount.remote_path(&command.cwd)?,
+            &mount.root,
+        )?;
+        // Wrapping happens only here, after callers supply a raw command. Never
+        // run shell::prepare on an SSH/Docker command or on the virtual cache.
+        return Ok((options, None));
+    }
+    let integration = shell::prepare(&mut command).unwrap_or_else(|error| {
+        crate::journal::error(format_args!("Could not prepare shell integration: {error}"));
+        None
+    });
+    let env = terminal_env(&command);
+    Ok((
+        tty::Options {
             shell: command
                 .program
-                .clone()
-                .map(|p| tty::Shell::new(p, command.args.clone())),
-            working_directory: Some(command.cwd.clone()),
+                .map(|program| tty::Shell::new(program, command.args)),
+            working_directory: Some(command.cwd),
             drain_on_exit: true,
             env,
             #[cfg(target_os = "windows")]
             escape_args: true,
-        };
+        },
+        integration,
+    ))
+}
+
+fn file_link(
+    cwd: &Path,
+    mut link: crate::terminal_output::FileLink,
+) -> Option<crate::terminal_output::FileLink> {
+    match crate::remote::mount(cwd) {
+        Ok(Some(mount)) => {
+            let path = link.path.to_str()?;
+            let target = if path.starts_with('/') {
+                path.to_string()
+            } else {
+                format!(
+                    "{}/{}",
+                    mount.remote_path(cwd).ok()?.trim_end_matches('/'),
+                    path
+                )
+            };
+            // Target paths use POSIX separators even on a Windows client.
+            let mut parts = Vec::new();
+            for part in target.split('/') {
+                match part {
+                    "" | "." => {}
+                    ".." => {
+                        parts.pop();
+                    }
+                    part => parts.push(part),
+                }
+            }
+            link.path = mount.local_path(&format!("/{}", parts.join("/")))?;
+        }
+        Ok(None) => {
+            if link.path.is_relative() {
+                link.path = cwd.join(&link.path);
+            }
+        }
+        Err(_) => return None,
+    }
+    Some(link)
+}
+
+impl Terminal {
+    /// Starts the shell (or `command.program`) in a new PTY.
+    pub fn start(command: TerminalCommand) -> std::io::Result<StartedTerminal> {
+        let (options, integration) = pty_options(command)?;
+        let (tx, rx) = futures::channel::mpsc::unbounded();
         let window_size = WindowSize {
             num_lines: 24,
             num_cols: 80,
@@ -601,10 +745,7 @@ impl Terminal {
         if e.modifiers.platform || e.modifiers.control {
             let found =
                 crate::terminal_output::read_line(&*self.term.lock(), point.line).link_at(point);
-            if let Some(mut link) = found {
-                if link.path.is_relative() {
-                    link.path = self.cwd.join(&link.path);
-                }
+            if let Some(link) = found.and_then(|link| file_link(&self.cwd, link)) {
                 self.selecting = false;
                 cx.emit(TerminalEvent::OpenFile(link));
                 cx.stop_propagation();
@@ -1280,6 +1421,257 @@ mod tests {
 
     fn key(s: &str) -> Keystroke {
         Keystroke::parse(s).unwrap()
+    }
+
+    #[test]
+    fn target_terminals_use_target_shell_cwd_env_and_a_transport_tty() {
+        let mut command = TerminalCommand {
+            cwd: "/virtual/cache/sub".into(),
+            env: HashMap::from([
+                ("PATH".into(), "/local/tools".into()),
+                ("ZDOTDIR".into(), "/local/hooks".into()),
+                ("SOLDER_SHELL_DIR".into(), "/local/hooks".into()),
+                ("CHECK".into(), "a' b".into()),
+            ]),
+            ..Default::default()
+        };
+        let ssh = crate::remote::Endpoint::Ssh {
+            host: "user@example".into(),
+            port: 2222,
+        };
+        let options =
+            target_pty_options(&command, &ssh, "/srv/a b/sub", Path::new("/physical/cache"))
+                .unwrap();
+        let mut args: Vec<String> = [
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=2",
+            "-tt",
+            "-p",
+            "2222",
+            "--",
+            "user@example",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        args.push("cd -- '/srv/a b/sub' && exec env 'CHECK=a'\\'' b' 'COLORTERM=truecolor' 'TERM=xterm-256color' 'TERM_PROGRAM=Solder' '/bin/sh' '-l'".into());
+        assert_eq!(options.shell, Some(tty::Shell::new("ssh".into(), args)));
+        assert_eq!(options.working_directory, Some("/physical/cache".into()));
+        assert!(options.env.is_empty());
+        assert_eq!(command.cwd, PathBuf::from("/virtual/cache/sub"));
+
+        // A service from Workspace::start_service must not execute the local
+        // login shell's absolute path on the target or wrap the transport twice.
+        command.program = Some("/opt/local/bin/zsh".into());
+        command.args = vec!["-lc".into(), "npm run dev; printf '%s' \"$CHECK\"".into()];
+        let docker = crate::remote::Endpoint::Container {
+            program: "/local/bin/docker".into(),
+            id: "container-1".into(),
+            user: Some("dev".into()),
+            env: vec![],
+        };
+        let options =
+            target_pty_options(&command, &docker, "/work/sub", Path::new("/physical/cache"))
+                .unwrap();
+        let args: Vec<String> = [
+            "exec",
+            "-i",
+            "-t",
+            "-w",
+            "/work/sub",
+            "-u",
+            "dev",
+            "-e",
+            "CHECK=a' b",
+            "-e",
+            "COLORTERM=truecolor",
+            "-e",
+            "TERM=xterm-256color",
+            "-e",
+            "TERM_PROGRAM=Solder",
+            "container-1",
+            "/bin/sh",
+            "-lc",
+            "npm run dev; printf '%s' \"$CHECK\"",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(
+            options.shell,
+            Some(tty::Shell::new("/local/bin/docker".into(), args))
+        );
+        assert_eq!(options.working_directory, Some("/physical/cache".into()));
+        assert!(options.env.is_empty());
+    }
+
+    #[test]
+    fn local_terminal_options_keep_program_args_cwd_and_path() {
+        let command = TerminalCommand {
+            program: Some("/bin/sh".into()),
+            args: vec!["-c".into(), "printf local".into()],
+            cwd: "/local/project/sub".into(),
+            env: HashMap::from([("PATH".into(), "/local/tools".into())]),
+            ..Default::default()
+        };
+        let (options, integration) = pty_options(command).unwrap();
+        assert!(integration.is_none());
+        assert_eq!(
+            options.shell,
+            Some(tty::Shell::new(
+                "/bin/sh".into(),
+                vec!["-c".into(), "printf local".into()]
+            ))
+        );
+        assert_eq!(options.working_directory, Some("/local/project/sub".into()));
+        assert_eq!(options.env["PATH"], "/local/tools");
+        assert_eq!(options.env["TERM"], "xterm-256color");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_container_directory_still_launches_on_the_target() {
+        let root = db::testing::dir("terminal-shared-target");
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let mount = crate::remote::Mount::connect(
+            crate::remote::Target {
+                endpoint: crate::remote::Endpoint::Container {
+                    program: "docker".into(),
+                    id: "shared-target".into(),
+                    user: None,
+                    env: vec![],
+                },
+                path: "/work".into(),
+            },
+            root.clone(),
+            false,
+        )
+        .unwrap();
+        let (options, integration) = pty_options(TerminalCommand {
+            cwd: root.join("sub"),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(integration.is_none());
+        assert_eq!(options.working_directory, Some(mount.root.clone()));
+        assert_eq!(
+            options.shell,
+            Some(tty::Shell::new(
+                "docker".into(),
+                [
+                    "exec",
+                    "-i",
+                    "-t",
+                    "-w",
+                    "/work/sub",
+                    "-e",
+                    "COLORTERM=truecolor",
+                    "-e",
+                    "TERM=xterm-256color",
+                    "-e",
+                    "TERM_PROGRAM=Solder",
+                    "shared-target",
+                    "/bin/sh",
+                    "-l",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+            ))
+        );
+        drop(mount);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_links_map_target_absolute_and_relative_paths_and_refuse_other_roots() {
+        let folder = db::testing::dir("terminal-remote-links");
+        let source = folder.join("target");
+        let cache = folder.join("cache");
+        std::fs::create_dir_all(source.join("sub")).unwrap();
+        let mount = crate::remote::fixture(&source, &cache);
+        let cwd = cache.join("sub");
+        let link = |path: PathBuf| crate::terminal_output::FileLink {
+            path,
+            row: 12,
+            column: 3,
+        };
+        let absolute = Path::new(&mount.target.path).join("src/ёж.rs");
+        let mapped = file_link(&cwd, link(absolute)).unwrap();
+        assert_eq!(mapped, link(mount.root.join("src/ёж.rs")));
+        assert_eq!(file_link(&cwd, link("../src/ёж.rs".into())), Some(mapped));
+        assert!(file_link(&cwd, link("../../outside.rs".into())).is_none());
+        assert!(
+            file_link(
+                &cwd,
+                link(format!("{}-other/file.rs", mount.target.path).into())
+            )
+            .is_none()
+        );
+        assert!(file_link(&cwd, link("/etc/passwd".into())).is_none());
+        assert!(file_link(&cwd, link(cache.join("local-only.rs"))).is_none());
+        drop(mount);
+        assert!(file_link(&cwd, link("stale.rs".into())).is_none());
+        assert_eq!(
+            file_link(Path::new("/local/project"), link("src/main.rs".into())),
+            Some(link("/local/project/src/main.rs".into()))
+        );
+        assert_eq!(
+            file_link(Path::new("/local/project"), link("/outside/file.rs".into())),
+            Some(link("/outside/file.rs".into()))
+        );
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_pty_process_runs_in_the_target_and_closed_mounts_cannot_launch_locally() {
+        let folder = db::testing::dir("terminal-remote-process");
+        let source = folder.join("target");
+        let cache = folder.join("cache");
+        std::fs::create_dir_all(source.join("sub")).unwrap();
+        let mount = crate::remote::fixture(&source, &cache);
+        let command = TerminalCommand {
+            program: Some("/local-only/bin/zsh".into()),
+            args: vec![
+                "-lc".into(),
+                "printf 'target-cwd=%s\\ncheck=%s\\n' \"$PWD\" \"$CHECK\"; sleep 1".into(),
+            ],
+            cwd: cache.join("sub"),
+            env: HashMap::from([("CHECK".into(), "target env".into())]),
+            ..Default::default()
+        };
+        let started = Terminal::start(command.clone()).unwrap();
+        assert!(started.integration.is_none());
+        let wanted = format!("target-cwd={}/sub", mount.target.path);
+        let deadline = std::time::Instant::now() + crate::patience::WAIT;
+        loop {
+            let text = failure::output(&*started.term.lock()).0;
+            if text.contains(&wanted) && text.contains("check=target env") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{text}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        started
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(Msg::Shutdown)
+            .unwrap();
+        drop(started);
+        drop(mount);
+        assert!(pty_options(command).is_err());
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]

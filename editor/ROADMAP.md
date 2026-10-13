@@ -21,6 +21,23 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] Typing and saving in a native remote-project window, an external SSH
+      server and Linux/Windows clients. On macOS loopback, a release Solder
+      window read fresh server bytes instead of stale cache and followed an
+      external edit through project polling. Seven helper checks also passed;
+      Rust file revisions and LSP mapping are checked separately with processes.
+      SSH PTYs, reconnect and connection loss are not checked against a server.
+      Evidence is in `benchmarks/remote-projects.md`
+- [ ] Performance with active SSH connections or containers and large remote
+      inventories. `benchmarks/remote-projects.md` compares startup and typing
+      with these features inactive
+- [ ] Devcontainer startup against a real Docker daemon. Parsing, reviewed-file
+      snapshots, argv, bounded execution, cancellation and lifecycle are checked
+      with executable Docker fixtures; no image was downloaded or built here
+- [ ] Published extensions and notebook execution in remote projects. Extension
+      hosts remain local; filesystem-dependent providers and extension binaries
+      are not moved to the target. Target language servers use installed programs
+      or explicit language_servers.<name>.command overrides
 - [ ] Two causes of tests of the terminal failing on Linux in some runs
       and never on macOS are read from the code and fit what was seen, but
       were not seen on Linux. What an extension types into a terminal as
@@ -139,6 +156,29 @@ something of its own unchecked or unmade adds it here.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] Remote HTTP/database/context-server connections and port forwarding.
+      Existing localhost URLs still refer to the client machine. Remote file
+      inventories use the project's Git ignores; global Git excludes from the
+      target's home are not copied into the local context reader
+- [ ] Remote port forwarding, interactive SSH password/host-key prompts and
+      automatic tool installation. SSH uses existing OpenSSH configuration and
+      keys, strict known-host checking and a POSIX target with Python 3.9+, Git
+      and ripgrep for search. Project symlinks, non-UTF-8 paths, and navigation
+      outside the chosen project are refused. Settings/cache ancestors must be
+      directories rather than symlinks. Terminal relative links follow
+      its launch folder, not subsequent shell cd commands
+- [ ] Full devcontainer specification and reuse of earlier containers. The
+      initial implementation creates a fresh owned instance from cached images,
+      a Dockerfile or restricted Compose, with one writable project-root bind.
+      Features, extra/named-volume mounts, port forwarding, customizations,
+      UID rewriting, shell-environment probes and host lifecycle commands are
+      unsupported. Containers and volumes are retained after stopping. Failure
+      before create returns a validated ID can leave partial resources. The
+      environment must be reviewed again after restarting Solder
+- [ ] SSH save locking across independent programs. Saves compare the opened
+      revision and atomically replace the target file, but do not lock other
+      writers across the final check and rename. Recovery restores unsaved text
+      over the newly read file without retaining its original remote revision
 - [ ] A line is moved to where its language wants it only if the tree is
       in step within a millisecond of the key. On a busy machine a closing
       tag typed in a language of an extension can stay where it was typed,
@@ -730,9 +770,9 @@ update. They come after phase 9, in this order unless one is needed sooner.
       commands, model data and external text; remaining checks are above
 
 ### Projects that are somewhere else
-- [ ] A project on a server over SSH: files, terminal, Git, search and
-      language servers there (needs an SSH client, a dependency to decide on)
-- [ ] Dev containers: `devcontainer.json`, with terminals, services and the
+- [x] A project on a server over SSH: files, terminal, Git, search and
+      language servers there (using the installed OpenSSH client)
+- [x] Dev containers: `devcontainer.json`, with terminals, services and the
       agent inside
 
 Left out on purpose: a list of servers and deploys (far from an

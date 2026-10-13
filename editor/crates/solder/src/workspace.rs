@@ -252,6 +252,9 @@ mod session;
 #[path = "recovery.rs"]
 mod recovery;
 
+#[path = "remote_workspace.rs"]
+pub(crate) mod remote_workspace;
+
 /// A column of tabs. The workspace lays panes out left to right.
 #[derive(Default)]
 struct Pane {
@@ -284,6 +287,9 @@ impl Pane {
 }
 
 pub struct Workspace {
+    remote_mount: Option<Arc<crate::remote::Mount>>,
+    remote_task: Option<Task<()>>,
+    remote_status: Option<SharedString>,
     web_pages: Vec<(Entity<crate::webview::Page>, Subscription)>,
     web_front: Option<(Entity<crate::webview::Page>, usize)>,
     /// Files open as notebooks, each a tab, and the one in front with the
@@ -560,7 +566,7 @@ impl Workspace {
             cx.new(|cx| crate::agent_panel::AgentPanel::new(ai_store, weak, root.clone(), cx));
         let results = cx.new(|cx| ResultsView::new(database.clone(), cx));
         let response = cx.new(crate::response::ResponseView::new);
-        let project_search = cx.new(|cx| ProjectSearch::new(root, window, cx));
+        let project_search = cx.new(|cx| ProjectSearch::new(root.clone(), window, cx));
         let search_bar = cx.new(|cx| BufferSearchBar::new(window, cx));
         let subscriptions = vec![
             // Plugins' status texts are drawn in this window's status bar.
@@ -658,7 +664,11 @@ impl Workspace {
                     ServicesEvent::Kill(terminal) => this.remove_terminal(terminal, window, cx),
                     ServicesEvent::ContainerLogs(container) => {
                         let command = TerminalCommand {
-                            program: services::docker_path().map(|p| p.display().to_string()),
+                            program: if crate::remote::is_remote(&this.root(cx)) {
+                                Some("docker".into())
+                            } else {
+                                services::docker_path().map(|p| p.display().to_string())
+                            },
                             args: vec![
                                 "logs".into(),
                                 "-f".into(),
@@ -894,6 +904,9 @@ impl Workspace {
             })
         });
         let mut this = Self {
+            remote_mount: project.read(cx).mount().cloned(),
+            remote_task: None,
+            remote_status: None,
             web_pages: Vec::new(),
             web_front: None,
             notebooks: Vec::new(),
@@ -1014,6 +1027,33 @@ impl Workspace {
         self.all_editors()
             .filter(|e| e.read(cx).document().entity_id() == document)
             .count()
+    }
+
+    pub(crate) fn resume_remote_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_writer.is_none() && self.remote_mount.is_some() {
+            self.start_session(window, cx);
+        }
+    }
+
+    pub(crate) fn show_remote_error(&mut self, error: String, cx: &mut Context<Self>) {
+        self.remote_status = Some(error.into());
+        cx.notify();
+    }
+
+    fn remote_environment_changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(mount) = self.remote_mount.clone() {
+            self.project
+                .update(cx, |project, cx| project.attach_remote(mount, cx))
+                .ok();
+        }
+        let root = self.root(cx);
+        if let Some(store) = crate::lsp_store::LspStore::global(cx) {
+            store.update(cx, |store, cx| store.environment_changed(&root, cx));
+        }
+        self.git.update(cx, |git, cx| git.refresh_now(cx));
+        self.services
+            .update(cx, |services, cx| services.redetect(cx));
+        self.project_panel.update(cx, |panel, cx| panel.refresh(cx));
     }
 
     // ------------------------------------------------------------ tabs
@@ -4344,6 +4384,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let root = self.root(cx);
+        let locations = if crate::remote::is_remote(&root) {
+            locations
+                .into_iter()
+                .filter(|location| crate::remote::contains(&root, &location.path))
+                .collect::<Vec<_>>()
+        } else {
+            locations
+        };
         if locations.is_empty() {
             return;
         }
@@ -4368,6 +4417,11 @@ impl Workspace {
                 if let Some((_, doc)) = open.iter().find(|(p, _)| p == path) {
                     let text = doc.read(cx).text();
                     return (line < text.line_count()).then(|| text.line_str(line).into_owned());
+                }
+                // A remote result need not be materialized. Never fetch it
+                // while the picker is being laid out on the window thread.
+                if crate::remote::is_remote(path) {
+                    return None;
                 }
                 let lines = file_cache.entry(path.clone()).or_insert_with(|| {
                     std::fs::read_to_string(path)
@@ -4419,6 +4473,15 @@ impl Workspace {
             }
             None => {}
         }
+        let root = self.root(cx);
+        if crate::remote::is_remote(&root)
+            && per_file
+                .iter()
+                .any(|(path, _)| !crate::remote::contains(&root, path))
+        {
+            crate::journal::error("refused a language server edit outside the remote project");
+            return;
+        }
         for (path, edits) in per_file {
             if let Some(document) = self.document_for_path(&path, cx) {
                 document.update(cx, |d, cx| {
@@ -4456,7 +4519,10 @@ impl Workspace {
                         .map_err(|c| {
                             format!("{c:?} cannot be written in {}", loaded.encoding.name())
                         })
-                        .and_then(|bytes| std::fs::write(&path, bytes).map_err(|e| e.to_string()));
+                        .and_then(|bytes| {
+                            crate::remote::write_versioned(&path, &bytes, loaded.stamp.as_ref())
+                                .map_err(|e| e.to_string())
+                        });
                     if let Err(err) = written {
                         crate::journal::error(format_args!(
                             "could not write {}: {err}",
@@ -4905,7 +4971,7 @@ impl Workspace {
             if let Ok(Ok(Some(paths))) = answer.await
                 && let Some(root) = paths.into_iter().next()
             {
-                cx.update(|cx| crate::windows::open(root, cx)).ok();
+                cx.update(|cx| crate::windows::open_project(root, cx)).ok();
             }
         })
         .detach();
@@ -4946,17 +5012,21 @@ impl Workspace {
             }
             // Read as what the file was opened as.
             let written_in = document.read(cx).encoding();
+            let version = document.read(cx).version();
+            let opened = path.clone();
             cx.spawn(async move |_, cx| {
                 let content = cx
                     .background_executor()
-                    .spawn(async move { std::fs::read(&path) })
+                    .spawn(async move { crate::remote::read_versioned(&path) })
                     .await;
-                if let Ok(bytes) = content {
-                    let text = text::encoding::decode_as(&bytes, written_in);
+                if let Ok((bytes, stamp)) = content {
                     document
                         .update(cx, |d, cx| {
-                            if !d.is_dirty() {
-                                d.reload(&text, cx);
+                            if !d.is_dirty()
+                                && d.version() == version
+                                && d.path() == Some(opened.as_path())
+                            {
+                                d.reopen(&bytes, stamp, written_in, cx);
                             }
                         })
                         .ok();
@@ -4978,7 +5048,7 @@ impl Workspace {
                 } else {
                     to.join(rest)
                 };
-                document.update(cx, |d, cx| d.set_path(new, cx));
+                document.update(cx, |d, cx| d.renamed(new, cx));
             }
         }
         cx.notify();
@@ -6513,6 +6583,34 @@ impl Workspace {
             None => self.active_editor(),
         };
         match item {
+            Item::Environment => {
+                if crate::remote::is_remote(self.project.read(cx).root())
+                    && let Some(error) = self.project.read(cx).error()
+                {
+                    return vec![says(crate::lang::tf(
+                        "Remote project failed: {}",
+                        &[&error],
+                    ))];
+                }
+                if let Some(status) = &self.remote_status {
+                    return vec![says(status.to_string())];
+                }
+                let Some(mount) = &self.remote_mount else {
+                    return Vec::new();
+                };
+                let text = match &mount.target.endpoint {
+                    crate::remote::Endpoint::Ssh { host, .. } => {
+                        crate::lang::tf("SSH: {}", &[host])
+                    }
+                    crate::remote::Endpoint::Container { id, .. } => crate::lang::tf(
+                        "Container: {}",
+                        &[&id.chars().take(12).collect::<String>()],
+                    ),
+                    #[cfg(test)]
+                    crate::remote::Endpoint::Process { .. } => "fixture".into(),
+                };
+                vec![says(text)]
+            }
             Item::Project => {
                 let root = self.root(cx);
                 let name = root.file_name().map_or_else(
@@ -7118,6 +7216,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_untitled))
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::open_project))
+            .on_action(cx.listener(Self::connect_ssh))
+            .on_action(cx.listener(Self::open_devcontainer))
             .on_action(cx.listener(Self::open_preview))
             .on_action(cx.listener(Self::new_window))
             .on_action(cx.listener(Self::open_settings))
@@ -20645,6 +20745,40 @@ exports.activate = (context) => {
     }
 
     #[gpui::test]
+    fn an_ssh_destination_exists_before_the_entry_closes_and_can_retry(cx: &mut TestAppContext) {
+        let root = fixture("ssh-window-retry");
+        windows_setup(cx, None, &[]);
+        let entry = cx.update(crate::way_in::open_window);
+        let (destination, reconnect) = cx.update(|cx| {
+            crate::windows::cached_window(crate::windows::Place::of(root.clone()), &None, cx)
+        });
+        assert!(reconnect);
+        assert_eq!(cx.read(|cx| cx.windows().len()), 2);
+        entry
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        assert_eq!(
+            cx.read(project_windows).as_slice(),
+            std::slice::from_ref(&root)
+        );
+        destination
+            .update(cx, |workspace, _, cx| {
+                assert!(workspace.session_writer.is_none());
+                assert!(workspace._recovery_tick.is_none());
+                assert!(workspace.remote_mount.is_none());
+                workspace.show_remote_error("test connection failed".into(), cx);
+            })
+            .unwrap();
+        let (retry, reconnect) = cx.update(|cx| {
+            crate::windows::cached_window(crate::windows::Place::of(root.clone()), &None, cx)
+        });
+        assert!(reconnect);
+        assert_eq!(retry.window_id(), destination.window_id());
+        assert_eq!(cx.read(project_windows), [root]);
+        cx.update(crate::windows::stop);
+    }
+
+    #[gpui::test]
     async fn the_way_in_lists_projects_opened_before_and_opens_one(cx: &mut TestAppContext) {
         let (a, b) = (fixture("way-in-a"), fixture("way-in-b"));
         let gone = b.join("gone");
@@ -20658,7 +20792,13 @@ exports.activate = (context) => {
         let path = |path: &Path| path.display().to_string();
         assert_eq!(
             cx.read(listed),
-            ["Open a folder".to_string(), path(&a), path(&gone), path(&b)]
+            [
+                "Open a folder".to_string(),
+                "Connect to an SSH project".to_string(),
+                path(&a),
+                path(&gone),
+                path(&b)
+            ]
         );
         let cx = &mut VisualTestContext::from_window(way_in.into(), cx);
         // What is typed narrows the list; a folder can always be opened.

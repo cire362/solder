@@ -121,6 +121,12 @@ jobs:
         run: |
           bash ../scripts/test-test-temp.sh
           bash ../scripts/with-test-temp.sh cargo test --workspace --profile ci --locked
+      - name: Verify SSH transport on loopback
+        timeout-minutes: 2
+        run: |
+          code=0
+          python3 crates/solder/tests/fixtures/ssh_local.py --worker crates/solder/src/remote/worker.py || code=$?
+          if [ "$code" -ne 0 ] && [ "$code" -ne 77 ]; then exit "$code"; fi
       - name: Verify database TLS
         timeout-minutes: 5
         run: bash scripts/test-db-tls.sh

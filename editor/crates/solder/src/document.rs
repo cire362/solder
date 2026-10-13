@@ -157,6 +157,7 @@ pub struct Loaded {
     pub text: String,
     pub encoding: text::encoding::Encoding,
     pub read_only: Option<ReadOnly>,
+    pub stamp: Option<crate::remote::Stamp>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -197,6 +198,9 @@ impl SaveFailure {
                 "Not saved: {} cannot be written in {}. Save with another encoding.",
                 &[&format!("{character:?}"), &encoding.name()],
             ),
+            Self::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                crate::lang::t("The file changed on the target. Reopen it before saving.").into()
+            }
             Self::Io(error) => crate::lang::tf("Not saved: {}", &[&error]),
         }
     }
@@ -223,6 +227,7 @@ impl Loaded {
             text: decoded.text,
             encoding: decoded.encoding,
             read_only,
+            stamp: None,
         }
     }
 }
@@ -236,15 +241,19 @@ fn megabytes(bytes: u64) -> String {
 
 /// Reads a file to be opened in an editor. Blocking.
 pub fn load(path: &Path) -> std::io::Result<Loaded> {
-    let size = std::fs::metadata(path)?.len();
+    let size = crate::remote::metadata(path)?.len();
     if size > READ_LIMIT {
         return Ok(Loaded {
             text: String::new(),
             encoding: Default::default(),
             read_only: Some(ReadOnly::TooLarge(size)),
+            stamp: None,
         });
     }
-    Ok(Loaded::of(&std::fs::read(path)?))
+    let (bytes, stamp) = crate::remote::read_versioned(path)?;
+    let mut loaded = Loaded::of(&bytes);
+    loaded.stamp = stamp;
+    Ok(loaded)
 }
 
 /// How long git state waits after the last edit before recomputing.
@@ -287,6 +296,8 @@ pub struct Document {
     read_only: bool,
     /// What the file is written in, which is what it is saved in.
     encoding: text::encoding::Encoding,
+    /// The revision this view read, independent of reads made by other views.
+    stamp: Option<crate::remote::Stamp>,
     /// Something to say above the text: why it cannot be edited, or why
     /// it was not saved.
     notice: Option<gpui::SharedString>,
@@ -329,6 +340,7 @@ impl Document {
             blame_task: None,
             read_only: false,
             encoding: Default::default(),
+            stamp: None,
             notice: None,
             title_override: None,
             language_path: None,
@@ -372,6 +384,7 @@ impl Document {
 
     fn take(&mut self, loaded: &Loaded) {
         self.encoding = loaded.encoding;
+        self.stamp = loaded.stamp.clone();
         self.read_only = loaded.read_only.is_some();
         self.notice = loaded.read_only.as_ref().map(|why| why.message().into());
     }
@@ -381,11 +394,13 @@ impl Document {
     pub fn reopen(
         &mut self,
         bytes: &[u8],
+        stamp: Option<crate::remote::Stamp>,
         encoding: text::encoding::Encoding,
         cx: &mut Context<Self>,
     ) {
         let text = text::encoding::decode_as(bytes, encoding);
         self.reload(&text, cx);
+        self.stamp = stamp;
         self.encoding = encoding;
         // What could not be saved in the old one is no longer true.
         if !self.read_only {
@@ -1033,6 +1048,8 @@ impl Document {
         let text = self.text.text_for_save();
         let version = self.text.version();
         let encoding = self.encoding;
+        let stamp = self.stamp.clone();
+        let saved_path = path.clone();
         cx.spawn(async move |this, cx| {
             // In the encoding it was read in. A character that encoding
             // has no byte for is said, never written as another.
@@ -1041,11 +1058,20 @@ impl Document {
                 .spawn(async move {
                     let bytes = text::encoding::encode(&text, encoding)
                         .map_err(|character| SaveFailure::Encoding(character, encoding))?;
-                    std::fs::write(&path, bytes).map_err(SaveFailure::Io)
+                    crate::remote::write_versioned(&path, &bytes, stamp.as_ref())
+                        .map_err(SaveFailure::Io)
                 })
                 .await;
             this.update(cx, |this, cx| match result {
-                Ok(()) => {
+                Ok(stamp) => {
+                    if this.path.as_ref() != Some(&saved_path) {
+                        this.notice = Some(
+                            crate::lang::t("The file path changed during save. Save again.").into(),
+                        );
+                        cx.emit(DocumentEvent::DirtyChanged);
+                        return false;
+                    }
+                    this.stamp = stamp;
                     if this.text.version() == version {
                         this.text.mark_saved();
                     }
@@ -1108,6 +1134,7 @@ impl Document {
 
     pub fn set_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.path = Some(path);
+        self.stamp = None;
         self.blame = Arc::default();
         self.blame_error = None;
         self.refresh_blame(cx);
@@ -1115,6 +1142,13 @@ impl Document {
         self.syntax_generation += 1;
         self.initial_parse(cx);
         cx.emit(DocumentEvent::PathChanged);
+    }
+
+    /// A rename keeps the revision that was opened; Save As does not.
+    pub fn renamed(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let stamp = self.stamp.take();
+        self.set_path(path, cx);
+        self.stamp = stamp;
     }
 
     // ------------------------------------------------------------ syntax
@@ -1254,6 +1288,58 @@ mod tests {
         assert_eq!(failure.message(), "Не сохранено: disk detail");
         crate::lang::set(crate::lang::Language::English);
         assert_eq!(failure.message(), "Not saved: disk detail");
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn remote_documents_keep_their_own_revisions_and_encoding(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let directory = db::testing::dir("document-remote").canonicalize().unwrap();
+        let source = directory.join("server");
+        let cache = directory.join("cache");
+        std::fs::create_dir(&source).unwrap();
+        let file = source.join("file.txt");
+        std::fs::write(&file, [0xff, 0xfe, b'A', 0, b'\n', 0]).unwrap();
+        let mount = crate::remote::fixture(&source, &cache);
+        let path = cache.join("file.txt");
+        let loaded = load(&path).unwrap();
+        let first = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+        // Another reader must not replace the revision the first document owns.
+        std::fs::write(&file, [0xff, 0xfe, b'B', 0, b'\n', 0]).unwrap();
+        let next = load(&path).unwrap();
+        let second = cx.new(|cx| Document::open(path.clone(), &next, cx));
+        first.update(cx, |doc, cx| {
+            doc.apply_edits(vec![(0..1, "C".into())], None, cx)
+        });
+        assert!(!first.update(cx, |doc, cx| doc.save(cx)).await);
+        assert!(first.read_with(cx, |doc, _| doc.is_dirty() && doc.notice().is_some()));
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            [0xff, 0xfe, b'B', 0, b'\n', 0]
+        );
+        second.update(cx, |doc, cx| {
+            doc.apply_edits(vec![(0..1, "D".into())], None, cx)
+        });
+        assert!(second.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            [0xff, 0xfe, b'D', 0, b'\n', 0]
+        );
+        crate::remote::rename(&path, &cache.join("renamed.txt")).unwrap();
+        second.update(cx, |doc, cx| doc.renamed(cache.join("renamed.txt"), cx));
+        second.update(cx, |doc, cx| {
+            doc.apply_edits(vec![(0..1, "E".into())], None, cx)
+        });
+        assert!(second.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(
+            std::fs::read(source.join("renamed.txt")).unwrap(),
+            [0xff, 0xfe, b'E', 0, b'\n', 0]
+        );
+        drop(mount);
+        second.update(cx, |doc, cx| {
+            doc.apply_edits(vec![(0..1, "F".into())], None, cx)
+        });
+        assert!(!second.update(cx, |doc, cx| doc.save(cx)).await);
     }
 
     #[test]

@@ -3,11 +3,7 @@
 
 use crate::git::{GitError, Repo, Result};
 use crate::lang::{t, tf};
-use std::{
-    ffi::OsStr,
-    path::Path,
-    process::{Command, Stdio},
-};
+use std::{path::Path, process::Stdio};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -58,21 +54,14 @@ impl PullRequest {
 }
 
 pub fn read(repo: &Repo, branch: &str, program: &Path) -> Result<PullRequest> {
-    let out = Command::new(program)
-        .current_dir(&repo.workdir)
-        .args([
-            OsStr::new("pr"),
-            OsStr::new("view"),
-            OsStr::new(branch),
-            OsStr::new("--json"),
-            OsStr::new("number,title,url,state,isDraft,headRefName,baseRefName,statusCheckRollup"),
-        ])
-        .env("GH_PROMPT_DISABLED", "true")
-        .env("NO_COLOR", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+    let out = read_command(repo, branch, program)
+        .and_then(|mut command| {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+        })
         .map_err(|e| {
             GitError(if e.kind() == std::io::ErrorKind::NotFound {
                 t("Install GitHub CLI (gh) to read pull requests.").into()
@@ -89,6 +78,64 @@ pub fn read(repo: &Repo, branch: &str, program: &Path) -> Result<PullRequest> {
         return Err(GitError(message));
     }
     parse(&out.stdout)
+}
+
+fn read_command(
+    repo: &Repo,
+    branch: &str,
+    program: &Path,
+) -> std::io::Result<std::process::Command> {
+    let remote = crate::remote::is_remote(&repo.workdir);
+    if remote && crate::remote::is_remote(program) {
+        let target = crate::git::command_path(&repo.workdir, program)?;
+        return read_command_with(repo, branch, Path::new(&target), crate::remote::command);
+    }
+    read_command_with(repo, branch, program, |cwd, name, args, env| {
+        if program.to_str().is_some() {
+            crate::remote::command(cwd, name, args, env)
+        } else if remote {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                t("Cannot map the remote repository path."),
+            ))
+        } else {
+            // Native executable names may contain non-UTF-8 bytes locally.
+            let mut command = std::process::Command::new(program);
+            command.current_dir(cwd).args(args);
+            for (key, value) in env {
+                command.env(key, value);
+            }
+            Ok(command)
+        }
+    })
+}
+
+fn read_command_with(
+    repo: &Repo,
+    branch: &str,
+    program: &Path,
+    launch: impl FnOnce(
+        &Path,
+        &str,
+        &[String],
+        &[(String, String)],
+    ) -> std::io::Result<std::process::Command>,
+) -> std::io::Result<std::process::Command> {
+    launch(
+        &repo.workdir,
+        &program.to_string_lossy(),
+        &[
+            "pr".into(),
+            "view".into(),
+            branch.into(),
+            "--json".into(),
+            "number,title,url,state,isDraft,headRefName,baseRefName,statusCheckRollup".into(),
+        ],
+        &[
+            ("GH_PROMPT_DISABLED".into(), "true".into()),
+            ("NO_COLOR".into(), "1".into()),
+        ],
+    )
 }
 
 fn link(value: &serde_json::Value) -> Option<String> {
@@ -148,6 +195,30 @@ fn parse(bytes: &[u8]) -> Result<PullRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routing_keeps_the_branch_and_target_environment_raw() {
+        let repo = Repo {
+            workdir: "/virtual/cache/repo".into(),
+        };
+        let branch = "feature/virtual-cache-repo";
+        let command =
+            read_command_with(&repo, branch, Path::new("gh"), |cwd, program, args, env| {
+                assert_eq!(cwd, repo.workdir);
+                assert_eq!(program, "gh");
+                assert_eq!(&args[..4], &["pr", "view", branch, "--json"]);
+                assert_eq!(
+                    env,
+                    &[
+                        ("GH_PROMPT_DISABLED".into(), "true".into()),
+                        ("NO_COLOR".into(), "1".into())
+                    ]
+                );
+                Ok(std::process::Command::new("fake-ssh"))
+            })
+            .unwrap();
+        assert_eq!(command.get_program(), "fake-ssh");
+    }
 
     #[test]
     fn russian_labels_keep_provider_states_and_names_unchanged() {

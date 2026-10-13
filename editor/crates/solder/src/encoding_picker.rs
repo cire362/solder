@@ -85,14 +85,23 @@ impl PickerDelegate for EncodingPicker {
                 let path = document.read(cx).path().map(std::path::Path::to_path_buf);
                 let clean = !document.read(cx).is_dirty();
                 if let Some(path) = path.filter(|_| clean) {
+                    let version = document.read(cx).version();
+                    let opened = path.clone();
                     cx.spawn(async move |_, cx| {
                         let read = cx
                             .background_executor()
-                            .spawn(async move { std::fs::read(&path) })
+                            .spawn(async move { crate::remote::read_versioned(&path) })
                             .await;
-                        if let Ok(bytes) = read {
+                        if let Ok((bytes, stamp)) = read {
                             document
-                                .update(cx, |document, cx| document.reopen(&bytes, encoding, cx))
+                                .update(cx, |document, cx| {
+                                    if document.version() == version
+                                        && document.path() == Some(opened.as_path())
+                                        && !document.is_dirty()
+                                    {
+                                        document.reopen(&bytes, stamp, encoding, cx);
+                                    }
+                                })
                                 .ok();
                         }
                     })

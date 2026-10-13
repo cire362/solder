@@ -14,7 +14,9 @@ use gpui::{
     App, AppContext, Context, Entity, EntityId, Global, SharedString, Subscription, Task,
     WeakEntity,
 };
-use lsp::{Encoding, LanguageServer, Notification, ServerCommand, path_to_uri, types as lt};
+use lsp::{
+    Encoding, LanguageServer, Notification, PathMap, ServerCommand, path_to_uri, types as lt,
+};
 use text::{Buffer, Point};
 
 use crate::{
@@ -107,10 +109,145 @@ pub fn spec_for(language: &str) -> Option<ServerSpec> {
 /// Nearest ancestor of `file` holding one of `markers`, else its folder.
 fn find_root(file: &Path, markers: &[&str]) -> PathBuf {
     let dir = file.parent().unwrap_or(file);
+    if crate::remote::is_remote(file) {
+        // Cache placeholders do not prove where a remote project's markers
+        // are. Keep every process server inside its registered mount instead.
+        return crate::remote::mount(file)
+            .ok()
+            .flatten()
+            .map(|mount| mount.root.clone())
+            .unwrap_or_else(|| dir.to_path_buf());
+    }
     dir.ancestors()
         .find(|d| markers.iter().any(|m| d.join(m).exists()))
         .unwrap_or(dir)
         .to_path_buf()
+}
+
+fn builtin_named(name: &str) -> Option<ServerSpec> {
+    [
+        "Rust",
+        "TypeScript",
+        "Go",
+        "Python",
+        "CSS",
+        "C",
+        "YAML",
+        "JSON",
+    ]
+    .into_iter()
+    .filter_map(spec_for)
+    .find(|spec| spec.name == name)
+}
+
+fn remote_extension_command(
+    name: &str,
+    overrides: &crate::settings::ServerOverride,
+) -> Option<ServerCommand> {
+    let native = builtin_named(name);
+    let program = overrides
+        .command
+        .as_deref()
+        .or_else(|| native.map(|spec| spec.program))?;
+    if program.trim().is_empty() {
+        return None;
+    }
+    Some(ServerCommand {
+        program: program.into(),
+        args: overrides.args.clone().unwrap_or_else(|| {
+            native
+                .map(|spec| spec.args.iter().map(|arg| arg.to_string()).collect())
+                .unwrap_or_default()
+        }),
+        env: Vec::new(),
+    })
+}
+
+type Spawned = (
+    Arc<LanguageServer>,
+    futures::channel::mpsc::UnboundedReceiver<Notification>,
+);
+
+/// Preserves the transport's argv instead of reconstructing its shell text.
+fn server_command(command: &std::process::Command) -> lsp::Result<ServerCommand> {
+    let string = |value: &std::ffi::OsStr| {
+        value
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| lsp::Error::Io("The server command is not UTF-8".into()))
+    };
+    let args = command.get_args().map(string).collect::<lsp::Result<_>>()?;
+    let env = command
+        .get_envs()
+        .map(|(key, value)| {
+            let value = value.ok_or_else(|| {
+                lsp::Error::Io("The server command cannot remove environment variables".into())
+            })?;
+            Ok((string(key)?, string(value)?))
+        })
+        .collect::<lsp::Result<_>>()?;
+    Ok(ServerCommand {
+        program: command.get_program().into(),
+        args,
+        env,
+    })
+}
+
+/// Everything that starts a process, including remote command preparation,
+/// belongs on the background executor. A closed mount never falls back locally.
+fn spawn_process(name: &str, command: &ServerCommand, root: &Path) -> lsp::Result<Spawned> {
+    if !crate::remote::is_remote(root) {
+        return LanguageServer::spawn(name, command, root);
+    }
+    let remote_root = crate::remote::remote_path(root)
+        .ok_or_else(|| lsp::Error::Io("The remote project connection is closed".into()))?;
+    let map = PathMap::new(root, remote_root)?;
+    let program = command
+        .program
+        .to_str()
+        .ok_or_else(|| lsp::Error::Io("The server command is not UTF-8".into()))?;
+    let mount = crate::remote::mount(root)
+        .map_err(|error| lsp::Error::Io(error.to_string()))?
+        .ok_or_else(|| lsp::Error::Io("The remote project connection is closed".into()))?;
+    let resolved = if mount.is_mirror() && !program.contains('/') {
+        mount
+            .which(program)
+            .map_err(|error| lsp::Error::Io(error.to_string()))?
+    } else {
+        None
+    };
+    let program = resolved.as_deref().unwrap_or(program);
+    let wrapped = crate::remote::command(root, program, &command.args, &command.env)
+        .map_err(|error| lsp::Error::Io(error.to_string()))?;
+    LanguageServer::spawn_mapped(name, &server_command(&wrapped)?, root, map)
+}
+
+fn uri_in_root(uri: &lt::Uri, root: &Path) -> bool {
+    uri.scheme()
+        .is_some_and(|scheme| scheme.as_str().eq_ignore_ascii_case("file"))
+        && lsp::uri_to_path(uri).is_some_and(|path| {
+            path.starts_with(root)
+                && !path
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir)
+        })
+}
+
+fn keep_project_symbols(symbols: &mut lt::WorkspaceSymbolResponse, root: &Path) {
+    match symbols {
+        lt::WorkspaceSymbolResponse::Flat(symbols) => {
+            symbols.retain(|symbol| uri_in_root(&symbol.location.uri, root));
+        }
+        lt::WorkspaceSymbolResponse::Nested(symbols) => {
+            symbols.retain(|symbol| {
+                let uri = match &symbol.location {
+                    lt::OneOf::Left(location) => &location.uri,
+                    lt::OneOf::Right(location) => &location.uri,
+                };
+                uri_in_root(uri, root)
+            });
+        }
+    }
 }
 
 /// Project-local `node_modules/.bin` first, then `PATH`, then the usual
@@ -302,6 +439,8 @@ pub struct LspStore {
     starts: HashMap<ServerKey, u64>,
     /// Latest progress or error message, shown in the status bar.
     status: Option<SharedString>,
+    /// Configuration notices survive another server finishing its startup.
+    remote_unconfigured: HashMap<ServerKey, SharedString>,
     /// Which servers the settings chose when the documents were last
     /// given theirs.
     chosen: Choice,
@@ -330,21 +469,18 @@ pub struct Problem {
 const PROBLEMS_OF_A_FILE: usize = 500;
 const FILES_WITH_PROBLEMS: usize = 2000;
 
-/// What the settings say of which servers start: the choice of each
-/// language, and the servers turned off by name.
+/// Which servers start and their overrides. A remote command configured
+/// after a notice must be retried without reopening the project.
 type Choice = (
     std::collections::BTreeMap<String, crate::settings::LanguageSettings>,
-    Vec<String>,
+    std::collections::BTreeMap<String, crate::settings::ServerOverride>,
 );
 
 fn choice(settings: &Settings) -> Choice {
-    let off = settings
-        .language_servers
-        .iter()
-        .filter(|(_, server)| server.disabled)
-        .map(|(name, _)| name.clone())
-        .collect();
-    (settings.languages.clone(), off)
+    (
+        settings.languages.clone(),
+        settings.language_servers.clone(),
+    )
 }
 
 /// A server asked the client to apply an edit (usually after a code action
@@ -400,6 +536,7 @@ pub fn init(cx: &mut App) {
                 .update(cx, |store, cx| {
                     let now = choice(Settings::get(cx));
                     if store.chosen != now {
+                        store.remote_settings_changed(&now, cx);
                         store.chosen = now;
                         store.extension_servers_changed(cx);
                     }
@@ -637,16 +774,19 @@ impl LspStore {
                     name: spec.name,
                     root: find_root(path, spec.root_markers),
                 };
-                // Extensions that were not asked yet what they add to it.
-                let set_up = self.set_up.entry(key.clone()).or_default();
-                let fresh: Vec<ExtensionServer> = brought
-                    .iter()
-                    .filter(|server| !set_up.asked.contains(&server.id))
-                    .cloned()
-                    .collect();
-                set_up.asked.extend(fresh.iter().map(|s| s.id.clone()));
-                if !fresh.is_empty() {
-                    asking = Some((key.clone(), spec, fresh));
+                // Additions can provision local extension binaries too.
+                // Remote servers use only options configured for the target.
+                if !crate::remote::is_remote(path) {
+                    let set_up = self.set_up.entry(key.clone()).or_default();
+                    let fresh: Vec<ExtensionServer> = brought
+                        .iter()
+                        .filter(|server| !set_up.asked.contains(&server.id))
+                        .cloned()
+                        .collect();
+                    set_up.asked.extend(fresh.iter().map(|s| s.id.clone()));
+                    if !fresh.is_empty() {
+                        asking = Some((key.clone(), spec, fresh));
+                    }
                 }
                 wanted.push((Attached::new(key, language_id), Some(spec), None));
             }
@@ -794,6 +934,10 @@ impl LspStore {
         servers: Vec<ExtensionServer>,
         cx: &mut Context<Self>,
     ) {
+        if crate::remote::is_remote(&key.root) {
+            self.start(key, spec, cx);
+            return;
+        }
         let store = crate::extension_store::ExtensionStore::global(cx);
         let adding = store.update(cx, |store, cx| {
             store.additions(spec.name, servers, &key.root, cx)
@@ -869,7 +1013,103 @@ impl LspStore {
         for id in self.docs.keys().copied().collect::<Vec<_>>() {
             self.attach(id, cx);
         }
+        let was_notice = self.status.as_ref().is_some_and(|status| {
+            self.remote_unconfigured
+                .values()
+                .any(|notice| notice == status)
+        });
+        let docs = &self.docs;
+        self.remote_unconfigured.retain(|key, _| {
+            docs.values()
+                .any(|entry| entry.servers.iter().any(|attached| attached.key == *key))
+        });
+        if was_notice {
+            self.status = self.remote_unconfigured.values().next().cloned();
+        }
         cx.emit(LspStoreEvent::ServersChanged);
+    }
+
+    fn remote_settings_changed(&mut self, now: &Choice, cx: &mut Context<Self>) {
+        let changed: Vec<ServerKey> = self
+            .servers
+            .keys()
+            .filter(|key| {
+                crate::remote::is_remote(&key.root)
+                    && self.chosen.1.get(key.name) != now.1.get(key.name)
+            })
+            .cloned()
+            .collect();
+        for key in changed {
+            if let Some(ServerState::Running { server, .. }) = self.servers.remove(&key) {
+                server.kill();
+            }
+            // A previous initialize can still be in flight.
+            *self.starts.entry(key.clone()).or_default() += 1;
+            let notice = self.remote_unconfigured.remove(&key);
+            if notice.is_some() && self.status == notice {
+                self.status = self.remote_unconfigured.values().next().cloned();
+            }
+            self.forget_problems(&key, cx);
+            for entry in self.docs.values_mut() {
+                for attached in &mut entry.servers {
+                    if attached.key == key {
+                        attached.opened = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A shared project switched to a container, or an SSH connection was
+    /// replaced. In-flight starts from its old environment must not win.
+    pub fn environment_changed(&mut self, root: &Path, cx: &mut Context<Self>) {
+        let keys = self
+            .servers
+            .keys()
+            .filter(|key| key.root.starts_with(root))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            *self.starts.entry(key.clone()).or_default() += 1;
+            if let Some(ServerState::Running { server, .. }) = self.servers.remove(&key) {
+                cx.background_executor()
+                    .spawn(async move {
+                        server.kill();
+                    })
+                    .detach();
+            }
+            self.set_up.remove(&key);
+            self.hosts.remove(&key);
+            self.remote_unconfigured.remove(&key);
+            self.forget_problems(&key, cx);
+            for entry in self.docs.values_mut() {
+                for attached in &mut entry.servers {
+                    if attached.key == key {
+                        attached.opened = false;
+                    }
+                }
+            }
+        }
+        let documents = self
+            .docs
+            .iter()
+            .filter_map(|(id, entry)| {
+                entry
+                    .document
+                    .upgrade()
+                    .filter(|doc| {
+                        doc.read(cx)
+                            .path()
+                            .is_some_and(|path| path.starts_with(root))
+                    })
+                    .map(|_| *id)
+            })
+            .collect::<Vec<_>>();
+        for id in documents {
+            self.attach(id, cx);
+        }
+        cx.emit(LspStoreEvent::ServersChanged);
+        cx.notify();
     }
 
     /// Which VS Code extensions answer for which languages changed, or
@@ -905,6 +1145,8 @@ impl LspStore {
     /// Takes the host of a VS Code extension as a server. It runs already
     /// and only has to say what it can do.
     fn start_from_host(&mut self, key: ServerKey, cx: &mut Context<Self>) {
+        // Linked providers remain local and see local document URIs. Their
+        // text features may work remotely; host filesystem APIs are not mapped.
         let store = crate::extension_store::ExtensionStore::global(cx);
         let linked = store.update(cx, |store, _| store.language_server(key.name));
         let Some((server, notifications, number)) = linked else {
@@ -940,6 +1182,36 @@ impl LspStore {
         server: ExtensionServer,
         cx: &mut Context<Self>,
     ) {
+        if crate::remote::is_remote(&key.root) {
+            // A known native server with the same name can run on the
+            // target without asking the extension for its local binary.
+            let overrides = Settings::get(cx)
+                .language_servers
+                .get(key.name)
+                .cloned()
+                .unwrap_or_default();
+            let Some(command) = remote_extension_command(key.name, &overrides) else {
+                let notice: SharedString = crate::lang::tf(
+                    "Set language_servers.{}.command to a program on the target",
+                    &[&key.name],
+                )
+                .into();
+                self.status = Some(notice.clone());
+                self.remote_unconfigured.insert(key.clone(), notice);
+                self.servers.insert(key, ServerState::Failed);
+                cx.notify();
+                return;
+            };
+            self.start_command(
+                key,
+                command,
+                overrides.initialization_options,
+                overrides.settings,
+                None,
+                cx,
+            );
+            return;
+        }
         self.servers.insert(key.clone(), ServerState::Starting);
         self.status = Some(crate::lang::tf("Getting {} ready...", &[&server.name]).into());
         cx.notify();
@@ -1025,6 +1297,7 @@ impl LspStore {
             .unwrap_or_default();
         let program = match overrides.command.as_deref() {
             Some(cmd) => Some(PathBuf::from(cmd)),
+            None if crate::remote::is_remote(&key.root) => Some(PathBuf::from(spec.program)),
             None => find_program(spec.program, &key.root),
         };
         let Some(program) = program else {
@@ -1044,14 +1317,12 @@ impl LspStore {
                 .unwrap_or_else(|| spec.args.iter().map(|a| a.to_string()).collect()),
             env: Vec::new(),
         };
-        self.servers.insert(key.clone(), ServerState::Starting);
-        self.status = Some(crate::lang::tf("Starting {}...", &[&spec.name]).into());
-        cx.notify();
         // The user's options, and on top of them what extensions add.
         let mut options = overrides.initialization_options;
         let (added, mut settings) = self
             .set_up
             .get(&key)
+            .filter(|_| !crate::remote::is_remote(&key.root))
             .map(|set_up| (set_up.options.clone(), set_up.settings.clone()))
             .unwrap_or_default();
         // The settings the user gave the server, over what extensions add.
@@ -1065,14 +1336,32 @@ impl LspStore {
             (None, Some(added)) => options = Some(added),
             (_, None) => {}
         }
+        self.start_command(key, command, options, settings, Some(spec.install_hint), cx);
+    }
+
+    fn start_command(
+        &mut self,
+        key: ServerKey,
+        command: ServerCommand,
+        options: Option<serde_json::Value>,
+        settings: Option<serde_json::Value>,
+        install_hint: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
+        let remote = crate::remote::is_remote(&key.root);
+        self.remote_unconfigured.remove(&key);
+        self.servers.insert(key.clone(), ServerState::Starting);
+        self.status = Some(crate::lang::tf("Starting {}...", &[&key.name]).into());
+        cx.notify();
         let starts = self.starts.entry(key.clone()).or_default();
         *starts += 1;
         let this_start = *starts;
         cx.spawn(async move |this, cx| {
             let root = key.root.clone();
+            let name = key.name;
             let spawned = cx
                 .background_executor()
-                .spawn(async move { LanguageServer::spawn(spec.name, &command, &root) })
+                .spawn(async move { spawn_process(name, &command, &root) })
                 .await;
             let result = match spawned {
                 Ok((server, notifications)) => server
@@ -1093,10 +1382,17 @@ impl LspStore {
                     this.started(key, server, notifications, cx)
                 }
                 Err(err) => {
-                    let message = crate::lang::tf(
-                        "{} failed to start: {}. {}",
-                        &[&spec.name, &err, &spec.install_hint],
-                    );
+                    let message = if remote {
+                        crate::lang::tf(
+                            "Remote server {} failed to start: {}. Check the target program in language_servers.{}.command",
+                            &[&key.name, &err, &key.name],
+                        )
+                    } else {
+                        crate::lang::tf(
+                            "{} failed to start: {}. {}",
+                            &[&key.name, &err, &install_hint.unwrap_or_default()],
+                        )
+                    };
                     this.status = Some(message.clone().into());
                     this.servers.insert(key, ServerState::Failed);
                     cx.notify();
@@ -1125,7 +1421,7 @@ impl LspStore {
                 }
             }
         });
-        self.status = None;
+        self.status = self.remote_unconfigured.values().next().cloned();
         self.servers.insert(
             key.clone(),
             ServerState::Running {
@@ -1429,6 +1725,9 @@ impl LspStore {
                 else {
                     return;
                 };
+                if crate::remote::is_remote(&key.root) && !uri_in_root(&params.uri, &key.root) {
+                    return;
+                }
                 let Some(server) = self.server(key).cloned() else {
                     return;
                 };
@@ -1551,7 +1850,9 @@ impl LspStore {
                         r.message.as_deref(),
                         r.percentage,
                     )),
-                    lt::WorkDoneProgress::End(_) => None,
+                    lt::WorkDoneProgress::End(_) => {
+                        self.remote_unconfigured.values().next().cloned()
+                    }
                 };
                 cx.notify();
             }
@@ -1694,8 +1995,17 @@ impl LspStore {
                     work_done_progress_params: Default::default(),
                     partial_result_params: Default::default(),
                 };
+                let project = crate::remote::is_remote(root).then(|| root.to_path_buf());
                 let request = server
                     .request::<lt::request::WorkspaceSymbolRequest>(params)
+                    .map(move |answer| {
+                        answer.map(|mut symbols| {
+                            if let (Some(project), Some(symbols)) = (&project, &mut symbols) {
+                                keep_project_symbols(symbols, project);
+                            }
+                            symbols
+                        })
+                    })
                     .boxed();
                 Some((key.name, server.encoding(), request))
             })
@@ -2000,6 +2310,128 @@ pub fn from_range(buffer: &Buffer, range: lt::Range, encoding: Encoding) -> Rang
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_extensions_need_target_commands_but_known_native_servers_do_not() {
+        let mut overrides = crate::settings::ServerOverride::default();
+        assert!(remote_extension_command("marksman", &overrides).is_none());
+        let native = remote_extension_command("pyright", &overrides).unwrap();
+        assert_eq!(native.program, Path::new("pyright-langserver"));
+        assert_eq!(native.args, ["--stdio"]);
+        overrides.command = Some("/target/bin/server".into());
+        overrides.args = Some(vec!["--stdio".into(), "a b 日本語".into()]);
+        let explicit = remote_extension_command("marksman", &overrides).unwrap();
+        assert_eq!(explicit.program, Path::new("/target/bin/server"));
+        assert_eq!(explicit.args, ["--stdio", "a b 日本語"]);
+        assert!(explicit.env.is_empty());
+        overrides.command = Some(" ".into());
+        assert!(remote_extension_command("marksman", &overrides).is_none());
+    }
+
+    #[test]
+    fn wrapped_commands_preserve_arguments_and_environment_without_shell_reparsing() {
+        let mut command = std::process::Command::new("ssh");
+        command.args([
+            "-T",
+            "user@host",
+            "cd '/target/a b' && exec 'server' '日本語'",
+            "",
+        ]);
+        command.env("LSP_TEST", "a b '日本語'");
+        let converted = server_command(&command).unwrap();
+        assert_eq!(converted.program, Path::new("ssh"));
+        assert_eq!(
+            converted.args,
+            [
+                "-T",
+                "user@host",
+                "cd '/target/a b' && exec 'server' '日本語'",
+                ""
+            ]
+        );
+        assert_eq!(converted.env, [("LSP_TEST".into(), "a b '日本語'".into())]);
+        command.env_remove("LSP_REMOVE");
+        assert!(server_command(&command).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapped_non_utf8_arguments_are_reported_without_lossy_substitution() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut command = std::process::Command::new("ssh");
+        command.arg(std::ffi::OsString::from_vec(vec![0xff]));
+        assert!(server_command(&command).is_err());
+    }
+
+    #[test]
+    fn foreign_diagnostic_and_symbol_uris_do_not_belong_to_a_remote_cache() {
+        use std::str::FromStr;
+        let root = std::env::temp_dir().join("solder remote cache 日本語");
+        let inside = path_to_uri(&root.join("src/a b.rs"));
+        assert!(uri_in_root(&inside, &root));
+        let outside = path_to_uri(
+            &root
+                .with_file_name("solder remote cache 日本語-other")
+                .join("a.rs"),
+        );
+        assert!(!uri_in_root(&outside, &root));
+        let escape = lt::Uri::from_str(&format!(
+            "{}/%2F..%2Foutside.rs",
+            path_to_uri(&root).as_str()
+        ))
+        .unwrap();
+        assert!(!uri_in_root(&escape, &root));
+        for uri in [
+            "untitled:/src/a.rs",
+            "https://host/src/a.rs",
+            "file://other-host/src/a.rs",
+        ] {
+            assert!(!uri_in_root(&lt::Uri::from_str(uri).unwrap(), &root));
+        }
+        for ranged in [false, true] {
+            let mut location = serde_json::json!({"uri": inside});
+            if ranged {
+                location["range"] = serde_json::json!({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}});
+            }
+            let mut foreign = location.clone();
+            foreign["uri"] = serde_json::json!(outside);
+            let mut symbols = serde_json::from_value(serde_json::json!([
+                {"name": "inside", "kind": 12, "location": location, "data": {"uri": "file:///target/opaque"}},
+                {"name": "outside", "kind": 12, "location": foreign}
+            ])).unwrap();
+            keep_project_symbols(&mut symbols, &root);
+            let symbols = serde_json::to_value(symbols).unwrap();
+            assert_eq!(symbols.as_array().unwrap().len(), 1);
+            assert_eq!(symbols[0]["location"]["uri"], inside.as_str());
+            if !ranged {
+                assert_eq!(symbols[0]["data"]["uri"], "file:///target/opaque");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_roots_stay_at_the_mount_and_closed_mounts_do_not_spawn_locally() {
+        let directory = db::testing::dir("lsp-remote-root").canonicalize().unwrap();
+        let source = directory.join("target");
+        let cache = directory.join("cache");
+        std::fs::create_dir_all(source.join("nested/src")).unwrap();
+        std::fs::write(source.join("nested/Cargo.toml"), "").unwrap();
+        let mount = crate::remote::fixture(&source, &cache);
+        let root = mount.root.clone();
+        assert_eq!(
+            find_root(&root.join("nested/src/a.rs"), &["Cargo.toml"]),
+            root
+        );
+        drop(mount);
+        let command = ServerCommand {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "exit 0".into()],
+            env: Vec::new(),
+        };
+        assert!(spawn_process("closed mount", &command, &root).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn the_servers_of_a_language_are_the_ones_chosen() {

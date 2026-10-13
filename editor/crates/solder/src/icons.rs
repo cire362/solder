@@ -269,6 +269,7 @@ pub fn named(name: &str) -> Option<&'static str> {
 pub fn item(item: &Item) -> &'static str {
     match item {
         Item::Project => "folder",
+        Item::Environment => "terminal-window",
         Item::File => "file",
         Item::Breadcrumbs => "list",
         Item::Branch => "git-branch",

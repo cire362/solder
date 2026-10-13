@@ -30,6 +30,31 @@ with run (tests, builds, linters) and fix what fails, keep the plan current with
 call finish with a short summary. Commands have no network and can only write inside the project; \
 ask for access only when a command truly needs it. Do not commit; Solder handles Git.";
 
+fn system_for(root: Option<&std::path::Path>) -> String {
+    let remote = root.is_some_and(crate::remote::is_remote);
+    let target = root.and_then(crate::remote::remote_path);
+    system_with_target(remote, target.as_deref())
+}
+
+fn system_with_target(remote: bool, target: Option<&str>) -> String {
+    if !remote {
+        return SYSTEM.to_string();
+    }
+    // Keep local standing instructions intact; a remote task must never
+    // inherit the assertion that its shell is confined by the client.
+    let (common, _) = SYSTEM.split_once("Commands have no network").unwrap();
+    let mut system = format!(
+        "{common}Commands run on the remote target with no sandbox. Every shell call requires the user's explicit full access approval. Do not commit; Solder handles Git."
+    );
+    if let Some(target) = target {
+        system.push_str(&format!(
+            "\nThe working directory on the target is {}.",
+            serde_json::to_string(target).unwrap()
+        ));
+    }
+    system
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
     Starting,
@@ -155,7 +180,11 @@ impl AgentTask {
             task: None,
         };
         let created = cx.background_executor().spawn(async move {
-            let sandbox = Sandbox::detect();
+            let sandbox = if crate::remote::is_remote(&repo) {
+                Sandbox::None
+            } else {
+                Sandbox::detect()
+            };
             Worktree::create(&repo, &trees, &title).map(|wt| (wt, sandbox))
         });
         this.task = Some(cx.spawn(async move |this, cx| {
@@ -277,10 +306,13 @@ impl AgentTask {
             },
             system: self.system(),
             turns,
-            tools: agent::specs(self.phase)
-                .into_iter()
-                .chain(self.mcp.iter().map(|tool| tool.spec.clone()))
-                .collect(),
+            tools: agent::specs_for(
+                self.phase,
+                self.worktree.as_ref().map(|wt| wt.path.as_path()),
+            )
+            .into_iter()
+            .chain(self.mcp.iter().map(|tool| tool.spec.clone()))
+            .collect(),
             max_tokens: 8192,
         }
     }
@@ -288,7 +320,7 @@ impl AgentTask {
     /// The standing instructions: the agent's own, then what each context
     /// server says about using it.
     fn system(&self) -> String {
-        let mut system = SYSTEM.to_string();
+        let mut system = system_for(self.worktree.as_ref().map(|wt| wt.path.as_path()));
         let mut said: Vec<&str> = Vec::new();
         for tool in &self.mcp {
             if said.contains(&tool.server_name.as_str()) {
@@ -747,6 +779,17 @@ impl AgentTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_system_names_the_target_without_claiming_local_sandboxing() {
+        let cwd = "/srv/a repo\nwith \"quotes\"";
+        let system = system_with_target(true, Some(cwd));
+        assert!(system.contains(&serde_json::to_string(cwd).unwrap()));
+        assert!(system.contains("Every shell call requires") && system.contains("no sandbox"));
+        assert!(!system.contains("Commands have no network"));
+        assert!(!system.contains("virtual/cache"));
+        assert_eq!(system_with_target(false, Some(cwd)), SYSTEM);
+    }
 
     #[test]
     fn translated_call_titles_keep_tool_names_and_model_instructions() {

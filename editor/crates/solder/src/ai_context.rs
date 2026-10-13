@@ -75,8 +75,7 @@ impl Policy {
         if !ai::context::allows_file(root) {
             return Err(crate::lang::t("This project folder is excluded from AI context.").into());
         }
-        let canonical = root
-            .canonicalize()
+        let canonical = crate::remote::canonicalize(root)
             .map_err(|_| crate::lang::t("Cannot read the project folder."))?;
         if !ai::context::allows_file(&canonical) {
             return Err(crate::lang::t("This project folder is excluded from AI context.").into());
@@ -84,29 +83,37 @@ impl Policy {
         let path = canonical.join(".solderignore");
         let mut builder = GitignoreBuilder::new(&canonical);
         let mut rules = None;
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                if !metadata.is_file() || metadata.len() > IGNORE_LIMIT {
-                    return Err(crate::lang::t("Cannot read .solderignore safely.").into());
+        if crate::remote::is_remote(&canonical) {
+            let checked = checked_path(&canonical, &path)?;
+            match crate::remote::metadata(&checked) {
+                Ok(metadata) => {
+                    if !metadata.is_file() || metadata.is_symlink() || metadata.len() > IGNORE_LIMIT
+                    {
+                        return Err(crate::lang::t("Cannot read .solderignore safely.").into());
+                    }
+                    let bytes = crate::remote::read(&checked)
+                        .map_err(|_| crate::lang::t("Cannot read .solderignore."))?;
+                    checked_path(&canonical, &checked)?;
+                    rules = Some(parse_rules(&path, bytes, &mut builder)?);
                 }
-                let mut bytes = Vec::new();
-                File::open(&path)
-                    .and_then(|file| file.take(IGNORE_LIMIT + 1).read_to_end(&mut bytes))
-                    .map_err(|_| crate::lang::t("Cannot read .solderignore."))?;
-                if bytes.len() as u64 > IGNORE_LIMIT {
-                    return Err(crate::lang::t(".solderignore is too large.").into());
-                }
-                let source = String::from_utf8(bytes)
-                    .map_err(|_| crate::lang::t(".solderignore must be UTF-8."))?;
-                for line in source.lines() {
-                    builder
-                        .add_line(Some(path.clone()), line)
-                        .map_err(|_| crate::lang::t("Invalid pattern in .solderignore."))?;
-                }
-                rules = Some(source);
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(crate::lang::t("Cannot read .solderignore.").into()),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(crate::lang::t("Cannot read .solderignore.").into()),
+        } else {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if !metadata.is_file() || metadata.len() > IGNORE_LIMIT {
+                        return Err(crate::lang::t("Cannot read .solderignore safely.").into());
+                    }
+                    let mut bytes = Vec::new();
+                    File::open(&path)
+                        .and_then(|file| file.take(IGNORE_LIMIT + 1).read_to_end(&mut bytes))
+                        .map_err(|_| crate::lang::t("Cannot read .solderignore."))?;
+                    rules = Some(parse_rules(&path, bytes, &mut builder)?);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(crate::lang::t("Cannot read .solderignore.").into()),
+            }
         }
         Ok(Self {
             root: canonical,
@@ -155,6 +162,80 @@ impl Policy {
     }
 }
 
+fn parse_rules(
+    path: &Path,
+    bytes: Vec<u8>,
+    builder: &mut GitignoreBuilder,
+) -> Result<String, String> {
+    if bytes.len() as u64 > IGNORE_LIMIT {
+        return Err(crate::lang::t(".solderignore is too large.").into());
+    }
+    let source =
+        String::from_utf8(bytes).map_err(|_| crate::lang::t(".solderignore must be UTF-8."))?;
+    for line in source.lines() {
+        builder
+            .add_line(Some(path.to_path_buf()), line)
+            .map_err(|_| crate::lang::t("Invalid pattern in .solderignore."))?;
+    }
+    Ok(source)
+}
+
+/// Resolve an existing path or its nearest existing parent before letting
+/// a file tool reach it. Target symlinks are rejected by the transport.
+pub(crate) fn checked_path(root: &Path, path: &Path) -> Result<PathBuf, String> {
+    checked_path_with(root, path, crate::remote::canonicalize, |path| {
+        if crate::remote::is_remote(path) {
+            crate::remote::metadata(path).map(|metadata| metadata.is_symlink())
+        } else {
+            fs::symlink_metadata(path).map(|metadata| metadata.file_type().is_symlink())
+        }
+    })
+}
+
+fn checked_path_with(
+    root: &Path,
+    path: &Path,
+    canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
+    is_symlink: impl Fn(&Path) -> std::io::Result<bool>,
+) -> Result<PathBuf, String> {
+    let denied = || crate::lang::t("Cannot check the project's context rules.").to_string();
+    let canonical_root = canonicalize(root).map_err(|_| denied())?;
+    let relative = path
+        .strip_prefix(root)
+        .or_else(|_| path.strip_prefix(&canonical_root))
+        .map_err(|_| denied())?;
+    if relative
+        .components()
+        .any(|part| matches!(part, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(denied());
+    }
+    let mut parent = path;
+    let mut missing = Vec::new();
+    let mut checked = loop {
+        match canonicalize(parent) {
+            Ok(checked) => break checked,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && parent != root => {
+                match is_symlink(parent) {
+                    Ok(_) => return Err(denied()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return Err(denied()),
+                }
+                missing.push(parent.file_name().ok_or_else(denied)?.to_os_string());
+                parent = parent.parent().ok_or_else(denied)?;
+            }
+            Err(_) => return Err(denied()),
+        }
+    };
+    if !checked.starts_with(&canonical_root) {
+        return Err(denied());
+    }
+    for part in missing.into_iter().rev() {
+        checked.push(part);
+    }
+    Ok(checked)
+}
+
 /// Whether one file may go to a model: the `.env` rule and the project's
 /// `.solderignore`, without walking the project. Blocks on a small read.
 pub fn allows_path(root: &Path, path: &Path) -> Result<bool, String> {
@@ -162,8 +243,7 @@ pub fn allows_path(root: &Path, path: &Path) -> Result<bool, String> {
         return Ok(false);
     }
     let policy = Policy::load(root)?;
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    Ok(policy.allows(&path, false))
+    Ok(checked_path(root, path).is_ok_and(|path| policy.allows(&path, false)))
 }
 
 pub fn prepare(input: Input, cancelled: &AtomicBool) -> Result<Prepared, String> {
@@ -178,6 +258,9 @@ pub fn prepare(input: Input, cancelled: &AtomicBool) -> Result<Prepared, String>
         });
     }
     let policy = Arc::new(Policy::load(&input.root)?);
+    if crate::remote::is_remote(&policy.root) {
+        return prepare_remote(input, &policy, cancelled);
+    }
     let filter_policy = policy.clone();
     let mut walker = WalkBuilder::new(&policy.root);
     walker
@@ -238,6 +321,210 @@ pub fn prepare(input: Input, cancelled: &AtomicBool) -> Result<Prepared, String>
         return Err(crate::lang::t("Context rules changed. Try again.").into());
     }
     Ok(Prepared { file, map })
+}
+
+fn prepare_remote(
+    input: Input,
+    policy: &Policy,
+    cancelled: &AtomicBool,
+) -> Result<Prepared, String> {
+    let (entries, limited) = remote_entries(
+        &input.root,
+        &policy.root,
+        usize::MAX,
+        SCAN_LIMIT,
+        true,
+        cancelled,
+    )?;
+    let paths: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| !entry.directory)
+        .map(|entry| entry.path)
+        .collect();
+    let files: HashSet<_> = paths.iter().cloned().collect();
+    if input
+        .history
+        .iter()
+        .any(|path| !policy.indexed(path, &files))
+    {
+        return Err(crate::lang::t("Context rules changed. Start a new chat.").into());
+    }
+    let file = input
+        .file
+        .filter(|file| policy.indexed(&file.source, &files));
+    let map = if input.project {
+        Some(build_map(
+            policy,
+            paths,
+            &input.question,
+            file.as_ref(),
+            limited,
+            cancelled,
+        )?)
+    } else {
+        None
+    };
+    if Policy::load(&input.root)?.rules != policy.rules {
+        return Err(crate::lang::t("Context rules changed. Try again.").into());
+    }
+    Ok(Prepared { file, map })
+}
+
+pub(crate) struct RemoteEntry {
+    pub path: PathBuf,
+    pub directory: bool,
+}
+
+/// Mirror names are an inventory only. File types, canonical paths and
+/// ignore-file bytes are checked on the target before they are used.
+pub(crate) fn remote_entries(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    limit: usize,
+    respect_ignore: bool,
+    cancelled: &AtomicBool,
+) -> Result<(Vec<RemoteEntry>, bool), String> {
+    let policy = Policy::load(root)?;
+    let dir = checked_path(root, dir)?;
+    let failed = || crate::lang::t("Cannot check the project's context rules.").to_string();
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(crate::lang::t("Context preparation stopped.").into());
+    }
+    let mut inherited = Vec::new();
+    if respect_ignore {
+        let mut ancestor = policy.root.clone();
+        for part in dir
+            .strip_prefix(&policy.root)
+            .map_err(|_| failed())?
+            .components()
+        {
+            inherited.extend(remote_ignore(&policy.root, &ancestor)?);
+            ancestor.push(part);
+        }
+    }
+    let metadata = crate::remote::metadata(&dir).map_err(|_| failed())?;
+    if metadata.is_file() {
+        let allowed = policy.allows(&dir, false) && !ignored_by(&inherited, &dir, false);
+        return Ok((
+            if allowed {
+                vec![RemoteEntry {
+                    path: dir,
+                    directory: false,
+                }]
+            } else {
+                Vec::new()
+            },
+            false,
+        ));
+    }
+    if !metadata.is_dir() || metadata.is_symlink() {
+        return Err(failed());
+    }
+    crate::remote::sync_tree(&dir).map_err(|_| failed())?;
+    let mut stack = vec![(dir, depth, inherited)];
+    let mut entries = Vec::new();
+    let mut visited = 0;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while let Some((dir, depth, mut rules)) = stack.pop() {
+        if respect_ignore {
+            rules.extend(remote_ignore(&policy.root, &dir)?);
+        }
+        // read_dir supplies names, never bytes or trusted file types.
+        let mut names: Vec<_> = fs::read_dir(&dir)
+            .map_err(|_| failed())?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<_>>()
+            .map_err(|_| failed())?;
+        names.sort();
+        let mut children = Vec::new();
+        for name in names {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(crate::lang::t("Context preparation stopped.").into());
+            }
+            if visited >= limit || Instant::now() >= deadline {
+                return Ok((entries, true));
+            }
+            visited += 1;
+            let path = dir.join(name);
+            // Remote agent checkouts live inside this repository. Walking
+            // them here would attach duplicate trees and other tasks.
+            if path
+                .strip_prefix(&policy.root)
+                .is_ok_and(|relative| relative.starts_with(".solder/worktrees"))
+            {
+                continue;
+            }
+            if !policy.allows(&path, false) && !policy.allows(&path, true) {
+                continue;
+            }
+            // A symlink may name private data even if its own name is
+            // allowed. It contributes neither a file nor a directory.
+            let Ok(path) = checked_path(&policy.root, &path) else {
+                continue;
+            };
+            let metadata = match crate::remote::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(failed()),
+            };
+            if metadata.is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
+                continue;
+            }
+            let directory = metadata.is_dir();
+            if !policy.allows(&path, directory) || ignored_by(&rules, &path, directory) {
+                continue;
+            }
+            if directory && depth > 1 {
+                children.push((path.clone(), depth - 1, rules.clone()));
+            }
+            if path.to_str().is_some() {
+                entries.push(RemoteEntry { path, directory });
+            }
+        }
+        stack.extend(children.into_iter().rev());
+    }
+    Ok((entries, false))
+}
+
+fn ignored_by(rules: &[Arc<Gitignore>], path: &Path, directory: bool) -> bool {
+    for rule in rules.iter().rev() {
+        let matched = rule.matched_path_or_any_parents(path, directory);
+        if !matched.is_none() {
+            return matched.is_ignore();
+        }
+    }
+    false
+}
+
+fn remote_ignore(root: &Path, dir: &Path) -> Result<Vec<Arc<Gitignore>>, String> {
+    let failed = || crate::lang::t("Cannot check the project's context rules.").to_string();
+    let mut rules = Vec::new();
+    for name in [".gitignore", ".ignore"] {
+        let path = checked_path(root, &dir.join(name))?;
+        let metadata = match crate::remote::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(failed()),
+        };
+        if !metadata.is_file() || metadata.is_symlink() || metadata.len() > IGNORE_LIMIT {
+            return Err(failed());
+        }
+        let bytes = crate::remote::read(&path).map_err(|_| failed())?;
+        if bytes.len() as u64 > IGNORE_LIMIT {
+            return Err(failed());
+        }
+        checked_path(root, &path)?;
+        let source = String::from_utf8(bytes).map_err(|_| failed())?;
+        let mut builder = GitignoreBuilder::new(dir);
+        for line in source.lines() {
+            builder
+                .add_line(Some(path.clone()), line)
+                .map_err(|_| failed())?;
+        }
+        rules.push(Arc::new(builder.build().map_err(|_| failed())?));
+    }
+    Ok(rules)
 }
 
 fn build_map(
@@ -336,6 +623,28 @@ fn build_map(
 }
 
 fn read_source(path: &Path, budget: &mut u64) -> Option<String> {
+    if crate::remote::is_remote(path) {
+        if crate::remote::canonicalize(path).ok()?.as_path() != path {
+            return None;
+        }
+        let metadata = crate::remote::metadata(path).ok()?;
+        let size = metadata.len();
+        if !metadata.is_file() || metadata.is_symlink() || size > SOURCE_LIMIT || size > *budget {
+            return None;
+        }
+        *budget -= size;
+        let bytes = crate::remote::read(path).ok()?;
+        let after = crate::remote::metadata(path).ok()?;
+        if bytes.len() as u64 != size
+            || bytes.contains(&0)
+            || after.len() != size
+            || after.modified().ok()? != metadata.modified().ok()?
+            || crate::remote::canonicalize(path).ok()?.as_path() != path
+        {
+            return None;
+        }
+        return String::from_utf8(bytes).ok();
+    }
     if path.canonicalize().ok()?.as_path() != path {
         return None;
     }
@@ -359,6 +668,84 @@ fn read_source(path: &Path, budget: &mut u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_canonicalization_fails_closed_and_checks_missing_parents() {
+        let root = Path::new("/virtual/cache/repo");
+        let missing = root.join("new/file.rs");
+        let absent = || std::io::Error::new(std::io::ErrorKind::NotFound, "absent on target");
+        let checked = checked_path_with(
+            root,
+            &missing,
+            |path| {
+                if path == root {
+                    Ok(root.to_path_buf())
+                } else {
+                    Err(absent())
+                }
+            },
+            |_| Err(absent()),
+        )
+        .unwrap();
+        assert_eq!(checked, missing);
+        assert!(
+            checked_path_with(
+                root,
+                &missing,
+                |path| {
+                    if path == root {
+                        Ok(root.to_path_buf())
+                    } else if path == root.join("new") {
+                        Ok("/outside".into())
+                    } else {
+                        Err(absent())
+                    }
+                },
+                |_| Err(absent())
+            )
+            .is_err()
+        );
+        assert!(
+            checked_path_with(
+                root,
+                &missing,
+                |path| {
+                    if path == root {
+                        Ok(root.to_path_buf())
+                    } else {
+                        Err(absent())
+                    }
+                },
+                |path| if path == root.join("new") {
+                    Ok(true)
+                } else {
+                    Err(absent())
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            checked_path_with(
+                root,
+                &missing,
+                |_| Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "closed mount"
+                )),
+                |_| panic!("must not fall back to cache")
+            )
+            .is_err()
+        );
+        assert!(
+            checked_path_with(
+                root,
+                &root.join("../outside"),
+                |path| Ok(path.to_path_buf()),
+                |_| panic!("parent traversal")
+            )
+            .is_err()
+        );
+    }
 
     fn fixture(name: &str) -> PathBuf {
         let root = db::testing::dir(name);

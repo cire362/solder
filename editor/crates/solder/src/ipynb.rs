@@ -10,15 +10,22 @@ const LIMIT: u64 = 64 * 1024 * 1024;
 pub struct File {
     original: Value,
     cells: HashMap<u64, Value>,
+    stamp: std::sync::Arc<std::sync::Mutex<Option<crate::remote::Stamp>>>,
 }
 
 impl File {
     pub fn read(path: &Path) -> Result<(Self, Value), String> {
-        if std::fs::metadata(path).map_err(|e| e.to_string())?.len() > LIMIT {
+        if crate::remote::metadata(path)
+            .map_err(|e| e.to_string())?
+            .len()
+            > LIMIT
+        {
             return Err(crate::lang::t("This notebook is larger than 64 MB").into());
         }
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        Self::decode(&bytes)
+        let (bytes, stamp) = crate::remote::read_versioned(path).map_err(|e| e.to_string())?;
+        let (file, shown) = Self::decode(&bytes)?;
+        *file.stamp.lock().unwrap_or_else(|e| e.into_inner()) = stamp;
+        Ok((file, shown))
     }
 
     fn decode(bytes: &[u8]) -> Result<(Self, Value), String> {
@@ -52,6 +59,7 @@ impl File {
             Self {
                 original,
                 cells: kept,
+                stamp: Default::default(),
             },
             json!({"cells":shown}),
         ))
@@ -88,7 +96,15 @@ impl File {
         let mut bytes =
             serde_json::to_vec_pretty(&self.content(cells)).map_err(|e| e.to_string())?;
         bytes.push(b'\n');
-        write_atomic(path, &bytes)
+        let mut stamp = self.stamp.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::remote::is_remote(path) {
+            *stamp = crate::remote::write_versioned(path, &bytes, stamp.as_ref())
+                .map_err(|e| e.to_string())?;
+        } else {
+            write_atomic(path, &bytes)?;
+            *stamp = Some(crate::remote::stamp_for_bytes(path, &bytes).map_err(|e| e.to_string())?);
+        }
+        Ok(())
     }
 }
 
