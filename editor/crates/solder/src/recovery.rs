@@ -25,6 +25,9 @@ struct Kept {
     /// The file the text is of. None for a text that was never a file.
     path: Option<PathBuf>,
     text: String,
+    /// Version 1 did not retain the revision of the text's original read.
+    #[serde(default)]
+    stamp: Option<crate::remote::Stamp>,
 }
 
 enum Op {
@@ -32,6 +35,7 @@ enum Op {
         file: PathBuf,
         path: Option<PathBuf>,
         text: text::Rope,
+        stamp: Option<crate::remote::Stamp>,
     },
     Forget(PathBuf),
     /// Everything asked before this is on disk.
@@ -40,6 +44,7 @@ enum Op {
 
 pub(super) struct Recovery {
     dir: PathBuf,
+    run: u128,
     /// One thread writes, in the order it is asked: a text kept and then
     /// let go is never let go first.
     ops: mpsc::Sender<Op>,
@@ -53,11 +58,17 @@ impl Recovery {
         std::thread::spawn(move || {
             for op in asked {
                 match op {
-                    Op::Keep { file, path, text } => {
+                    Op::Keep {
+                        file,
+                        path,
+                        text,
+                        stamp,
+                    } => {
                         let kept = Kept {
-                            version: 1,
+                            version: 2,
                             path,
                             text: text.to_string(),
+                            stamp,
                         };
                         let written = serde_json::to_vec(&kept)
                             .map_err(|e| e.to_string())
@@ -79,6 +90,10 @@ impl Recovery {
         });
         Self {
             dir,
+            run: std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
             ops,
             kept: HashMap::default(),
         }
@@ -104,7 +119,7 @@ pub(super) fn folder(root: &Path) -> PathBuf {
 
 /// What was kept in a folder, with each file it is of as it is on disk
 /// now. Blocking.
-fn read(dir: &Path) -> Vec<(Kept, Option<crate::document::Loaded>)> {
+fn read(dir: &Path) -> Vec<(PathBuf, Kept, Option<crate::document::Loaded>)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -120,15 +135,18 @@ fn read(dir: &Path) -> Vec<(Kept, Option<crate::document::Loaded>)> {
             .then(|| std::fs::read(&file).ok())
             .flatten()
             .and_then(|bytes| serde_json::from_slice::<Kept>(&bytes).ok())
-            .filter(|kept| kept.version == 1);
-        // Read or not, it is done with: what is put back is kept anew.
-        let _ = std::fs::remove_file(&file);
-        if let Some(kept) = kept {
+            .filter(|kept| matches!(kept.version, 1 | 2));
+        // Reading is not consuming: a failed load or a window that goes
+        // away before restoration must leave the only copy intact.
+        if let Some(mut kept) = kept {
+            if kept.version == 1 {
+                kept.stamp = None;
+            }
             let on_disk = kept
                 .path
                 .as_deref()
                 .and_then(|path| crate::document::load(path).ok());
-            found.push((kept, on_disk));
+            found.push((file, kept, on_disk));
         }
     }
     found
@@ -147,7 +165,15 @@ impl Workspace {
         for document in documents {
             let id = document.entity_id();
             let doc = document.read(cx);
-            if !doc.is_dirty() || doc.is_read_only() || doc.text().len() > KEEP_LIMIT {
+            if !doc.is_dirty() {
+                continue;
+            }
+            if doc.is_read_only() || doc.text().len() > KEEP_LIMIT {
+                // A document that outgrew the limit still has its last
+                // recoverable copy; the limit must not discard it.
+                if recovery.kept.contains_key(&id) {
+                    changed.insert(id);
+                }
                 continue;
             }
             changed.insert(id);
@@ -160,17 +186,27 @@ impl Workspace {
                     Some(path) => session::name_of(path),
                     None => format!("untitled-{}-{}", std::process::id(), id.as_u64()),
                 };
-                recovery.dir.join(format!("{name}.json"))
+                // A not-yet-restored copy for this path may still exist,
+                // including one whose target could not be read.
+                recovery.dir.join(format!(
+                    "{name}-{}-{}-{}.json",
+                    std::process::id(),
+                    recovery.run,
+                    id.as_u64()
+                ))
             });
+            let (path, text, stamp) = doc.recovery_snapshot();
             let keep = Op::Keep {
                 file: file.clone(),
-                path: doc.path().map(Path::to_path_buf),
-                text: doc.text().rope().clone(),
+                path,
+                text,
+                stamp,
             };
             let _ = recovery.ops.send(keep);
             recovery.kept.insert(id, (doc.version(), file));
         }
-        // Saved, undone back to what is on disk, or closed.
+        // Saved, local undo back to disk, or explicitly closed. A remote
+        // recovery stays dirty until it is saved or closed with an answer.
         recovery.kept.retain(|id, (_, file)| {
             let stays = changed.contains(id);
             if !stays {
@@ -211,8 +247,8 @@ impl Workspace {
                 .spawn(async move { read(&dir) })
                 .await;
             this.update_in(cx, |this, window, cx| {
-                for (kept, on_disk) in found {
-                    this.recover_one(kept, on_disk, window, cx);
+                for (file, kept, on_disk) in found {
+                    this.recover_one(file, kept, on_disk, window, cx);
                 }
             })
             .ok();
@@ -222,19 +258,33 @@ impl Workspace {
 
     fn recover_one(
         &mut self,
+        file: PathBuf,
         kept: Kept,
         on_disk: Option<crate::document::Loaded>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let remote = kept.path.as_deref().is_some_and(crate::remote::is_remote);
+        if (remote && on_disk.is_none())
+            || on_disk
+                .as_ref()
+                .is_some_and(|file| file.read_only.is_some())
+        {
+            return;
+        }
         let open = kept
             .path
             .as_deref()
             .and_then(|path| self.document_for_path(path, cx));
+        // Typing while the background read ran must not be overwritten.
+        if open.as_ref().is_some_and(|document| {
+            let document = document.read(cx);
+            document.is_dirty() || document.is_read_only()
+        }) {
+            return;
+        }
         let document = match (open, &kept.path, on_disk) {
             (Some(document), _, _) => document,
-            // A file that can no longer be edited is left as it is.
-            (None, Some(_), Some(file)) if file.read_only.is_some() => return,
             (None, Some(path), Some(file)) => {
                 self.add_loaded(path.clone(), &file, None, window, cx);
                 let Some(editor) = self.active_editor() else {
@@ -251,7 +301,21 @@ impl Workspace {
                 editor.read(cx).document().clone()
             }
         };
-        document.update(cx, |document, cx| document.recover(&kept.text, cx));
+        let restored = document.update(cx, |document, cx| {
+            document.recover(&kept.text, kept.stamp, cx)
+        });
+        let Some(recovery) = self.recovery.as_mut() else {
+            return;
+        };
+        if restored {
+            // Adopt the existing copy before another keep/quit. Force one
+            // rewrite so legacy entries migrate through the same writer.
+            let version = document.read(cx).version().wrapping_sub(1);
+            recovery.kept.insert(document.entity_id(), (version, file));
+        } else {
+            // An editable local document already contains the kept text.
+            let _ = recovery.ops.send(Op::Forget(file));
+        }
     }
 
     /// Begins keeping unsaved text for this window's project, and puts
@@ -268,21 +332,279 @@ impl Workspace {
         }
         self.recovery = Some(Recovery::new(folder(&self.root(cx))));
         self.recover_unsaved(window, cx);
-        // Asked to quit, the last of what was typed is kept first: the
-        // key that quits asks nothing.
-        self._subscriptions
-            .push(cx.on_app_quit(|this, cx| this.keep_unsaved(cx)));
+        // An acknowledged quit has already flushed or discarded its
+        // recovery. Other app exits still keep the last of what was typed.
+        self._subscriptions.push(cx.on_app_quit(|this, cx| {
+            if quit::confirmed(cx) || this.close_confirmed {
+                Task::ready(())
+            } else {
+                this.keep_unsaved(cx)
+            }
+        }));
         self._recovery_tick = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
-                let Ok(kept) = this.update(cx, |this, cx| match this.restoring {
-                    true => Task::ready(()),
-                    false => this.keep_unsaved(cx),
+                let Ok(kept) = this.update(cx, |this, cx| {
+                    match this.restoring || this.close_preparing || quit::pause_recovery(cx) {
+                        true => Task::ready(()),
+                        false => this.keep_unsaved(cx),
+                    }
                 }) else {
                     break;
                 };
                 kept.await;
             }
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_versions_are_read_without_consuming_any_copy() {
+        let dir = db::testing::dir("recovery-versions");
+        let stamp = crate::remote::Stamp {
+            length: 3,
+            mtime: 42,
+            hash: Some("original".into()),
+        };
+        let legacy = serde_json::json!({"version":1,"path":null,"text":"legacy"});
+        let current = serde_json::json!({"version":2,"path":null,"text":"current","stamp":stamp});
+        for (name, value) in [
+            ("legacy", legacy),
+            ("current", current),
+            (
+                "future",
+                serde_json::json!({"version":3,"path":null,"text":"future"}),
+            ),
+        ] {
+            std::fs::write(dir.join(format!("{name}.json")), value.to_string()).unwrap();
+        }
+        std::fs::write(dir.join("broken.json"), b"{unfinished").unwrap();
+        std::fs::File::create(dir.join("large.json"))
+            .unwrap()
+            .set_len(KEPT_BYTES + 1)
+            .unwrap();
+        let found = read(&dir);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].1.text, "current");
+        assert_eq!(found[0].1.stamp, Some(stamp));
+        assert_eq!(found[1].1.text, "legacy");
+        assert_eq!(found[1].1.stamp, None);
+        assert!(found.iter().all(|(_, _, loaded)| loaded.is_none()));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 5);
+        assert_eq!(read(&dir).len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_remote_recovery_is_unchanged_and_can_be_retried() {
+        let dir = db::testing::dir("recovery-unavailable")
+            .canonicalize()
+            .unwrap();
+        let source = dir.join("server");
+        let cache = dir.join("cache");
+        let copies = dir.join("copies");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&copies).unwrap();
+        let target = source.join("file.txt");
+        let path = cache.join("file.txt");
+        std::fs::write(&target, b"original").unwrap();
+        let mount = crate::remote::fixture(&source, &cache);
+        let stamp = crate::document::load(&path).unwrap().stamp;
+        let file = copies.join("work.json");
+        let bytes = serde_json::to_vec(&Kept {
+            version: 2,
+            path: Some(path.clone()),
+            text: "unsaved work".into(),
+            stamp: stamp.clone(),
+        })
+        .unwrap();
+        std::fs::write(&file, &bytes).unwrap();
+        drop(mount);
+        let found = read(&copies);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].2.is_none());
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+
+        let _mount = crate::remote::fixture(&source, &cache);
+        std::fs::remove_file(&target).unwrap();
+        assert!(read(&copies)[0].2.is_none());
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+        std::fs::write(&target, b"\0\x01\x02").unwrap();
+        assert!(read(&copies)[0].2.as_ref().unwrap().read_only.is_some());
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+        std::fs::write(&target, b"new target").unwrap();
+        let found = read(&copies);
+        assert_eq!(found[0].1.stamp, stamp);
+        assert_eq!(found[0].2.as_ref().unwrap().text, "new target");
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn writer_and_restart_keep_the_original_remote_revision(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = db::testing::dir("recovery-restart").canonicalize().unwrap();
+        let source = dir.join("server");
+        let cache = dir.join("cache");
+        std::fs::create_dir(&source).unwrap();
+        let target = source.join("file.txt");
+        let path = cache.join("file.txt");
+        std::fs::write(&target, [0xff, 0xfe, b'A', 0]).unwrap();
+        let mount = crate::remote::fixture(&source, &cache);
+        let loaded = crate::document::load(&path).unwrap();
+        let original = loaded.stamp.clone().unwrap();
+        let document = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+        document.update(cx, |doc, cx| {
+            doc.apply_edits(vec![(0..1, "U".into())], None, cx)
+        });
+        let (recovered_path, text, stamp) =
+            document.read_with(cx, |doc, _| doc.recovery_snapshot());
+        let recovery = Recovery::new(dir.join("copies"));
+        let file = recovery.dir.join("work.json");
+        recovery
+            .ops
+            .send(Op::Keep {
+                file: file.clone(),
+                path: recovered_path,
+                text,
+                stamp,
+            })
+            .unwrap();
+        cx.update(|cx| recovery.done(cx)).await;
+        let written: Kept = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(written.version, 2);
+        assert_eq!(written.stamp, Some(original.clone()));
+        drop(document);
+        drop(recovery);
+        drop(mount);
+
+        // Same length and mtime: the persisted hash still rejects the
+        // change made while Solder was not running.
+        std::fs::write(&target, [0xff, 0xfe, b'B', 0]).unwrap();
+        std::fs::File::open(&target)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_nanos(original.mtime))
+            .unwrap();
+        let _mount = crate::remote::fixture(&source, &cache);
+        let (copy, kept, loaded) = read(file.parent().unwrap()).pop().unwrap();
+        assert_eq!(copy, file);
+        assert_eq!(kept.stamp, Some(original));
+        let loaded = loaded.unwrap();
+        let restored = cx.new(|cx| Document::open(path, &loaded, cx));
+        assert!(restored.update(cx, |doc, cx| doc.recover(&kept.text, kept.stamp, cx)));
+        assert!(!restored.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(std::fs::read(&target).unwrap(), [0xff, 0xfe, b'B', 0]);
+        assert!(restored.read_with(cx, |doc, _| doc.is_dirty()));
+        assert!(file.exists());
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn failed_save_as_after_undo_preserves_the_original_recovery(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let dir = db::testing::dir("recovery-failed-save-as")
+            .canonicalize()
+            .unwrap();
+        let source = dir.join("server");
+        let cache = dir.join("cache");
+        std::fs::create_dir(&source).unwrap();
+        // A file used as a parent produces a real target IO failure.
+        std::fs::write(source.join("blocker"), b"not a directory").unwrap();
+        let _mount = crate::remote::fixture(&source, &cache);
+        let recovery = Recovery::new(dir.join("copies"));
+
+        for legacy in [false, true] {
+            let name = if legacy { "legacy" } else { "versioned" };
+            let target = source.join(format!("{name}.txt"));
+            let path = cache.join(format!("{name}.txt"));
+            std::fs::write(&target, b"before").unwrap();
+            let stamp = crate::document::load(&path)
+                .unwrap()
+                .stamp
+                .filter(|_| !legacy);
+            let baseline = "today 🐟";
+            std::fs::write(&target, baseline.as_bytes()).unwrap();
+            let loaded = crate::document::load(&path).unwrap();
+            let document = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+            document.update(cx, |doc, cx| doc.recover("unsaved work", stamp.clone(), cx));
+            let copy = recovery.dir.join(format!("{name}.json"));
+            // The same snapshot and ordered writer that keep_unsaved uses.
+            let keep = |cx: &mut gpui::TestAppContext| {
+                let (path, text, stamp) = document.read_with(cx, |doc, _| doc.recovery_snapshot());
+                recovery
+                    .ops
+                    .send(Op::Keep {
+                        file: copy.clone(),
+                        path,
+                        text,
+                        stamp,
+                    })
+                    .unwrap();
+                cx.update(|cx| recovery.done(cx))
+            };
+            let assert_original = || {
+                let kept: Kept = serde_json::from_slice(&std::fs::read(&copy).unwrap()).unwrap();
+                assert_eq!(kept.path.as_ref(), Some(&path));
+                assert_eq!(kept.text, "unsaved work");
+                assert_eq!(kept.stamp, stamp);
+            };
+            keep(cx).await;
+            assert_original();
+
+            let origin = document.entity_id();
+            document.update(cx, |doc, cx| doc.undo(origin, cx)).unwrap();
+            let destination = cache.join(format!("{name}-new.txt"));
+            document.update(cx, |doc, cx| {
+                doc.set_path(destination.clone(), cx);
+                doc.set_encoding(text::encoding::Encoding::Windows1252, cx);
+            });
+            assert!(!document.update(cx, |doc, cx| doc.save(cx)).await);
+            assert!(document.read_with(cx, |doc, _| {
+                doc.notice().unwrap().contains("cannot be written")
+            }));
+            assert!(!source.join(format!("{name}-new.txt")).exists());
+            assert!(document.read_with(cx, |doc, _| doc.is_dirty()));
+            keep(cx).await;
+            assert_original();
+
+            document.update(cx, |doc, cx| {
+                doc.set_encoding(text::encoding::Encoding::Utf8, cx);
+                doc.set_path(cache.join("blocker/new.txt"), cx);
+            });
+            assert!(!document.update(cx, |doc, cx| doc.save(cx)).await);
+            assert!(document.read_with(cx, |doc, _| {
+                doc.notice().unwrap().starts_with("Not saved:")
+            }));
+            keep(cx).await;
+            assert_original();
+
+            // Returning to the source still uses its original revision,
+            // even after a destination reset the document's save stamp.
+            document.update(cx, |doc, cx| doc.set_path(path.clone(), cx));
+            assert!(!document.update(cx, |doc, cx| doc.save(cx)).await);
+            keep(cx).await;
+            assert_original();
+
+            // The original stamp (including a legacy unknown one) must
+            // not be used as the destination's expected revision.
+            document.update(cx, |doc, cx| doc.set_path(destination.clone(), cx));
+            assert!(document.update(cx, |doc, cx| doc.save(cx)).await);
+            assert_eq!(
+                std::fs::read(source.join(format!("{name}-new.txt"))).unwrap(),
+                baseline.as_bytes()
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), baseline.as_bytes());
+            assert!(!document.read_with(cx, |doc, _| doc.is_dirty()));
+            let (path, text, stamp) = document.read_with(cx, |doc, _| doc.recovery_snapshot());
+            assert_eq!(path, Some(destination));
+            assert_eq!(text.to_string(), baseline);
+            assert!(stamp.is_some());
+        }
     }
 }

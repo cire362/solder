@@ -15,6 +15,7 @@ use crate::{
     settings::Settings,
     theme::{ActiveTheme, Theme, UI_FONT_SIZE, UI_FONT_SMALL},
 };
+use futures::{FutureExt, future::Shared};
 use gpui::{
     AnyElement, App, AppContext, ClickEvent, Context, Div, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, Image, ImageFormat, InteractiveElement, IntoElement, KeyBinding,
@@ -117,6 +118,8 @@ pub struct Notebook {
     selected: usize,
     dirty: bool,
     generation: u64,
+    pending_saves: usize,
+    save_tail: Option<Shared<Task<bool>>>,
     ipynb: Option<crate::ipynb::File>,
     /// What runs its cells, as the extension calls it.
     runner: Option<SharedString>,
@@ -184,6 +187,8 @@ impl Notebook {
             selected: 0,
             dirty: false,
             generation: 0,
+            pending_saves: 0,
+            save_tail: None,
             ipynb: None,
             runner: None,
             note: None,
@@ -198,7 +203,19 @@ impl Notebook {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        self.dirty || self.is_saving()
+    }
+
+    pub(crate) fn is_saving(&self) -> bool {
+        self.pending_saves != 0
+    }
+
+    pub(crate) fn pending_save(&self) -> Option<Shared<Task<bool>>> {
+        self.is_saving().then(|| self.save_tail.clone()).flatten()
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        self.generation
     }
 
     pub(crate) fn reader(&self) -> (String, String) {
@@ -543,35 +560,58 @@ impl Notebook {
     /// Resolves to whether it was written.
     pub fn save(&mut self, cx: &mut Context<Self>) -> Task<bool> {
         let generation = self.generation;
-        let asked = match self.ipynb.clone() {
-            Some(file) => {
-                let path = self.path.clone();
-                let cells = self
-                    .cells
-                    .iter()
-                    .map(|cell| (cell.handle, cell.code, cell.editor.read(cx).text(cx)))
-                    .collect::<Vec<_>>();
-                cx.background_executor()
-                    .spawn(async move { file.save(&path, &cells).map(|_| Value::Bool(true)) })
-            }
-            None => self.ask("notebook.save", json!({ "uri": self.uri }), cx),
-        };
+        let native = self.ipynb.clone().map(|file| {
+            let cells = self
+                .cells
+                .iter()
+                .map(|cell| (cell.handle, cell.code, cell.editor.read(cx).text(cx)))
+                .collect::<Vec<_>>();
+            (file, self.path.clone(), cells)
+        });
+        let previous = self.save_tail.take();
+        self.pending_saves += 1;
         self.note = None;
-        cx.spawn(async move |this, cx| {
-            let saved = asked.await;
-            let done = saved.is_ok();
-            this.update(cx, |this, cx| {
-                match saved {
-                    Ok(_) if this.generation == generation => this.dirty = false,
-                    Ok(_) => {}
-                    Err(why) => this.note = Some(why.into()),
+        cx.emit(NotebookEvent::Changed);
+        cx.notify();
+        let saving = cx
+            .spawn(async move |this, cx| {
+                // Capture the cells at the request, but start their write after
+                // earlier snapshots. A late older save must not replace a new one.
+                if let Some(previous) = previous {
+                    previous.await;
                 }
-                cx.emit(NotebookEvent::Changed);
-                cx.notify();
+                let saved = match native {
+                    Some((file, path, cells)) => {
+                        cx.background_executor()
+                            .spawn(
+                                async move { file.save(&path, &cells).map(|_| Value::Bool(true)) },
+                            )
+                            .await
+                    }
+                    None => match this.update(cx, |this, cx| {
+                        this.ask("notebook.save", json!({ "uri": this.uri }), cx)
+                    }) {
+                        Ok(asked) => asked.await,
+                        Err(_) => return false,
+                    },
+                };
+                let done = saved.is_ok();
+                this.update(cx, |this, cx| {
+                    this.pending_saves -= 1;
+                    match saved {
+                        Ok(_) if this.generation == generation => this.dirty = false,
+                        Ok(_) => {}
+                        Err(why) => this.note = Some(why.into()),
+                    }
+                    cx.emit(NotebookEvent::Changed);
+                    cx.notify();
+                })
+                .ok();
+                done
             })
-            .ok();
-            done
-        })
+            .shared();
+        self.save_tail = Some(saving.clone());
+        cx.spawn(async move |_, _| saving.await)
     }
 
     /// Its tab is in front, or no longer: extensions read which notebook
@@ -1134,6 +1174,68 @@ fn unbase64(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    async fn queued_notebook_saves_write_snapshots_in_order(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            cx.set_global(Settings::default());
+        });
+        let path = db::testing::dir("notebook-save-order").join("notes.ipynb");
+        std::fs::write(&path, serde_json::to_vec(&json!({"nbformat":4,"nbformat_minor":5,"metadata":{},
+            "cells":[{"cell_type":"code","source":"original","metadata":{},"execution_count":null,"outputs":[]}]})).unwrap()).unwrap();
+        let book =
+            cx.new(|cx| Notebook::open(path.clone(), String::new(), "jupyter-notebook".into(), cx));
+        for _ in 0..crate::patience::LOOKS {
+            cx.run_until_parked();
+            if book.read_with(cx, |book, _| book.is_ready()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(book.read_with(cx, |book, _| book.is_ready()));
+        let editor = book.read_with(cx, |book, _| book.cells[0].editor.clone());
+        let document = editor.read_with(cx, |editor, _| editor.document().clone());
+        let (release, blocked) = futures::channel::oneshot::channel();
+        book.update(cx, |book, cx| {
+            book.save_tail = Some(
+                cx.spawn(async move |_, _| blocked.await.unwrap_or(false))
+                    .shared(),
+            );
+        });
+        document.update(cx, |doc, cx| {
+            doc.edit(
+                vec![(0..0, "first ".into())],
+                &[],
+                Some(editor.entity_id()),
+                cx,
+            );
+        });
+        let first = book.update(cx, |book, cx| book.save(cx));
+        document.update(cx, |doc, cx| {
+            doc.edit(
+                vec![(0..0, "second ".into())],
+                &[],
+                Some(editor.entity_id()),
+                cx,
+            );
+        });
+        let second = book.update(cx, |book, cx| book.save(cx));
+        cx.run_until_parked();
+        assert!(book.read_with(cx, |book, _| book.is_saving() && book.is_dirty()));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap()["cells"][0]["source"],
+            "original"
+        );
+        release.send(true).unwrap();
+        assert!(first.await);
+        assert!(second.await);
+        assert!(!book.read_with(cx, |book, _| book.is_saving() || book.is_dirty()));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(path).unwrap()).unwrap()["cells"][0]["source"],
+            "second first original"
+        );
+    }
 
     #[test]
     fn localized_output_notices_keep_the_program_output_and_mime() {

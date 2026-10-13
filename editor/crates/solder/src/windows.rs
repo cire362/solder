@@ -245,6 +245,22 @@ pub fn init(path: Option<PathBuf>, cx: &mut App) {
     .detach();
 }
 
+/// Wait for the current window set before the platform's short quit timeout.
+pub(crate) fn flush(cx: &App) -> Task<()> {
+    let done = (|| {
+        let windows = cx.try_global::<Windows>()?;
+        let writer = windows.writer.as_ref().filter(|_| windows.learned)?;
+        let (send, receive) = futures::channel::oneshot::channel();
+        writer.send((windows.kept(), Some(send))).ok()?;
+        Some(receive)
+    })();
+    cx.background_executor().spawn(async move {
+        if let Some(done) = done {
+            done.await.ok();
+        }
+    })
+}
+
 /// The user closed a window, and it is out of the set: unless it is the
 /// only one, which is what the next start comes back to. A window that
 /// goes because the run ends was not closed by anybody, so this is said

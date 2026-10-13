@@ -21,6 +21,15 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] Native multi-window Quit, window/tab close, failed-save and notebook
+      controls, and Linux/Windows. On macOS, paste, Undo/Redo, the changed mark,
+      Cmd-Q, Cancel and Save All were checked in one real window; saved bytes,
+      process exit and recovery cleanup were checked too. Character-by-character
+      input injection was unreliable. Multi-window decisions, independent
+      file/notebook copies, edits during decisions and save ordering are checked
+      headlessly. Original remote recovery revisions use the real local helper
+      process; a live SSH restart remains unverified. Evidence is in
+      `benchmarks/file-state-and-exit.md`
 - [ ] Typing and saving in a native remote-project window, an external SSH
       server and Linux/Windows clients. On macOS loopback, a release Solder
       window read fresh server bytes instead of stale cache and followed an
@@ -177,8 +186,8 @@ something of its own unchecked or unmade adds it here.
       environment must be reviewed again after restarting Solder
 - [ ] SSH save locking across independent programs. Saves compare the opened
       revision and atomically replace the target file, but do not lock other
-      writers across the final check and rename. Recovery restores unsaved text
-      over the newly read file without retaining its original remote revision
+      writers across the final check and rename. Recovery now retains the
+      original remote revision; legacy copies without it require Save As
 - [ ] A line is moved to where its language wants it only if the tree is
       in step within a millisecond of the key. On a busy machine a closing
       tag typed in a language of an extension can stay where it was typed,
@@ -296,9 +305,21 @@ something of its own unchecked or unmade adds it here.
       kinds a server gives them (read, written) are not told apart, and
       the color is the matching bracket's, there being no token of their
       own. Go to type definition and go to declaration are not there
-- [ ] A file undone back to what is on disk stays marked as changed
-- [ ] `cmd-q` quits without asking about files that are not saved. Their
-      text is kept and comes back, but nothing says so before the quit
+- [ ] Local text and container-bind saves still write directly to the file;
+      they do not guarantee an atomic replacement after a crash or IO failure.
+      Separate target namespaces and external writers can bypass duplicate-copy
+      detection; aliases of a missing destination may also escape it. Local
+      hard-link identity is checked on Unix; Windows currently checks path
+      aliases only
+- [ ] Direct system Quit bypasses the editor's question: GPUI's shutdown
+      callback cannot cancel it. Keyboard/palette Quit now asks across every
+      project window and waits for saves and recovery cleanup. Force Quit and
+      termination cannot wait for a decision or guarantee recovery
+- [ ] Recovery does not cover notebooks. Malformed, unsupported, unreadable or
+      duplicate recovery copies are retained on disk, with no recovery-manager
+      screen. The reader considers at most 256 copies per pass. Manually typing
+      identical file bytes is conservatively dirty; undo to the saved history
+      state is clean. Encoding/line-ending changes are not undone with text
 - [ ] Tabs closed are remembered while the window is open, not across a
       restart
 - [ ] Jupyter: no kernel is started and the ipywidgets protocol is not

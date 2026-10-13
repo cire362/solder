@@ -198,9 +198,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-g", FindPrev, None),
     ]);
     cx.on_action(|_: &Quit, cx| {
-        // Before the windows start to close: they are not being closed.
-        crate::windows::quitting(cx);
-        cx.quit()
+        // A global snapshot must run after any view handling this action.
+        cx.defer(quit::request);
     });
 }
 
@@ -249,6 +248,8 @@ const CLOSED_TABS: usize = 32;
 #[path = "session.rs"]
 mod session;
 
+#[path = "quit.rs"]
+mod quit;
 #[path = "recovery.rs"]
 mod recovery;
 
@@ -359,6 +360,9 @@ pub struct Workspace {
     recovery: Option<recovery::Recovery>,
     _recovery_tick: Option<Task<()>>,
     restoring: bool,
+    closing: bool,
+    close_preparing: bool,
+    close_confirmed: bool,
     /// The files of the tabs closed last, the latest at the end, each
     /// with the pane it was in.
     closed_tabs: Vec<(session::File, usize)>,
@@ -924,6 +928,9 @@ impl Workspace {
             recovery: None,
             _recovery_tick: None,
             restoring: false,
+            closing: false,
+            close_preparing: false,
+            close_confirmed: false,
             closed_tabs: Vec::new(),
             left,
             right,
@@ -1320,6 +1327,8 @@ impl Workspace {
             self.remove_tab(editor, window, cx);
             return;
         }
+        let version = document.read(cx).version();
+        let path = document.read(cx).path().map(Path::to_path_buf);
         let name = document.read(cx).title();
         let answer = window.prompt(
             PromptLevel::Warning,
@@ -1337,13 +1346,29 @@ impl Workspace {
                 if let Some(saved) = saved
                     && saved.await
                 {
-                    this.update_in(cx, |this, window, cx| this.remove_tab(&editor, window, cx))
-                        .ok();
+                    this.update_in(cx, |this, window, cx| {
+                        if editor.read(cx).doc(cx).is_dirty() {
+                            this.close(&editor, window, cx);
+                        } else {
+                            this.remove_tab(&editor, window, cx);
+                        }
+                    })
+                    .ok();
                 }
             }
             Some(1) => {
-                this.update_in(cx, |this, window, cx| this.remove_tab(&editor, window, cx))
-                    .ok();
+                while let Ok(Some(pending)) = document.update(cx, |doc, _| doc.pending_save()) {
+                    pending.await;
+                }
+                this.update_in(cx, |this, window, cx| {
+                    let doc = document.read(cx);
+                    if doc.version() != version || doc.path() != path.as_deref() {
+                        this.close(&editor, window, cx);
+                    } else {
+                        this.remove_tab(&editor, window, cx);
+                    }
+                })
+                .ok();
             }
             _ => {}
         })
@@ -1527,93 +1552,171 @@ impl Workspace {
     }
 
     fn confirm_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let dirty: Vec<Entity<Document>> = self
-            .documents(cx)
-            .into_iter()
-            .filter(|d| d.read(cx).is_dirty())
-            .collect();
-        // Notebooks with changes are asked about with the files.
-        let open = self.notebooks.iter().map(|(notebook, _)| notebook);
-        let books: Vec<Entity<crate::notebook::Notebook>> = open
-            .filter(|notebook| notebook.read(cx).is_dirty())
-            .cloned()
-            .collect();
-        if dirty.is_empty() && books.is_empty() {
-            crate::windows::closed(window.window_handle().window_id(), cx);
-            if self.session_writer.is_some() {
-                let saved = self.keep_session(cx);
-                cx.spawn_in(window, async move |_, cx| {
-                    saved.await;
-                    cx.update(|window, _| window.remove_window()).ok();
-                })
-                .detach();
-                return false;
-            }
-            return true;
+        if self.closing || quit::busy(cx) {
+            return false;
         }
-        let message = match (dirty.as_slice(), books.as_slice()) {
-            ([one], []) => tf("Save changes to {}?", &[&one.read(cx).title()]),
-            ([], [one]) => tf("Save changes to {}?", &[&one.read(cx).title()]),
-            _ => tf("Save changes to {} files?", &[&(dirty.len() + books.len())]),
-        };
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &message,
-            Some(t("Your changes will be lost if you don't save them.")),
-            &[t("Save All"), t("Don't Save"), t("Cancel")],
-            cx,
-        );
+        self.closing = true;
+        let changes = quit::Changes::of(self, cx);
+        let answer = (!changes.is_empty()).then(|| {
+            window.prompt(
+                PromptLevel::Warning,
+                &changes.message(),
+                Some(t("Your changes will be lost if you don't save them.")),
+                &[t("Save All"), t("Don't Save"), t("Cancel")],
+                cx,
+            )
+        });
         cx.spawn_in(window, async move |this, cx| {
-            let close = match answer.await.ok() {
+            let choice = match answer {
+                Some(answer) => answer.await.ok(),
+                None => Some(0),
+            };
+            if !matches!(choice, Some(0 | 1)) {
+                this.update(cx, |this, _| this.closing = false).ok();
+                return;
+            }
+            loop {
+                let Ok(pending) = this.update(cx, |this, cx| this.pending_saves(cx)) else {
+                    return;
+                };
+                if pending.is_empty() {
+                    break;
+                }
+                for pending in pending {
+                    pending.await;
+                }
+            }
+            let Ok(unchanged) = this.update_in(cx, |this, window, cx| {
+                if changes.permits(&quit::Changes::of(this, cx)) {
+                    return true;
+                }
+                this.closing = false;
+                this.confirm_window_close(window, cx);
+                false
+            }) else {
+                return;
+            };
+            if !unchanged {
+                return;
+            }
+            let discard = match choice {
                 Some(0) => {
-                    let Ok(tasks) = this.update_in(cx, |this, window, cx| {
-                        let editors: Vec<Entity<Editor>> = dirty
-                            .iter()
-                            .filter_map(|d| {
-                                this.all_editors()
-                                    .find(|e| e.read(cx).document() == d)
-                                    .cloned()
-                            })
-                            .collect();
-                        let mut saving = editors
-                            .iter()
-                            .map(|e| this.save_editor(e, window, cx))
-                            .collect::<Vec<_>>();
-                        for book in &books {
-                            saving.push(book.update(cx, |book, cx| book.save(cx)));
+                    let Ok(copies) = gpui::AsyncApp::update(cx, |cx| changes.copies_to_save(cx))
+                    else {
+                        return;
+                    };
+                    let paths = copies.values().cloned().collect();
+                    let duplicate = cx
+                        .background_executor()
+                        .spawn(async move { quit::duplicate_file(paths) })
+                        .await;
+                    if let Some(path) = duplicate {
+                        if let Ok(shown) = this.update_in(cx, |_, window, cx| {
+                            window.prompt(
+                                PromptLevel::Warning,
+                                &tf("Multiple open copies of {}", &[&path.display()]),
+                                Some(t("Close the other copies before saving.")),
+                                &[t("OK")],
+                                cx,
+                            )
+                        }) {
+                            shown.await.ok();
                         }
-                        saving
+                        this.update(cx, |this, _| this.closing = false).ok();
+                        return;
+                    }
+                    let Ok(same_copies) =
+                        gpui::AsyncApp::update(cx, |cx| changes.copies_to_save(cx) == copies)
+                    else {
+                        return;
+                    };
+                    let Ok(unchanged) = this.update_in(cx, |this, window, cx| {
+                        if same_copies && changes.permits(&quit::Changes::of(this, cx)) {
+                            return true;
+                        }
+                        this.closing = false;
+                        this.confirm_window_close(window, cx);
+                        false
                     }) else {
                         return;
                     };
-                    let mut all = true;
-                    for task in tasks {
-                        all &= task.await;
+                    if !unchanged {
+                        return;
                     }
-                    all
+                    let Ok(tasks) =
+                        this.update_in(cx, |this, window, cx| this.save_dirty(window, cx))
+                    else {
+                        return;
+                    };
+                    let mut saved = true;
+                    for task in tasks {
+                        saved &= task.await;
+                    }
+                    if !saved {
+                        this.update(cx, |this, _| this.closing = false).ok();
+                        return;
+                    }
+                    false
                 }
                 Some(1) => true,
-                _ => false,
+                _ => {
+                    this.update(cx, |this, _| this.closing = false).ok();
+                    return;
+                }
             };
-            if close {
-                let saved = this.update(cx, |this, cx| this.keep_session(cx));
-                if let Ok(saved) = saved {
-                    saved.await;
+            let can_close = |this: &Self, cx: &App| {
+                let current = quit::Changes::of(this, cx);
+                if !this.pending_saves(cx).is_empty() {
+                    return false;
                 }
-                // What was not saved was asked about and let go: it is
-                // not to come back at the next start.
-                if let Ok(forgotten) = this.update(cx, |this, cx| this.forget_unsaved(cx)) {
-                    forgotten.await;
+                if discard {
+                    changes.permits(&current)
+                } else {
+                    current.is_empty()
                 }
-                this.update_in(cx, |this, window, cx| {
-                    // Nothing left to ask about; close for real.
-                    this.panes = vec![Pane::default()];
-                    crate::windows::closed(window.window_handle().window_id(), cx);
-                    window.remove_window();
-                    cx.notify();
+            };
+            let Ok(ready) = this.update_in(cx, |this, window, cx| {
+                if !can_close(this, cx) {
+                    this.closing = false;
+                    this.confirm_window_close(window, cx);
+                    return None;
+                }
+                this.close_preparing = true;
+                Some((this.keep_session(cx), this.keep_unsaved(cx)))
+            }) else {
+                return;
+            };
+            let Some((saved, kept)) = ready else {
+                return;
+            };
+            let saved = saved.await;
+            kept.await;
+            if !saved {
+                this.update(cx, |this, _| {
+                    this.closing = false;
+                    this.close_preparing = false;
                 })
                 .ok();
+                return;
             }
+            if let Ok(forgotten) = this.update(cx, |this, cx| this.forget_unsaved(cx)) {
+                forgotten.await;
+            }
+            this.update_in(cx, |this, window, cx| {
+                // The prompt and disk writes yielded to the app. A new edit
+                // never inherits the decision made for the earlier text.
+                if !can_close(this, cx) {
+                    this.close_preparing = false;
+                    this.closing = false;
+                    this.keep_unsaved(cx).detach();
+                    this.confirm_window_close(window, cx);
+                    return;
+                }
+                this.close_confirmed = true;
+                crate::windows::closed(window.window_handle().window_id(), cx);
+                window.remove_window();
+            })
+            .ok();
         })
         .detach();
         false
@@ -4616,11 +4719,57 @@ impl Workspace {
             let Ok(Ok(Some(path))) = answer.await else {
                 return false;
             };
-            let Ok(save) = document.update(cx, |d, cx| {
-                d.set_path(path.clone(), cx);
-                d.save(cx)
-            }) else {
-                return false;
+            let protect_copies = this
+                .update(cx, |this, cx| this.closing || quit::busy(cx))
+                .unwrap_or(true);
+            let save = loop {
+                let copies = if protect_copies {
+                    let Ok(copies) = gpui::AsyncApp::update(cx, |cx| {
+                        quit::copies_with_target(document.entity_id(), &path, cx)
+                    }) else {
+                        return false;
+                    };
+                    let paths = copies.values().cloned().collect();
+                    let duplicate = cx
+                        .background_executor()
+                        .spawn(async move { quit::duplicate_file(paths) })
+                        .await;
+                    if let Some(duplicate) = duplicate {
+                        if let Ok(shown) = this.update_in(cx, |_, window, cx| {
+                            window.prompt(
+                                PromptLevel::Warning,
+                                &tf("Multiple open copies of {}", &[&duplicate.display()]),
+                                Some(t("Close the other copies before saving.")),
+                                &[t("OK")],
+                                cx,
+                            )
+                        }) {
+                            shown.await.ok();
+                        }
+                        return false;
+                    }
+                    Some(copies)
+                } else {
+                    None
+                };
+                let Ok(save) = gpui::AsyncApp::update(cx, |cx| {
+                    // The alias check yielded. Validate the inventory and start
+                    // the save in one effect so a newly opened copy is included.
+                    if copies.as_ref().is_some_and(|copies| {
+                        *copies != quit::copies_with_target(document.entity_id(), &path, cx)
+                    }) {
+                        return None;
+                    }
+                    Some(document.update(cx, |d, cx| {
+                        d.set_path(path.clone(), cx);
+                        d.save(cx)
+                    }))
+                }) else {
+                    return false;
+                };
+                if let Some(save) = save {
+                    break save;
+                }
             };
             let saved = save.await;
             this.update(cx, |this, cx| {
@@ -5399,6 +5548,7 @@ impl Workspace {
             self.remove_notebook(notebook, window, cx);
             return;
         }
+        let version = notebook.read(cx).version();
         let name = notebook.read(cx).title();
         let answer = window.prompt(
             PromptLevel::Warning,
@@ -5409,7 +5559,14 @@ impl Workspace {
         );
         let notebook = notebook.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let close = match answer.await.ok() {
+            let choice = answer.await.ok();
+            if !matches!(choice, Some(0 | 1)) {
+                return;
+            }
+            while let Ok(Some(pending)) = notebook.update(cx, |book, _| book.pending_save()) {
+                pending.await;
+            }
+            let saved = match choice {
                 Some(0) => match notebook.update(cx, |notebook, cx| notebook.save(cx)) {
                     Ok(saved) => saved.await,
                     Err(_) => false,
@@ -5417,9 +5574,19 @@ impl Workspace {
                 Some(1) => true,
                 _ => false,
             };
-            if close {
+            if saved {
                 this.update_in(cx, |this, window, cx| {
-                    this.remove_notebook(&notebook, window, cx)
+                    let book = notebook.read(cx);
+                    let unchanged = if choice == Some(1) {
+                        book.version() == version && !book.is_saving()
+                    } else {
+                        !book.is_dirty()
+                    };
+                    if unchanged {
+                        this.remove_notebook(&notebook, window, cx);
+                    } else {
+                        this.close_notebook(&notebook, window, cx);
+                    }
                 })
                 .ok();
             }
@@ -20687,18 +20854,20 @@ exports.activate = (context) => {
         );
 
         // Closed while another is open, a window is out of the set.
-        assert!(VisualTestContext::from_window(second.into(), cx).simulate_close());
-        second
-            .update(cx, |_, window, _| window.remove_window())
-            .unwrap();
+        assert!(!VisualTestContext::from_window(second.into(), cx).simulate_close());
+        soon(cx, "the second window to finish closing", &|cx| {
+            !cx.windows()
+                .iter()
+                .any(|window| window.window_id() == second.window_id())
+        });
         soon(cx, "one window in the file", &|_| {
             roots(&kept_read(&kept_in)) == [a.clone()]
         });
         // The last one ends the run, and is what the next one starts with.
-        assert!(VisualTestContext::from_window(first.into(), cx).simulate_close());
-        first
-            .update(cx, |_, window, _| window.remove_window())
-            .unwrap();
+        assert!(!VisualTestContext::from_window(first.into(), cx).simulate_close());
+        soon(cx, "the last window to finish closing", &|cx| {
+            cx.windows().is_empty()
+        });
         for _ in 0..20 {
             cx.executor().advance_clock(Duration::from_millis(50));
             cx.run_until_parked();
@@ -20775,6 +20944,521 @@ exports.activate = (context) => {
         assert!(reconnect);
         assert_eq!(retry.window_id(), destination.window_id());
         assert_eq!(cx.read(project_windows), [root]);
+        cx.update(crate::windows::stop);
+    }
+
+    fn quit_file(
+        name: &str,
+        cx: &mut TestAppContext,
+    ) -> (gpui::WindowHandle<Workspace>, Entity<Editor>, PathBuf) {
+        let root = fixture(name);
+        let path = root.join("notes.txt");
+        std::fs::write(&path, "saved\n").unwrap();
+        let window = cx.update(|cx| crate::windows::open(root, cx));
+        let editor = window
+            .update(cx, |workspace, window, cx| {
+                workspace.add_editor(Some(path.clone()), "saved\n", None, window, cx);
+                workspace.active_editor().unwrap().clone()
+            })
+            .unwrap();
+        (window, editor, path)
+    }
+
+    fn quit_edit(editor: &Entity<Editor>, text: &str, cx: &mut TestAppContext) {
+        let document = cx.read(|cx| editor.read(cx).document().clone());
+        document.update(cx, |doc, cx| {
+            doc.seal_history();
+            doc.edit(vec![(0..0, text.into())], &[], Some(editor.entity_id()), cx);
+        });
+    }
+
+    fn quit_prompt(cx: &mut TestAppContext) {
+        for _ in 0..crate::patience::LOOKS {
+            cx.run_until_parked();
+            if cx.has_pending_prompt() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for a quit prompt");
+    }
+
+    #[gpui::test]
+    fn quitting_checks_all_windows_once_and_cancel_preserves_them(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        windows_setup(cx, None, &[]);
+        let (first, editor, _) = quit_file("quit-first", cx);
+        let (second, other, _) = quit_file("quit-second", cx);
+        quit_edit(&editor, "first ", cx);
+        quit_edit(&other, "second ", cx);
+        let document = cx.read(|cx| editor.read(cx).document().clone());
+        first
+            .update(cx, |workspace, window, cx| {
+                let split = cx.new(|cx| Editor::for_document(document, cx));
+                workspace.add_tab(split, window, cx);
+            })
+            .unwrap();
+        cx.dispatch_action(first.into(), Quit);
+        assert!(cx.has_pending_prompt());
+        assert_eq!(cx.pending_prompt().unwrap().0, "Save changes to 2 files?");
+        // Repeating Quit and closing a project do not stack extra questions.
+        cx.dispatch_action(second.into(), Quit);
+        second
+            .update(cx, |workspace, window, cx| {
+                assert!(!workspace.confirm_window_close(window, cx));
+            })
+            .unwrap();
+        cx.simulate_prompt_answer("Cancel");
+        soon(cx, "the cancelled quit", &|cx| !quit::busy(cx));
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(cx.read(|cx| cx.windows().len()), 2);
+        assert!(
+            cx.read(|cx| editor.read(cx).doc(cx).is_dirty() && other.read(cx).doc(cx).is_dirty())
+        );
+        cx.update(crate::windows::stop);
+    }
+
+    #[gpui::test]
+    fn saving_before_quit_writes_every_window_and_keeps_tabs(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        windows_setup(cx, None, &[]);
+        let (first, editor, path) = quit_file("quit-save-first", cx);
+        let (second, other, other_path) = quit_file("quit-save-second", cx);
+        quit_edit(&editor, "first ", cx);
+        quit_edit(&other, "second ", cx);
+        cx.dispatch_action(first.into(), Quit);
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Save All");
+        soon(cx, "the confirmed quit", &quit::confirmed);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "first saved\n");
+        assert_eq!(
+            std::fs::read_to_string(other_path).unwrap(),
+            "second saved\n"
+        );
+        assert!(
+            first
+                .read_with(cx, |workspace, _| workspace.panes[0].tabs.len() == 1)
+                .unwrap()
+        );
+        assert!(
+            second
+                .read_with(cx, |workspace, _| workspace.panes[0].tabs.len() == 1)
+                .unwrap()
+        );
+        assert!(
+            cx.read(|cx| !editor.read(cx).doc(cx).is_dirty() && !other.read(cx).doc(cx).is_dirty())
+        );
+        cx.update(crate::windows::stop);
+    }
+
+    #[gpui::test]
+    fn quitting_saves_the_notebook_and_the_file_behind_it(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        windows_setup(cx, None, &[]);
+        let (window, editor, path) = quit_file("quit-native-notebook", cx);
+        quit_edit(&editor, "file ", cx);
+        let book_path = path.with_extension("ipynb");
+        std::fs::write(&book_path, serde_json::to_vec(&serde_json::json!({
+            "nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{
+                "cell_type":"code","source":"print(1)","metadata":{},"execution_count":null,"outputs":[]
+            }]
+        })).unwrap()).unwrap();
+        window
+            .update(cx, |workspace, window, cx| {
+                workspace.open_path(book_path.clone(), None, window, cx)
+            })
+            .unwrap();
+        let notebook = cx.read(|cx| window.read(cx).unwrap().notebooks[0].0.clone());
+        soon(cx, "the notebook to open", &|cx| {
+            notebook.read(cx).is_ready()
+        });
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        notebook.update_in(cx, |notebook, window, cx| notebook.focus(window, cx));
+        cx.simulate_input("# quit\n");
+        assert!(cx.read(|cx| notebook.read(cx).is_dirty()));
+        cx.dispatch_action(Quit);
+        assert_eq!(cx.pending_prompt().unwrap().0, "Save changes to 2 files?");
+        cx.simulate_prompt_answer("Save All");
+        wait_for(cx, "the notebook quit", &quit::confirmed);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "file saved\n");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(book_path).unwrap()).unwrap();
+        assert_eq!(saved["cells"][0]["source"], "# quit\nprint(1)");
+        assert!(!cx.read(|cx| notebook.read(cx).is_dirty()));
+        cx.update(|_, cx| crate::windows::stop(cx));
+    }
+
+    #[gpui::test]
+    fn a_failed_save_cancels_quit_and_keeps_the_text(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        windows_setup(cx, None, &[]);
+        let (window, editor, path) = quit_file("quit-save-failure", cx);
+        quit_edit(&editor, "unsaved ", cx);
+        // A directory is refused as a file, even when tests run as root.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        cx.dispatch_action(window.into(), Quit);
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Save All");
+        soon(cx, "the stopped quit", &|cx| !quit::busy(cx));
+        assert!(!cx.read(quit::confirmed));
+        assert_eq!(cx.read(|cx| cx.windows().len()), 1);
+        assert!(
+            cx.read(|cx| editor.read(cx).doc(cx).is_dirty()
+                && editor.read(cx).doc(cx).notice().is_some())
+        );
+        assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), "unsaved saved\n");
+        cx.update(crate::windows::stop);
+    }
+
+    #[gpui::test]
+    fn quit_does_not_overwrite_two_independent_buffers_of_one_file(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        windows_setup(cx, None, &[]);
+        let (first, editor, path) = quit_file("quit-duplicate-first", cx);
+        let (second, _, _) = quit_file("quit-duplicate-second", cx);
+        let other = second
+            .update(cx, |workspace, window, cx| {
+                workspace.add_editor(Some(path.clone()), "saved\n", None, window, cx);
+                workspace.active_editor().unwrap().clone()
+            })
+            .unwrap();
+        quit_edit(&editor, "first ", cx);
+        quit_edit(&other, "second ", cx);
+        cx.dispatch_action(first.into(), Quit);
+        cx.simulate_prompt_answer("Save All");
+        for _ in 0..crate::patience::LOOKS {
+            cx.run_until_parked();
+            if cx.has_pending_prompt() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(cx.has_pending_prompt());
+        assert!(
+            cx.pending_prompt()
+                .unwrap()
+                .0
+                .starts_with("Multiple open copies")
+        );
+        cx.simulate_prompt_answer("Ok");
+        soon(cx, "duplicate save blocked", &|cx| !quit::busy(cx));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "saved\n");
+        assert!(!cx.read(quit::confirmed));
+        assert!(
+            cx.read(|cx| editor.read(cx).doc(cx).is_dirty() && other.read(cx).doc(cx).is_dirty())
+        );
+        cx.update(crate::windows::stop);
+    }
+
+    #[gpui::test]
+    fn cancelling_save_as_keeps_the_untitled_text_and_aborts_quit(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        windows_setup(cx, None, &[]);
+        let (window, _, _) = quit_file("quit-untitled", cx);
+        let editor = window
+            .update(cx, |workspace, window, cx| {
+                workspace.add_editor(None, "", None, window, cx);
+                workspace.active_editor().unwrap().clone()
+            })
+            .unwrap();
+        quit_edit(&editor, "only copy", cx);
+        cx.dispatch_action(window.into(), Quit);
+        cx.simulate_prompt_answer("Save All");
+        cx.run_until_parked();
+        assert!(cx.did_prompt_for_new_path());
+        cx.simulate_new_path_selection(|_| None);
+        soon(cx, "the cancelled Save As", &|cx| !quit::busy(cx));
+        assert!(!cx.read(quit::confirmed));
+        assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), "only copy");
+        assert!(
+            cx.read(|cx| editor.read(cx).doc(cx).is_dirty() && editor.read(cx).path(cx).is_none())
+        );
+        assert_eq!(cx.read(|cx| cx.windows().len()), 1);
+        cx.update(crate::windows::stop);
+    }
+
+    #[gpui::test]
+    fn quit_waits_for_a_manual_save_and_asks_about_undo_during_it(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        windows_setup(cx, None, &[]);
+        let (window, editor, path) = quit_file("quit-pending-undo", cx);
+        quit_edit(&editor, "written ", cx);
+        window
+            .update(cx, |_, window, cx| {
+                let document = editor.read(cx).document().clone();
+                document.update(cx, |doc, cx| {
+                    doc.save(cx).detach();
+                    doc.undo(editor.entity_id(), cx).unwrap();
+                    assert!(doc.is_saving() && doc.is_dirty());
+                });
+                window.dispatch_action(Box::new(Quit), cx);
+            })
+            .unwrap();
+        quit_prompt(cx);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "written saved\n");
+        assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), "saved\n");
+        assert!(cx.read(|cx| editor.read(cx).doc(cx).is_dirty()));
+        assert!(!cx.read(quit::confirmed));
+        cx.simulate_prompt_answer("Cancel");
+        soon(cx, "the pending save quit cancelled", &|cx| !quit::busy(cx));
+        cx.update(crate::windows::stop);
+    }
+
+    #[gpui::test]
+    fn quit_does_not_save_new_edits_in_another_window(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        windows_setup(cx, None, &[]);
+        let (first, _, path) = quit_file("quit-save-approved-first", cx);
+        let (second, other, other_path) = quit_file("quit-save-approved-second", cx);
+        let untitled = first
+            .update(cx, |workspace, window, cx| {
+                workspace.add_editor(None, "", None, window, cx);
+                workspace.active_editor().unwrap().clone()
+            })
+            .unwrap();
+        quit_edit(&untitled, "approved", cx);
+        cx.dispatch_action(first.into(), Quit);
+        cx.simulate_prompt_answer("Save All");
+        cx.run_until_parked();
+        assert!(cx.did_prompt_for_new_path());
+        // This previously clean file was not part of Save All's decision.
+        quit_edit(&other, "new ", cx);
+        let destination = path.with_file_name("new.txt");
+        cx.simulate_new_path_selection(|_| Some(destination.clone()));
+        quit_prompt(cx);
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), "approved");
+        assert_eq!(std::fs::read_to_string(other_path).unwrap(), "saved\n");
+        assert!(!cx.read(quit::confirmed));
+        cx.simulate_prompt_answer("Cancel");
+        soon(cx, "the cancelled new changes question", &|cx| {
+            !quit::busy(cx)
+        });
+        assert!(
+            second
+                .read_with(cx, |workspace, cx| !quit::Changes::of(workspace, cx)
+                    .is_empty())
+                .unwrap()
+        );
+        cx.update(crate::windows::stop);
+    }
+
+    #[gpui::test]
+    fn quit_guards_a_dirty_file_even_when_its_other_copy_is_clean(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        windows_setup(cx, None, &[]);
+        let (first, editor, path) = quit_file("quit-clean-alias-first", cx);
+        let (second, _, _) = quit_file("quit-clean-alias-second", cx);
+        second
+            .update(cx, |workspace, window, cx| {
+                workspace.add_editor(Some(path.clone()), "saved\n", None, window, cx);
+            })
+            .unwrap();
+        quit_edit(&editor, "unsaved ", cx);
+        cx.dispatch_action(first.into(), Quit);
+        cx.simulate_prompt_answer("Save All");
+        quit_prompt(cx);
+        assert!(
+            cx.pending_prompt()
+                .unwrap()
+                .0
+                .starts_with("Multiple open copies")
+        );
+        cx.simulate_prompt_answer("Ok");
+        soon(cx, "the clean copy save blocked", &|cx| !quit::busy(cx));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "saved\n");
+        cx.update(crate::windows::stop);
+    }
+
+    #[gpui::test]
+    fn quit_does_not_overwrite_independent_notebooks(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        windows_setup(cx, None, &[]);
+        let (first, _, path) = quit_file("quit-book-copies-first", cx);
+        let (second, _, _) = quit_file("quit-book-copies-second", cx);
+        let path = path.with_extension("ipynb");
+        let original = serde_json::to_vec(&serde_json::json!({"nbformat":4,"nbformat_minor":5,"metadata":{},
+            "cells":[{"cell_type":"code","source":"original","metadata":{},"execution_count":null,"outputs":[]}]})).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        for window in [first, second] {
+            window
+                .update(cx, |workspace, window, cx| {
+                    workspace.open_path(path.clone(), None, window, cx)
+                })
+                .unwrap();
+            let book = cx.read(|cx| window.read(cx).unwrap().notebooks[0].0.clone());
+            soon(cx, "the independent notebook", &|cx| {
+                book.read(cx).is_ready()
+            });
+            let visual = &mut VisualTestContext::from_window(window.into(), cx);
+            book.update_in(visual, |book, window, cx| book.focus(window, cx));
+            visual.simulate_input("new ");
+            assert!(visual.read(|cx| book.read(cx).is_dirty()));
+        }
+        cx.dispatch_action(first.into(), Quit);
+        cx.simulate_prompt_answer("Save All");
+        quit_prompt(cx);
+        assert!(
+            cx.pending_prompt()
+                .unwrap()
+                .0
+                .starts_with("Multiple open copies")
+        );
+        cx.simulate_prompt_answer("Ok");
+        soon(cx, "the notebook copies blocked", &|cx| !quit::busy(cx));
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        cx.update(crate::windows::stop);
+    }
+
+    #[gpui::test]
+    fn quit_save_as_cannot_overwrite_another_open_document(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        windows_setup(cx, None, &[]);
+        let (window, editor, path) = quit_file("quit-save-as-collision", cx);
+        quit_edit(&editor, "named ", cx);
+        let untitled = window
+            .update(cx, |workspace, window, cx| {
+                workspace.add_editor(None, "", None, window, cx);
+                workspace.active_editor().unwrap().clone()
+            })
+            .unwrap();
+        quit_edit(&untitled, "untitled", cx);
+        cx.dispatch_action(window.into(), Quit);
+        cx.simulate_prompt_answer("Save All");
+        cx.run_until_parked();
+        assert!(cx.did_prompt_for_new_path());
+        cx.simulate_new_path_selection(|_| Some(path.clone()));
+        quit_prompt(cx);
+        assert!(
+            cx.pending_prompt()
+                .unwrap()
+                .0
+                .starts_with("Multiple open copies")
+        );
+        cx.simulate_prompt_answer("Ok");
+        soon(cx, "the Save As collision stopped", &|cx| !quit::busy(cx));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "named saved\n");
+        assert!(cx.read(|cx| untitled.read(cx).doc(cx).is_dirty()));
+        assert!(cx.read(|cx| untitled.read(cx).path(cx).is_none()));
+        assert_eq!(cx.read(|cx| untitled.read(cx).text(cx)), "untitled");
+        assert!(!cx.read(quit::confirmed));
+        cx.update(crate::windows::stop);
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    fn window_close_does_not_overwrite_hard_linked_documents(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        windows_setup(cx, None, &[]);
+        let (window, editor, path) = quit_file("close-hard-link", cx);
+        let linked = path.with_file_name("linked.txt");
+        std::fs::hard_link(&path, &linked).unwrap();
+        let other = window
+            .update(cx, |workspace, window, cx| {
+                workspace.add_editor(Some(linked), "saved\n", None, window, cx);
+                workspace.active_editor().unwrap().clone()
+            })
+            .unwrap();
+        quit_edit(&editor, "first ", cx);
+        quit_edit(&other, "second ", cx);
+        window
+            .update(cx, |workspace, window, cx| {
+                assert!(!workspace.confirm_window_close(window, cx));
+            })
+            .unwrap();
+        cx.simulate_prompt_answer("Save All");
+        quit_prompt(cx);
+        assert!(
+            cx.pending_prompt()
+                .unwrap()
+                .0
+                .starts_with("Multiple open copies")
+        );
+        cx.simulate_prompt_answer("Ok");
+        soon(cx, "the alias close stopped", &|cx| {
+            !window.read(cx).unwrap().closing
+        });
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "saved\n");
+        assert!(
+            cx.read(|cx| editor.read(cx).doc(cx).is_dirty() && other.read(cx).doc(cx).is_dirty())
+        );
+        assert_eq!(cx.read(|cx| cx.windows().len()), 1);
+        cx.update(crate::windows::stop);
+    }
+
+    #[gpui::test]
+    fn window_close_rechecks_edits_and_cancel_releases_its_guard(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        windows_setup(cx, None, &[]);
+        let (window, editor, _) = quit_file("window-close-new-edit", cx);
+        quit_edit(&editor, "old ", cx);
+        window
+            .update(cx, |workspace, window, cx| {
+                assert!(!workspace.confirm_window_close(window, cx));
+                assert!(!workspace.confirm_window_close(window, cx));
+            })
+            .unwrap();
+        assert!(cx.has_pending_prompt());
+        quit_edit(&editor, "new ", cx);
+        cx.simulate_prompt_answer("Don't Save");
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        soon(cx, "the close guard released", &|cx| {
+            !window.read(cx).unwrap().closing
+        });
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(cx.read(|cx| cx.windows().len()), 1);
+        assert_eq!(cx.read(|cx| editor.read(cx).text(cx)), "new old saved\n");
+        cx.dispatch_action(window.into(), Quit);
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        soon(cx, "the quit guard released", &|cx| !quit::busy(cx));
+        cx.update(crate::windows::stop);
+    }
+
+    #[gpui::test]
+    fn discard_rechecks_other_window_edits_and_does_not_restore_them(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        windows_setup(cx, None, &[]);
+        let (first, editor, path) = quit_file("quit-discard-first", cx);
+        let (second, other, _) = quit_file("quit-discard-second", cx);
+        let recovery_dir = db::testing::dir("quit-discard-recovery");
+        first
+            .update(cx, |workspace, _, _| {
+                workspace.recovery = Some(recovery::Recovery::new(recovery_dir.clone()))
+            })
+            .unwrap();
+        quit_edit(&editor, "unsaved ", cx);
+        first
+            .update(cx, |workspace, _, cx| workspace.keep_unsaved(cx))
+            .unwrap()
+            .detach();
+        soon(cx, "the recovery record", &|_| {
+            std::fs::read_dir(&recovery_dir).unwrap().next().is_some()
+        });
+        cx.dispatch_action(first.into(), Quit);
+        assert!(cx.has_pending_prompt());
+        // This edit was not part of the first decision to discard.
+        quit_edit(&other, "new ", cx);
+        cx.simulate_prompt_answer("Don't Save");
+        soon(cx, "the new quit question", &|cx| quit::busy(cx));
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        assert_eq!(cx.pending_prompt().unwrap().0, "Save changes to 2 files?");
+        assert!(!cx.read(quit::confirmed));
+        cx.simulate_prompt_answer("Cancel");
+        soon(cx, "the cancelled second question", &|cx| !quit::busy(cx));
+        assert!(std::fs::read_dir(&recovery_dir).unwrap().next().is_some());
+        cx.dispatch_action(second.into(), Quit);
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Don't Save");
+        soon(cx, "the confirmed discard", &quit::confirmed);
+        assert!(std::fs::read_dir(&recovery_dir).unwrap().next().is_none());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "saved\n");
+        assert!(
+            cx.read(|cx| editor.read(cx).doc(cx).is_dirty() && other.read(cx).doc(cx).is_dirty())
+        );
         cx.update(crate::windows::stop);
     }
 

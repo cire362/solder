@@ -271,7 +271,13 @@ impl Workspace {
         self.start_recovery(window, cx);
         self.offer_crash_once(window, cx);
         self._subscriptions.push(cx.on_app_quit(|this, cx| {
-            let saved = this.keep_session(cx);
+            // A confirmed close already flushed its original tabs; do not
+            // replace them from a view the platform is tearing down.
+            let saved = if this.close_confirmed {
+                Task::ready(true)
+            } else {
+                this.keep_session(cx)
+            };
             async move {
                 saved.await;
             }
@@ -281,7 +287,7 @@ impl Workspace {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let saved = this.update(cx, |this, cx| {
-                    if this.restoring {
+                    if this.restoring || this.close_preparing || quit::pause_recovery(cx) {
                         return None;
                     }
                     let snapshot = this.snapshot(cx);

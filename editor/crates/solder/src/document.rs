@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::{FutureExt, future::Shared};
 use gpui::{Context, EntityId, EventEmitter, Task};
 use syntax::SyntaxTree;
 use text::{
@@ -189,6 +190,8 @@ impl ReadOnly {
 enum SaveFailure {
     Encoding(char, text::encoding::Encoding),
     Io(std::io::Error),
+    PathChanged,
+    RecoveryRevisionMissing,
 }
 
 impl SaveFailure {
@@ -202,6 +205,13 @@ impl SaveFailure {
                 crate::lang::t("The file changed on the target. Reopen it before saving.").into()
             }
             Self::Io(error) => crate::lang::tf("Not saved: {}", &[&error]),
+            Self::PathChanged => {
+                crate::lang::t("The file path changed during save. Save again.").into()
+            }
+            Self::RecoveryRevisionMissing => {
+                crate::lang::t("This recovered text has no target revision. Save it to a new file.")
+                    .into()
+            }
         }
     }
 }
@@ -270,6 +280,9 @@ pub struct Document {
     parse_task: Option<Task<()>>,
     indent_unit: &'static str,
     was_dirty: bool,
+    pending_saves: usize,
+    /// Foreground completion, including the revision and dirty-state update.
+    save_tail: Option<Shared<Task<bool>>>,
     /// Sorted by start.
     diagnostics: Arc<Vec<Diagnostic>>,
     /// Sorted by where they are.
@@ -298,6 +311,9 @@ pub struct Document {
     encoding: text::encoding::Encoding,
     /// The revision this view read, independent of reads made by other views.
     stamp: Option<crate::remote::Stamp>,
+    /// Undo may return to today's target text, which is not proof that
+    /// the recovered work was saved. Keep its original until an answer.
+    recovered_remote: Option<RecoveredRemote>,
     /// Something to say above the text: why it cannot be edited, or why
     /// it was not saved.
     notice: Option<gpui::SharedString>,
@@ -305,6 +321,13 @@ pub struct Document {
     title_override: Option<String>,
     /// Picks the grammar when there is no path.
     language_path: Option<PathBuf>,
+}
+
+struct RecoveredRemote {
+    path: PathBuf,
+    stamp: Option<crate::remote::Stamp>,
+    original: text::Rope,
+    baseline: text::Rope,
 }
 
 impl Document {
@@ -322,6 +345,8 @@ impl Document {
             parse_task: None,
             indent_unit,
             was_dirty: false,
+            pending_saves: 0,
+            save_tail: None,
             diagnostics: Arc::default(),
             server_inlays: Arc::default(),
             inlays: Arc::default(),
@@ -341,6 +366,7 @@ impl Document {
             read_only: false,
             encoding: Default::default(),
             stamp: None,
+            recovered_remote: None,
             notice: None,
             title_override: None,
             language_path: None,
@@ -400,7 +426,11 @@ impl Document {
     ) {
         let text = text::encoding::decode_as(bytes, encoding);
         self.reload(&text, cx);
-        self.stamp = stamp;
+        // Reopening an encoding retains undo history. Its later undo
+        // must not authorize the recovered text against a newer target.
+        if self.recovered_remote.is_none() {
+            self.stamp = stamp;
+        }
         self.encoding = encoding;
         // What could not be saved in the old one is no longer true.
         if !self.read_only {
@@ -575,7 +605,16 @@ impl Document {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.text.is_dirty()
+        self.text.is_dirty() || self.recovered_remote.is_some() || self.is_saving()
+    }
+
+    pub(crate) fn is_saving(&self) -> bool {
+        self.pending_saves != 0
+    }
+
+    /// Await this tail, then recapture it: another save may have been queued.
+    pub(crate) fn pending_save(&self) -> Option<Shared<Task<bool>>> {
+        self.is_saving().then(|| self.save_tail.clone()).flatten()
     }
 
     pub fn version(&self) -> u64 {
@@ -1029,8 +1068,8 @@ impl Document {
     }
 
     fn update_dirty(&mut self, cx: &mut Context<Self>) {
-        if self.text.is_dirty() != self.was_dirty {
-            self.was_dirty = self.text.is_dirty();
+        if self.is_dirty() != self.was_dirty {
+            self.was_dirty = self.is_dirty();
             cx.emit(DocumentEvent::DirtyChanged);
         }
     }
@@ -1045,51 +1084,100 @@ impl Document {
         if self.read_only {
             return Task::ready(false);
         }
-        let text = self.text.text_for_save();
-        let version = self.text.version();
+        let checkpoint = self.text.save_checkpoint();
+        let rope = self.text.rope().clone();
+        let line_ending = self.text.line_ending();
         let encoding = self.encoding;
-        let stamp = self.stamp.clone();
         let saved_path = path.clone();
-        cx.spawn(async move |this, cx| {
-            // In the encoding it was read in. A character that encoding
-            // has no byte for is said, never written as another.
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let bytes = text::encoding::encode(&text, encoding)
-                        .map_err(|character| SaveFailure::Encoding(character, encoding))?;
-                    crate::remote::write_versioned(&path, &bytes, stamp.as_ref())
-                        .map_err(SaveFailure::Io)
-                })
-                .await;
-            this.update(cx, |this, cx| match result {
-                Ok(stamp) => {
+        let previous = self.save_tail.take();
+        self.pending_saves += 1;
+        self.was_dirty = self.is_dirty();
+        cx.emit(DocumentEvent::DirtyChanged);
+        let save = cx
+            .spawn(async move |this, cx| {
+                if let Some(previous) = previous {
+                    // Each request reports its own result. A failed write
+                    // leaves the revision available for the next attempt.
+                    previous.await;
+                }
+                // Read our revision after the previous foreground completion,
+                // never one captured before it wrote, or from a different path.
+                let Ok(stamp) = this.read_with(cx, |this, _| {
                     if this.path.as_ref() != Some(&saved_path) {
-                        this.notice = Some(
-                            crate::lang::t("The file path changed during save. Save again.").into(),
-                        );
-                        cx.emit(DocumentEvent::DirtyChanged);
-                        return false;
+                        return Err(SaveFailure::PathChanged);
                     }
-                    this.stamp = stamp;
-                    if this.text.version() == version {
-                        this.text.mark_saved();
+                    let source = this
+                        .recovered_remote
+                        .as_ref()
+                        .filter(|recovered| recovered.path == saved_path);
+                    let stamp = source
+                        .map_or_else(|| this.stamp.clone(), |recovered| recovered.stamp.clone());
+                    if source.is_some() && stamp.is_none() {
+                        return Err(SaveFailure::RecoveryRevisionMissing);
                     }
-                    this.notice = None;
-                    this.update_dirty(cx);
-                    cx.emit(DocumentEvent::Saved);
-                    true
-                }
-                Err(why) => {
-                    // Choose the language on the window's thread, after IO:
-                    // the user may have changed it while the save ran.
-                    this.notice = Some(why.message().into());
+                    Ok(stamp)
+                }) else {
+                    return false;
+                };
+                let result = match stamp {
+                    Ok(stamp) => {
+                        // Flattening and restoring line endings can be large,
+                        // so they run with the encoding and IO off this thread.
+                        cx.background_executor()
+                            .spawn(async move {
+                                let text = match line_ending {
+                                    text::LineEnding::Lf => rope.to_string(),
+                                    text::LineEnding::CrLf => {
+                                        rope.to_string().replace('\n', "\r\n")
+                                    }
+                                };
+                                let bytes = text::encoding::encode(&text, encoding).map_err(
+                                    |character| SaveFailure::Encoding(character, encoding),
+                                )?;
+                                crate::remote::write_versioned(&path, &bytes, stamp.as_ref())
+                                    .map_err(SaveFailure::Io)
+                            })
+                            .await
+                    }
+                    Err(why) => Err(why),
+                };
+                this.update(cx, |this, cx| {
+                    this.pending_saves -= 1;
+                    let result = if this.path.as_ref() == Some(&saved_path) {
+                        result
+                    } else {
+                        Err(SaveFailure::PathChanged)
+                    };
+                    let saved = match result {
+                        Ok(stamp) => {
+                            this.stamp = stamp;
+                            // Undo during IO may return to the old clean state.
+                            // Only the snapshot actually written is now saved.
+                            this.text.mark_saved_at(checkpoint);
+                            this.recovered_remote = None;
+                            this.notice = None;
+                            true
+                        }
+                        Err(why) => {
+                            // The language may have changed while the save ran.
+                            this.notice = Some(why.message().into());
+                            false
+                        }
+                    };
+                    this.was_dirty = this.is_dirty();
+                    // Pending state changes even when the text stays dirty.
                     cx.emit(DocumentEvent::DirtyChanged);
-                    false
-                }
+                    if saved {
+                        cx.emit(DocumentEvent::Saved);
+                    }
+                    saved
+                })
+                .unwrap_or(false)
             })
-            .unwrap_or(false)
-        })
+            .shared();
+        self.save_tail = Some(save.clone());
+        // The document owns the write; cancelling a caller's wait cannot cancel it.
+        cx.spawn(async move |_, _| save.await)
     }
 
     /// Takes new contents from disk as one undoable step and marks the
@@ -1112,10 +1200,40 @@ impl Document {
 
     /// Puts back text that was typed and never saved, as changes that are
     /// not saved: one step back from it is the file as it is on disk.
-    /// False where there was nothing to put back.
-    pub fn recover(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
-        if self.read_only || *self.text.rope() == text {
+    /// Remote recovery retains its own read revision even if the text
+    /// already matches today's file. None means an old, unversioned copy.
+    pub(crate) fn recover(
+        &mut self,
+        text: &str,
+        stamp: Option<crate::remote::Stamp>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.read_only {
             return false;
+        }
+        let remote = self.path.as_deref().is_some_and(crate::remote::is_remote);
+        if remote {
+            self.stamp = stamp;
+            self.recovered_remote = Some(RecoveredRemote {
+                path: self.path.clone().unwrap(),
+                stamp: self.stamp.clone(),
+                original: text::Rope::from_str(text),
+                baseline: self.text.rope().clone(),
+            });
+            self.notice = Some(if self.stamp.is_none() {
+                crate::lang::t("This recovered text has no target revision. Save it to a new file.")
+                    .into()
+            } else {
+                crate::lang::t(
+                    "This text was recovered. Its recovery copy is kept until you save or close it.",
+                )
+                .into()
+            });
+        }
+        if *self.text.rope() == text {
+            self.update_dirty(cx);
+            cx.notify();
+            return remote;
         }
         let len = self.text.len();
         self.text.seal_history();
@@ -1124,31 +1242,82 @@ impl Document {
             .edit([(0..len, text.to_string())], &[], Instant::now())
             .into();
         self.text.seal_history();
-        let said = crate::lang::t(
-            "This text was not saved when Solder closed. Undo brings back the file as it is on disk.",
-        );
-        self.notice = Some(said.into());
+        if !remote {
+            let said = crate::lang::t(
+                "This text was not saved when Solder closed. Undo brings back the file as it is on disk.",
+            );
+            self.notice = Some(said.into());
+        }
         self.after_change(applied, None, cx);
         true
     }
 
+    /// A remote undo to the startup baseline must not replace the only
+    /// recovery copy of the original work with the target's newer text.
+    pub(crate) fn recovery_snapshot(
+        &self,
+    ) -> (Option<PathBuf>, text::Rope, Option<crate::remote::Stamp>) {
+        match &self.recovered_remote {
+            Some(recovered) => {
+                let text = if self.text.rope() == &recovered.baseline {
+                    &recovered.original
+                } else {
+                    self.text.rope()
+                };
+                // An attempted Save As does not reassign the original
+                // recovery to its destination before the write succeeds.
+                (
+                    Some(recovered.path.clone()),
+                    text.clone(),
+                    recovered.stamp.clone(),
+                )
+            }
+            None => (
+                self.path.clone(),
+                self.text.rope().clone(),
+                self.stamp.clone(),
+            ),
+        }
+    }
+
     pub fn set_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.path = Some(path);
+        if self.path.as_ref() == Some(&path) {
+            return;
+        }
+        // The old clean checkpoint belongs to another destination. Undo
+        // cannot make this one saved, even if its first write fails.
+        self.text.touch();
+        self.was_dirty = self.is_dirty();
+        cx.emit(DocumentEvent::DirtyChanged);
         self.stamp = None;
+        // Choosing a destination is not a successful save. In particular,
+        // an undo to the baseline still needs its protected original.
+        self.changed_path(path, cx);
+    }
+
+    fn changed_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.path = Some(path);
         self.blame = Arc::default();
         self.blame_error = None;
         self.refresh_blame(cx);
         self.syntax = None;
         self.syntax_generation += 1;
         self.initial_parse(cx);
+        self.update_dirty(cx);
         cx.emit(DocumentEvent::PathChanged);
     }
 
     /// A rename keeps the revision that was opened; Save As does not.
     pub fn renamed(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let stamp = self.stamp.take();
-        self.set_path(path, cx);
-        self.stamp = stamp;
+        if let Some(recovered) = self.recovered_remote.as_mut()
+            && self.path.as_ref() == Some(&recovered.path)
+        {
+            recovered.path = path.clone();
+            // Recovery must write its changed source path even though a
+            // rename did not change the text's contents.
+            self.text.touch();
+        }
+        self.changed_path(path, cx);
     }
 
     // ------------------------------------------------------------ syntax
@@ -1272,6 +1441,24 @@ mod tests {
     use super::*;
     use gpui::AppContext;
 
+    fn hold_save_queue(
+        doc: &mut Document,
+        cx: &mut Context<Document>,
+    ) -> futures::channel::oneshot::Sender<()> {
+        let (release, held) = futures::channel::oneshot::channel();
+        let previous = doc.save_tail.take();
+        doc.save_tail = Some(
+            cx.spawn(async move |_, _| {
+                if let Some(previous) = previous {
+                    previous.await;
+                }
+                held.await.is_ok()
+            })
+            .shared(),
+        );
+        release
+    }
+
     #[gpui::test]
     fn file_notices_use_the_language_when_the_file_is_shown(cx: &mut gpui::TestAppContext) {
         let loaded = std::thread::spawn(|| Loaded::of(b"\0\x01\x02"))
@@ -1340,6 +1527,469 @@ mod tests {
             doc.apply_edits(vec![(0..1, "F".into())], None, cx)
         });
         assert!(!second.update(cx, |doc, cx| doc.save(cx)).await);
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn remote_recovery_preserves_originals_through_same_content_undo_and_reopen(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let directory = db::testing::dir("document-recovery-originals")
+            .canonicalize()
+            .unwrap();
+        let source = directory.join("server");
+        let cache = directory.join("cache");
+        std::fs::create_dir(&source).unwrap();
+        let target = source.join("file.txt");
+        let path = cache.join("file.txt");
+        std::fs::write(&target, b"before").unwrap();
+        let _mount = crate::remote::fixture(&source, &cache);
+        let original = load(&path).unwrap().stamp;
+        std::fs::write(&target, b"today").unwrap();
+        let loaded = load(&path).unwrap();
+
+        let same = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+        assert!(same.update(cx, |doc, cx| doc.recover("today", original.clone(), cx)));
+        assert!(same.read_with(cx, |doc, _| doc.is_dirty()));
+        assert_eq!(
+            same.read_with(cx, |doc, _| doc.recovery_snapshot().2),
+            original
+        );
+        assert!(!same.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(std::fs::read(&target).unwrap(), b"today");
+
+        let restored = cx.new(|cx| Document::open(path, &loaded, cx));
+        restored.update(cx, |doc, cx| doc.recover("unsaved", original.clone(), cx));
+        let origin = restored.entity_id();
+        restored.update(cx, |doc, cx| doc.undo(origin, cx)).unwrap();
+        assert_eq!(
+            restored.read_with(cx, |doc, _| doc.text().rope().to_string()),
+            "today"
+        );
+        assert!(restored.read_with(cx, |doc, _| doc.is_dirty()));
+        let (_, text, stamp) = restored.read_with(cx, |doc, _| doc.recovery_snapshot());
+        assert_eq!(text.to_string(), "unsaved");
+        assert_eq!(stamp, original);
+        restored.update(cx, |doc, cx| doc.redo(origin, cx)).unwrap();
+        // An encoding reread is undoable too. It cannot borrow today's
+        // revision and then save the old recovery through another undo.
+        restored.update(cx, |doc, cx| {
+            doc.reopen(b"today", loaded.stamp.clone(), loaded.encoding, cx);
+            doc.undo(origin, cx).unwrap();
+        });
+        assert_eq!(
+            restored.read_with(cx, |doc, _| doc.recovery_snapshot().2),
+            original
+        );
+        assert!(!restored.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(std::fs::read(&target).unwrap(), b"today");
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn legacy_remote_recovery_requires_save_as_even_when_contents_match(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let directory = db::testing::dir("document-recovery-legacy")
+            .canonicalize()
+            .unwrap();
+        let source = directory.join("server");
+        let cache = directory.join("cache");
+        std::fs::create_dir(&source).unwrap();
+        let target = source.join("file.txt");
+        let path = cache.join("file.txt");
+        std::fs::write(&target, b"today").unwrap();
+        let _mount = crate::remote::fixture(&source, &cache);
+        let loaded = load(&path).unwrap();
+        let restored = cx.new(|cx| Document::open(path, &loaded, cx));
+        restored.update(cx, |doc, cx| doc.recover("today", None, cx));
+        assert!(restored.read_with(cx, |doc, _| doc.is_dirty()));
+        assert_eq!(
+            restored.read_with(cx, |doc, _| doc.recovery_snapshot().2),
+            None
+        );
+        assert!(!restored.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(std::fs::read(&target).unwrap(), b"today");
+
+        // A rename retains the unknown revision rather than authorizing
+        // an overwrite of another existing target.
+        let renamed = cache.join("renamed.txt");
+        std::fs::write(source.join("renamed.txt"), b"other work").unwrap();
+        restored.update(cx, |doc, cx| doc.renamed(renamed, cx));
+        assert!(!restored.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(
+            std::fs::read(source.join("renamed.txt")).unwrap(),
+            b"other work"
+        );
+
+        restored.update(cx, |doc, cx| doc.set_path(cache.join("new.txt"), cx));
+        assert!(restored.read_with(cx, |doc, _| doc.is_dirty()));
+        assert!(restored.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(std::fs::read(source.join("new.txt")).unwrap(), b"today");
+        assert!(!restored.read_with(cx, |doc, _| doc.is_dirty()));
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn unchanged_remote_recovery_can_be_saved_and_cleared(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let directory = db::testing::dir("document-recovery-save")
+            .canonicalize()
+            .unwrap();
+        let source = directory.join("server");
+        let cache = directory.join("cache");
+        std::fs::create_dir(&source).unwrap();
+        let target = source.join("file.txt");
+        let path = cache.join("file.txt");
+        std::fs::write(&target, b"before").unwrap();
+        let _mount = crate::remote::fixture(&source, &cache);
+        let loaded = load(&path).unwrap();
+        let restored = cx.new(|cx| Document::open(path, &loaded, cx));
+        restored.update(cx, |doc, cx| {
+            doc.recover("unsaved", loaded.stamp.clone(), cx)
+        });
+        restored.update(cx, |doc, cx| {
+            doc.set_path(doc.path().unwrap().to_path_buf(), cx)
+        });
+        assert_eq!(
+            restored.read_with(cx, |doc, _| doc.stamp.clone()),
+            loaded.stamp
+        );
+        assert!(restored.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(std::fs::read(&target).unwrap(), b"unsaved");
+        assert!(!restored.read_with(cx, |doc, _| doc.is_dirty()));
+        assert!(restored.read_with(cx, |doc, _| doc.recovered_remote.is_none()));
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn queued_remote_saves_use_completed_revisions_and_expose_the_current_tail(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let directory = db::testing::dir("document-save-queue")
+            .canonicalize()
+            .unwrap();
+        let source = directory.join("server");
+        let cache = directory.join("cache");
+        std::fs::create_dir(&source).unwrap();
+        let target = source.join("file.txt");
+        let path = cache.join("file.txt");
+        std::fs::write(&target, b"before").unwrap();
+        let _mount = crate::remote::fixture(&source, &cache);
+        let loaded = load(&path).unwrap();
+        let document = cx.new(|cx| Document::open(path, &loaded, cx));
+        let (release_first, first, first_tail) = document.update(cx, |doc, cx| {
+            doc.recover("first", loaded.stamp.clone(), cx);
+            let release = hold_save_queue(doc, cx);
+            let save = doc.save(cx);
+            assert_eq!(doc.pending_saves, 1);
+            (release, save, doc.pending_save().unwrap())
+        });
+        let (release_second, second) = document.update(cx, |doc, cx| {
+            // Keep the second write stopped after the first completes, so
+            // inspecting the first result cannot race with its replacement.
+            let release = hold_save_queue(doc, cx);
+            doc.apply_edits(vec![(0..doc.text().len(), "second".into())], None, cx);
+            let save = doc.save(cx);
+            assert_eq!(doc.pending_saves, 2);
+            assert!(doc.is_saving());
+            assert!(doc.is_dirty());
+            (release, save)
+        });
+        let changes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            let changes = changes.clone();
+            cx.subscribe(&document, move |document, event, cx| {
+                if matches!(event, DocumentEvent::DirtyChanged) {
+                    changes.borrow_mut().push(document.read(cx).pending_saves);
+                }
+            })
+        });
+
+        release_first.send(()).unwrap();
+        assert!(first.await);
+        assert!(first_tail.await);
+        assert_eq!(std::fs::read(&target).unwrap(), b"first");
+        assert!(document.read_with(cx, |doc, _| doc.recovered_remote.is_none()));
+        assert_eq!(document.read_with(cx, |doc, _| doc.pending_saves), 1);
+        // A waiter on the old tail must recapture after awaiting it.
+        let tail = document.read_with(cx, |doc, _| doc.pending_save().unwrap());
+        release_second.send(()).unwrap();
+        assert!(tail.await);
+        assert!(second.await);
+        assert_eq!(std::fs::read(&target).unwrap(), b"second");
+        assert!(document.read_with(cx, |doc, _| doc.pending_save().is_none()));
+        assert!(!document.read_with(cx, |doc, _| doc.is_dirty() || doc.is_saving()));
+        assert_eq!(*changes.borrow(), vec![1, 0]);
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn failed_queued_save_leaves_the_revision_for_the_next_attempt(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let directory = db::testing::dir("document-save-queue-failure")
+            .canonicalize()
+            .unwrap();
+        let source = directory.join("server");
+        let cache = directory.join("cache");
+        std::fs::create_dir(&source).unwrap();
+        let target = source.join("file.txt");
+        let path = cache.join("file.txt");
+        std::fs::write(&target, b"before").unwrap();
+        let _mount = crate::remote::fixture(&source, &cache);
+        let loaded = load(&path).unwrap();
+        let document = cx.new(|cx| Document::open(path, &loaded, cx));
+        let (first, release, second) = document.update(cx, |doc, cx| {
+            doc.recover("😀", loaded.stamp.clone(), cx);
+            doc.set_encoding(text::encoding::Encoding::Windows1252, cx);
+            let first = doc.save(cx);
+            let release = hold_save_queue(doc, cx);
+            doc.apply_edits(vec![(0..doc.text().len(), "retry".into())], None, cx);
+            doc.set_encoding(text::encoding::Encoding::Utf8, cx);
+            (first, release, doc.save(cx))
+        });
+        assert!(!first.await);
+        assert_eq!(std::fs::read(&target).unwrap(), b"before");
+        document.read_with(cx, |doc, _| {
+            assert_eq!(doc.stamp, loaded.stamp);
+            assert!(doc.recovered_remote.is_some());
+            assert!(doc.notice().is_some());
+            assert_eq!(doc.pending_saves, 1);
+            assert!(doc.is_dirty());
+        });
+        release.send(()).unwrap();
+        assert!(second.await);
+        assert_eq!(std::fs::read(&target).unwrap(), b"retry");
+        assert!(document.read_with(cx, |doc, _| doc.recovered_remote.is_none()));
+        assert!(!document.read_with(cx, |doc, _| doc.is_dirty() || doc.is_saving()));
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn queued_save_rejects_a_changed_path_without_clearing_recovery(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let directory = db::testing::dir("document-save-queue-path")
+            .canonicalize()
+            .unwrap();
+        let source = directory.join("server");
+        let cache = directory.join("cache");
+        std::fs::create_dir(&source).unwrap();
+        let target = source.join("file.txt");
+        let path = cache.join("file.txt");
+        std::fs::write(&target, b"before").unwrap();
+        let _mount = crate::remote::fixture(&source, &cache);
+        let loaded = load(&path).unwrap();
+        let document = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+        let (release_first, first, release_second, second) = document.update(cx, |doc, cx| {
+            doc.recover("unsaved", loaded.stamp.clone(), cx);
+            let release_first = hold_save_queue(doc, cx);
+            let first = doc.save(cx);
+            let release_second = hold_save_queue(doc, cx);
+            doc.set_path(cache.join("new.txt"), cx);
+            (release_first, first, release_second, doc.save(cx))
+        });
+        release_first.send(()).unwrap();
+        assert!(!first.await);
+        assert_eq!(std::fs::read(&target).unwrap(), b"before");
+        assert!(!source.join("new.txt").exists());
+        document.read_with(cx, |doc, _| {
+            assert_eq!(doc.pending_saves, 1);
+            assert!(doc.text.is_dirty());
+            assert_eq!(doc.recovery_snapshot().0, Some(path));
+            assert!(doc.recovered_remote.is_some());
+        });
+        release_second.send(()).unwrap();
+        assert!(second.await);
+        assert_eq!(std::fs::read(source.join("new.txt")).unwrap(), b"unsaved");
+        assert!(document.read_with(cx, |doc, _| doc.recovered_remote.is_none()));
+        assert!(!document.read_with(cx, |doc, _| doc.is_dirty() || doc.is_saving()));
+    }
+
+    #[gpui::test]
+    fn save_as_invalidates_the_clean_checkpoint_but_physical_rename_does_not(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = db::testing::dir("document-save-as-checkpoint")
+            .canonicalize()
+            .unwrap();
+        let path = directory.join("file.txt");
+        let renamed = directory.join("renamed.txt");
+        std::fs::write(&path, b"original").unwrap();
+        let loaded = load(&path).unwrap();
+        let document = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+        let changes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _subscription = cx.update(|cx| {
+            let changes = changes.clone();
+            cx.subscribe(&document, move |_, event, _| {
+                if matches!(event, DocumentEvent::DirtyChanged) {
+                    changes.set(changes.get() + 1);
+                }
+            })
+        });
+
+        std::fs::rename(&path, &renamed).unwrap();
+        document.update(cx, |doc, cx| {
+            let version = doc.version();
+            doc.renamed(renamed.clone(), cx);
+            assert_eq!(doc.stamp, loaded.stamp);
+            assert_eq!(doc.version(), version);
+            assert!(!doc.is_dirty());
+            doc.set_path(renamed, cx);
+            assert_eq!(doc.version(), version);
+            assert!(!doc.is_dirty());
+        });
+        assert_eq!(changes.get(), 0);
+        document.update(cx, |doc, cx| {
+            doc.set_path(directory.join("new.txt"), cx);
+            assert!(doc.text.is_dirty());
+            assert!(doc.is_dirty());
+        });
+        assert_eq!(changes.get(), 1);
+    }
+
+    #[gpui::test]
+    async fn failed_save_as_after_old_path_write_keeps_undone_text_dirty(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let directory = db::testing::dir("document-save-as-pending-undo")
+            .canonicalize()
+            .unwrap();
+        let path = directory.join("file.txt");
+        let blocked = directory.join("blocked");
+        std::fs::write(&path, b"original").unwrap();
+        // A regular file as the parent fails on every platform, regardless
+        // of the test runner's permission to write protected directories.
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let destination = blocked.join("file.txt");
+        let loaded = load(&path).unwrap();
+        let document = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+        let origin = document.entity_id();
+        let (release_first, first) = document.update(cx, |doc, cx| {
+            let release = hold_save_queue(doc, cx);
+            doc.apply_edits(vec![(0..doc.text().len(), "edited".into())], None, cx);
+            let save = doc.save(cx);
+            doc.undo(origin, cx).unwrap();
+            assert_eq!(doc.text.rope().to_string(), "original");
+            assert!(!doc.text.is_dirty());
+            assert!(doc.is_saving());
+            (release, save)
+        });
+        release_first.send(()).unwrap();
+        // Drain background work after each foreground step. Once the real
+        // write finishes, its foreground completion stays queued until the
+        // path has changed, so no timing or filesystem speed decides the race.
+        while std::fs::read(&path).unwrap() != b"edited" {
+            assert!(cx.dispatcher.tick(false), "save did not reach the write");
+            while cx.dispatcher.tick(true) {}
+        }
+        let (release_second, second) = document.update(cx, |doc, cx| {
+            assert_eq!(doc.pending_saves, 1);
+            assert!(!doc.text.is_dirty());
+            let release = hold_save_queue(doc, cx);
+            doc.set_path(destination.clone(), cx);
+            assert!(doc.text.is_dirty());
+            (release, doc.save(cx))
+        });
+        assert!(!first.await);
+        assert_eq!(std::fs::read(&path).unwrap(), b"edited");
+        document.read_with(cx, |doc, _| {
+            assert_eq!(doc.pending_saves, 1);
+            assert_eq!(doc.text.rope().to_string(), "original");
+            assert!(doc.text.is_dirty());
+            assert!(doc.is_dirty());
+        });
+        release_second.send(()).unwrap();
+        assert!(!second.await);
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"edited");
+        document.read_with(cx, |doc, _| {
+            assert_eq!(doc.path(), Some(destination.as_path()));
+            assert_eq!(doc.text.rope().to_string(), "original");
+            assert!(!doc.is_saving());
+            assert!(doc.pending_save().is_none());
+            assert!(doc.notice().is_some());
+            assert!(doc.text.is_dirty());
+            assert!(doc.is_dirty());
+        });
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn async_save_marks_the_written_checkpoint_after_edit_and_undo(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let directory = db::testing::dir("document-save-checkpoint")
+            .canonicalize()
+            .unwrap();
+        let source = directory.join("server");
+        let cache = directory.join("cache");
+        std::fs::create_dir(&source).unwrap();
+        let target = source.join("file.txt");
+        let path = cache.join("file.txt");
+        std::fs::write(&target, b"before").unwrap();
+        let _mount = crate::remote::fixture(&source, &cache);
+        let loaded = load(&path).unwrap();
+        let document = cx.new(|cx| Document::open(path, &loaded, cx));
+        document.update(cx, |doc, cx| {
+            doc.recover("unsaved", loaded.stamp.clone(), cx)
+        });
+        let origin = document.entity_id();
+
+        // Do the edits in this update, before the spawned IO can run.
+        // Undo returns to the saved snapshot with a different version.
+        let save = document.update(cx, |doc, cx| {
+            let save = doc.save(cx);
+            doc.apply_edits(vec![(0..doc.text().len(), "later".into())], None, cx);
+            doc.undo(origin, cx).unwrap();
+            assert_eq!(doc.text().rope().to_string(), "unsaved");
+            assert!(doc.is_dirty());
+            assert!(doc.is_saving());
+            assert!(doc.pending_save().is_some());
+            assert!(doc.recovered_remote.is_some());
+            save
+        });
+        assert!(save.await);
+        assert_eq!(std::fs::read(&target).unwrap(), b"unsaved");
+        assert!(!document.read_with(cx, |doc, _| doc.is_dirty()));
+        assert!(document.read_with(cx, |doc, _| doc.pending_save().is_none()));
+        assert!(document.read_with(cx, |doc, _| doc.recovered_remote.is_none()));
+
+        // Undo to the old clean text while saving new text. That text
+        // becomes dirty when the target has actually received the new one.
+        let save = document.update(cx, |doc, cx| {
+            doc.apply_edits(vec![(0..doc.text().len(), "next".into())], None, cx);
+            let save = doc.save(cx);
+            doc.undo(origin, cx).unwrap();
+            assert_eq!(doc.text().rope().to_string(), "unsaved");
+            assert!(!doc.text.is_dirty());
+            assert!(doc.is_dirty());
+            assert!(doc.is_saving());
+            assert!(doc.pending_save().is_some());
+            save
+        });
+        assert!(save.await);
+        assert_eq!(std::fs::read(&target).unwrap(), b"next");
+        assert!(document.read_with(cx, |doc, _| doc.is_dirty()));
+        assert!(!document.read_with(cx, |doc, _| doc.is_saving()));
+        assert_eq!(
+            document.read_with(cx, |doc, _| doc.recovery_snapshot().1.to_string()),
+            "unsaved"
+        );
+        document.update(cx, |doc, cx| doc.redo(origin, cx)).unwrap();
+        assert_eq!(
+            document.read_with(cx, |doc, _| doc.text().rope().to_string()),
+            "next"
+        );
+        assert!(!document.read_with(cx, |doc, _| doc.is_dirty()));
     }
 
     #[test]

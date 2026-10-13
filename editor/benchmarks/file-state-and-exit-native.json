@@ -1,0 +1,22 @@
+{
+  "date": "2026-10-14",
+  "platform": "arm64 macOS 26.6.2",
+  "surface": "Temporary .app containing the branch release binary; original process used isolated HOME and a disposable text file",
+  "verified": [
+    "Paste into native editor",
+    "Undo twice returned to disk text and removed the changed dot",
+    "Redo twice restored the changed text and dot",
+    "Cmd-Q displayed Save All / Don't Save / Cancel",
+    "Cancel preserved the window and edits",
+    "Save All wrote the edited file and original process exited",
+    "Recovery directory had no files after confirmed exit"
+  ],
+  "saved_text": " native saved\n",
+  "not_verified": [
+    "Character-by-character injection was unreliable; paste worked",
+    "Native multi-window quit and window/tab close",
+    "Native failed-save, notebook and remote-recovery controls",
+    "Linux and Windows"
+  ],
+  "automation_note": "Reading accessibility state after exit relaunched the temporary app; that extra process was stopped. The original process exit and saved bytes were checked separately."
+}
