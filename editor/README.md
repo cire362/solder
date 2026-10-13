@@ -156,16 +156,35 @@ line above the text says which and why. Edits a language server or an
 extension makes to a file that is not open are written in that file's own
 encoding too.
 
-**Text that is not saved is kept aside** as it is typed, for whatever ends
-the editor without asking: a crash, the power, or `cmd-q`, which asks
-nothing. Within a second of a change the whole text of the file goes to
-`sessions/recovery/` beside the settings; saving the file, closing its
-tab, or closing the window with an answer about its changes removes it. What is found there at the next start was neither
-saved nor let go, and is put back: into the tab of its file, into a new
-tab where its file is gone or it never had one. It comes back as changes
-that are not saved, with a line above the text that says so, and one undo
-from it is the file as it is on disk. Nothing is written to the file
-itself until you save. A text over 16 MB is not kept.
+**Quit** (`cmd-q` or the palette) asks once about changes in all project
+windows. **Save All** finishes their writes before quitting; **Don't Save**
+lets go of the changes; **Cancel** keeps every window open. A failed save or
+cancelled Save As stops the quit. Changes made while a question or a write
+is pending get another question. Independent open copies of the same local
+file or notebook block Save All: close the other copies first. Closing a
+window follows the same checks for its files and notebooks.
+
+Undo back to a saved history state removes the changed mark; redo away
+from it puts it back. Saves of one document or notebook run in request
+order. A file's successful save records the state actually written, so
+undo and typing during IO cannot make a different state appear saved.
+Encoding and line-ending changes remain changes until saved.
+
+**Text that is not saved is kept aside** as it is typed, for a crash or
+another exit without a decision. Within a second of a change the whole
+text of the file goes to `sessions/recovery/` beside the settings; saving
+the file, closing its tab, or closing the window with an answer removes
+it. What is found at the next start is put back after the tabs, as unsaved
+changes with a notice and one undo to the disk text. Nothing is written
+to the file until you save. A text over 16 MB is not kept; an earlier
+copy is retained. Notebook recovery is not implemented.
+
+Recovered remote text retains its original read revision, even after an
+undo or a failed Save As. A newer target refuses the save. A recovery copy
+from an older version without that revision needs Save As to a new file.
+Disconnected, unreadable and unsupported recovery copies remain on disk.
+The operating system's direct Quit can bypass this question: GPUI's
+shutdown callback cannot cancel it. Recovery still runs on that path.
 
 A tab can be **pinned** (`cmd-k shift-enter`, or **Workspace: Toggle pin
 tab** in the palette): it goes before the tabs that are not, shows a pin

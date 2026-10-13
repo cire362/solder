@@ -52,11 +52,20 @@ impl LineEnding {
     }
 }
 
+/// The text and save format captured for a write from one buffer.
+#[derive(Clone, Copy, Debug)]
+pub struct SaveCheckpoint {
+    state: u64,
+    format_generation: u64,
+}
+
 pub struct Buffer {
     rope: Rope,
     line_ending: LineEnding,
     version: u64,
-    saved_version: u64,
+    saved_state: u64,
+    format_generation: u64,
+    saved_format_generation: u64,
     history: History,
 }
 
@@ -93,7 +102,9 @@ impl Buffer {
             rope: Rope::from_str(&text),
             line_ending,
             version: 0,
-            saved_version: 0,
+            saved_state: 0,
+            format_generation: 0,
+            saved_format_generation: 0,
             history: History::default(),
         }
     }
@@ -102,16 +113,41 @@ impl Buffer {
         &self.rope
     }
 
+    /// Monotonic mutation version, including undo, redo and format changes.
     pub fn version(&self) -> u64 {
         self.version
     }
 
+    /// Whether the history checkpoint or save format differs from the last save.
     pub fn is_dirty(&self) -> bool {
-        self.version != self.saved_version
+        self.format_generation != self.saved_format_generation
+            || self.history.state() != self.saved_state
     }
 
+    /// Captures the current text and format before starting a write and seals
+    /// the undo group. This does not mark anything saved. Read the bytes and
+    /// encoding for that write in the same update, before any further mutation.
+    pub fn save_checkpoint(&mut self) -> SaveCheckpoint {
+        // Keep the captured checkpoint reachable if typing resumes during IO.
+        self.history.seal();
+        SaveCheckpoint {
+            state: self.history.state(),
+            format_generation: self.format_generation,
+        }
+    }
+
+    /// Records a successful write of a checkpoint captured from this buffer,
+    /// even if the current text or format changed while the write ran.
+    /// On failure, discard the checkpoint without calling this method.
+    pub fn mark_saved_at(&mut self, checkpoint: SaveCheckpoint) {
+        self.saved_state = checkpoint.state;
+        self.saved_format_generation = checkpoint.format_generation;
+    }
+
+    /// Marks the current text and format clean and seals the undo group.
     pub fn mark_saved(&mut self) {
-        self.saved_version = self.version;
+        let checkpoint = self.save_checkpoint();
+        self.mark_saved_at(checkpoint);
     }
 
     pub fn line_ending(&self) -> LineEnding {
@@ -122,6 +158,11 @@ impl Buffer {
     /// it changed: it is to be saved in another encoding.
     pub fn touch(&mut self) {
         self.version += 1;
+        // A completing save cannot clear format changes made after its capture.
+        self.format_generation = self
+            .format_generation
+            .checked_add(1)
+            .expect("save format generation overflow");
     }
 
     /// Changes what lines end with when the text is saved. The text is
@@ -129,7 +170,7 @@ impl Buffer {
     pub fn set_line_ending(&mut self, ending: LineEnding) {
         if self.line_ending != ending {
             self.line_ending = ending;
-            self.version += 1;
+            self.touch();
         }
     }
 
@@ -234,7 +275,8 @@ impl Buffer {
     /// order they were applied (highest offset first).
     ///
     /// Consecutive calls within [`History::GROUP_INTERVAL`] merge into a single
-    /// undo step unless [`Buffer::seal_history`] was called in between.
+    /// undo step unless [`Buffer::seal_history`], [`Buffer::save_checkpoint`] or
+    /// [`Buffer::mark_saved`] was called in between.
     pub fn edit<S: AsRef<str>>(
         &mut self,
         edits: impl IntoIterator<Item = (Range<usize>, S)>,
@@ -511,9 +553,15 @@ mod tests {
         let mut b = Buffer::new("");
         b.edit([(0..0, "a")], &[], now());
         b.undo();
+        assert!(!b.is_dirty());
         b.edit([(0..0, "b")], &[], now());
         assert!(b.redo().is_none());
         assert_eq!(b.rope().to_string(), "b");
+        assert!(b.is_dirty());
+        b.undo().unwrap();
+        assert!(!b.is_dirty());
+        b.redo().unwrap();
+        assert!(b.is_dirty());
     }
 
     #[test]
@@ -524,5 +572,372 @@ mod tests {
         assert!(b.is_dirty());
         b.mark_saved();
         assert!(!b.is_dirty());
+    }
+
+    #[test]
+    fn grouped_undo_restores_saved_text_without_rewinding_version() {
+        let t = now();
+        let mut b = Buffer::new("hello");
+        b.edit([(5..5, " world"), (0..1, "H")], &[], t);
+        b.edit([(11..11, "!")], &[], t + Duration::from_millis(50));
+        assert_eq!(b.version(), 3);
+        assert!(b.is_dirty());
+
+        for _ in 0..3 {
+            let version = b.version();
+            assert_eq!(b.undo().unwrap().0.len(), 3);
+            assert_eq!(b.version(), version + 3);
+            assert_eq!(b.rope().to_string(), "hello");
+            assert!(!b.is_dirty());
+            assert!(b.undo().is_none());
+            assert_eq!(b.version(), version + 3);
+
+            assert_eq!(b.redo().unwrap().0.len(), 3);
+            assert_eq!(b.version(), version + 6);
+            assert_eq!(b.rope().to_string(), "Hello world!");
+            assert!(b.is_dirty());
+            assert!(b.redo().is_none());
+            assert_eq!(b.version(), version + 6);
+        }
+    }
+
+    #[test]
+    fn saving_seals_typing_groups_and_preserves_selections() {
+        let t = now();
+        let mut b = Buffer::new("a");
+        b.edit([(1..1, "b")], &[Selection::cursor(1)], t);
+        b.set_selections_after(&[Selection::cursor(2)]);
+        let version = b.version();
+        b.mark_saved();
+        b.mark_saved();
+        assert_eq!(b.version(), version);
+        assert!(!b.is_dirty());
+
+        b.edit([(2..2, "c")], &[Selection::cursor(2)], t);
+        b.set_selections_after(&[Selection::cursor(3)]);
+        b.edit([(3..3, "d")], &[Selection::cursor(3)], t);
+        b.set_selections_after(&[Selection::cursor(4)]);
+        assert!(b.is_dirty());
+
+        let (edits, selections) = b.undo().unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(selections, [Selection::cursor(2)]);
+        assert_eq!(b.rope().to_string(), "ab");
+        assert!(!b.is_dirty());
+        assert_eq!(b.undo().unwrap().1, [Selection::cursor(1)]);
+        assert_eq!(b.rope().to_string(), "a");
+        assert!(b.is_dirty());
+
+        assert_eq!(b.redo().unwrap().1, [Selection::cursor(2)]);
+        assert_eq!(b.rope().to_string(), "ab");
+        assert!(!b.is_dirty());
+        assert_eq!(b.redo().unwrap().1, [Selection::cursor(4)]);
+        assert_eq!(b.rope().to_string(), "abcd");
+        assert!(b.is_dirty());
+    }
+
+    #[test]
+    fn new_branch_does_not_reuse_discarded_saved_checkpoint() {
+        let t = now();
+        let mut b = Buffer::new("a");
+        b.edit([(1..1, "b")], &[], t);
+        b.mark_saved();
+        b.undo().unwrap();
+        assert!(b.is_dirty());
+
+        // The same undo depth now contains different text from the saved branch.
+        b.edit([(1..1, "c")], &[], t);
+        assert_eq!(b.rope().to_string(), "ac");
+        assert!(b.is_dirty());
+        assert!(b.redo().is_none());
+        b.undo().unwrap();
+        assert_eq!(b.rope().to_string(), "a");
+        assert!(b.is_dirty());
+        b.redo().unwrap();
+        assert_eq!(b.rope().to_string(), "ac");
+        assert!(b.is_dirty());
+
+        b.mark_saved();
+        assert!(!b.is_dirty());
+        b.edit([(2..2, "d")], &[], t);
+        assert!(b.is_dirty());
+        b.undo().unwrap();
+        assert_eq!(b.rope().to_string(), "ac");
+        assert!(!b.is_dirty());
+    }
+
+    #[test]
+    fn saving_after_undo_keeps_redo_and_replaces_checkpoint() {
+        let t = now();
+        let mut b = Buffer::new("a");
+        b.edit([(1..1, "b")], &[], t);
+        b.seal_history();
+        b.edit([(2..2, "c")], &[], t);
+        b.mark_saved();
+        b.undo().unwrap();
+        assert_eq!(b.rope().to_string(), "ab");
+        assert!(b.is_dirty());
+
+        let version = b.version();
+        b.mark_saved();
+        assert_eq!(b.version(), version);
+        assert!(!b.is_dirty());
+        b.redo().unwrap();
+        assert_eq!(b.rope().to_string(), "abc");
+        assert!(b.is_dirty());
+        b.undo().unwrap();
+        assert!(!b.is_dirty());
+        b.undo().unwrap();
+        assert_eq!(b.rope().to_string(), "a");
+        assert!(b.is_dirty());
+        b.redo().unwrap();
+        assert_eq!(b.rope().to_string(), "ab");
+        assert!(!b.is_dirty());
+    }
+
+    #[test]
+    fn encoding_touch_stays_dirty_across_text_undo_and_redo() {
+        let t = now();
+        let mut b = Buffer::new("a");
+        b.touch();
+        assert_eq!(b.version(), 1);
+        assert!(b.is_dirty());
+        assert!(b.undo().is_none());
+        assert!(b.is_dirty());
+        b.edit([(1..1, "b")], &[], t);
+        b.undo().unwrap();
+        assert_eq!(b.rope().to_string(), "a");
+        assert!(b.is_dirty());
+        b.redo().unwrap();
+        assert!(b.is_dirty());
+        b.undo().unwrap();
+
+        b.mark_saved();
+        assert!(!b.is_dirty());
+        b.redo().unwrap();
+        assert!(b.is_dirty());
+        b.undo().unwrap();
+        assert!(!b.is_dirty());
+
+        let version = b.version();
+        b.touch();
+        assert_eq!(b.version(), version + 1);
+        b.edit([(1..1, "c")], &[], t);
+        b.undo().unwrap();
+        assert!(b.is_dirty());
+        b.mark_saved();
+        assert!(!b.is_dirty());
+    }
+
+    #[test]
+    fn line_ending_changes_stay_dirty_across_text_undo_and_redo() {
+        let mut b = Buffer::new("a\r\n");
+        b.set_line_ending(LineEnding::Lf);
+        assert_eq!(b.version(), 1);
+        b.edit([(0..1, "b")], &[], now());
+        b.undo().unwrap();
+        assert_eq!(b.text_for_save(), "a\n");
+        assert!(b.is_dirty());
+        b.redo().unwrap();
+        assert_eq!(b.text_for_save(), "b\n");
+        assert!(b.is_dirty());
+        b.undo().unwrap();
+
+        // Like encoding touches, reverting a format choice still needs a save.
+        b.set_line_ending(LineEnding::CrLf);
+        assert_eq!(b.text_for_save(), "a\r\n");
+        assert!(b.is_dirty());
+        let version = b.version();
+        b.set_line_ending(LineEnding::CrLf);
+        assert_eq!(b.version(), version);
+        assert!(b.is_dirty());
+        b.mark_saved();
+        assert_eq!(b.version(), version);
+        assert!(!b.is_dirty());
+
+        b.redo().unwrap();
+        assert!(b.is_dirty());
+        b.undo().unwrap();
+        assert!(!b.is_dirty());
+        b.set_line_ending(LineEnding::CrLf);
+        assert!(!b.is_dirty());
+        b.set_line_ending(LineEnding::Lf);
+        assert!(b.is_dirty());
+    }
+
+    #[test]
+    fn empty_edits_preserve_version_checkpoint_and_redo() {
+        let t = now();
+        let mut b = Buffer::new("a");
+        assert!(b.undo().is_none());
+        assert!(b.redo().is_none());
+        assert!(
+            b.edit(std::iter::empty::<(Range<usize>, &str)>(), &[], t)
+                .is_empty()
+        );
+        assert!(b.edit([(99..100, "")], &[], t).is_empty());
+        assert_eq!(b.version(), 0);
+        assert!(!b.is_dirty());
+
+        b.edit([(1..1, "b")], &[], t);
+        b.mark_saved();
+        b.edit([(2..2, "c")], &[], t);
+        b.undo().unwrap();
+        assert!(!b.is_dirty());
+        let version = b.version();
+        assert!(b.edit([(99..100, "")], &[], t).is_empty());
+        assert_eq!(b.version(), version);
+        assert!(!b.is_dirty());
+        b.redo().unwrap();
+        assert_eq!(b.rope().to_string(), "abc");
+        assert!(b.is_dirty());
+        b.undo().unwrap();
+        assert_eq!(b.rope().to_string(), "ab");
+        assert!(!b.is_dirty());
+    }
+
+    #[test]
+    fn completed_save_records_captured_text_even_after_undo() {
+        let mut b = Buffer::new("B");
+        b.edit([(0..1, "A")], &[], now());
+        let version = b.version();
+        let checkpoint = b.save_checkpoint();
+        assert_eq!(b.version(), version);
+        assert!(b.is_dirty());
+
+        b.undo().unwrap();
+        assert_eq!(b.rope().to_string(), "B");
+        assert_eq!(b.version(), version + 1);
+        assert!(!b.is_dirty());
+        b.mark_saved_at(checkpoint);
+        assert_eq!(b.version(), version + 1);
+        assert!(b.is_dirty());
+        b.redo().unwrap();
+        assert_eq!(b.rope().to_string(), "A");
+        assert_eq!(b.version(), version + 2);
+        assert!(!b.is_dirty());
+        b.undo().unwrap();
+        assert!(b.is_dirty());
+    }
+
+    #[test]
+    fn save_capture_seals_history_and_completion_keeps_later_typing_grouped() {
+        let t = now();
+        let mut b = Buffer::new("B");
+        b.edit([(0..1, "A")], &[Selection::cursor(0)], t);
+        b.set_selections_after(&[Selection::cursor(1)]);
+        let checkpoint = b.save_checkpoint();
+        b.edit([(1..1, "C")], &[Selection::cursor(1)], t);
+        let version = b.version();
+        b.mark_saved_at(checkpoint);
+        assert_eq!(b.version(), version);
+        assert!(b.is_dirty());
+        b.edit([(2..2, "D")], &[Selection::cursor(2)], t);
+        b.set_selections_after(&[Selection::cursor(3)]);
+
+        let (edits, selections) = b.undo().unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(selections, [Selection::cursor(1)]);
+        assert_eq!(b.rope().to_string(), "A");
+        assert!(!b.is_dirty());
+        b.undo().unwrap();
+        assert_eq!(b.rope().to_string(), "B");
+        assert!(b.is_dirty());
+        b.redo().unwrap();
+        assert!(!b.is_dirty());
+        assert_eq!(b.redo().unwrap().1, [Selection::cursor(3)]);
+        assert_eq!(b.rope().to_string(), "ACD");
+        assert!(b.is_dirty());
+    }
+
+    #[test]
+    fn completed_save_of_discarded_branch_keeps_current_branch_dirty() {
+        let t = now();
+        let mut b = Buffer::new("B");
+        b.edit([(0..1, "A")], &[], t);
+        let checkpoint = b.save_checkpoint();
+        b.undo().unwrap();
+        b.edit([(0..1, "C")], &[], t);
+        b.mark_saved_at(checkpoint);
+        assert_eq!(b.rope().to_string(), "C");
+        assert!(b.is_dirty());
+        assert!(b.redo().is_none());
+        b.undo().unwrap();
+        assert_eq!(b.rope().to_string(), "B");
+        assert!(b.is_dirty());
+        b.redo().unwrap();
+        assert_eq!(b.rope().to_string(), "C");
+        assert!(b.is_dirty());
+    }
+
+    #[test]
+    fn encoding_changes_during_save_remain_dirty() {
+        let mut b = Buffer::new("B");
+        b.edit([(0..1, "A")], &[], now());
+        b.touch();
+        let checkpoint = b.save_checkpoint();
+        b.touch();
+        let version = b.version();
+        b.mark_saved_at(checkpoint);
+        assert_eq!(b.version(), version);
+        assert!(b.is_dirty());
+        b.undo().unwrap();
+        assert!(b.is_dirty());
+        b.redo().unwrap();
+        assert_eq!(b.rope().to_string(), "A");
+        assert!(b.is_dirty());
+
+        let retry = b.save_checkpoint();
+        b.mark_saved_at(retry);
+        assert!(!b.is_dirty());
+        b.touch();
+        assert!(b.is_dirty());
+        b.mark_saved();
+        assert!(!b.is_dirty());
+    }
+
+    #[test]
+    fn line_ending_changes_during_save_remain_dirty() {
+        let mut b = Buffer::new("a\n");
+        b.set_line_ending(LineEnding::CrLf);
+        let checkpoint = b.save_checkpoint();
+        b.set_line_ending(LineEnding::Lf);
+        b.set_line_ending(LineEnding::CrLf);
+        let version = b.version();
+        b.mark_saved_at(checkpoint);
+        assert_eq!(b.version(), version);
+        assert_eq!(b.text_for_save(), "a\r\n");
+        assert!(b.is_dirty());
+
+        let retry = b.save_checkpoint();
+        b.set_line_ending(LineEnding::CrLf);
+        assert_eq!(b.version(), version);
+        b.mark_saved_at(retry);
+        assert!(!b.is_dirty());
+    }
+
+    #[test]
+    fn failed_save_does_not_advance_saved_checkpoint() {
+        let t = now();
+        let mut b = Buffer::new("B");
+        b.edit([(0..1, "A")], &[], t);
+        b.mark_saved();
+        b.edit([(0..1, "C")], &[], t);
+        let version = b.version();
+        // A failed write discards its checkpoint without recording completion.
+        let _failed_write = b.save_checkpoint();
+        assert_eq!(b.version(), version);
+        assert!(b.is_dirty());
+        b.undo().unwrap();
+        assert_eq!(b.rope().to_string(), "A");
+        assert!(!b.is_dirty());
+        b.redo().unwrap();
+        assert_eq!(b.rope().to_string(), "C");
+        assert!(b.is_dirty());
+
+        let mut format_only = Buffer::new("A");
+        format_only.touch();
+        let _failed_write = format_only.save_checkpoint();
+        assert!(format_only.is_dirty());
     }
 }

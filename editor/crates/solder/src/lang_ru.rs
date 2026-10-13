@@ -417,6 +417,22 @@ pub const COMMANDS: &[(&str, &str)] = &[
 
 /// What is given to `t` and `tf` in the code.
 pub const WORDS: &[(&str, &str)] = &[
+    (
+        "This recovered text has no target revision. Save it to a new file.",
+        "Для этого восстановленного текста неизвестна версия файла на сервере. Сохраните его в новый файл.",
+    ),
+    (
+        "This text was recovered. Its recovery copy is kept until you save or close it.",
+        "Этот текст восстановлен. Его резервная копия останется до сохранения или закрытия.",
+    ),
+    (
+        "Multiple open copies of {}",
+        "Несколько открытых копий файла {}",
+    ),
+    (
+        "Close the other copies before saving.",
+        "Закройте остальные копии перед сохранением.",
+    ),
     ("Connect to an SSH project", "Подключиться к проекту по SSH"),
     (
         "The container does not share the host project files",

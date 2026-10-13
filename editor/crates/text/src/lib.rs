@@ -11,7 +11,7 @@ mod history;
 mod movement;
 pub mod wrap;
 
-pub use buffer::{Buffer, Edit, LineEnding, Point};
+pub use buffer::{Buffer, Edit, LineEnding, Point, SaveCheckpoint};
 pub use history::History;
 pub use movement::{Selection, SelectionGoal, TAB_SIZE};
 pub use ropey::Rope;

@@ -118,6 +118,12 @@ Never guess a signature.
   of a server Solder knows; options are read once, at the start, so such a
   server is started again (`LspStore::restart`) when they change, and a
   start that finishes after a later one began is dropped.
+- Save completion records the buffer checkpoint captured with its payload,
+  not the current mutation version. Each document and notebook serializes its
+  saves; quit and close wait for pending writes before deciding what is dirty.
+  `workspace::quit` owns one decision across project windows and rechecks changes
+  after each await. Recovery retains a remote document's original read revision;
+  a restart load cannot grant overwrite permission to recovered text.
 - Project tabs and view positions are kept by `workspace::session` in the
   settings folder. Its writer serializes disk writes on one thread; reads
   and file loads are off the UI thread too. Extension pages are restored
