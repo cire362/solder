@@ -51,6 +51,8 @@ implementation; its native-window checks and the recovery manager are below.
       a published extension. Headless and first-party process checks cover cell
       edits, execution outputs, metadata, native/extension restoration, external
       changes, source aliases, pending saves, closed views and recovery cleanup.
+      Native Linux/Windows workflow and evidence collection are prepared in
+      `verification/native-ci.md`; runner results remain open.
       Missing or declined extension readers retain their copies. Original local
       text revisions and weak legacy stamps are checked separately. Performance
       with recovery files present is not measured. Verification and plain-file
