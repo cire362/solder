@@ -1,0 +1,63 @@
+{
+  "reader": "Roadmap.books 1.0.0, first-party fixture",
+  "source_commit": "837dec9",
+  "forced_exit_pid": 55337,
+  "original_sha256": "b2afc6f3184ef47d74b881e35a0cdae31ec5b06cad65ec6457c8e20cf6605059",
+  "recovery_data": {
+    "cells": [
+      {
+        "kind": 2,
+        "value": "extension_recovered_cell = 2",
+        "languageId": "javascript",
+        "outputs": [
+          {
+            "items": [
+              {
+                "data": "Zml4dHVyZSBvdXRwdXQ6IGV4dGVuc2lvbl9yZWNvdmVyZWRfY2VsbCA9IDI=",
+                "mime": "text/plain"
+              }
+            ],
+            "metadata": {
+              "keep": "execution-output"
+            }
+          }
+        ],
+        "metadata": {
+          "keep": "code-metadata"
+        },
+        "executionSummary": {
+          "executionOrder": 1,
+          "success": true,
+          "timing": {
+            "startTime": 1792008463618,
+            "endTime": 1792008463618
+          }
+        }
+      },
+      {
+        "kind": 1,
+        "value": "# First party note",
+        "languageId": "markdown",
+        "outputs": [],
+        "metadata": {
+          "keep": "markdown-metadata"
+        }
+      }
+    ],
+    "metadata": {
+      "keep": "extension-notebook-proof"
+    }
+  },
+  "recovered_in_native_window": true,
+  "serializer_failure_notice": "Roadmap fixture refuses this save",
+  "original_unchanged_after_failure": true,
+  "recovery_retained_after_failure": true,
+  "export_sha256": "6f63c88137d90d2695ceb78f81ebf61ada69fb4c5f107bd4ba7746b7bc0a11d7",
+  "export_matches_recovery": true,
+  "original_unchanged_after_export": true,
+  "dirty_mark_after_export": true,
+  "extension_owned_save_matches_recovery": true,
+  "successful_save_sha256": "6f63c88137d90d2695ceb78f81ebf61ada69fb4c5f107bd4ba7746b7bc0a11d7",
+  "recovery_removed_after_save": true,
+  "dirty_mark_cleared_after_save": true
+}

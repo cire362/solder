@@ -1,0 +1,41 @@
+{
+  "metadata": {
+    "keep": "extension-notebook-proof"
+  },
+  "cells": [
+    {
+      "kind": 2,
+      "languageId": "javascript",
+      "value": "first_party_cell = 1",
+      "metadata": {
+        "keep": "code-metadata"
+      },
+      "executionSummary": {
+        "executionOrder": 7,
+        "success": true
+      },
+      "outputs": [
+        {
+          "metadata": {
+            "keep": "output-metadata"
+          },
+          "items": [
+            {
+              "mime": "text/plain",
+              "data": "b3JpZ2luYWwgZXh0ZW5zaW9uIG91dHB1dA=="
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": 1,
+      "languageId": "markdown",
+      "value": "# First party note",
+      "metadata": {
+        "keep": "markdown-metadata"
+      },
+      "outputs": []
+    }
+  ]
+}

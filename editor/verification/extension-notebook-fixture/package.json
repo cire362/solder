@@ -1,0 +1,30 @@
+{
+  "name": "books",
+  "publisher": "Roadmap",
+  "version": "1.0.0",
+  "displayName": "Roadmap notebook check",
+  "main": "main.js",
+  "contributes": {
+    "notebooks": [
+      {
+        "type": "roadmap-book",
+        "displayName": "Roadmap book",
+        "selector": [
+          {
+            "filenamePattern": "*.proofnote"
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "roadmap.failSave",
+        "title": "Roadmap: Fail next notebook save"
+      },
+      {
+        "command": "roadmap.saveBook",
+        "title": "Roadmap: Save notebook through extension"
+      }
+    ]
+  }
+}

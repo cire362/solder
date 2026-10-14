@@ -1,0 +1,85 @@
+{
+  "original_sha256": "b4c7a143d8b109b2322e8d66761a9fdcc90f8d1f1b923e4c62c5b88de5391f74",
+  "backup_file": "notebook-ea7b644062779c5f-23587-1792006877861455000-4294967355.book.json",
+  "backup_stamp": {
+    "length": 959,
+    "mtime": 1792006657497439420,
+    "hash": "b4c7a143d8b109b2322e8d66761a9fdcc90f8d1f1b923e4c62c5b88de5391f74"
+  },
+  "native_typed_cells": [
+    "native_cell = 2 # key: фи",
+    "# Note edited live"
+  ],
+  "forced_exit_pid": 23587,
+  "external_sha256": "8e3a3356e1e6be0d54b5ee90bf5a681222163c087de8b4c1dfab77d5171027d1",
+  "save_refused_notice": "The file changed; reopen it before saving",
+  "export_sha256": "80096e3b80f87af852b1ce16c8317b6520c08940d9c0593bbefa989e504c6167",
+  "export_matches_recovery": true,
+  "original_unchanged_after_export": true,
+  "dirty_mark_after_export": true,
+  "close_cancel_verified": true,
+  "close_discard_verified": true,
+  "recovery_removed_after_acknowledged_close": true,
+  "successful_save_after_recovery": true,
+  "successful_save_sha256": "4ad1547d3abb99323a159248d4eb4937e172994dde5c286bbde57dfc5d8a1ab2",
+  "recovery_removed_after_successful_save": true,
+  "date": "2026-10-15",
+  "timezone": "Asia/Yekaterinburg",
+  "source_commit": "837dec9",
+  "build_profile": "ci",
+  "os": "macOS 26.6.2",
+  "cpu": "Apple M4",
+  "binary_sha256": "2d67b3f55da62c63f800eab8fb5250887adee001c10600718665187e77e4e4b6",
+  "native_bulk_type_text": "Only separators arrived; full Latin text used native paste; separate a/b key events inserted ф/и under the current keyboard layout",
+  "startup_bug": "With an earlier empty saved session, a CLI notebook tab was inactive until clicked",
+  "scope": "Built-in Jupyter reader, isolated disposable files; no published extension was launched",
+  "restored_notebook_model": {
+    "nbformat": 4,
+    "nbformat_minor": 5,
+    "metadata": {
+      "keep": "native-proof",
+      "language_info": {
+        "name": "python"
+      }
+    },
+    "cells": [
+      {
+        "cell_type": "code",
+        "id": "native-code",
+        "metadata": {
+          "tags": [
+            "keep"
+          ]
+        },
+        "source": "native_cell = 2 # key: фи",
+        "execution_count": 7,
+        "outputs": [
+          {
+            "output_type": "stream",
+            "name": "stdout",
+            "text": "saved output stays\n"
+          },
+          {
+            "output_type": "display_data",
+            "metadata": {},
+            "data": {
+              "text/plain": "table stays",
+              "text/html": "<b>table stays</b>"
+            }
+          }
+        ]
+      },
+      {
+        "cell_type": "markdown",
+        "id": "native-text",
+        "metadata": {},
+        "source": "# Note edited live",
+        "attachments": {
+          "keep.txt": {
+            "text/plain": "attachment stays"
+          }
+        }
+      }
+    ]
+  }
+}

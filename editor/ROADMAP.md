@@ -20,9 +20,25 @@ out of something that otherwise works. An entry goes when it is checked or
 made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
+This whole section is one completion task on `feat/roadmap-completion`.
+Work proceeds from top to bottom, with a checked commit for each correction or
+addition, progress pushed on the same branch, and one pull request when the
+whole task is finished. A platform or external-service check keeps its own
+open entry until it has evidence. PR #58 is the preceding recovery/export
+implementation; its native-window checks and the recovery manager are below.
+
 ### Not verified
-- [ ] Crash recovery and Export copy of notebooks in a native window, on
-      Linux/Windows, with large outputs, abrupt power loss, independent views or
+- [x] Native Jupyter recovery/export in a real macOS window: edited cells,
+      retained outputs and attachments, SIGKILL, restored unsaved work, rejected
+      a changed source, exported another file, saved an unchanged source and
+      verified recovery cleanup. Paste and individual keys worked; continuous
+      bulk input is not claimed. Evidence: `verification/native-notebook-recovery.md`
+- [x] First-party extension notebook recovery/export in a real macOS window:
+      permission, pasted cell input, controller outputs, SIGKILL restoration,
+      refused serialization, separate export, extension-owned save and cleanup.
+      Evidence and repeatable fixture: `verification/extension-notebook-recovery.md`
+- [ ] Notebook recovery/export on Linux/Windows, with large outputs,
+      abrupt power loss, independent views or
       a published extension. Headless and first-party process checks cover cell
       edits, execution outputs, metadata, native/extension restoration, external
       changes, source aliases, pending saves, closed views and recovery cleanup.
@@ -181,6 +197,13 @@ something of its own unchecked or unmade adds it here.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] An explicitly opened notebook after an earlier empty saved session can
+      remain an inactive tab with blank content until clicked. Reproduced in
+      `verification/native-notebook-recovery.md`; session restoration must keep
+      the requested view in front
+- [ ] Notebook recovery and successful export notices use the error color and
+      long export paths can be clipped. Informational completion should be
+      distinguishable from a failed save
 - [ ] Remote HTTP/database/context-server connections and port forwarding.
       Existing localhost URLs still refer to the client machine. Remote file
       inventories use the project's Git ignores; global Git excludes from the
@@ -333,7 +356,9 @@ something of its own unchecked or unmade adds it here.
       callback cannot cancel it. Keyboard/palette Quit now asks across every
       project window and waits for saves and recovery cleanup. Force Quit and
       termination cannot wait for a decision or guarantee recovery
-- [ ] A recovery-manager screen for malformed, unsupported, unreadable,
+- [ ] A recovery-manager screen to inspect retained copies, restore or export
+      recoverable work, and discard a selected copy after an explicit decision.
+      It must explain malformed, unsupported, unreadable,
       permission-denied or duplicate copies retained on disk. Each text/notebook
       reader considers at most 256 copies per pass. Text over 16 MB and notebook
       recovery files over 16 MB retain an earlier smaller copy. Text recovery does
