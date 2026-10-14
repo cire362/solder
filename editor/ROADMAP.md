@@ -42,8 +42,12 @@ implementation; its native-window checks and the recovery manager are below.
       permission, pasted cell input, controller outputs, SIGKILL restoration,
       refused serialization, separate export, extension-owned save and cleanup.
       Evidence and repeatable fixture: `verification/extension-notebook-recovery.md`
-- [ ] Notebook recovery/export on Linux/Windows, with large outputs,
-      abrupt power loss, independent views or
+- [x] Native Jupyter on macOS with a 5.4 MB notebook (3.3 MB stream output,
+      2 MB attachment): force-exit recovery, complete save and cleanup, plus two
+      independent native processes with stale-save refusal and separate rescue
+      export. Full models and hashes: `verification/large-notebook-recovery.md`
+- [ ] Notebook recovery/export on Linux/Windows, with snapshots beyond the
+      16 MB retention limit, abrupt power loss, independent extension views or
       a published extension. Headless and first-party process checks cover cell
       edits, execution outputs, metadata, native/extension restoration, external
       changes, source aliases, pending saves, closed views and recovery cleanup.

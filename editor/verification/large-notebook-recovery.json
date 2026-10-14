@@ -1,0 +1,29 @@
+{
+  "fixture_bytes": 5400478,
+  "recovery_bytes": 5400828,
+  "forced_exit_pid": 80698,
+  "source_sha256": "9d4f7a0e579643c0643878c8a9d20586623c4539d2720b961c8439d5808eed50",
+  "recovered_in_native_window": true,
+  "full_saved_model_equals_recovery": true,
+  "recovery_removed_after_save": true,
+  "output_bytes": 3300000,
+  "attachment_bytes": 2000000,
+  "saved_sha256": "6b67eae8191c17ffadd56fee7f3a32f30ede55e2184c114bd650e99272a5846e",
+  "independent_views": {
+    "scope": "Two separate native Solder processes with separate settings and recovery folders, same physical notebook",
+    "view_a_saved_cell": "independent_view_a = 3",
+    "view_b_retained_cell": "independent_view_b = 4",
+    "view_b_save_refused_notice": "The file changed; reopen it before saving",
+    "view_a_source_unchanged_after_view_b_save_and_export": true,
+    "view_b_export_matches_full_recovery": true,
+    "view_a_sha256": "ec0009584fe7cdc177820fc37f09063fbd08793c49bafee59e0b21a751d0c4ad",
+    "view_b_export_sha256": "d2680b4c247daa83deadd45f8e4e453b96ea9aad5612996a296aeb949dfd009d"
+  },
+  "date": "2026-10-15",
+  "source": "837dec9 plus session-foreground fix committed as 297d607",
+  "os": "macOS 26.6.2",
+  "build_profile": "ci",
+  "output_sha256": "15d14d1da178146257c39c35cf23380c7b17e566a74ede5a30340ecd43e74a3b",
+  "attachment_sha256": "347f4b15c98e5ebcfdbfd574889a27af6e84ae4f14eed72a279938869168395e",
+  "independent_copy_recovery_removed_after_acknowledged_close": true
+}
