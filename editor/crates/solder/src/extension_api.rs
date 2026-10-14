@@ -1213,9 +1213,8 @@ impl ExtensionStore {
                 self.decoration_said(id, method, params, cx)
             }
             "view" | "view.changed" => self.view_said(id, method, params, cx),
-            "notebook.outputs" | "notebook.run" | "notebook.runners" | "notebook.saved" => {
-                self.notebook_said(id, method, params, cx)
-            }
+            "notebook.outputs" | "notebook.run" | "notebook.runners" | "notebook.saved"
+            | "notebook.version" => self.notebook_said(id, method, params, cx),
             // An answer of the language server its host is, or something
             // that server says on its own.
             "lsp" => {

@@ -1740,21 +1740,42 @@ const fs = require('fs');
 const crypto = require('crypto');
 const childProcess = require('child_process');
 const calls = [], releases = [], saves = [];
-let mode = {};
+let mode = {}, reads = 0, runs = 0, denyReads = false;
 const book = () => v.workspace.notebookDocuments[0];
 const pause = () => new Promise((resolve) => releases.push(resolve));
 const hash = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
+const packed = (data) => ({ metadata: data.metadata, cells: data.cells.map((cell) => ({
+  kind: cell.kind, value: cell.value, languageId: cell.languageId, metadata: cell.metadata,
+  executionSummary: cell.executionSummary,
+  outputs: (cell.outputs || []).map((output) => ({ metadata: output.metadata,
+    items: output.items.map((item) => ({ mime: item.mime, data: Buffer.from(item.data).toString('base64') })),
+  })),
+})) });
+const openFile = fs.promises.open;
+fs.promises.open = (...args) => {
+  if (denyReads && args[1] === 'r') throw new Error('fixture source reads forbidden');
+  return openFile(...args);
+};
 exports.activate = (context) => {
   context.subscriptions.push(
     v.workspace.registerNotebookSerializer('save-book', {
       async deserializeNotebook(bytes) {
+        reads += 1;
         if (mode.openHold) await pause();
+        if (mode.json) {
+          const data = JSON.parse(Buffer.from(bytes).toString());
+          for (const cell of data.cells) for (const output of cell.outputs || []) {
+            for (const item of output.items) item.data = Buffer.from(item.data, 'base64');
+          }
+          return data;
+        }
         return new v.NotebookData([new v.NotebookCellData(v.NotebookCellKind.Code, Buffer.from(bytes).toString(), 'plaintext')]);
       },
       async serializeNotebook(data) {
         calls.push(data.cells[0].value);
         if (mode.hold) await pause();
         if (mode.fail) throw new Error('fixture serializer failed');
+        if (mode.json) return Buffer.from(JSON.stringify(packed(data)));
         return Buffer.from(data.cells[0].value);
       },
     }),
@@ -1764,8 +1785,24 @@ exports.activate = (context) => {
     v.commands.registerCommand('demo.mode', (value) => { mode = value; }),
     v.commands.registerCommand('demo.release', () => { releases.shift()(); }),
     v.commands.registerCommand('demo.save', () => book().save()),
+    v.notebooks.createNotebookController('fixture.runner', 'save-book', 'Fixture runner', (cells, notebook, controller) => {
+      runs += 1;
+      for (const cell of cells) {
+        const run = controller.createNotebookCellExecution(cell);
+        run.start(100);
+        run.token.onCancellationRequested(() => run.end(false, 200));
+      }
+    }),
+    v.commands.registerCommand('demo.denyReads', (value) => { denyReads = value; }),
+    v.commands.registerCommand('demo.largeOutput', (size) => {
+      book().cellAt(0).outputs = [new v.NotebookCellOutput([
+        new v.NotebookCellOutputItem(Buffer.alloc(size, 255), 'application/octet-stream'),
+      ], { large: true })];
+    }),
     v.commands.registerCommand('demo.state', () => ({
       calls, saves, waiting: releases.length, dirty: book() && book().isDirty,
+      reads, runs, version: book() && book().version, uri: book() && book().uri.toString(),
+      running: book() && book()._running.size,
     })),
     v.commands.registerCommand('demo.time', (file) => fs.utimesSync(file, 1234567890, 1234567890)),
     v.commands.registerCommand('demo.external', (value) => {
@@ -1811,8 +1848,20 @@ exports.activate = (context) => {
         process.nextTick(() => args[args.length - 1](new Error('fixture metadata copy failed')));
       };
     }),
-    v.commands.registerCommand('demo.xattr', (name, value) => {
-      childProcess.execFileSync('/usr/bin/xattr', ['-w', name, value, book().uri.fsPath]);
+    v.commands.registerCommand('demo.linkRace', (value) => {
+      const link = fs.promises.link;
+      fs.promises.link = async (from, to) => {
+        fs.promises.link = link;
+        fs.writeFileSync(to, value);
+        return link(from, to);
+      };
+    }),
+    v.commands.registerCommand('demo.clock', (elapsed) => {
+      const now = Date.now();
+      Date.now = () => now + elapsed;
+    }),
+    v.commands.registerCommand('demo.xattr', (name, value, file = book().uri.fsPath) => {
+      childProcess.execFileSync('/usr/bin/xattr', ['-w', name, value, file]);
     }),
   );
 };
@@ -1876,6 +1925,746 @@ exports.activate = (context) => {
                     .to_string_lossy()
                     .contains(".solder-"))
         );
+    }
+
+    fn notebook_snapshot(host: &VsHost, uri: &str) -> Value {
+        host.request("notebook.snapshot", json!({ "uri": uri }), SOON)
+            .unwrap()
+    }
+
+    fn notebook_restore(host: &VsHost, uri: &str, snapshot: &Value) -> Answer {
+        host.request(
+            "notebook.restore",
+            json!({ "uri": uri, "type": "save-book", "snapshot": snapshot }),
+            SOON,
+        )
+    }
+
+    fn notebook_prepare_copy(host: &VsHost, uri: &str, target: &Path) -> Value {
+        host.request(
+            "notebook.export.prepare",
+            json!({ "uri": uri, "target": target.to_string_lossy() }),
+            SOON,
+        )
+        .unwrap()
+    }
+
+    fn notebook_copy(host: &VsHost, uri: &str, target: &Path, token: &Value) -> Answer {
+        host.request(
+            "notebook.export",
+            json!({ "uri": uri, "target": target.to_string_lossy(), "token": token }),
+            SOON,
+        )
+    }
+
+    fn notebook_restarted(host: &VsHost, file: &Path) -> VsHost {
+        host.stop();
+        let dir = file.parent().unwrap();
+        let node = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join("node"))
+            .find(|node| node.is_file())
+            .unwrap();
+        let host = VsHost::start(
+            &node.to_string_lossy(),
+            &dir.join("host/host.js"),
+            &dir.join("ext"),
+            &dir.join("storage"),
+            &[],
+            |_| {},
+        )
+        .unwrap();
+        host.request("activate", json!({}), SOON).unwrap();
+        host
+    }
+
+    fn notebook_rich_fixture(name: &str) -> Option<(VsHost, PathBuf, String, Value)> {
+        let (host, _told, dir) = hosted(name, NOTEBOOK_SAVE_FIXTURE)?;
+        host.request("activate", json!({}), SOON).unwrap();
+        notebook_command(&host, "demo.mode", json!([{ "json": true }]));
+        let data = json!({
+            "metadata": { "custom": { "nested": [null, true, "kept"] } },
+            "cells": [{
+                "kind": 2, "value": "original", "languageId": "python",
+                "metadata": { "collapsed": true, "attachments": { "name": "payload" } },
+                "executionSummary": { "executionOrder": 7, "success": true,
+                    "timing": { "startTime": 100, "endTime": 200 } },
+                "outputs": [{ "metadata": { "display_id": "one" }, "items": [
+                    { "mime": "text/plain", "data": "aGVsbG8K" },
+                    { "mime": "application/octet-stream", "data": "AP8qgA==" },
+                    { "mime": "image/png", "data": "AP8=" },
+                ] }, { "metadata": { "empty": true }, "items": [] }],
+            }, {
+                "kind": 1, "value": "# Markdown", "languageId": "markdown",
+                "metadata": { "tags": ["note"] }, "outputs": [],
+            }],
+        });
+        let file = dir.join("rich.book");
+        std::fs::write(&file, serde_json::to_vec(&data).unwrap()).unwrap();
+        let uri = notebook_open(&host, &file);
+        Some((host, file, uri, data))
+    }
+
+    #[test]
+    fn notebook_recovery_keeps_complete_api_data_and_original_stamp_across_restart() {
+        let Some((host, file, uri, mut data)) = notebook_rich_fixture("notebook-recovery-restart")
+        else {
+            return;
+        };
+        notebook_edit(&host, &uri, "recovered");
+        data["cells"][0]["value"] = json!("recovered");
+        let snapshot = notebook_snapshot(&host, &uri);
+        assert_eq!(snapshot["data"], data);
+        assert_eq!(snapshot["version"], 1);
+        assert_eq!(snapshot["type"], "save-book");
+        assert_eq!(snapshot["version_at_capture"], 2);
+        assert_eq!(snapshot.as_object().unwrap().len(), 5);
+        for field in ["size", "mtime", "dev", "ino"] {
+            assert!(snapshot["revision"][field].is_string());
+        }
+        let opened = host
+            .request(
+                "notebook.open",
+                json!({ "uri": uri, "type": "save-book" }),
+                SOON,
+            )
+            .unwrap();
+        let restarted = notebook_restarted(&host, &file);
+        std::fs::write(&file, "external changes").unwrap();
+        // Restore must work without any file read or deserializer call.
+        notebook_command(&restarted, "demo.denyReads", json!([true]));
+        assert_eq!(notebook_restore(&restarted, &uri, &snapshot), Ok(opened));
+        assert_eq!(notebook_snapshot(&restarted, &uri), snapshot);
+        let state = notebook_command(&restarted, "demo.state", json!([]));
+        assert_eq!(state["reads"], 0);
+        assert_eq!(state["runs"], 0);
+        assert_eq!(state["running"], 0);
+        assert_eq!(state["dirty"], true);
+        assert_eq!(state["calls"], json!([]));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "external changes");
+        notebook_command(&restarted, "demo.denyReads", json!([false]));
+        notebook_command(&restarted, "demo.mode", json!([{ "json": true }]));
+        assert!(
+            restarted
+                .request("notebook.save", json!({ "uri": uri }), SOON)
+                .unwrap_err()
+                .contains("changed on disk")
+        );
+        assert_eq!(notebook_snapshot(&restarted, &uri), snapshot);
+        let target = file.with_file_name("rescued.book");
+        let token = notebook_prepare_copy(&restarted, &uri, &target);
+        assert_eq!(
+            notebook_copy(&restarted, &uri, &target, &token),
+            Ok(json!(true))
+        );
+        let copied: Value = serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(copied, data);
+        let state = notebook_command(&restarted, "demo.state", json!([]));
+        assert_eq!(state["uri"], uri);
+        assert_eq!(state["dirty"], true);
+        assert_eq!(state["saves"], json!([]));
+        assert_eq!(notebook_snapshot(&restarted, &uri), snapshot);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "external changes");
+
+        let missing = notebook_restarted(&restarted, &file);
+        std::fs::remove_file(&file).unwrap();
+        assert!(notebook_restore(&missing, &uri, &snapshot).is_ok());
+        assert!(!file.exists());
+        assert_eq!(notebook_snapshot(&missing, &uri), snapshot);
+        notebook_no_staging(&file);
+    }
+
+    #[test]
+    fn notebook_snapshot_retains_outputs_larger_than_the_editor_preview_limit() {
+        let Some((host, _file, uri)) = notebook_fixture("notebook-recovery-large-output") else {
+            return;
+        };
+        let size: usize = (8 << 20) + 1;
+        notebook_edit(&host, &uri, "mine");
+        notebook_command(&host, "demo.largeOutput", json!([size]));
+        let snapshot = notebook_snapshot(&host, &uri);
+        let bytes = snapshot["data"]["cells"][0]["outputs"][0]["items"][0]["data"]
+            .as_str()
+            .unwrap();
+        assert_eq!(bytes.len(), 4 * size.div_ceil(3));
+        assert_eq!(
+            snapshot["data"]["cells"][0]["outputs"][0]["metadata"],
+            json!({ "large": true })
+        );
+        host.notify("notebook.close", json!({ "uri": uri }));
+        let restored = notebook_restore(&host, &uri, &snapshot).unwrap();
+        assert_eq!(restored["cells"][0]["outputs"][0]["items"][0]["size"], size);
+        assert!(restored["cells"][0]["outputs"][0]["items"][0]["data"].is_null());
+        assert_eq!(notebook_snapshot(&host, &uri), snapshot);
+    }
+
+    #[test]
+    fn notebook_restore_refuses_legacy_invalid_and_dirty_replacements_and_resets_runs() {
+        let Some((host, file, uri, _)) = notebook_rich_fixture("notebook-recovery-invalid") else {
+            return;
+        };
+        let snapshot = notebook_snapshot(&host, &uri);
+        let mut invalid = Vec::new();
+        invalid.push(json!({ "cells": snapshot["data"]["cells"] }));
+        invalid.push(Value::Null);
+        for (pointer, value) in [
+            ("/version", json!(2)),
+            ("/type", json!("other-book")),
+            ("/version_at_capture", json!(0)),
+            ("/revision", Value::Null),
+            ("/revision/size", json!(42)),
+            ("/revision/ino", json!("-1")),
+            ("/revision/sha256", json!("bad")),
+            ("/revision/resolved", json!("relative.book")),
+            ("/data/cells/0/kind", json!(3)),
+            ("/data/cells/0/metadata", json!([])),
+            ("/data/cells/0/executionSummary/success", json!("yes")),
+            ("/data/cells/0/outputs/0/items/0/data", json!("not base64!")),
+            ("/data/cells/0/outputs/0/items/0/data", json!("AB==")),
+        ] {
+            let mut broken = snapshot.clone();
+            *broken.pointer_mut(pointer).unwrap() = value;
+            invalid.push(broken);
+        }
+        let original = std::fs::read(&file).unwrap();
+        for broken in invalid {
+            assert!(
+                notebook_restore(&host, &uri, &broken)
+                    .unwrap_err()
+                    .contains("Invalid or unsupported")
+            );
+            assert_eq!(notebook_snapshot(&host, &uri), snapshot);
+        }
+        notebook_edit(&host, &uri, "dirty known cells");
+        let dirty = notebook_snapshot(&host, &uri);
+        assert!(
+            notebook_restore(&host, &uri, &snapshot)
+                .unwrap_err()
+                .contains("dirty notebook")
+        );
+        assert_eq!(notebook_snapshot(&host, &uri), dirty);
+        assert_eq!(std::fs::read(&file).unwrap(), original);
+        assert_eq!(notebook_command(&host, "demo.save", json!([])), true);
+        host.request(
+            "notebook.execute",
+            json!({ "uri": uri, "handles": [0] }),
+            SOON,
+        )
+        .unwrap();
+        assert_eq!(
+            notebook_command(&host, "demo.state", json!([]))["running"],
+            1
+        );
+        let restored = notebook_restore(&host, &uri, &snapshot).unwrap();
+        assert_eq!(restored["runner"], "Fixture runner");
+        assert_eq!(restored["cells"][0]["value"], "original");
+        let state = notebook_command(&host, "demo.state", json!([]));
+        assert_eq!(state["running"], 0);
+        assert_eq!(state["runs"], 1);
+        assert_eq!(state["dirty"], true);
+        assert_eq!(notebook_snapshot(&host, &uri)["data"], snapshot["data"]);
+    }
+
+    #[test]
+    fn notebook_snapshot_captures_cells_at_request_and_revision_after_preceding_save() {
+        let Some((host, file, uri)) = notebook_fixture("notebook-recovery-order") else {
+            return;
+        };
+        let original = notebook_snapshot(&host, &uri);
+        notebook_edit(&host, &uri, "saved first");
+        notebook_command(&host, "demo.mode", json!([{ "hold": true }]));
+        let (tx, saved) = mpsc::channel();
+        host.ask("notebook.save", json!({ "uri": uri }), move |answer| {
+            tx.send(answer).unwrap();
+        });
+        notebook_waiting(&host, 1);
+        notebook_edit(&host, &uri, "captured second");
+        let (tx, captured) = mpsc::channel();
+        host.ask("notebook.snapshot", json!({ "uri": uri }), move |answer| {
+            tx.send(answer).unwrap();
+        });
+        notebook_command(&host, "demo.state", json!([]));
+        assert!(captured.try_recv().is_err());
+        notebook_edit(&host, &uri, "later third");
+        notebook_command(&host, "demo.release", json!([]));
+        assert_eq!(saved.recv_timeout(SOON).unwrap(), Ok(json!(true)));
+        let snapshot = captured.recv_timeout(SOON).unwrap().unwrap();
+        assert_eq!(snapshot["data"]["cells"][0]["value"], "captured second");
+        assert_eq!(snapshot["version_at_capture"], 3);
+        assert_ne!(snapshot["revision"], original["revision"]);
+        assert_eq!(
+            snapshot["revision"],
+            notebook_snapshot(&host, &uri)["revision"]
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "saved first");
+        assert_eq!(
+            notebook_command(&host, "demo.state", json!([]))["dirty"],
+            true
+        );
+        notebook_command(&host, "demo.mode", json!([{}]));
+        std::fs::write(&file, "changed outside").unwrap();
+        assert!(
+            host.request("notebook.save", json!({ "uri": uri }), SOON)
+                .is_err()
+        );
+        assert_eq!(
+            snapshot["revision"],
+            notebook_snapshot(&host, &uri)["revision"]
+        );
+    }
+
+    #[test]
+    fn notebook_restore_supersedes_pending_opens_even_when_closed_before_they_finish() {
+        let Some((host, file, uri)) = notebook_fixture("notebook-recovery-opening") else {
+            return;
+        };
+        notebook_edit(&host, &uri, "recovered");
+        let snapshot = notebook_snapshot(&host, &uri);
+        host.notify("notebook.close", json!({ "uri": uri }));
+        notebook_command(&host, "demo.mode", json!([{ "openHold": true }]));
+        let open_async = || {
+            let (tx, rx) = mpsc::channel();
+            host.ask(
+                "notebook.open",
+                json!({ "uri": uri, "type": "save-book" }),
+                move |answer| {
+                    tx.send(answer).unwrap();
+                },
+            );
+            rx
+        };
+        let early = open_async();
+        notebook_waiting(&host, 0);
+        let duplicate = open_async();
+        let state = notebook_command(&host, "demo.state", json!([]));
+        assert_eq!(state["reads"], 2);
+        let restored = notebook_restore(&host, &uri, &snapshot).unwrap();
+        notebook_command(&host, "demo.release", json!([]));
+        assert_eq!(early.recv_timeout(SOON).unwrap(), Ok(restored.clone()));
+        assert_eq!(duplicate.recv_timeout(SOON).unwrap(), Ok(restored));
+        assert_eq!(notebook_snapshot(&host, &uri), snapshot);
+
+        host.notify("notebook.close", json!({ "uri": uri }));
+        let early = open_async();
+        notebook_waiting(&host, 0);
+        notebook_restore(&host, &uri, &snapshot).unwrap();
+        host.notify("notebook.close", json!({ "uri": uri }));
+        notebook_command(&host, "demo.release", json!([]));
+        assert!(
+            early
+                .recv_timeout(SOON)
+                .unwrap()
+                .unwrap_err()
+                .contains("superseded")
+        );
+        assert!(
+            host.request("notebook.snapshot", json!({ "uri": uri }), SOON)
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "aaaa");
+    }
+
+    #[test]
+    fn a_queued_notebook_restore_cannot_recreate_a_closed_view() {
+        let Some((host, _file, uri)) = notebook_fixture("notebook-restore-closed") else {
+            return;
+        };
+        let snapshot = notebook_snapshot(&host, &uri);
+        notebook_command(&host, "demo.mode", json!([{ "hold": true }]));
+        let (send, saving) = mpsc::channel();
+        host.ask("notebook.save", json!({"uri":uri}), move |answer| {
+            send.send(answer).unwrap();
+        });
+        notebook_waiting(&host, 1);
+        let (send, restoring) = mpsc::channel();
+        host.ask(
+            "notebook.restore",
+            json!({"uri":uri,"type":"save-book","snapshot":snapshot,"lifecycle":"old-view"}),
+            move |answer| {
+                send.send(answer).unwrap();
+            },
+        );
+        notebook_command(&host, "demo.state", json!([]));
+        assert!(restoring.try_recv().is_err());
+        host.notify("notebook.close", json!({"uri":uri,"lifecycle":"old-view"}));
+        notebook_command(&host, "demo.release", json!([]));
+        assert!(saving.recv_timeout(SOON).unwrap().is_ok());
+        assert!(
+            restoring
+                .recv_timeout(SOON)
+                .unwrap()
+                .unwrap_err()
+                .contains("closed")
+        );
+        assert!(
+            host.request("notebook.snapshot", json!({"uri":uri}), SOON)
+                .is_err()
+        );
+        assert!(
+            host.request(
+                "notebook.restore",
+                json!({"uri":uri,"type":"save-book","snapshot":snapshot,"lifecycle":"old-view"}),
+                SOON
+            )
+            .is_err()
+        );
+        assert!(notebook_restore(&host, &uri, &snapshot).unwrap()["dirty"] == true);
+        host.notify("notebook.close", json!({"uri":uri}));
+        notebook_command(&host, "demo.mode", json!([{}]));
+        host.request(
+            "notebook.open",
+            json!({"uri":uri,"type":"save-book","lifecycle":"new-view"}),
+            SOON,
+        )
+        .unwrap();
+        // An old completion must not close the view opened in its place.
+        host.notify("notebook.close", json!({"uri":uri,"lifecycle":"old-view"}));
+        assert!(
+            host.request("notebook.snapshot", json!({"uri":uri}), SOON)
+                .is_ok()
+        );
+        assert!(
+            host.request(
+                "notebook.restore",
+                json!({"uri":uri,"type":"save-book","snapshot":snapshot,"lifecycle":"other-view"}),
+                SOON
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn notebook_copy_captures_request_data_queues_with_saves_and_keeps_source_state() {
+        let Some((host, file, uri)) = notebook_fixture("notebook-copy-order") else {
+            return;
+        };
+        let target = file.with_file_name("copy.book");
+        let token = notebook_prepare_copy(&host, &uri, &target);
+        notebook_edit(&host, &uri, "requested copy");
+        let before = notebook_snapshot(&host, &uri);
+        notebook_command(&host, "demo.mode", json!([{ "hold": true }]));
+        let (tx, copied) = mpsc::channel();
+        host.ask(
+            "notebook.export",
+            json!({ "uri": uri, "target": target.to_string_lossy(), "token": token }),
+            move |answer| {
+                tx.send(answer).unwrap();
+            },
+        );
+        notebook_waiting(&host, 1);
+        notebook_edit(&host, &uri, "later saved cells");
+        let (tx, saved) = mpsc::channel();
+        host.ask("notebook.save", json!({ "uri": uri }), move |answer| {
+            tx.send(answer).unwrap();
+        });
+        notebook_command(&host, "demo.state", json!([]));
+        notebook_command(&host, "demo.release", json!([]));
+        assert_eq!(copied.recv_timeout(SOON).unwrap(), Ok(json!(true)));
+        notebook_waiting(&host, 2);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "requested copy");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "aaaa");
+        let state = notebook_command(&host, "demo.state", json!([]));
+        assert_eq!(state["dirty"], true);
+        assert_eq!(state["uri"], uri);
+        assert_eq!(state["saves"], json!([]));
+        assert!(
+            notebook_copy(&host, &uri, &target, &token)
+                .unwrap_err()
+                .contains("token")
+        );
+        notebook_command(&host, "demo.release", json!([]));
+        assert_eq!(saved.recv_timeout(SOON).unwrap(), Ok(json!(true)));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "later saved cells");
+        assert_ne!(
+            notebook_snapshot(&host, &uri)["revision"],
+            before["revision"]
+        );
+        assert_eq!(
+            notebook_command(&host, "demo.state", json!([]))["dirty"],
+            false
+        );
+        notebook_no_staging(&file);
+    }
+
+    #[test]
+    fn notebook_copy_conflicts_failures_and_exclusive_creation_preserve_both_files() {
+        let Some((host, file, uri)) = notebook_fixture("notebook-copy-failed") else {
+            return;
+        };
+        notebook_edit(&host, &uri, "mine");
+        let before = notebook_snapshot(&host, &uri);
+        let target = file.with_file_name("copy.book");
+        let token = notebook_prepare_copy(&host, &uri, &target);
+        notebook_command(&host, "demo.mode", json!([{ "fail": true }]));
+        assert!(
+            notebook_copy(&host, &uri, &target, &token)
+                .unwrap_err()
+                .contains("serializer failed")
+        );
+        assert!(!target.exists());
+        assert!(
+            notebook_copy(&host, &uri, &target, &token)
+                .unwrap_err()
+                .contains("token")
+        );
+        notebook_command(&host, "demo.mode", json!([{}]));
+
+        let token = notebook_prepare_copy(&host, &uri, &target);
+        notebook_command(&host, "demo.linkRace", json!(["arrived at publication"]));
+        assert!(notebook_copy(&host, &uri, &target, &token).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "arrived at publication"
+        );
+        notebook_no_staging(&file);
+        let token = notebook_prepare_copy(&host, &uri, &target);
+        std::fs::write(&target, "changed after prepare").unwrap();
+        assert!(
+            notebook_copy(&host, &uri, &target, &token)
+                .unwrap_err()
+                .contains("changed on disk")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "changed after prepare"
+        );
+        let token = notebook_prepare_copy(&host, &uri, &target);
+        notebook_command(&host, "demo.stageHold", json!([]));
+        let calls = notebook_command(&host, "demo.state", json!([]))["calls"]
+            .as_array()
+            .unwrap()
+            .len();
+        let (tx, copied) = mpsc::channel();
+        host.ask(
+            "notebook.export",
+            json!({ "uri": uri, "target": target.to_string_lossy(), "token": token }),
+            move |answer| {
+                tx.send(answer).unwrap();
+            },
+        );
+        notebook_waiting(&host, calls + 1);
+        std::fs::write(&target, "changed during staging").unwrap();
+        notebook_command(&host, "demo.release", json!([]));
+        assert!(
+            copied
+                .recv_timeout(SOON)
+                .unwrap()
+                .unwrap_err()
+                .contains("changed on disk")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "changed during staging"
+        );
+        notebook_no_staging(&file);
+        let token = notebook_prepare_copy(&host, &uri, &target);
+        notebook_command(&host, "demo.renameFailure", json!([]));
+        assert!(
+            notebook_copy(&host, &uri, &target, &token)
+                .unwrap_err()
+                .contains("rename failed")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "changed during staging"
+        );
+        let token = notebook_prepare_copy(&host, &uri, &target);
+        std::fs::remove_file(&target).unwrap();
+        assert!(notebook_copy(&host, &uri, &target, &token).is_err());
+        assert!(!target.exists());
+        assert_eq!(notebook_snapshot(&host, &uri), before);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "aaaa");
+        let state = notebook_command(&host, "demo.state", json!([]));
+        assert_eq!(state["dirty"], true);
+        assert_eq!(state["uri"], uri);
+        assert_eq!(state["saves"], json!([]));
+        notebook_no_staging(&file);
+    }
+
+    #[test]
+    fn notebook_copy_tokens_are_bound_one_use_bounded_and_expire() {
+        let Some((host, file, uri)) = notebook_fixture("notebook-copy-tokens") else {
+            return;
+        };
+        notebook_edit(&host, &uri, "mine");
+        let target = file.with_file_name("copy.book");
+        let first = notebook_prepare_copy(&host, &uri, &target);
+        for _ in 0..128 {
+            notebook_prepare_copy(&host, &uri, &target);
+        }
+        assert!(
+            notebook_copy(&host, &uri, &target, &first)
+                .unwrap_err()
+                .contains("token")
+        );
+        let token = notebook_prepare_copy(&host, &uri, &target);
+        let other = file.with_file_name("other.book");
+        assert!(
+            notebook_copy(&host, &uri, &other, &token)
+                .unwrap_err()
+                .contains("token")
+        );
+        assert!(
+            notebook_copy(&host, &uri, &target, &token)
+                .unwrap_err()
+                .contains("token")
+        );
+        let token = notebook_prepare_copy(&host, &uri, &target);
+        notebook_command(&host, "demo.clock", json!([6 * 60 * 1000]));
+        assert!(
+            notebook_copy(&host, &uri, &target, &token)
+                .unwrap_err()
+                .contains("token")
+        );
+        assert!(!target.exists());
+        assert!(!other.exists());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "aaaa");
+        assert_eq!(
+            notebook_command(&host, "demo.state", json!([]))["dirty"],
+            true
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notebook_copy_survives_a_deleted_source_directory_and_refuses_dangling_aliases() {
+        use std::os::unix::fs::symlink;
+        let Some((host, _told, dir)) =
+            hosted("notebook-copy-missing-source", NOTEBOOK_SAVE_FIXTURE)
+        else {
+            return;
+        };
+        host.request("activate", json!({}), SOON).unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let file = project.join("source.book");
+        std::fs::write(&file, "aaaa").unwrap();
+        let uri = notebook_open(&host, &file);
+        notebook_edit(&host, &uri, "mine");
+        let before = notebook_snapshot(&host, &uri);
+        std::fs::remove_dir_all(&project).unwrap();
+        let target = dir.join("rescued.book");
+        let token = notebook_prepare_copy(&host, &uri, &target);
+        assert_eq!(notebook_copy(&host, &uri, &target, &token), Ok(json!(true)));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "mine");
+        assert_eq!(notebook_snapshot(&host, &uri), before);
+        assert_eq!(
+            notebook_command(&host, "demo.state", json!([]))["dirty"],
+            true
+        );
+
+        std::fs::create_dir(&project).unwrap();
+        let late = dir.join("late.book");
+        let token = notebook_prepare_copy(&host, &uri, &late);
+        symlink(&late, &file).unwrap();
+        assert!(
+            notebook_copy(&host, &uri, &late, &token)
+                .unwrap_err()
+                .contains("source")
+        );
+        assert!(!late.exists());
+        assert_eq!(notebook_snapshot(&host, &uri), before);
+        assert!(
+            host.request(
+                "notebook.export.prepare",
+                json!({ "uri": uri, "target": late.to_string_lossy() }),
+                SOON
+            )
+            .unwrap_err()
+            .contains("source")
+        );
+        notebook_no_staging(&target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notebook_copy_refuses_source_aliases_and_preserves_destination_mode() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let Some((host, file, uri)) = notebook_fixture("notebook-copy-alias") else {
+            return;
+        };
+        let alias = file.with_file_name("alias.book");
+        let hardlink = file.with_file_name("hardlink.book");
+        symlink(&file, &alias).unwrap();
+        std::fs::hard_link(&file, &hardlink).unwrap();
+        for target in [&file, &alias, &hardlink] {
+            assert!(
+                host.request(
+                    "notebook.export.prepare",
+                    json!({ "uri": uri, "target": target.to_string_lossy() }),
+                    SOON
+                )
+                .unwrap_err()
+                .contains("source")
+            );
+        }
+        std::fs::remove_file(&hardlink).unwrap();
+        let target = file.with_file_name("copy.book");
+        std::fs::write(&target, "destination").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        #[cfg(target_os = "macos")]
+        if Path::new("/usr/bin/xattr").is_file() {
+            notebook_command(
+                &host,
+                "demo.xattr",
+                json!(["com.solder.copy-test", "source"]),
+            );
+            notebook_command(
+                &host,
+                "demo.xattr",
+                json!([
+                    "com.solder.copy-test",
+                    "destination",
+                    target.to_string_lossy()
+                ]),
+            );
+        }
+        notebook_edit(&host, &uri, "mine");
+        let before = notebook_snapshot(&host, &uri);
+        let token = notebook_prepare_copy(&host, &uri, &target);
+        assert_eq!(notebook_copy(&host, &uri, &target, &token), Ok(json!(true)));
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "mine");
+        #[cfg(target_os = "macos")]
+        if Path::new("/usr/bin/xattr").is_file() {
+            let output = Command::new("/usr/bin/xattr")
+                .args(["-p", "com.solder.copy-test"])
+                .arg(&target)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap().trim(),
+                "destination"
+            );
+        }
+        assert_eq!(notebook_snapshot(&host, &uri), before);
+        assert_eq!(
+            notebook_command(&host, "demo.state", json!([]))["dirty"],
+            true
+        );
+
+        let token = notebook_prepare_copy(&host, &uri, &target);
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o440)).unwrap();
+        assert!(
+            notebook_copy(&host, &uri, &target, &token)
+                .unwrap_err()
+                .contains("read-only")
+        );
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let token = notebook_prepare_copy(&host, &uri, &target);
+        symlink(&target, file.with_file_name("target-symlink.book")).unwrap();
+        std::fs::hard_link(&target, &hardlink).unwrap();
+        assert!(
+            notebook_copy(&host, &uri, &target, &token)
+                .unwrap_err()
+                .contains("hard links")
+        );
+        assert_eq!(notebook_snapshot(&host, &uri), before);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "aaaa");
+        notebook_no_staging(&file);
     }
 
     #[test]
@@ -2347,7 +3136,7 @@ exports.activate = (context) => {
             .unwrap();
         assert_eq!(
             opened,
-            json!({ "runner": "Demo runner", "cells": [
+            json!({ "runner": "Demo runner", "dirty": false, "version": 1, "cells": [
                 { "handle": 0, "code": false, "language": "markdown", "value": "# Title", "outputs": [] },
                 { "handle": 1, "code": true, "language": "javascript", "value": "hello", "outputs": [] },
             ] })
@@ -2395,9 +3184,9 @@ exports.activate = (context) => {
             heard("notebook.run"),
             [
                 json!({ "uri": uri, "handle": 2, "running": true }),
-                json!({ "uri": uri, "handle": 2, "running": false, "failed": true, "order": 1 }),
+                json!({ "uri": uri, "handle": 2, "running": false, "failed": true, "order": 1, "version": 6 }),
                 json!({ "uri": uri, "handle": 1, "running": true }),
-                json!({ "uri": uri, "handle": 1, "running": false, "failed": false, "order": 2 }),
+                json!({ "uri": uri, "handle": 1, "running": false, "failed": false, "order": 2, "version": 9 }),
             ]
         );
         let outputs = heard("notebook.outputs");

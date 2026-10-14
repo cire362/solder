@@ -9,6 +9,8 @@
 // extension sees it, and says to the editor what a run puts out.
 
 const fileSave = require('./file-save');
+const crypto = require('crypto');
+const path = require('path');
 const { classes } = require('./types');
 const { TextDocument } = require('./documents');
 
@@ -114,6 +116,63 @@ function plainOutputs(outputs) {
   }));
 }
 
+// Recovery uses NotebookData, never the serializer's file format. Binary
+// output items keep all their bytes, including forms the editor cannot draw.
+function packedData(data) {
+  for (const cell of data.cells) {
+    for (const output of cell.outputs) {
+      for (const item of output.items) item.data = Buffer.from(item.data).toString('base64');
+    }
+  }
+  return JSON.parse(JSON.stringify(data));
+}
+
+function packedRevision(revision) {
+  return { ...revision, ...Object.fromEntries(['size', 'mtime', 'dev', 'ino'].map((field) => [field, revision[field].toString()])) };
+}
+
+function unpackSnapshot(snapshot, type) {
+  const invalid = () => { throw new Error('Invalid or unsupported notebook recovery snapshot'); };
+  const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const metadata = (value) => value === undefined || object(value);
+  if (!object(snapshot) || snapshot.version !== 1 || snapshot.type !== type
+    || !Number.isSafeInteger(snapshot.version_at_capture) || snapshot.version_at_capture < 1
+    || !object(snapshot.revision) || !object(snapshot.data) || !Array.isArray(snapshot.data.cells)
+    || !metadata(snapshot.data.metadata)) invalid();
+  const revision = { ...snapshot.revision };
+  if (typeof revision.resolved !== 'string' || !path.isAbsolute(revision.resolved)
+    || typeof revision.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(revision.sha256)) invalid();
+  for (const field of ['size', 'mtime', 'dev', 'ino']) {
+    const value = revision[field];
+    if (typeof value !== 'string' || !(field === 'mtime' ? /^-?(0|[1-9]\d*)$/ : /^(0|[1-9]\d*)$/).test(value)) invalid();
+    revision[field] = BigInt(value);
+  }
+  // Clone metadata and summaries too, so a queued restore owns its request.
+  const data = JSON.parse(JSON.stringify(snapshot.data));
+  for (const cell of data.cells) {
+    if (!object(cell) || ![NotebookCellKind.Markup, NotebookCellKind.Code].includes(cell.kind)
+      || typeof cell.value !== 'string' || typeof cell.languageId !== 'string'
+      || !metadata(cell.metadata) || !Array.isArray(cell.outputs)) invalid();
+    const summary = cell.executionSummary;
+    if (summary !== undefined && (!object(summary)
+      || (summary.executionOrder !== undefined && (!Number.isSafeInteger(summary.executionOrder) || summary.executionOrder < 0))
+      || (summary.success !== undefined && typeof summary.success !== 'boolean')
+      || (summary.timing !== undefined && (!object(summary.timing)
+        || !Number.isFinite(summary.timing.startTime) || !Number.isFinite(summary.timing.endTime))))) invalid();
+    for (const output of cell.outputs) {
+      if (!object(output) || !Array.isArray(output.items) || !metadata(output.metadata)) invalid();
+      for (const item of output.items) {
+        if (!object(item) || typeof item.mime !== 'string' || typeof item.data !== 'string'
+          || item.data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(item.data)) invalid();
+        const bytes = Buffer.from(item.data, 'base64');
+        if (bytes.toString('base64') !== item.data) invalid();
+        item.data = bytes;
+      }
+    }
+  }
+  return { data, revision, version: snapshot.version_at_capture };
+}
+
 module.exports = function buildNotebooks(core) {
   const serializers = new Map();
   const messaging = new Map();
@@ -121,7 +180,12 @@ module.exports = function buildNotebooks(core) {
   const controllers = [];
   // The notebooks the editor has open, by where their file is.
   const open = new Map();
+  const openings = new Map();
   const files = new WeakMap();
+  const closedViews = new Set();
+  const copyTokens = new Map();
+  const COPY_TOKEN_LIMIT = 128;
+  const COPY_TOKEN_LIFETIME = 5 * 60 * 1000;
   const opened = new EventEmitter();
   const closed = new EventEmitter();
   const changed = new EventEmitter();
@@ -189,8 +253,10 @@ module.exports = function buildNotebooks(core) {
       },
       // Saved by the extension itself: the editor is told it is as on disk.
       async save() {
+        const client_tag = notebook._clientTag;
+        const version = notebook.version;
         await saveNotebook(notebook);
-        if (!notebook.isDirty) core.notify('notebook.saved', { uri: uri.toString() });
+        if (!notebook.isDirty) core.notify('notebook.saved', { uri: uri.toString(), client_tag, version });
         return true;
       },
     };
@@ -220,6 +286,14 @@ module.exports = function buildNotebooks(core) {
     data.metadata = structuredClone(notebook.metadata);
     return data;
   }
+  function inSaveQueue(notebook, work) {
+    const file = files.get(notebook);
+    const pending = file.saves.then(work);
+    // A refused request keeps the original revision and leaves the queue
+    // available to later saves, recovery snapshots and copies.
+    file.saves = pending.catch(() => {});
+    return pending;
+  }
   async function saveNotebook(notebook) {
     const serializer = serializers.get(notebook.notebookType);
     if (!serializer) throw new Error(`The extension writes no notebooks of the kind ${notebook.notebookType}`);
@@ -228,17 +302,13 @@ module.exports = function buildNotebooks(core) {
     const data = dataOf(notebook);
     const version = notebook.version;
     const file = files.get(notebook);
-    const pending = file.saves.then(async () => {
+    return inSaveQueue(notebook, async () => {
       const bytes = Buffer.from(await serializer.serializeNotebook(data, never));
       file.revision = await fileSave.save(file.path, file.revision, bytes);
       if (notebook.version === version) notebook.isDirty = false;
       saved.fire(notebook);
       return true;
     });
-    // A refused write leaves the expected revision intact and cannot stop
-    // the next request from trying with that same revision.
-    file.saves = pending.catch(() => {});
-    return pending;
   }
   function describe(cell) {
     return {
@@ -248,6 +318,7 @@ module.exports = function buildNotebooks(core) {
       value: cell.document.getText(),
       outputs: plainOutputs(cell.outputs),
       order: cell.executionSummary && cell.executionSummary.executionOrder,
+      ...(cell.executionSummary?.success === false ? { failed: true } : {}),
     };
   }
   function touched(notebook, event) {
@@ -273,6 +344,10 @@ module.exports = function buildNotebooks(core) {
   function runner(type) {
     return controllers.find((controller) => controller.notebookType === type);
   }
+  function described(notebook) {
+    const controller = runner(notebook.notebookType);
+    return { dirty: notebook.isDirty, client_tag: notebook._clientTag, version: notebook.version, cells: notebook._cells.map(describe), runner: controller && String(controller.label || controller.id) };
+  }
   function announce() {
     core.notify('notebook.runners', {
       runners: controllers.map((controller) => ({ type: controller.notebookType, label: String(controller.label || controller.id) })),
@@ -287,8 +362,9 @@ module.exports = function buildNotebooks(core) {
     let order;
     let began;
     const put = (target = cell) => {
-      core.notify('notebook.outputs', { uri, handle: target._handle, outputs: plainOutputs(target.outputs) });
+      if (notebook.isClosed) return;
       touched(notebook, { cellChanges: [{ cell: target, outputs: target.outputs }] });
+      core.notify('notebook.outputs', { uri, handle: target._handle, outputs: plainOutputs(target.outputs), version: notebook.version });
     };
     const list = (value) => [].concat(value || []);
     const run = {
@@ -301,15 +377,17 @@ module.exports = function buildNotebooks(core) {
         order = value;
       },
       start(time) {
+        if (notebook.isClosed) return;
         began = time || Date.now();
         notebook._running.add(source);
         core.notify('notebook.run', { uri, handle: cell._handle, running: true });
       },
       end(success, time) {
+        if (notebook.isClosed) return;
         notebook._running.delete(source);
         cell.executionSummary = { executionOrder: order, success, timing: began ? { startTime: began, endTime: time || Date.now() } : undefined };
-        core.notify('notebook.run', { uri, handle: cell._handle, running: false, failed: success === false, order });
         touched(notebook, { cellChanges: [{ cell, executionSummary: cell.executionSummary }] });
+        core.notify('notebook.run', { uri, handle: cell._handle, running: false, failed: success === false, order, version: notebook.version });
       },
       async clearOutput(target = cell) {
         target.outputs = [];
@@ -420,20 +498,124 @@ module.exports = function buildNotebooks(core) {
   const asked = {
     'notebook.renderer.activate': async () => true,
     // A file read into cells by the extension that knows its kind.
-    'notebook.open': async ({ type, uri }) => {
+    'notebook.open': async ({ type, uri, lifecycle }) => {
+      if (lifecycle && closedViews.has(lifecycle)) throw new Error('The notebook view was closed');
       const serializer = serializers.get(type);
       if (!serializer) throw new Error(`The extension reads no notebooks of the kind ${type}`);
       const where = Uri.parse(uri);
+      const name = where.toString();
+      const known = open.get(name);
+      if (known) return described(known);
+      const pending = openings.get(name);
+      if (pending) return pending.promise;
+      const opening = { lifecycle };
+      openings.set(name, opening);
+      opening.promise = (async () => {
+        const source = await fileSave.read(where.fsPath);
+        const data = await serializer.deserializeNotebook(source.bytes, never);
+        // Restore and close invalidate this opening, even if the restored
+        // notebook was closed again before deserialization finished.
+        if (openings.get(name) !== opening) {
+          const arrived = open.get(name);
+          if (arrived) return described(arrived);
+          throw new Error('The notebook opening was superseded');
+        }
+        const notebook = makeNotebook(where, type, data, source.revision);
+        notebook._view = lifecycle;
+        open.set(name, notebook);
+        opened.fire(notebook);
+        const controller = runner(type);
+        if (controller) controller._selected.fire({ notebook, selected: true });
+        return described(notebook);
+      })().finally(() => {
+        if (openings.get(name) === opening) openings.delete(name);
+      });
+      return opening.promise;
+    },
+    'notebook.snapshot': async ({ uri }) => {
+      const notebook = found(uri);
+      const data = packedData(dataOf(notebook));
+      const version = notebook.version;
+      return inSaveQueue(notebook, () => ({
+        version: 1,
+        type: notebook.notebookType,
+        // Only our preceding successful saves may advance this stamp.
+        revision: packedRevision(files.get(notebook).revision),
+        data,
+        version_at_capture: version,
+      }));
+    },
+    'notebook.restore': async ({ uri, type, snapshot, lifecycle }) => {
+      if (!serializers.has(type)) throw new Error(`The extension reads no notebooks of the kind ${type}`);
+      const recovered = unpackSnapshot(snapshot, type);
+      const where = Uri.parse(uri);
       const known = open.get(where.toString());
-      if (known) return { cells: known._cells.map(describe), runner: runner(type) && String(runner(type).label) };
-      const source = await fileSave.read(where.fsPath);
-      const data = await serializer.deserializeNotebook(source.bytes, never);
-      const notebook = makeNotebook(where, type, data, source.revision);
-      open.set(where.toString(), notebook);
-      opened.fire(notebook);
-      const controller = runner(type);
-      if (controller) controller._selected.fire({ notebook, selected: true });
-      return { cells: notebook._cells.map(describe), runner: controller && String(controller.label || controller.id) };
+      const replace = () => {
+        if (lifecycle && closedViews.has(lifecycle)) throw new Error('The notebook view was closed');
+        const current = open.get(where.toString());
+        const pending = openings.get(where.toString());
+        if (lifecycle && ((current?._view && current._view !== lifecycle)
+          || (pending?.lifecycle && pending.lifecycle !== lifecycle))) {
+          throw new Error('Cannot restore over another notebook view');
+        }
+        if ((known && (known.isClosed || current !== known)) || (current && current.isDirty)) {
+          throw new Error('Cannot restore over a closed or changed notebook');
+        }
+        openings.delete(where.toString());
+        const selected = front && front.notebook === current ? front.selection.start : undefined;
+        if (current) {
+          current.isClosed = true;
+          for (const source of [...current._running]) source.cancel();
+          current._running.clear();
+          for (const cell of current._cells) dropCell(cell);
+          closed.fire(current);
+        }
+        const notebook = makeNotebook(where, type, recovered.data, recovered.revision);
+        notebook._view = lifecycle;
+        notebook.version = Math.max(recovered.version, current ? current.version + 1 : 1);
+        notebook.isDirty = true;
+        open.set(where.toString(), notebook);
+        opened.fire(notebook);
+        if (selected !== undefined) {
+          front = editorOf(notebook, selected);
+          frontChanged.fire(front);
+        }
+        const controller = runner(type);
+        if (controller) controller._selected.fire({ notebook, selected: true });
+        return described(notebook);
+      };
+      if (known && known.isDirty) throw new Error('Cannot restore over an open dirty notebook');
+      return known ? inSaveQueue(known, replace) : replace();
+    },
+    'notebook.export.prepare': async ({ uri, target }) => {
+      const notebook = found(uri);
+      const file = files.get(notebook);
+      const where = Uri.parse(target);
+      if (where.scheme !== 'file' || where.authority || where.query || where.fragment) throw new Error('A notebook copy needs a local file');
+      const expected = await fileSave.prepareCopy(file.path, file.revision, where.fsPath);
+      const now = Date.now();
+      for (const [token, entry] of copyTokens) if (entry.expires <= now) copyTokens.delete(token);
+      while (copyTokens.size >= COPY_TOKEN_LIMIT) copyTokens.delete(copyTokens.keys().next().value);
+      const token = crypto.randomBytes(32).toString('hex');
+      copyTokens.set(token, { notebook, target: where.toString(), expected, expires: now + COPY_TOKEN_LIFETIME });
+      return token;
+    },
+    'notebook.export': async ({ uri, target, token }) => {
+      const prepared = copyTokens.get(token);
+      copyTokens.delete(token);
+      const notebook = found(uri);
+      const where = Uri.parse(target);
+      if (!prepared || prepared.notebook !== notebook || prepared.target !== where.toString()
+        || prepared.expires <= Date.now()) throw new Error('Invalid or expired notebook copy token');
+      const serializer = serializers.get(notebook.notebookType);
+      if (!serializer) throw new Error(`The extension writes no notebooks of the kind ${notebook.notebookType}`);
+      const data = dataOf(notebook);
+      const file = files.get(notebook);
+      return inSaveQueue(notebook, async () => {
+        const bytes = Buffer.from(await serializer.serializeNotebook(data, never));
+        await fileSave.writeCopy(file.path, file.revision, where.fsPath, prepared.expected, bytes);
+        return true;
+      });
     },
     // Written back by the same extension, from the cells as they are now.
     'notebook.save': async ({ uri }) => {
@@ -467,10 +649,11 @@ module.exports = function buildNotebooks(core) {
     },
     'notebook.renderer.closed'({ id }) { rendererPages.delete(id); },
     // The text of a cell as it is now.
-    'notebook.cell'({ uri, handle, value }) {
+    'notebook.cell'({ uri, handle, value, client_tag }) {
       const notebook = open.get(key(uri));
       const cell = notebook && notebook._cells.find((one) => one._handle === handle);
       if (!cell) return;
+      notebook._clientTag = client_tag;
       const document = cell.document;
       const whole = new Range(0, 0, document.lineCount, 0);
       const was = document.getText().length;
@@ -480,12 +663,14 @@ module.exports = function buildNotebooks(core) {
       notebook.isDirty = true;
       core.docs.changed.fire({ document, contentChanges: [{ range: whole, rangeOffset: 0, rangeLength: was, text: document._text }], reason: undefined });
       touched(notebook, { cellChanges: [{ cell, document }] });
+      core.notify('notebook.version', { uri, version: notebook.version, client_tag });
     },
     // The cells in their order, after one was added, removed or moved. A
     // number the notebook does not know yet is a new cell.
-    'notebook.cells'({ uri, cells }) {
+    'notebook.cells'({ uri, cells, client_tag }) {
       const notebook = open.get(key(uri));
       if (!notebook) return;
+      notebook._clientTag = client_tag;
       const before = notebook._cells;
       const after = cells.map((one) => before.find((cell) => cell._handle === one.handle)
         || makeCell(notebook, one.handle, { kind: one.code ? NotebookCellKind.Code : NotebookCellKind.Markup, language: one.language, value: one.value }));
@@ -500,11 +685,19 @@ module.exports = function buildNotebooks(core) {
       notebook.isDirty = true;
       for (const cell of removedCells) if (!after.includes(cell)) dropCell(cell);
       touched(notebook, { contentChanges: [{ range: new NotebookRange(head, before.length - tail), removedCells, addedCells }] });
+      core.notify('notebook.version', { uri, version: notebook.version, client_tag });
     },
-    'notebook.close'({ uri }) {
+    'notebook.close'({ uri, lifecycle }) {
+      if (lifecycle) {
+        closedViews.add(lifecycle);
+        if (closedViews.size > 512) closedViews.delete(closedViews.values().next().value);
+      }
+      openings.delete(key(uri));
       const notebook = open.get(key(uri));
       if (!notebook) return;
+      if (lifecycle && notebook._view && notebook._view !== lifecycle) return;
       open.delete(key(uri));
+      for (const [token, entry] of copyTokens) if (entry.notebook === notebook) copyTokens.delete(token);
       for (const source of [...notebook._running]) source.cancel();
       for (const cell of notebook._cells) dropCell(cell);
       notebook.isClosed = true;

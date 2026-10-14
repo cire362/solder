@@ -313,7 +313,7 @@ pub struct Document {
     stamp: Option<crate::remote::Stamp>,
     /// Undo may return to today's target text, which is not proof that
     /// the recovered work was saved. Keep its original until an answer.
-    recovered_remote: Option<RecoveredRemote>,
+    recovery_source: Option<RecoverySource>,
     /// Something to say above the text: why it cannot be edited, or why
     /// it was not saved.
     notice: Option<gpui::SharedString>,
@@ -323,7 +323,7 @@ pub struct Document {
     language_path: Option<PathBuf>,
 }
 
-struct RecoveredRemote {
+struct RecoverySource {
     path: PathBuf,
     stamp: Option<crate::remote::Stamp>,
     original: text::Rope,
@@ -366,7 +366,7 @@ impl Document {
             read_only: false,
             encoding: Default::default(),
             stamp: None,
-            recovered_remote: None,
+            recovery_source: None,
             notice: None,
             title_override: None,
             language_path: None,
@@ -401,6 +401,13 @@ impl Document {
         doc
     }
 
+    /// Restoration freezes a cell until its host and UI agree on the model.
+    pub(crate) fn lock_cell(&mut self, locked: bool, cx: &mut Context<Self>) {
+        debug_assert!(self.path.is_none() && self.title_override.is_none());
+        self.read_only = locked;
+        cx.notify();
+    }
+
     /// A file as it was read from disk.
     pub fn open(path: PathBuf, loaded: &Loaded, cx: &mut Context<Self>) -> Self {
         let mut doc = Self::new(Some(path), &loaded.text, cx);
@@ -428,7 +435,7 @@ impl Document {
         self.reload(&text, cx);
         // Reopening an encoding retains undo history. Its later undo
         // must not authorize the recovered text against a newer target.
-        if self.recovered_remote.is_none() {
+        if self.recovery_source.is_none() {
             self.stamp = stamp;
         }
         self.encoding = encoding;
@@ -605,7 +612,7 @@ impl Document {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.text.is_dirty() || self.recovered_remote.is_some() || self.is_saving()
+        self.text.is_dirty() || self.recovery_source.is_some() || self.is_saving()
     }
 
     pub(crate) fn is_saving(&self) -> bool {
@@ -971,12 +978,18 @@ impl Document {
     }
 
     pub fn undo(&mut self, origin: EntityId, cx: &mut Context<Self>) -> Option<Vec<Selection>> {
+        if self.read_only {
+            return None;
+        }
         let (edits, selections) = self.text.undo()?;
         self.after_change(edits.into(), Some(origin), cx);
         Some(selections)
     }
 
     pub fn redo(&mut self, origin: EntityId, cx: &mut Context<Self>) -> Option<Vec<Selection>> {
+        if self.read_only {
+            return None;
+        }
         let (edits, selections) = self.text.redo()?;
         self.after_change(edits.into(), Some(origin), cx);
         Some(selections)
@@ -1107,7 +1120,7 @@ impl Document {
                         return Err(SaveFailure::PathChanged);
                     }
                     let source = this
-                        .recovered_remote
+                        .recovery_source
                         .as_ref()
                         .filter(|recovered| recovered.path == saved_path);
                     let stamp = source
@@ -1154,7 +1167,7 @@ impl Document {
                             // Undo during IO may return to the old clean state.
                             // Only the snapshot actually written is now saved.
                             this.text.mark_saved_at(checkpoint);
-                            this.recovered_remote = None;
+                            this.recovery_source = None;
                             this.notice = None;
                             true
                         }
@@ -1200,7 +1213,7 @@ impl Document {
 
     /// Puts back text that was typed and never saved, as changes that are
     /// not saved: one step back from it is the file as it is on disk.
-    /// Remote recovery retains its own read revision even if the text
+    /// Named recovery retains its own read revision even if the text
     /// already matches today's file. None means an old, unversioned copy.
     pub(crate) fn recover(
         &mut self,
@@ -1211,11 +1224,19 @@ impl Document {
         if self.read_only {
             return false;
         }
-        let remote = self.path.as_deref().is_some_and(crate::remote::is_remote);
-        if remote {
-            self.stamp = stamp;
-            self.recovered_remote = Some(RecoveredRemote {
-                path: self.path.clone().unwrap(),
+        let named = self.path.is_some();
+        if let Some(path) = self.path.clone() {
+            // The startup read describes today's bytes, not the revision
+            // against which the recovered edits were originally made.
+            // Length and timestamp alone cannot prove a recovered source's
+            // identity after an external edit which preserves both.
+            self.stamp = stamp.filter(|stamp| {
+                stamp.hash.as_ref().is_some_and(|hash| {
+                    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            });
+            self.recovery_source = Some(RecoverySource {
+                path,
                 stamp: self.stamp.clone(),
                 original: text::Rope::from_str(text),
                 baseline: self.text.rope().clone(),
@@ -1233,7 +1254,7 @@ impl Document {
         if *self.text.rope() == text {
             self.update_dirty(cx);
             cx.notify();
-            return remote;
+            return named;
         }
         let len = self.text.len();
         self.text.seal_history();
@@ -1242,7 +1263,7 @@ impl Document {
             .edit([(0..len, text.to_string())], &[], Instant::now())
             .into();
         self.text.seal_history();
-        if !remote {
+        if !named {
             let said = crate::lang::t(
                 "This text was not saved when Solder closed. Undo brings back the file as it is on disk.",
             );
@@ -1252,12 +1273,12 @@ impl Document {
         true
     }
 
-    /// A remote undo to the startup baseline must not replace the only
+    /// An undo to the startup baseline must not replace the only
     /// recovery copy of the original work with the target's newer text.
     pub(crate) fn recovery_snapshot(
         &self,
     ) -> (Option<PathBuf>, text::Rope, Option<crate::remote::Stamp>) {
-        match &self.recovered_remote {
+        match &self.recovery_source {
             Some(recovered) => {
                 let text = if self.text.rope() == &recovered.baseline {
                     &recovered.original
@@ -1281,7 +1302,7 @@ impl Document {
     }
 
     pub(crate) fn protected_save_source(&self) -> Option<PathBuf> {
-        self.recovered_remote
+        self.recovery_source
             .as_ref()
             .map(|recovered| recovered.path.clone())
     }
@@ -1305,7 +1326,7 @@ impl Document {
             return;
         }
         let stamp = if same_recovery {
-            self.recovered_remote
+            self.recovery_source
                 .as_ref()
                 .and_then(|recovered| recovered.stamp.clone())
         } else if same_current {
@@ -1315,7 +1336,7 @@ impl Document {
         };
         self.set_path(path.clone(), cx);
         self.stamp = stamp;
-        if same_recovery && let Some(recovered) = self.recovered_remote.as_mut() {
+        if same_recovery && let Some(recovered) = self.recovery_source.as_mut() {
             recovered.path = path;
         }
     }
@@ -1349,7 +1370,7 @@ impl Document {
 
     /// A rename keeps the revision that was opened; Save As does not.
     pub fn renamed(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if let Some(recovered) = self.recovered_remote.as_mut()
+        if let Some(recovered) = self.recovery_source.as_mut()
             && self.path.as_ref() == Some(&recovered.path)
         {
             recovered.path = path.clone();
@@ -1480,6 +1501,18 @@ pub fn map_offset(offset: usize, edits: &[text::Edit]) -> usize {
 mod tests {
     use super::*;
     use gpui::AppContext;
+
+    async fn load_off_ui(path: &Path, cx: &gpui::TestAppContext) -> Loaded {
+        let path = path.to_path_buf();
+        cx.background_spawn(async move { load(&path).unwrap() })
+            .await
+    }
+
+    async fn read_off_ui(path: &Path, cx: &gpui::TestAppContext) -> Vec<u8> {
+        let path = path.to_path_buf();
+        cx.background_spawn(async move { std::fs::read(path).unwrap() })
+            .await
+    }
 
     fn hold_save_queue(
         doc: &mut Document,
@@ -1650,6 +1683,336 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn local_recovery_checks_the_original_length_time_and_hash(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        for (change, bytes) in [
+            ("length", "longer than before"),
+            ("time", "before"),
+            ("hash", "edited"),
+        ] {
+            let (path, original, loaded) = cx
+                .background_spawn(async move {
+                    let path = db::testing::dir("document-local-recovery-revision")
+                        .join(format!("{change}.txt"));
+                    std::fs::write(&path, "before").unwrap();
+                    let original = load(&path).unwrap().stamp.unwrap();
+                    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                    std::fs::write(&path, bytes).unwrap();
+                    let modified = if change == "time" {
+                        modified + Duration::from_secs(1)
+                    } else {
+                        modified
+                    };
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_times(std::fs::FileTimes::new().set_modified(modified))
+                        .unwrap();
+                    let loaded = load(&path).unwrap();
+                    let current = loaded.stamp.as_ref().unwrap();
+                    assert_eq!(original.length == current.length, change != "length");
+                    assert_eq!(original.mtime == current.mtime, change != "time");
+                    assert_eq!(original.hash == current.hash, change == "time");
+                    (path, original, loaded)
+                })
+                .await;
+            let document = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+            assert!(document.update(cx, |doc, cx| {
+                doc.recover("unsaved", Some(original.clone()), cx)
+            }));
+            assert!(!document.update(cx, |doc, cx| doc.save(cx)).await);
+            assert_eq!(read_off_ui(&path, cx).await, bytes.as_bytes());
+            document.read_with(cx, |doc, _| {
+                assert!(doc.is_dirty());
+                assert!(!doc.is_saving());
+                assert!(doc.notice().is_some());
+                assert_eq!(doc.stamp, Some(original.clone()));
+                let snapshot = doc.recovery_snapshot();
+                assert_eq!(snapshot.0, Some(path.clone()));
+                assert_eq!(snapshot.1.to_string(), "unsaved");
+                assert_eq!(snapshot.2, Some(original));
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn local_recovery_stays_dirty_at_the_startup_baseline_and_after_reopen(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let (path, original, loaded) = cx
+            .background_spawn(async move {
+                let path = db::testing::dir("document-local-recovery-baseline").join("file.txt");
+                std::fs::write(&path, "before").unwrap();
+                let original = load(&path).unwrap().stamp;
+                std::fs::write(&path, "today").unwrap();
+                let loaded = load(&path).unwrap();
+                (path, original, loaded)
+            })
+            .await;
+        let same = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+        assert!(same.update(cx, |doc, cx| doc.recover("today", original.clone(), cx)));
+        same.read_with(cx, |doc, _| {
+            assert!(!doc.text.is_dirty());
+            assert!(doc.is_dirty());
+            assert_eq!(doc.recovery_snapshot().2, original);
+        });
+        assert!(!same.update(cx, |doc, cx| doc.save(cx)).await);
+
+        let document = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+        let origin = document.entity_id();
+        document.update(cx, |doc, cx| {
+            assert!(doc.recover("unsaved", original.clone(), cx));
+            doc.undo(origin, cx).unwrap();
+            assert_eq!(doc.text.rope().to_string(), "today");
+            assert!(!doc.text.is_dirty());
+            assert!(doc.is_dirty());
+            assert_eq!(doc.recovery_snapshot().1.to_string(), "unsaved");
+            doc.redo(origin, cx).unwrap();
+            doc.reopen(b"today", loaded.stamp.clone(), loaded.encoding, cx);
+            assert!(doc.is_dirty());
+            assert_eq!(doc.recovery_snapshot().1.to_string(), "unsaved");
+            doc.undo(origin, cx).unwrap();
+            assert_eq!(doc.text.rope().to_string(), "unsaved");
+            assert_eq!(doc.stamp, original);
+            assert_eq!(doc.recovery_snapshot().2, original);
+        });
+        assert!(!document.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(read_off_ui(&path, cx).await, b"today");
+    }
+
+    #[gpui::test]
+    async fn unchanged_local_recovery_saves_and_advances_its_revision(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        for recovered in ["before", "unsaved"] {
+            let (path, loaded) = cx
+                .background_spawn(async move {
+                    let path = db::testing::dir("document-local-recovery-save")
+                        .join(format!("{recovered}.txt"));
+                    std::fs::write(&path, "before").unwrap();
+                    let loaded = load(&path).unwrap();
+                    (path, loaded)
+                })
+                .await;
+            let document = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+            assert!(document.update(cx, |doc, cx| {
+                doc.recover(recovered, loaded.stamp.clone(), cx)
+            }));
+            assert!(document.read_with(cx, |doc, _| doc.is_dirty()));
+            assert!(document.update(cx, |doc, cx| doc.save(cx)).await);
+            let saved = load_off_ui(&path, cx).await;
+            assert_eq!(saved.text, recovered);
+            document.read_with(cx, |doc, _| {
+                assert!(!doc.is_dirty());
+                assert!(doc.notice().is_none());
+                assert!(doc.protected_save_source().is_none());
+                assert_eq!(doc.stamp, saved.stamp);
+            });
+            document.update(cx, |doc, cx| {
+                doc.apply_edits(vec![(0..doc.text.len(), "next".into())], None, cx);
+            });
+            assert!(document.update(cx, |doc, cx| doc.save(cx)).await);
+            assert_eq!(read_off_ui(&path, cx).await, b"next");
+            assert!(!document.read_with(cx, |doc, _| doc.is_dirty()));
+        }
+    }
+
+    #[gpui::test]
+    async fn legacy_local_recovery_requires_another_path_even_if_the_source_is_missing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        for exists in [true, false] {
+            let (path, renamed, destination, loaded) = cx
+                .background_spawn(async move {
+                    let directory = db::testing::dir("document-local-recovery-legacy");
+                    let path = directory.join("file.txt");
+                    let loaded = if exists {
+                        std::fs::write(&path, "today").unwrap();
+                        load(&path).unwrap()
+                    } else {
+                        Loaded::of(b"")
+                    };
+                    (
+                        path,
+                        directory.join("renamed.txt"),
+                        directory.join("new.txt"),
+                        loaded,
+                    )
+                })
+                .await;
+            let recovered = if exists { "today" } else { "unsaved" };
+            let document = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+            assert!(document.update(cx, |doc, cx| doc.recover(recovered, None, cx)));
+            document.read_with(cx, |doc, _| {
+                assert!(doc.is_dirty());
+                assert!(doc.stamp.is_none());
+                assert!(doc.recovery_snapshot().2.is_none());
+                assert_eq!(doc.protected_save_source(), Some(path.clone()));
+            });
+            assert!(!document.update(cx, |doc, cx| doc.save(cx)).await);
+            document.update(cx, |doc, cx| {
+                doc.set_save_target(path.clone(), loaded.stamp.clone(), true, true, cx);
+            });
+            assert!(!document.update(cx, |doc, cx| doc.save(cx)).await);
+            let from = path.clone();
+            let to = renamed.clone();
+            cx.background_spawn(async move {
+                if exists {
+                    assert_eq!(std::fs::read(&from).unwrap(), b"today");
+                    std::fs::rename(from, to).unwrap();
+                } else {
+                    assert!(!from.exists());
+                }
+            })
+            .await;
+            document.update(cx, |doc, cx| doc.renamed(renamed.clone(), cx));
+            assert!(!document.update(cx, |doc, cx| doc.save(cx)).await);
+            assert_eq!(
+                document.read_with(cx, |doc, _| doc.protected_save_source()),
+                Some(renamed.clone())
+            );
+            if exists {
+                assert_eq!(read_off_ui(&renamed, cx).await, b"today");
+            } else {
+                cx.background_spawn(async move { assert!(!renamed.exists()) })
+                    .await;
+            }
+            document.update(cx, |doc, cx| {
+                doc.set_save_target(destination.clone(), None, false, false, cx);
+            });
+            assert!(document.update(cx, |doc, cx| doc.save(cx)).await);
+            assert_eq!(read_off_ui(&destination, cx).await, recovered.as_bytes());
+            assert!(!document.read_with(cx, |doc, _| doc.is_dirty()));
+            assert!(document.read_with(cx, |doc, _| doc.protected_save_source().is_none()));
+        }
+    }
+
+    #[gpui::test]
+    async fn missing_local_recovery_source_does_not_grant_creation_permission(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let (path, destination, original, chosen) = cx
+            .background_spawn(async move {
+                let directory = db::testing::dir("document-local-recovery-missing");
+                let path = directory.join("file.txt");
+                let destination = directory.join("chosen.txt");
+                std::fs::write(&path, "before").unwrap();
+                let original = load(&path).unwrap().stamp;
+                std::fs::remove_file(&path).unwrap();
+                std::fs::write(&destination, "other").unwrap();
+                let chosen = crate::remote::revision(&destination).unwrap();
+                (path, destination, original, chosen)
+            })
+            .await;
+        let document = cx.new(|cx| Document::new(Some(path.clone()), "", cx));
+        document.update(cx, |doc, cx| doc.recover("unsaved", original.clone(), cx));
+        assert!(!document.update(cx, |doc, cx| doc.save(cx)).await);
+        document.read_with(cx, |doc, _| {
+            assert!(doc.is_dirty());
+            assert_eq!(doc.recovery_snapshot().2, original);
+        });
+        cx.background_spawn(async move { assert!(!path.exists()) })
+            .await;
+        document.update(cx, |doc, cx| {
+            doc.set_save_target(destination.clone(), chosen, false, false, cx);
+        });
+        assert!(document.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(read_off_ui(&destination, cx).await, b"unsaved");
+        assert!(!document.read_with(cx, |doc, _| doc.is_dirty()));
+    }
+
+    #[gpui::test]
+    async fn failed_local_recovery_save_as_keeps_the_original_snapshot_after_undo(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let (path, blocked, destination, original, loaded) = cx
+            .background_spawn(async move {
+                let directory = db::testing::dir("document-local-recovery-save-as-undo");
+                let path = directory.join("file.txt");
+                std::fs::write(&path, "before").unwrap();
+                let original = load(&path).unwrap().stamp;
+                std::fs::write(&path, "today").unwrap();
+                let loaded = load(&path).unwrap();
+                let blocked = directory.join("blocked");
+                std::fs::write(&blocked, "not a directory").unwrap();
+                (
+                    path,
+                    blocked.join("file.txt"),
+                    directory.join("new.txt"),
+                    original,
+                    loaded,
+                )
+            })
+            .await;
+        let document = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+        let origin = document.entity_id();
+        document.update(cx, |doc, cx| {
+            doc.recover("unsaved", original.clone(), cx);
+            doc.set_save_target(blocked, None, false, false, cx);
+        });
+        assert!(!document.update(cx, |doc, cx| doc.save(cx)).await);
+        document.update(cx, |doc, cx| {
+            doc.undo(origin, cx).unwrap();
+            assert_eq!(doc.text.rope().to_string(), "today");
+            assert!(doc.is_dirty());
+            assert_eq!(doc.protected_save_source(), Some(path.clone()));
+            let snapshot = doc.recovery_snapshot();
+            assert_eq!(snapshot.0, Some(path.clone()));
+            assert_eq!(snapshot.1.to_string(), "unsaved");
+            assert_eq!(snapshot.2, original);
+        });
+        assert!(!document.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(
+            document.read_with(cx, |doc, _| doc.recovery_snapshot().1.to_string()),
+            "unsaved"
+        );
+        document.update(cx, |doc, cx| {
+            doc.set_save_target(path.clone(), loaded.stamp.clone(), false, true, cx);
+        });
+        assert!(!document.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(read_off_ui(&path, cx).await, b"today");
+        document.update(cx, |doc, cx| {
+            doc.redo(origin, cx).unwrap();
+            doc.set_save_target(destination.clone(), None, false, false, cx);
+        });
+        assert!(document.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(read_off_ui(&destination, cx).await, b"unsaved");
+        assert!(!document.read_with(cx, |doc, _| doc.is_dirty()));
+        assert!(document.read_with(cx, |doc, _| doc.protected_save_source().is_none()));
+    }
+
+    #[gpui::test]
+    async fn untitled_recovery_can_still_be_saved_to_its_first_path(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let document = cx.new(|cx| Document::new(None, "", cx));
+        assert!(document.update(cx, |doc, cx| doc.recover("unsaved", None, cx)));
+        document.read_with(cx, |doc, _| {
+            assert!(doc.is_dirty());
+            assert!(doc.protected_save_source().is_none());
+            assert!(doc.recovery_snapshot().0.is_none());
+        });
+        let destination = cx
+            .background_spawn(async move {
+                db::testing::dir("document-untitled-recovery").join("new.txt")
+            })
+            .await;
+        document.update(cx, |doc, cx| {
+            doc.set_save_target(destination.clone(), None, false, false, cx);
+        });
+        assert!(document.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(read_off_ui(&destination, cx).await, b"unsaved");
+        assert!(!document.read_with(cx, |doc, _| doc.is_dirty()));
+    }
+
+    #[gpui::test]
     async fn save_as_uses_the_selected_destination_revision(cx: &mut gpui::TestAppContext) {
         cx.executor().allow_parking();
         let dir = db::testing::dir("document-local-save-as");
@@ -1684,39 +2047,81 @@ mod tests {
     ) {
         use std::os::unix::fs::symlink;
         cx.executor().allow_parking();
-        let dir = db::testing::dir("document-source-alias");
-        let path = dir.join("source.txt");
-        let alias = dir.join("alias.txt");
-        std::fs::write(&path, "before").unwrap();
-        symlink(&path, &alias).unwrap();
-        let loaded = load(&path).unwrap();
+        let (dir, path, alias, loaded) = cx
+            .background_spawn(async move {
+                let dir = db::testing::dir("document-source-alias");
+                let path = dir.join("source.txt");
+                let alias = dir.join("alias.txt");
+                std::fs::write(&path, "before").unwrap();
+                symlink(&path, &alias).unwrap();
+                let loaded = load(&path).unwrap();
+                (dir, path, alias, loaded)
+            })
+            .await;
         let document = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
         document.update(cx, |d, cx| {
             d.apply_edits(vec![(0..6, "ours".into())], None, cx)
         });
-        std::fs::write(&path, "external").unwrap();
-        let now = crate::remote::revision(&alias).unwrap();
+        let source = path.clone();
+        let target = alias.clone();
+        let (now, same_recovery) = cx
+            .background_spawn(async move {
+                std::fs::write(&source, "external").unwrap();
+                (
+                    crate::remote::revision(&target).unwrap(),
+                    crate::remote::same_file(&source, &target).unwrap(),
+                )
+            })
+            .await;
+        assert!(same_recovery);
         document.update(cx, |d, cx| {
-            d.set_save_target(alias.clone(), now, true, false, cx)
+            d.set_save_target(alias.clone(), now.clone(), true, false, cx)
         });
         assert!(!document.update(cx, |d, cx| d.save(cx)).await);
-        assert_eq!(std::fs::read(&path).unwrap(), b"external");
+        assert_eq!(read_off_ui(&path, cx).await, b"external");
         assert_eq!(document.read_with(cx, |d, _| d.stamp.clone()), loaded.stamp);
-        let recovered = cx.new(|cx| Document::open(path.clone(), &load(&path).unwrap(), cx));
-        recovered.update(cx, |d, cx| {
-            d.recover("legacy", None, cx);
-            d.set_path(dir.join("attempt.txt"), cx);
-            d.set_save_target(
-                alias.clone(),
-                crate::remote::revision(&alias).unwrap(),
-                false,
-                true,
-                cx,
-            );
-        });
-        assert!(!recovered.update(cx, |d, cx| d.save(cx)).await);
-        assert_eq!(std::fs::read(&path).unwrap(), b"external");
-        assert!(recovered.read_with(cx, |d, _| d.is_dirty()));
+        let restarted = load_off_ui(&path, cx).await;
+        for original in [loaded.stamp.clone(), None] {
+            let recovered = cx.new(|cx| Document::open(path.clone(), &restarted, cx));
+            recovered.update(cx, |d, cx| {
+                d.recover("unsaved", original.clone(), cx);
+                d.set_path(dir.join("attempt.txt"), cx);
+                assert_eq!(d.protected_save_source(), Some(path.clone()));
+                d.set_save_target(alias.clone(), now.clone(), false, same_recovery, cx);
+            });
+            assert!(!recovered.update(cx, |d, cx| d.save(cx)).await);
+            assert_eq!(read_off_ui(&path, cx).await, b"external");
+            recovered.read_with(cx, |d, _| {
+                assert!(d.is_dirty());
+                assert_eq!(d.stamp, original);
+                assert_eq!(d.protected_save_source(), Some(alias.clone()));
+                let snapshot = d.recovery_snapshot();
+                assert_eq!(snapshot.0, Some(alias.clone()));
+                assert_eq!(snapshot.1.to_string(), "unsaved");
+                assert_eq!(snapshot.2, original);
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn weak_local_recovery_stamp_requires_a_different_destination(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let path = db::testing::dir("local-recovery-weak-stamp").join("file.txt");
+        std::fs::write(&path, "disk").unwrap();
+        let loaded = load(&path).unwrap();
+        let mut stamp = loaded.stamp.clone().unwrap();
+        stamp.hash = None;
+        let document = cx.new(|cx| Document::open(path.clone(), &loaded, cx));
+        document.update(cx, |doc, cx| doc.recover("recovered", Some(stamp), cx));
+        assert!(document.read_with(cx, |doc, _| doc.recovery_snapshot().2.is_none()));
+        assert!(!document.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "disk");
+        let rescued = path.with_file_name("copy.txt");
+        document.update(cx, |doc, cx| doc.set_path(rescued.clone(), cx));
+        assert!(document.update(cx, |doc, cx| doc.save(cx)).await);
+        assert_eq!(std::fs::read_to_string(rescued).unwrap(), "recovered");
     }
 
     #[cfg(unix)]
@@ -1793,7 +2198,7 @@ mod tests {
         assert!(restored.update(cx, |doc, cx| doc.save(cx)).await);
         assert_eq!(std::fs::read(&target).unwrap(), b"unsaved");
         assert!(!restored.read_with(cx, |doc, _| doc.is_dirty()));
-        assert!(restored.read_with(cx, |doc, _| doc.recovered_remote.is_none()));
+        assert!(restored.read_with(cx, |doc, _| doc.recovery_source.is_none()));
     }
 
     #[cfg(unix)]
@@ -1846,7 +2251,7 @@ mod tests {
         assert!(first.await);
         assert!(first_tail.await);
         assert_eq!(std::fs::read(&target).unwrap(), b"first");
-        assert!(document.read_with(cx, |doc, _| doc.recovered_remote.is_none()));
+        assert!(document.read_with(cx, |doc, _| doc.recovery_source.is_none()));
         assert_eq!(document.read_with(cx, |doc, _| doc.pending_saves), 1);
         // A waiter on the old tail must recapture after awaiting it.
         let tail = document.read_with(cx, |doc, _| doc.pending_save().unwrap());
@@ -1890,7 +2295,7 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"before");
         document.read_with(cx, |doc, _| {
             assert_eq!(doc.stamp, loaded.stamp);
-            assert!(doc.recovered_remote.is_some());
+            assert!(doc.recovery_source.is_some());
             assert!(doc.notice().is_some());
             assert_eq!(doc.pending_saves, 1);
             assert!(doc.is_dirty());
@@ -1898,7 +2303,7 @@ mod tests {
         release.send(()).unwrap();
         assert!(second.await);
         assert_eq!(std::fs::read(&target).unwrap(), b"retry");
-        assert!(document.read_with(cx, |doc, _| doc.recovered_remote.is_none()));
+        assert!(document.read_with(cx, |doc, _| doc.recovery_source.is_none()));
         assert!(!document.read_with(cx, |doc, _| doc.is_dirty() || doc.is_saving()));
     }
 
@@ -1936,12 +2341,12 @@ mod tests {
             assert_eq!(doc.pending_saves, 1);
             assert!(doc.text.is_dirty());
             assert_eq!(doc.recovery_snapshot().0, Some(path));
-            assert!(doc.recovered_remote.is_some());
+            assert!(doc.recovery_source.is_some());
         });
         release_second.send(()).unwrap();
         assert!(second.await);
         assert_eq!(std::fs::read(source.join("new.txt")).unwrap(), b"unsaved");
-        assert!(document.read_with(cx, |doc, _| doc.recovered_remote.is_none()));
+        assert!(document.read_with(cx, |doc, _| doc.recovery_source.is_none()));
         assert!(!document.read_with(cx, |doc, _| doc.is_dirty() || doc.is_saving()));
     }
 
@@ -2087,14 +2492,14 @@ mod tests {
             assert!(doc.is_dirty());
             assert!(doc.is_saving());
             assert!(doc.pending_save().is_some());
-            assert!(doc.recovered_remote.is_some());
+            assert!(doc.recovery_source.is_some());
             save
         });
         assert!(save.await);
         assert_eq!(std::fs::read(&target).unwrap(), b"unsaved");
         assert!(!document.read_with(cx, |doc, _| doc.is_dirty()));
         assert!(document.read_with(cx, |doc, _| doc.pending_save().is_none()));
-        assert!(document.read_with(cx, |doc, _| doc.recovered_remote.is_none()));
+        assert!(document.read_with(cx, |doc, _| doc.recovery_source.is_none()));
 
         // Undo to the old clean text while saving new text. That text
         // becomes dirty when the target has actually received the new one.

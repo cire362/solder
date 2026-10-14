@@ -27,7 +27,10 @@ use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 actions!(
@@ -41,7 +44,8 @@ actions!(
         AddText,
         DeleteCell,
         MoveCellUp,
-        MoveCellDown
+        MoveCellDown,
+        ExportCopy
     ]
 );
 
@@ -112,6 +116,11 @@ pub struct Notebook {
     kind: String,
     uri: String,
     state: State,
+    loading_generation: u64,
+    recovered_generation: Option<u64>,
+    restoration_cancelled: Option<Arc<AtomicBool>>,
+    client_tag: Option<String>,
+    host_version: Option<u64>,
     cells: Vec<Cell>,
     next_handle: u64,
     /// The cell the cursor is in, or was in last.
@@ -142,13 +151,14 @@ impl Notebook {
     pub fn open(path: PathBuf, extension: String, kind: String, cx: &mut Context<Self>) -> Self {
         let uri = crate::extension_api::uri(&path);
         let me = cx.weak_entity();
+        let lifecycle = format!("view-{}", cx.entity_id());
         let reading = (!extension.is_empty())
             .then(|| ExtensionStore::try_global(cx))
             .flatten()
             .map(|store| {
                 store.update(cx, |store, cx| {
                     store.notebook_opened(&extension, &uri, me);
-                    let params = json!({ "type": kind, "uri": uri });
+                    let params = json!({ "type": kind, "uri": uri, "lifecycle":lifecycle });
                     store.ask_host(&extension, "notebook.open", params, cx)
                 })
             });
@@ -159,12 +169,17 @@ impl Notebook {
                     .background_executor()
                     .spawn(async move { crate::ipynb::File::read(&path) })
                     .await;
-                this.update(cx, |this, cx| match read {
-                    Ok((file, read)) => {
-                        this.ipynb = Some(file);
-                        this.read(Ok(read), cx);
+                this.update(cx, |this, cx| {
+                    if this.loading_generation != 0 {
+                        return;
                     }
-                    Err(why) => this.read(Err(why), cx),
+                    match read {
+                        Ok((file, read)) => {
+                            this.ipynb = Some(file);
+                            this.read(Ok(read), cx);
+                        }
+                        Err(why) => this.read(Err(why), cx),
+                    }
                 })
                 .ok();
                 return;
@@ -173,7 +188,12 @@ impl Notebook {
                 Some(reading) => reading.await,
                 None => Err(crate::lang::t("Extensions are not there to read it").into()),
             };
-            this.update(cx, |this, cx| this.read(read, cx)).ok();
+            this.update(cx, |this, cx| {
+                if this.loading_generation == 0 {
+                    this.read(read, cx);
+                }
+            })
+            .ok();
         })
         .detach();
         Self {
@@ -182,6 +202,11 @@ impl Notebook {
             kind,
             uri,
             state: State::Reading,
+            loading_generation: 0,
+            recovered_generation: None,
+            restoration_cancelled: None,
+            client_tag: None,
+            host_version: None,
             cells: Vec::new(),
             next_handle: 0,
             selected: 0,
@@ -195,6 +220,256 @@ impl Notebook {
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    /// Captures only cheap rope/model handles on this thread. Flattening,
+    /// notebook JSON and disk writes belong to the recovery writer's workers.
+    pub(crate) fn recovery_snapshot(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<Value, String>>> {
+        if !matches!(self.state, State::Ready) {
+            return None;
+        }
+        if self
+            .cells
+            .iter()
+            .map(|cell| cell.editor.read(cx).doc(cx).text().len())
+            .sum::<usize>()
+            > 16 * 1024 * 1024
+        {
+            return None;
+        }
+        if let Some(file) = &self.ipynb {
+            let checkpoint = file.checkpoint()?;
+            let cells = self
+                .cells
+                .iter()
+                .map(|cell| {
+                    (
+                        cell.handle,
+                        cell.code,
+                        cell.editor.read(cx).doc(cx).text().rope().clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            Some(cx.background_executor().spawn(async move {
+                let cells = cells
+                    .into_iter()
+                    .map(|(handle, code, text)| (handle, code, text.to_string()))
+                    .collect::<Vec<_>>();
+                Ok(checkpoint.snapshot(&cells))
+            }))
+        } else {
+            Some(self.ask("notebook.snapshot", json!({"uri":self.uri}), cx))
+        }
+    }
+
+    pub(crate) fn recovered_generation(&self) -> Option<u64> {
+        self.recovered_generation
+    }
+
+    pub(crate) fn selected(&self) -> usize {
+        self.selected
+    }
+
+    /// A live-disk read begun by session restoration must not replace this
+    /// recovery later. Permission is still checked by the extension store.
+    pub(crate) fn restore(
+        &mut self,
+        snapshot: Value,
+        selected: usize,
+        cx: &mut Context<Self>,
+    ) -> Task<bool> {
+        if self.is_dirty() || self.restoration_cancelled.is_some() {
+            return Task::ready(false);
+        }
+        self.state = State::Reading;
+        for cell in &self.cells {
+            let document = cell.editor.read(cx).document().clone();
+            document.update(cx, |document, cx| document.lock_cell(true, cx));
+        }
+        self.loading_generation += 1;
+        let ticket = self.loading_generation;
+        let generation = self.generation;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.restoration_cancelled = Some(cancelled.clone());
+        let native = self.extension.is_empty();
+        let (native_snapshot, asked) = if native {
+            (Some(snapshot), None)
+        } else {
+            let mut params = json!({"uri":self.uri,"type":self.kind,"lifecycle":format!("view-{}", cx.entity_id())});
+            params["snapshot"] = snapshot;
+            let asked = match ExtensionStore::try_global(cx) {
+                Some(store) => store.update(cx, |store, cx| {
+                    store.ask_host_guarded(
+                        &self.extension,
+                        "notebook.restore",
+                        params,
+                        Some(cancelled.clone()),
+                        cx,
+                    )
+                }),
+                None => Task::ready(Err(crate::lang::t("Extensions are not there").into())),
+            };
+            (None, Some(asked))
+        };
+        cx.spawn(async move |this, cx| {
+            let result = if native {
+                cx.background_executor().spawn(async move {
+                    crate::ipynb::File::restore(&native_snapshot.unwrap()).map(|(file, shown)| (Some(file), shown))
+                }).await
+            } else {
+                asked.unwrap().await.map(|shown| (None, shown))
+            };
+            this.update(cx, |this, cx| {
+                if this.loading_generation != ticket || cancelled.load(Ordering::Acquire) {
+                    return false;
+                }
+                this.restoration_cancelled = None;
+                match result {
+                    Ok((file, shown)) => {
+                        this.cells.clear(); this.next_handle = 0;
+                        this.ipynb = file;
+                        this.read(Ok(shown), cx);
+                        this.selected = selected.min(this.cells.len().saturating_sub(1));
+                        this.dirty = true; this.generation = this.generation.max(generation) + 1;
+                        this.recovered_generation = Some(this.generation);
+                        this.note = Some(crate::lang::t("This notebook was recovered. Its copy is kept until you save or close it.").into());
+                        cx.emit(NotebookEvent::Changed); cx.notify(); true
+                    }
+                    Err(why) => {
+                        for cell in &this.cells {
+                            let document = cell.editor.read(cx).document().clone();
+                            document.update(cx, |document, cx| document.lock_cell(false, cx));
+                        }
+                        if !this.cells.is_empty() { this.state = State::Ready; }
+                        if matches!(this.state, State::Reading) { this.state = State::Failed(why.clone().into()); }
+                        this.note = Some(why.into()); cx.notify(); false
+                    }
+                }
+            }).unwrap_or(false)
+        })
+    }
+
+    pub(crate) fn export_copy(&mut self, _: &ExportCopy, _: &mut Window, cx: &mut Context<Self>) {
+        let parent = self.path.parent().unwrap_or(Path::new("."));
+        let stem = self.path.file_stem().unwrap_or_default().to_string_lossy();
+        let extension = self.path.extension().unwrap_or_default().to_string_lossy();
+        let name = if extension.is_empty() {
+            format!("{stem}.copy")
+        } else {
+            format!("{stem}.copy.{extension}")
+        };
+        let asked = cx.prompt_for_new_path(parent, Some(&name));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = asked.await else {
+                return;
+            };
+            let Ok(exported) = this.update(cx, |this, cx| this.export(path, cx)) else {
+                return;
+            };
+            exported.await;
+        })
+        .detach();
+    }
+
+    /// Export is a copy. It does not mark the original notebook saved or
+    /// transfer its source revision to the chosen destination.
+    pub(crate) fn export(&mut self, path: PathBuf, cx: &mut Context<Self>) -> Task<bool> {
+        if !matches!(self.state, State::Ready) {
+            return Task::ready(false);
+        }
+        let source = self.path.clone();
+        let native = self.ipynb.clone();
+        let cells = self
+            .cells
+            .iter()
+            .map(|cell| {
+                (
+                    cell.handle,
+                    cell.code,
+                    cell.editor.read(cx).doc(cx).text().rope().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let target_uri = crate::extension_api::uri(&path);
+        let prepared = native.is_none().then(|| {
+            self.ask(
+                "notebook.export.prepare",
+                json!({"uri":self.uri,"target":target_uri}),
+                cx,
+            )
+        });
+        let native_destination = native.as_ref().map(|file| {
+            let (file, source, target) = (file.clone(), source.clone(), path.clone());
+            cx.background_executor()
+                .spawn(async move { copy_revision(&file, &source, &target) })
+        });
+        let uri = self.uri.clone();
+        let previous = self.save_tail.take();
+        self.pending_saves += 1;
+        cx.emit(NotebookEvent::Changed);
+        cx.notify();
+        let exporting = cx
+            .spawn(async move |this, cx| {
+                if let Some(previous) = previous {
+                    previous.await;
+                }
+                let result = if let Some(file) = native {
+                    let target = path.clone();
+                    cx.background_executor()
+                        .spawn(async move {
+                            let stamp = native_destination.unwrap().await?;
+                            if copy_revision(&file, &source, &target)? != stamp {
+                                return Err(crate::lang::t(
+                                    "The notebook copy destination changed. Export again.",
+                                )
+                                .into());
+                            }
+                            let cells = cells
+                                .into_iter()
+                                .map(|(handle, code, text)| (handle, code, text.to_string()))
+                                .collect::<Vec<_>>();
+                            file.export(&target, &cells, stamp.as_ref())
+                        })
+                        .await
+                } else {
+                    match prepared.unwrap().await {
+                        Ok(token) => {
+                            match this.update(cx, |this, cx| {
+                                this.ask(
+                                    "notebook.export",
+                                    json!({"uri":uri,"target":target_uri,"token":token}),
+                                    cx,
+                                )
+                            }) {
+                                Ok(asked) => asked.await.map(|_| ()),
+                                Err(_) => return false,
+                            }
+                        }
+                        Err(why) => Err(why),
+                    }
+                };
+                let done = result.is_ok();
+                this.update(cx, |this, cx| {
+                    this.pending_saves -= 1;
+                    this.note = Some(match result {
+                        Ok(()) => {
+                            crate::lang::tf("Notebook copy exported to {}", &[&path.display()])
+                                .into()
+                        }
+                        Err(why) => why.into(),
+                    });
+                    cx.emit(NotebookEvent::Changed);
+                    cx.notify();
+                })
+                .ok();
+                done
+            })
+            .shared();
+        self.save_tail = Some(exporting.clone());
+        cx.spawn(async move |_, _| exporting.await)
     }
 
     pub fn title(&self) -> String {
@@ -238,6 +513,8 @@ impl Notebook {
     fn read(&mut self, read: Result<Value, String>, cx: &mut Context<Self>) {
         match read {
             Ok(read) => {
+                self.client_tag = read["client_tag"].as_str().map(str::to_owned);
+                self.host_version = read["version"].as_u64();
                 self.runner = read["runner"]
                     .as_str()
                     .map(|label| label.to_string().into());
@@ -249,10 +526,15 @@ impl Notebook {
                     let mut made = self.cell(handle, code, language, &value, cx);
                     made.outputs = outputs(&cell["outputs"]);
                     made.order = cell["order"].as_u64();
+                    made.failed = cell["failed"] == true;
                     self.cells.push(made);
                 }
                 self.list.reset(self.cells.len());
                 self.state = State::Ready;
+                if read["dirty"] == true {
+                    self.dirty = true;
+                    cx.emit(NotebookEvent::Changed);
+                }
             }
             Err(why) => self.state = State::Failed(why.into()),
         }
@@ -339,9 +621,10 @@ impl Notebook {
             return;
         };
         let value = cell.editor.read(cx).text(cx);
-        let params = json!({ "uri": self.uri, "handle": handle, "value": value });
-        self.tell("notebook.cell", params, cx);
         self.changed(cx);
+        self.client_tag = Some(format!("{}:{}", cx.entity_id(), self.generation));
+        let params = json!({ "uri": self.uri, "handle": handle, "value": value, "client_tag":self.client_tag });
+        self.tell("notebook.cell", params, cx);
     }
 
     /// Says which cells there are and in what order, after one was added,
@@ -358,12 +641,13 @@ impl Notebook {
                 json!({ "handle": cell.handle, "code": cell.code, "language": cell.language, "value": value })
             })
             .collect();
+        self.changed(cx);
+        self.client_tag = Some(format!("{}:{}", cx.entity_id(), self.generation));
         self.tell(
             "notebook.cells",
-            json!({ "uri": self.uri, "cells": cells }),
+            json!({ "uri": self.uri, "cells": cells, "client_tag":self.client_tag }),
             cx,
         );
-        self.changed(cx);
     }
 
     /// Something its extension said of it.
@@ -374,12 +658,23 @@ impl Notebook {
             .iter_mut()
             .find(|cell| Some(cell.handle) == handle);
         match (method, cell) {
-            ("notebook.outputs", Some(cell)) => cell.outputs = outputs(&params["outputs"]),
+            ("notebook.version", _) => {
+                if params["client_tag"].as_str() == self.client_tag.as_deref() {
+                    self.host_version = params["version"].as_u64();
+                }
+            }
+            ("notebook.outputs", Some(cell)) => {
+                cell.outputs = outputs(&params["outputs"]);
+                self.host_version = params["version"].as_u64();
+                self.changed(cx);
+            }
             ("notebook.run", Some(cell)) => {
                 cell.running = params["running"] == true;
                 if !cell.running {
                     cell.failed = params["failed"] == true;
                     cell.order = params["order"].as_u64().or(cell.order);
+                    self.host_version = params["version"].as_u64();
+                    self.changed(cx);
                 }
             }
             ("notebook.runners", _) => {
@@ -391,8 +686,12 @@ impl Notebook {
                 self.runner = mine.map(|runner| text(&runner["label"]).into());
             }
             ("notebook.saved", _) => {
-                self.dirty = false;
-                cx.emit(NotebookEvent::Changed);
+                if params["client_tag"].as_str() == self.client_tag.as_deref()
+                    && params["version"].as_u64() == self.host_version
+                {
+                    self.dirty = false;
+                    cx.emit(NotebookEvent::Changed);
+                }
             }
             _ => return,
         }
@@ -428,6 +727,9 @@ impl Notebook {
     }
 
     fn run(&mut self, handles: Vec<u64>, cx: &mut Context<Self>) {
+        if !matches!(self.state, State::Ready) {
+            return;
+        }
         if handles.is_empty() {
             return;
         }
@@ -515,6 +817,9 @@ impl Notebook {
     }
 
     fn delete_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.state, State::Ready) {
+            return;
+        }
         if ix >= self.cells.len() {
             return;
         }
@@ -534,6 +839,9 @@ impl Notebook {
 
     /// Moves a cell one place up or down.
     fn move_at(&mut self, ix: usize, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.state, State::Ready) {
+            return;
+        }
         let to = match down {
             true => ix + 1,
             false => ix.wrapping_sub(1),
@@ -559,6 +867,9 @@ impl Notebook {
     /// Has the extension write the file from the cells as they are.
     /// Resolves to whether it was written.
     pub fn save(&mut self, cx: &mut Context<Self>) -> Task<bool> {
+        if !matches!(self.state, State::Ready) {
+            return Task::ready(false);
+        }
         let generation = self.generation;
         let native = self.ipynb.clone().map(|file| {
             let cells = self
@@ -624,7 +935,15 @@ impl Notebook {
 
     /// Its tab was closed.
     pub fn closed(&mut self, cx: &mut Context<Self>) {
-        self.tell("notebook.close", json!({ "uri": self.uri }), cx);
+        self.loading_generation += 1;
+        if let Some(cancelled) = self.restoration_cancelled.take() {
+            cancelled.store(true, Ordering::Release);
+        }
+        self.tell(
+            "notebook.close",
+            json!({ "uri": self.uri, "lifecycle":format!("view-{}",cx.entity_id()) }),
+            cx,
+        );
         if let Some(store) = ExtensionStore::try_global(cx) {
             let (extension, uri) = (self.extension.clone(), self.uri.clone());
             store.update(cx, |store, _| store.notebook_closed(&extension, &uri));
@@ -997,6 +1316,7 @@ impl Render for Notebook {
             .flex_col()
             .bg(theme.bg)
             .on_action(cx.listener(Self::run_cell))
+            .on_action(cx.listener(Self::export_copy))
             .on_action(cx.listener(Self::run_cell_and_next))
             .on_action(cx.listener(Self::run_all))
             .on_action(cx.listener(Self::interrupt))
@@ -1171,9 +1491,166 @@ fn unbase64(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Blocking: capture a chosen copy destination without granting source aliases.
+fn copy_revision(
+    file: &crate::ipynb::File,
+    source: &Path,
+    target: &Path,
+) -> Result<Option<crate::remote::Stamp>, String> {
+    let current_alias = match crate::remote::same_file(source, target) {
+        Ok(alias) => alias,
+        Err(_)
+            if file.original_source().is_some()
+                && crate::remote::metadata(source)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            false
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let original_alias = match file.original_source() {
+        Some(source) => {
+            crate::remote::same_file(source, target).map_err(|error| error.to_string())?
+        }
+        None => false,
+    };
+    let stamp = crate::remote::revision(target).map_err(|error| error.to_string())?;
+    if current_alias || original_alias || (file.original_source().is_none() && stamp.is_some()) {
+        return Err(crate::lang::t("Choose another path for the notebook copy").into());
+    }
+    Ok(stamp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    async fn restoration_locks_cells_and_export_protects_the_original_symlink_target(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        cx.update(|cx| cx.set_global(Settings::default()));
+        let root = db::testing::dir("notebook-restore-lock");
+        let path = root.join("book.ipynb");
+        let bytes = serde_json::to_vec(&json!({"nbformat":4,"metadata":{},"cells":[
+            {"cell_type":"code","source":"original","metadata":{},"outputs":[],"execution_count":null}]})).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let (file, _) = crate::ipynb::File::read(&path).unwrap();
+        let snapshot = file
+            .checkpoint()
+            .unwrap()
+            .snapshot(&[(0, true, "recovered".into())]);
+        let book =
+            cx.new(|cx| Notebook::open(path.clone(), String::new(), "jupyter-notebook".into(), cx));
+        for _ in 0..crate::patience::LOOKS {
+            cx.run_until_parked();
+            if book.read_with(cx, |book, _| book.is_ready()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(book.read_with(cx, |book, _| book.is_ready()));
+        let editor = book.read_with(cx, |book, _| book.cells[0].editor.clone());
+        let document = editor.read_with(cx, |ed, _| ed.document().clone());
+        let restoring = book.update(cx, |book, cx| book.restore(snapshot, 0, cx));
+        document.update(cx, |doc, cx| {
+            assert!(doc.is_read_only());
+            assert!(
+                doc.edit(
+                    vec![(0..0, "late".into())],
+                    &[],
+                    Some(editor.entity_id()),
+                    cx
+                )
+                .is_empty()
+            );
+            assert!(doc.undo(editor.entity_id(), cx).is_none());
+            assert!(doc.redo(editor.entity_id(), cx).is_none());
+        });
+        assert!(restoring.await);
+        assert_eq!(
+            book.read_with(cx, |book, cx| book.cells[0].editor.read(cx).text(cx)),
+            "recovered"
+        );
+        #[cfg(unix)]
+        {
+            let alias = root.join("link.ipynb");
+            std::os::unix::fs::symlink(&path, &alias).unwrap();
+            book.update(cx, |book, _| book.path = alias.clone());
+            std::fs::remove_file(&alias).unwrap();
+            // The old physical target stays protected even with a dangling view path.
+            assert!(
+                !book
+                    .update(cx, |book, cx| book.export(path.clone(), cx))
+                    .await
+            );
+            let rescue = root.join("copy.ipynb");
+            assert!(
+                book.update(cx, |book, cx| book.export(rescue.clone(), cx))
+                    .await
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&std::fs::read(rescue).unwrap()).unwrap()["cells"]
+                    [0]["source"],
+                "recovered"
+            );
+        }
+        assert!(book.read_with(cx, |book, _| book.is_dirty()));
+    }
+
+    #[gpui::test]
+    async fn failed_restoration_unlocks_cells_and_late_saved_messages_keep_new_outputs(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        cx.update(|cx| cx.set_global(Settings::default()));
+        let path = db::testing::dir("notebook-restore-failure").join("book.ipynb");
+        std::fs::write(&path, serde_json::to_vec(&json!({"nbformat":4,"metadata":{},"cells":[
+            {"cell_type":"code","source":"original","metadata":{},"outputs":[],"execution_count":null}]})).unwrap()).unwrap();
+        let book = cx.new(|cx| Notebook::open(path, String::new(), "jupyter-notebook".into(), cx));
+        for _ in 0..crate::patience::LOOKS {
+            cx.run_until_parked();
+            if book.read_with(cx, |book, _| book.is_ready()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !book
+                .update(cx, |book, cx| book.restore(Value::Null, 0, cx))
+                .await
+        );
+        book.update(cx, |book, cx| {
+            assert!(book.is_ready());
+            assert!(!book.cells[0].editor.read(cx).doc(cx).is_read_only());
+            book.client_tag = Some("edit-1".into());
+            book.heard(
+                "notebook.outputs",
+                &json!({"handle":0,"outputs":[],"version":4}),
+                cx,
+            );
+            book.heard(
+                "notebook.saved",
+                &json!({"client_tag":"edit-1","version":3}),
+                cx,
+            );
+            assert!(book.is_dirty());
+            book.heard(
+                "notebook.saved",
+                &json!({"client_tag":"edit-old","version":4}),
+                cx,
+            );
+            assert!(book.is_dirty());
+            book.heard(
+                "notebook.saved",
+                &json!({"client_tag":"edit-1","version":4}),
+                cx,
+            );
+            assert!(!book.is_dirty());
+        });
+    }
 
     #[gpui::test]
     async fn queued_notebook_saves_write_snapshots_in_order(cx: &mut gpui::TestAppContext) {
@@ -1232,8 +1709,27 @@ mod tests {
         assert!(second.await);
         assert!(!book.read_with(cx, |book, _| book.is_saving() || book.is_dirty()));
         assert_eq!(
-            serde_json::from_slice::<Value>(&std::fs::read(path).unwrap()).unwrap()["cells"][0]["source"],
+            serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap()["cells"][0]["source"],
             "second first original"
+        );
+        let destination = path.with_file_name("copy.ipynb");
+        std::fs::write(&destination, b"chosen destination").unwrap();
+        let (release, blocked) = futures::channel::oneshot::channel();
+        book.update(cx, |book, cx| {
+            book.save_tail = Some(
+                cx.spawn(async move |_, _| blocked.await.unwrap_or(false))
+                    .shared(),
+            );
+        });
+        let exported = book.update(cx, |book, cx| book.export(destination.clone(), cx));
+        cx.run_until_parked();
+        assert!(book.read_with(cx, |book, _| book.is_saving()));
+        std::fs::write(&destination, b"external edit during queue wait").unwrap();
+        release.send(true).unwrap();
+        assert!(!exported.await);
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"external edit during queue wait"
         );
     }
 

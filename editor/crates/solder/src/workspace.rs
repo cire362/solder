@@ -4835,6 +4835,12 @@ impl Workspace {
     }
 
     fn save_as(&mut self, _: &SaveAs, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((book, _)) = self.notebook_front.clone() {
+            book.update(cx, |book, cx| {
+                book.export_copy(&crate::notebook::ExportCopy, window, cx)
+            });
+            return;
+        }
         if let Some(editor) = self.active_editor().cloned() {
             self.save_as_editor(editor, window, cx).detach();
         }
@@ -5656,6 +5662,8 @@ impl Workspace {
             }
         }
         self.notebooks.retain(|(known, _)| known != notebook);
+        // Finish an earlier snapshot before forgetting this acknowledged close.
+        self.keep_unsaved(cx).detach();
         cx.notify();
     }
 
@@ -16617,10 +16625,7 @@ exports.activate = (context) => {
             notice.map(|notice| notice.to_string())
         };
         let said = cx.read(|cx| notice(cx)).unwrap();
-        assert!(
-            said.starts_with("This text was not saved when Solder closed"),
-            "{said}"
-        );
+        assert!(said.starts_with("This text was recovered."), "{said}");
         ws.update_in(cx, |w, window, cx| w.activate(0, 0, window, cx));
         cx.simulate_keystrokes("secondary-z");
         assert_eq!(cx.read(|cx| tabs(cx))[0].1, readme);
@@ -16881,6 +16886,168 @@ exports.activate = (context) => {
         assert!(cx.read(|cx| ws.read(cx).notebooks.is_empty()));
     }
 
+    fn finish_recovery_pass(ws: &Entity<Workspace>, cx: &mut VisualTestContext) {
+        let finished: std::rc::Rc<std::cell::Cell<bool>> = Default::default();
+        let done = finished.clone();
+        let pass = ws.update(cx, |ws, cx| ws.keep_unsaved(cx));
+        cx.spawn(async move |_| {
+            pass.await;
+            done.set(true);
+        })
+        .detach();
+        wait_for(cx, "the recovery writer", &|_| finished.get());
+    }
+
+    #[gpui::test]
+    fn native_notebook_recovery_survives_external_changes_and_exports_a_rescue_copy(
+        cx: &mut TestAppContext,
+    ) {
+        let root = fixture("notebook-recovery-external");
+        let path = root.join("book.ipynb");
+        let original = serde_json::json!({"nbformat":4,"nbformat_minor":5,"metadata":{"keep":42},"cells":[
+            {"cell_type":"code","id":"a","metadata":{"tags":["old"]},"source":"original","execution_count":3,
+            "outputs":[{"output_type":"stream","name":"stdout","text":"old output"}]}
+        ]});
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        let copies = db::testing::dir("notebook-recovery-copies");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.recovery = Some(recovery::Recovery::new(copies.clone()));
+            w.open_path(path.clone(), None, window, cx);
+        });
+        let book = cx.read(|cx| ws.read(cx).notebooks[0].0.clone());
+        wait_for(cx, "the initial cells", &|cx| book.read(cx).is_ready());
+        book.update_in(cx, |book, window, cx| book.focus(window, cx));
+        cx.simulate_input("unsaved ");
+        cx.dispatch_action(crate::notebook::AddText);
+        cx.simulate_input("note");
+        finish_recovery_pass(&ws, cx);
+        let copy = std::fs::read_dir(&copies)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let kept: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&copy).unwrap()).unwrap();
+        assert_eq!(
+            kept["snapshot"]["content"]["cells"][0]["source"],
+            "unsaved original"
+        );
+        assert_eq!(
+            kept["snapshot"]["content"]["metadata"],
+            original["metadata"]
+        );
+        let mut external = original.clone();
+        external["cells"][0]["source"] = "external".into();
+        let external_bytes = serde_json::to_vec(&external).unwrap();
+        std::fs::write(&path, &external_bytes).unwrap();
+        // Simulate a crash, retaining recovery instead of an acknowledged close.
+        ws.update(cx, |w, _| {
+            w.notebook_front = None;
+            w.notebooks.clear();
+            w.recovery = Some(recovery::Recovery::new(copies.clone()));
+        });
+        drop(book);
+        ws.update_in(cx, |w, window, cx| w.recover_unsaved(window, cx));
+        wait_for(cx, "the recovered cells", &|cx| {
+            ws.read(cx)
+                .notebooks
+                .first()
+                .is_some_and(|(book, _)| book.read(cx).is_ready() && book.read(cx).is_dirty())
+        });
+        let book = cx.read(|cx| ws.read(cx).notebooks[0].0.clone());
+        assert_eq!(
+            cx.read(|cx| book.read(cx).seen(cx)),
+            [
+                "code python [3]: unsaved original => old output",
+                "text markdown: note"
+            ]
+        );
+        let failed: std::rc::Rc<std::cell::Cell<Option<bool>>> = Default::default();
+        let answer = failed.clone();
+        let saving = book.update(cx, |book, cx| book.save(cx));
+        cx.spawn(async move |_| answer.set(Some(saving.await)))
+            .detach();
+        wait_for(cx, "the conflict", &|_| failed.get().is_some());
+        assert_eq!(failed.get(), Some(false));
+        assert_eq!(std::fs::read(&path).unwrap(), external_bytes);
+        assert!(copy.exists());
+        assert!(cx.read(|cx| book.read(cx).is_dirty()));
+        // Save As on a notebook exports a copy; the original stays dirty.
+        cx.dispatch_action(SaveAs);
+        cx.run_until_parked();
+        assert!(cx.did_prompt_for_new_path());
+        let rescue = root.join("rescued.ipynb");
+        cx.simulate_new_path_selection(|_| Some(rescue.clone()));
+        wait_for(cx, "the exported copy", &|cx| {
+            !book.read(cx).is_saving() && rescue.exists()
+        });
+        let exported: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&rescue).unwrap()).unwrap();
+        assert_eq!(exported["cells"][0]["source"], "unsaved original");
+        assert_eq!(exported["cells"][1]["source"], "note");
+        assert_eq!(
+            exported["cells"][0]["outputs"],
+            original["cells"][0]["outputs"]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), external_bytes);
+        assert!(cx.read(|cx| book.read(cx).is_dirty()));
+        cx.dispatch_action(CloseTab);
+        cx.simulate_prompt_answer("Don't Save");
+        wait_for(cx, "the acknowledged close", &|cx| {
+            ws.read(cx).notebooks.is_empty()
+        });
+        finish_recovery_pass(&ws, cx);
+        assert!(!copy.exists());
+    }
+
+    #[gpui::test]
+    fn saved_notebooks_release_recovery_and_bad_copies_remain(cx: &mut TestAppContext) {
+        let root = fixture("notebook-recovery-save");
+        let path = root.join("book.ipynb");
+        let original = serde_json::json!({"nbformat":4,"metadata":{},"cells":[{"cell_type":"code","id":"a","source":"original","metadata":{},"outputs":[],"execution_count":null}]});
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        let copies = db::testing::dir("notebook-recovery-save-copies");
+        let bad = copies.join("bad.book.json");
+        std::fs::write(&bad, b"not JSON").unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        ws.update_in(cx, |w, window, cx| {
+            w.recovery = Some(recovery::Recovery::new(copies.clone()));
+            w.open_path(path.clone(), None, window, cx);
+        });
+        let book = cx.read(|cx| ws.read(cx).notebooks[0].0.clone());
+        wait_for(cx, "the original notebook", &|cx| book.read(cx).is_ready());
+        book.update_in(cx, |book, window, cx| book.focus(window, cx));
+        cx.simulate_input("changed ");
+        finish_recovery_pass(&ws, cx);
+        assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 2);
+        ws.update(cx, |w, _| {
+            w.notebook_front = None;
+            w.notebooks.clear();
+            w.recovery = Some(recovery::Recovery::new(copies.clone()));
+        });
+        drop(book);
+        ws.update_in(cx, |w, window, cx| w.recover_unsaved(window, cx));
+        wait_for(cx, "the recovered notebook", &|cx| {
+            ws.read(cx)
+                .notebooks
+                .first()
+                .is_some_and(|(book, _)| book.read(cx).is_ready() && book.read(cx).is_dirty())
+        });
+        let book = cx.read(|cx| ws.read(cx).notebooks[0].0.clone());
+        cx.simulate_keystrokes("secondary-s");
+        wait_for(cx, "the saved recovery", &|cx| !book.read(cx).is_dirty());
+        finish_recovery_pass(&ws, cx);
+        assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&bad).unwrap(), b"not JSON");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["cells"][0]["source"], "changed original");
+    }
+
     /// A file an extension reads as a notebook opens as a tab of cells:
     /// typed into, run, added to and saved, with the extension doing the
     /// reading, the running and the writing.
@@ -16951,6 +17118,7 @@ exports.activate = (context) => {
   context.subscriptions.push(
     controller,
     vscode.workspace.registerNotebookSerializer('demo-book', reader),
+    vscode.commands.registerCommand('demo.save', () => vscode.workspace.notebookDocuments[0].save()),
     vscode.workspace.onDidCloseNotebookDocument((notebook) => console.log(`closed a notebook of ${notebook.cellCount}`)),
   );
 };"#,
@@ -17058,6 +17226,75 @@ exports.activate = (context) => {
             std::fs::read_to_string(&file).unwrap(),
             "text\n# Title\n---\ncode:javascript\nhello there\n---\ncode:javascript\nboom!"
         );
+
+        // Execution alone changes the model and must have its own recovery
+        // copy, even when nobody typed into a cell since the last save.
+        let copies = db::testing::dir("extension-notebook-recovery-copies");
+        ws.update(cx, |w, _| {
+            w.recovery = Some(recovery::Recovery::new(copies.clone()))
+        });
+        notebook.update_in(cx, |book, window, cx| book.select(1, window, cx));
+        cx.simulate_keystrokes("secondary-enter");
+        wait_for(cx, "the new execution", &|cx| {
+            notebook.read(cx).seen(cx)[1].starts_with("code javascript [5]")
+        });
+        assert!(cx.read(|cx| notebook.read(cx).is_dirty()));
+        let recovered_cells = cx.read(|cx| notebook.read(cx).seen(cx));
+        finish_recovery_pass(&ws, cx);
+        assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 1);
+        notebook.update(cx, |book, cx| book.closed(cx));
+        ws.update(cx, |w, _| {
+            w.notebook_front = None;
+            w.notebooks.clear();
+            w.recovery = Some(recovery::Recovery::new(copies.clone()));
+        });
+        ws.update_in(cx, |w, window, cx| w.recover_unsaved(window, cx));
+        wait_for(cx, "the extension notebook recovery", &|cx| {
+            ws.read(cx)
+                .notebooks
+                .first()
+                .is_some_and(|(book, _)| book.read(cx).is_ready() && book.read(cx).is_dirty())
+        });
+        let notebook = cx.read(|cx| ws.read(cx).notebooks[0].0.clone());
+        assert_eq!(cx.read(|cx| notebook.read(cx).seen(cx)), recovered_cells);
+        let copied = root.join("rescued.book");
+        cx.dispatch_action(SaveAs);
+        cx.run_until_parked();
+        assert!(cx.did_prompt_for_new_path());
+        cx.simulate_new_path_selection(|_| Some(copied.clone()));
+        wait_for(cx, "the extension notebook copy", &|cx| {
+            !notebook.read(cx).is_saving() && copied.exists()
+        });
+        assert_eq!(
+            std::fs::read(&copied).unwrap(),
+            std::fs::read(&file).unwrap()
+        );
+        assert!(cx.read(|cx| notebook.read(cx).is_dirty()));
+        assert_eq!(cx.read(|cx| notebook.read(cx).path.clone()), file);
+        cx.simulate_keystrokes("secondary-s");
+        wait_for(cx, "the recovered notebook save", &|cx| {
+            !notebook.read(cx).is_dirty()
+        });
+        notebook.update_in(cx, |book, window, cx| book.select(1, window, cx));
+        cx.dispatch_action(crate::editor::MoveToEnd);
+        cx.simulate_input(" recovered");
+        let saving = store.update(cx, |store, cx| {
+            store.ask_host(
+                "Acme.books",
+                "executeCommand",
+                serde_json::json!({"id":"demo.save","args":[]}),
+                cx,
+            )
+        });
+        cx.spawn(async move |_| {
+            assert_eq!(saving.await.unwrap(), serde_json::json!(true));
+        })
+        .detach();
+        wait_for(cx, "the extension-owned save acknowledgement", &|cx| {
+            !notebook.read(cx).is_dirty()
+        });
+        finish_recovery_pass(&ws, cx);
+        assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0);
 
         // Closed as a tab is, the file that was in front before is again,
         // and the extension hears that it is closed.

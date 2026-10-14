@@ -21,6 +21,15 @@ made, in the pull request that does it; a pull request that leaves
 something of its own unchecked or unmade adds it here.
 
 ### Not verified
+- [ ] Crash recovery and Export copy of notebooks in a native window, on
+      Linux/Windows, with large outputs, abrupt power loss, independent views or
+      a published extension. Headless and first-party process checks cover cell
+      edits, execution outputs, metadata, native/extension restoration, external
+      changes, source aliases, pending saves, closed views and recovery cleanup.
+      Missing or declined extension readers retain their copies. Original local
+      text revisions and weak legacy stamps are checked separately. Performance
+      with recovery files present is not measured. Verification and plain-file
+      startup/typing samples are in `benchmarks/recovery-and-notebook-rescue.md`
 - [ ] Atomic local saves in a real window, Windows replacement/ACL behavior,
       Linux extended attributes and ACLs, network filesystems, very large files
       and sudden power loss. Fault injection, same-size/time external edits,
@@ -320,21 +329,18 @@ something of its own unchecked or unmade adds it here.
       Windows hard-link identities and ACL preservation are not implemented.
       macOS/Linux metadata copying needs the system cp utility. A crash may leave
       a sibling staging file; there is no startup cleanup of these files
-- [ ] Local crash recovery currently uses the revision read at restart, rather
-      than protecting the original revision kept with the recovery copy as remote
-      recovery does. Changes made outside Solder before restart can therefore be
-      replaced when recovered local text is saved
 - [ ] Direct system Quit bypasses the editor's question: GPUI's shutdown
       callback cannot cancel it. Keyboard/palette Quit now asks across every
       project window and waits for saves and recovery cleanup. Force Quit and
       termination cannot wait for a decision or guarantee recovery
-- [ ] Recovery and Save As/export to another file do not cover notebooks.
-      A refused notebook save keeps cells in the open tab, without an alternate
-      destination or a crash-recovery copy. Malformed, unsupported, unreadable or
-      duplicate text recovery copies are retained on disk, with no recovery-manager
-      screen. The reader considers at most 256 copies per pass. Manually typing
-      identical file bytes is conservatively dirty; undo to the saved history
-      state is clean. Encoding/line-ending changes are not undone with text
+- [ ] A recovery-manager screen for malformed, unsupported, unreadable,
+      permission-denied or duplicate copies retained on disk. Each text/notebook
+      reader considers at most 256 copies per pass. Text over 16 MB and notebook
+      recovery files over 16 MB retain an earlier smaller copy. Text recovery does
+      not retain encoding/line-ending choices. Manually typing identical file
+      bytes is conservatively dirty; undo to the saved history state is clean
+      except for protected recovered work. Encoding/line-ending changes are not
+      undone with text
 - [ ] Tabs closed are remembered while the window is open, not across a
       restart
 - [ ] Jupyter: no kernel is started and the ipywidgets protocol is not
@@ -752,8 +758,11 @@ update. They come after phase 9, in this order unless one is needed sooner.
 - [x] Pinned tabs; the tab closed last opened again (`cmd-shift-t`). Tabs,
       split panes, cursors and scroll positions return per project, along
       with notebooks and pages whose extensions provide a serializer
-- [x] Unsaved text kept aside as it is typed and put back at the next
-      start after a crash, or after `cmd-q`, which asks nothing
+- [x] Unsaved text and notebooks kept aside and restored after a crash.
+      Recovery retains the original read revision of local/remote text and native/
+      extension notebooks. Notebook Export copy (also Save As) writes another file
+      without clearing the original changed mark. Keyboard/palette Quit asks;
+      direct system Quit can bypass the decision, as recorded above
 - [x] Line endings and encoding of a file kept as they were; files too large
       to edit opened for reading, with the reason said. The encodings are
       UTF-8, UTF-16 and two single-byte ones written here, with no

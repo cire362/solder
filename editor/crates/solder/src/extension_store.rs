@@ -1262,6 +1262,17 @@ impl ExtensionStore {
         params: serde_json::Value,
         cx: &mut Context<Self>,
     ) -> Task<Result<serde_json::Value, String>> {
+        self.ask_host_guarded(id, method, params, None, cx)
+    }
+
+    pub(crate) fn ask_host_guarded(
+        &mut self,
+        id: &str,
+        method: &'static str,
+        params: serde_json::Value,
+        cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<serde_json::Value, String>> {
         if !self.code.contains_key(id) {
             self.start_code(id, cx);
         }
@@ -1276,8 +1287,26 @@ impl ExtensionStore {
         let executor = cx.background_executor().clone();
         cx.background_executor().spawn(async move {
             let host = started.await.unwrap_or_else(|_| Err(STOPPED.into()))?;
+            if cancelled
+                .as_ref()
+                .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+            {
+                return Err("The notebook was closed".into());
+            }
             let (tx, rx) = oneshot::channel();
+            let cleanup = host.clone();
+            let closed = cancelled.clone();
+            let close_params =
+                serde_json::json!({"uri":params["uri"],"lifecycle":params["lifecycle"]});
             let id = host.ask(method, params, move |answer| {
+                if closed
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+                {
+                    // Closing can race with host startup before tell_host has
+                    // a process. Retire any model that still finished restoring.
+                    cleanup.notify("notebook.close", close_params);
+                }
                 let _ = tx.send(answer);
             });
             // Read-only providers can return a never-resolving promise while
@@ -1290,6 +1319,8 @@ impl ExtensionStore {
                     | "webview.restore"
                     | "customEditor.open"
                     | "notebook.open"
+                    | "notebook.snapshot"
+                    | "notebook.restore"
             ) {
                 match futures::future::select(rx, executor.timer(Duration::from_secs(30))).await {
                     futures::future::Either::Left((answer, _)) => {
@@ -1297,6 +1328,11 @@ impl ExtensionStore {
                     }
                     futures::future::Either::Right(_) => {
                         host.cancel(id);
+                        if method == "notebook.restore" {
+                            // A queued restore mutates its host. After timing out
+                            // it cannot be allowed to commit behind an unlocked UI.
+                            host.stop();
+                        }
                         Err("The extension did not answer. Restart its code in Extensions.".into())
                     }
                 }
