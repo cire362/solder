@@ -28,6 +28,11 @@ open entry until it has evidence. PR #58 is the preceding recovery/export
 implementation; its native-window checks and the recovery manager are below.
 
 ### Not verified
+- [x] Startup keeps an explicitly opened file, picture or notebook in front
+      while earlier tabs restore, and preserves a choice made during loading.
+      Five regression tests passed; the empty-session notebook case was also
+      rechecked in a real macOS window. Restored pages add tabs without taking
+      the selected view. Other-platform startup checks remain below
 - [x] Native Jupyter recovery/export in a real macOS window: edited cells,
       retained outputs and attachments, SIGKILL, restored unsaved work, rejected
       a changed source, exported another file, saved an unchanged source and
@@ -197,10 +202,6 @@ implementation; its native-window checks and the recovery manager are below.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
-- [ ] An explicitly opened notebook after an earlier empty saved session can
-      remain an inactive tab with blank content until clicked. Reproduced in
-      `verification/native-notebook-recovery.md`; session restoration must keep
-      the requested view in front
 - [ ] Notebook recovery and successful export notices use the error color and
       long export paths can be clipped. Informational completion should be
       distinguishable from a failed save

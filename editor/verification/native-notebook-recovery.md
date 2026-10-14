@@ -37,11 +37,18 @@ two disposable Jupyter format 4 files; no published extension was launched.
 
 Starting with an explicit notebook after an earlier empty saved project session
 left its tab inactive and the content blank. Clicking the tab made it active.
-The regression is being fixed separately on the same global branch.
+It is fixed in a separate commit on the same global branch: restoration keeps
+an already selected view and choices made while it loads. After rebuilding,
+launching the explicit notebook over an isolated empty saved session displayed
+its active tab and cells immediately, with no click. Five regression tests cover
+CLI files/cursors, notebooks, picture reuse, a choice during loading and pages
+restored without taking the current view.
 
 Success/recovery notices are currently colored like errors; this remains recorded
 in the roadmap. This check covers the built-in Jupyter reader on macOS only.
-Extension readers, Linux/Windows, large outputs, independent views, power loss,
-continuous bulk keyboard injection and a Jupyter kernel remain unverified.
+The first-party extension reader is covered separately in
+`extension-notebook-recovery.md`. Linux/Windows, large outputs, independent
+views, power loss, continuous bulk keyboard injection and a Jupyter kernel
+remain unverified by this native-reader check.
 Hashes, the preserved model and lifecycle checks are in
 [native-notebook-recovery.json](native-notebook-recovery.json).

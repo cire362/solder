@@ -93,6 +93,52 @@ struct Shown {
     front: bool,
 }
 
+#[derive(PartialEq)]
+enum Front {
+    File(Entity<Editor>),
+    Viewer(Entity<Viewer>),
+    Book(Entity<crate::notebook::Notebook>, usize),
+    Page(Entity<crate::webview::Page>, usize),
+}
+
+impl Front {
+    fn of(workspace: &Workspace) -> Option<Self> {
+        if let Some((page, pane)) = &workspace.web_front {
+            Some(Self::Page(page.clone(), *pane))
+        } else if let Some((book, pane)) = &workspace.notebook_front {
+            Some(Self::Book(book.clone(), *pane))
+        } else if let Some(viewer) = workspace.panes[workspace.active_pane].shown_viewer() {
+            Some(Self::Viewer(viewer.clone()))
+        } else {
+            workspace.active_editor().cloned().map(Self::File)
+        }
+    }
+
+    fn put(&self, workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+        match self {
+            Self::File(editor) => {
+                if let Some((pane, tab)) = workspace.locate(editor) {
+                    workspace.activate(pane, tab, window, cx);
+                }
+            }
+            Self::Viewer(viewer) => {
+                if let Some((pane, shown)) = workspace.locate_viewer(viewer) {
+                    workspace.show_viewer(pane, shown, true, window, cx);
+                }
+            }
+            Self::Book(book, pane) => {
+                let pane = (*pane).min(workspace.panes.len() - 1);
+                workspace.active_pane = pane;
+                workspace.show_notebook(book.clone(), pane, window, cx);
+            }
+            Self::Page(page, pane) => {
+                workspace.active_pane = (*pane).min(workspace.panes.len() - 1);
+                workspace.open_webview(page.read(cx).key.clone(), window, cx);
+            }
+        }
+    }
+}
+
 pub(super) struct Writer(mpsc::Sender<(Session, futures::channel::oneshot::Sender<bool>)>);
 
 impl Writer {
@@ -156,6 +202,37 @@ fn read(path: &Path, root: &Path) -> Option<Session> {
 }
 
 impl Workspace {
+    pub(super) fn open_session_webview(
+        &mut self,
+        key: crate::webview::Key,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let restoring = ExtensionStore::try_global(cx).is_some_and(|store| {
+            store.read(cx).api.webviews.get(&key).is_some_and(|page| {
+                self.restoring_pages
+                    .iter()
+                    .any(|(extension, view_type, uri)| {
+                        *extension == key.0
+                            && *view_type == page.view_type
+                            && *uri == page.document_uri
+                    })
+            })
+        });
+        // A serializer publishes its page before its request replies.
+        // Add the tab now; the restoration task owns its initial selection.
+        let front = restoring.then(|| Front::of(self));
+        self.open_webview(key, window, cx);
+        if let Some(front) = front {
+            if let Some(front) = front {
+                front.put(self, window, cx);
+            } else {
+                self.web_front = None;
+                self.front_of_pane(self.active_pane, window, cx);
+            }
+        }
+    }
+
     pub(super) fn snapshot(&self, cx: &App) -> Session {
         let panes = self
             .panes
@@ -319,6 +396,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.restoring = true;
+        self.restoring_pages.clear();
         let root = self.root(cx);
         cx.spawn_in(window, async move |this, cx| {
             let read = cx.background_executor().spawn(async move {
@@ -343,7 +421,13 @@ impl Workspace {
                 if loaded { break; }
                 cx.background_executor().timer(Duration::from_millis(25)).await;
             }
-            this.update_in(cx, |this, window, cx| {
+            let selection = this.update_in(cx, |this, window, cx| {
+                // The CLI opens its view before this read, and the user can
+                // choose another while it awaits. Both take precedence.
+                let front = Front::of(this);
+                this.restoring_pages = saved.pages.iter().map(|page| {
+                    (page.extension.clone(), page.view_type.clone(), page.document_uri.clone())
+                }).collect();
                 for (pane, (_, texts)) in saved.panes.iter().zip(files).enumerate() {
                     while this.panes.len() <= pane { this.panes.push(Pane::default()); }
                     this.active_pane = pane;
@@ -359,7 +443,7 @@ impl Workspace {
                         let known = this.panes[pane].tabs.iter().position(|tab| tab.editor.read(cx).path(cx) == Some(file.path.as_path()));
                         let editor = if let Some(known) = known { this.panes[pane].tabs[known].editor.clone() }
                             else { this.add_tab(editor.clone(), window, cx); editor };
-                        file.put(&editor, cx);
+                        if known.is_none() { file.put(&editor, cx); }
                         if let Some((pane, tab)) = this.locate(&editor) {
                             this.panes[pane].tabs[tab].pinned = file.pinned;
                         }
@@ -373,28 +457,45 @@ impl Workspace {
                     while this.panes.len() <= pane { this.panes.push(Pane::default()); }
                     let mut front = None;
                     for (shown, there) in shown.iter().zip(there) {
-                        let viewer = match shown.preview {
-                            true => this.document_for_path(&shown.path, cx)
-                                .filter(|_| crate::viewer::has_preview(&shown.path))
-                                .map(|document| cx.new(|cx| Viewer::preview(document, cx))),
-                            false => (there && crate::viewer::is_picture(&shown.path))
-                                .then(|| cx.new(|cx| Viewer::picture(shown.path.clone(), cx))),
+                        let known = this.panes[pane].viewers.iter().position(|(viewer, _)| {
+                            let viewer = viewer.read(cx);
+                            viewer.path == shown.path && viewer.is_preview() == shown.preview
+                        });
+                        let at = match known {
+                            Some(known) => known,
+                            None => {
+                                let viewer = match shown.preview {
+                                    true => this.document_for_path(&shown.path, cx)
+                                        .filter(|_| crate::viewer::has_preview(&shown.path))
+                                        .map(|document| cx.new(|cx| Viewer::preview(document, cx))),
+                                    false => (there && crate::viewer::is_picture(&shown.path))
+                                        .then(|| cx.new(|cx| Viewer::picture(shown.path.clone(), cx))),
+                                };
+                                let Some(viewer) = viewer else { continue; };
+                                this.add_viewer(viewer, pane, false, window, cx);
+                                this.panes[pane].viewers.len() - 1
+                            }
                         };
-                        let Some(viewer) = viewer else { continue; };
-                        this.add_viewer(viewer, pane, false, window, cx);
-                        if shown.front { front = Some(this.panes[pane].viewers.len() - 1); }
+                        if shown.front { front = Some(at); }
                     }
                     this.panes[pane].shown = front;
                 }
                 for pane in (0..this.panes.len()).rev() { this.drop_empty_pane(pane); }
                 this.active_pane = saved.active_pane.min(this.panes.len() - 1);
                 this.front_of_pane(this.active_pane, window, cx);
-                for book in &saved.books { this.open_notebook(book.path.clone(), book.extension.clone(), book.kind.clone(), window, cx); }
-                if let Some(book) = saved.front_book.and_then(|at| this.notebooks.get(at)).map(|(book, _)| book.clone()) {
-                    this.show_notebook(book, this.active_pane, window, cx);
+                let mut front_book = None;
+                for (at, book) in saved.books.iter().enumerate() {
+                    this.open_notebook(book.path.clone(), book.extension.clone(), book.kind.clone(), window, cx);
+                    if saved.front_book == Some(at) { front_book = this.notebook_front.as_ref().map(|(book, _)| book.clone()); }
+                }
+                if let Some(book) = &front_book {
+                    this.show_notebook(book.clone(), this.active_pane, window, cx);
                 } else { this.leave_notebook(cx); }
+                if let Some(front) = &front { front.put(this, window, cx); }
                 cx.notify();
-            }).ok();
+                (front.is_some(), Front::of(this), front_book)
+            });
+            let Ok((preserve_front, expected_front, front_book)) = selection else { return; };
             let mut front_page = None;
             for (at, page) in saved.pages.iter().enumerate() {
                 let request = cx.update(|_, cx| ExtensionStore::try_global(cx).map(|store| store.update(cx, |store, cx| {
@@ -424,14 +525,19 @@ impl Workspace {
                 }
             }
             this.update_in(cx, |this, window, cx| {
-                if let Some(key) = front_page {
-                    this.open_webview(key, window, cx);
-                } else if let Some(book) = saved.front_book.and_then(|at| this.notebooks.get(at)).map(|(book, _)| book.clone()) {
-                    this.show_notebook(book, this.active_pane, window, cx);
-                } else {
-                    this.front_of_pane(this.active_pane, window, cx);
+                // Restoring an extension can await again after the tabs.
+                // A choice made in that interval must also stay in front.
+                if !preserve_front && Front::of(this) == expected_front {
+                    if let Some(key) = front_page {
+                        this.open_webview(key, window, cx);
+                    } else if let Some(book) = front_book.filter(|book| this.notebooks.iter().any(|(known, _)| known == book)) {
+                        this.show_notebook(book, this.active_pane, window, cx);
+                    } else {
+                        this.front_of_pane(this.active_pane, window, cx);
+                    }
                 }
                 this.restoring = false;
+                this.restoring_pages.clear();
             }).ok();
         }).detach();
     }

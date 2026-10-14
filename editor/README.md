@@ -261,7 +261,10 @@ that is on a server is shown by its name: nothing is fetched.
 
 An SVG opens as text, and the same command draws it next to its source.
 
-Pictures and previews come back with the tabs at the next start.
+Pictures and previews come back with the tabs at the next start. A file,
+picture or notebook explicitly opened at startup stays in front while those
+tabs load. Choosing another tab while restoration waits also keeps that choice;
+a restored extension page adds its tab without taking the current view.
 
 ## Structure and breadcrumbs
 

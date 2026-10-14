@@ -360,6 +360,8 @@ pub struct Workspace {
     recovery: Option<recovery::Recovery>,
     _recovery_tick: Option<Task<()>>,
     restoring: bool,
+    /// Serializer notifications add these pages without taking the user's view.
+    restoring_pages: Vec<(String, String, Option<String>)>,
     closing: bool,
     close_preparing: bool,
     close_confirmed: bool,
@@ -928,6 +930,7 @@ impl Workspace {
             recovery: None,
             _recovery_tick: None,
             restoring: false,
+            restoring_pages: Vec::new(),
             closing: false,
             close_preparing: false,
             close_confirmed: false,
@@ -5328,7 +5331,7 @@ impl Workspace {
                 break;
             };
             match ask {
-                Ask::Webview { key } => self.open_webview(key, window, cx),
+                Ask::Webview { key } => self.open_session_webview(key, window, cx),
                 Ask::Notebook {
                     extension,
                     kind,
@@ -16834,6 +16837,238 @@ exports.activate = (context) => {
             !ws.read(cx).restoring
         });
         assert_eq!(cx.read(|cx| ws.read(cx).panes[1].tabs.len()), 2);
+    }
+
+    #[gpui::test]
+    fn session_restore_keeps_the_cli_notebook_in_front(cx: &mut TestAppContext) {
+        let root = fixture("session-cli-notebook");
+        let saved = db::testing::dir("session-cli-notebook-state").join("session.json");
+        let (initial, other) = (root.join("initial.ipynb"), root.join("other.ipynb"));
+        let notebook = serde_json::json!({"nbformat":4,"nbformat_minor":5,"metadata":{},
+            "cells":[{"cell_type":"code","id":"first","source":"print(1)",
+            "metadata":{},"execution_count":null,"outputs":[]}]});
+        for path in [&initial, &other] {
+            std::fs::write(path, serde_json::to_vec(&notebook).unwrap()).unwrap();
+        }
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        for populated in [false, true] {
+            ws.update_in(cx, |w, window, cx| {
+                w.leave_notebook(cx);
+                w.notebooks.clear();
+                w.panes = vec![Pane::default()];
+                w.active_pane = 0;
+                if populated {
+                    w.add_editor(Some(root.join("README.md")), "readme", None, window, cx);
+                    w.open_path(other.clone(), None, window, cx);
+                }
+                std::fs::write(&saved, serde_json::to_vec(&w.snapshot(cx)).unwrap()).unwrap();
+                w.leave_notebook(cx);
+                w.notebooks.clear();
+                w.panes = vec![Pane::default()];
+                // Match startup: the explicit path opens before session IO.
+                w.open_path(initial.clone(), None, window, cx);
+                w.restore_session(saved.clone(), window, cx);
+            });
+            let book = cx.read(|cx| ws.read(cx).notebooks[0].0.clone());
+            wait_for(cx, "the CLI notebook and restored session", &|cx| {
+                !ws.read(cx).restoring && book.read(cx).is_ready()
+            });
+            cx.read(|cx| {
+                let w = ws.read(cx);
+                assert_eq!(w.notebook_front.as_ref().map(|(book, _)| book), Some(&book));
+                assert!(w.active_editor().is_none());
+                assert!(w.web_front.is_none());
+                assert_eq!(w.notebooks.len(), if populated { 2 } else { 1 });
+                assert_eq!(w.panes[0].tabs.len(), usize::from(populated));
+                assert_eq!(book.read(cx).seen(cx), ["code python [ ]: print(1)"]);
+            });
+        }
+        // With no explicit view, the saved notebook still owns the front.
+        ws.update_in(cx, |w, window, cx| {
+            w.leave_notebook(cx);
+            w.notebooks.clear();
+            w.panes = vec![Pane::default()];
+            w.restore_session(saved, window, cx);
+        });
+        wait_for(cx, "the saved notebook front", &|cx| !ws.read(cx).restoring);
+        cx.read(|cx| {
+            let w = ws.read(cx);
+            assert_eq!(w.notebooks.len(), 1);
+            assert_eq!(w.notebook_front.as_ref().unwrap().0.read(cx).path, other);
+        });
+    }
+
+    #[gpui::test]
+    fn session_restore_keeps_the_cli_file_and_its_cursors(cx: &mut TestAppContext) {
+        let root = fixture("session-cli-file");
+        let saved = db::testing::dir("session-cli-file-state").join("session.json");
+        let initial = root.join("src/main.rs");
+        let loaded = crate::document::load(&initial).unwrap();
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        ws.update_in(cx, |w, window, cx| {
+            w.add_loaded(initial.clone(), &loaded, None, window, cx);
+            w.active_editor()
+                .unwrap()
+                .update(cx, |editor, cx| editor.select_range(3..5, cx));
+            w.split_right(&SplitRight, window, cx);
+            w.add_editor(Some(root.join("README.md")), "readme", None, window, cx);
+        });
+        let snapshot = cx.read(|cx| ws.read(cx).snapshot(cx));
+        std::fs::write(&saved, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let editor = ws.update_in(cx, |w, window, cx| {
+            w.panes = vec![Pane::default()];
+            w.active_pane = 0;
+            w.add_loaded(initial.clone(), &loaded, None, window, cx);
+            let editor = w.active_editor().unwrap().clone();
+            w.restore_session(saved, window, cx);
+            editor
+        });
+        wait_for(cx, "the CLI file and saved tabs", &|cx| {
+            !ws.read(cx).restoring
+        });
+        cx.read(|cx| {
+            let w = ws.read(cx);
+            assert_eq!(w.active_editor(), Some(&editor));
+            assert_eq!(w.active_pane, 0);
+            assert_eq!(editor.read(cx).newest_range(), 0..0);
+            assert_eq!(w.panes[0].tabs.len(), 1);
+            assert_eq!(w.panes[1].tabs.len(), 2);
+            assert!(w.all_editors().any(|editor| {
+                editor.read(cx).path(cx) == Some(root.join("README.md").as_path())
+            }));
+        });
+    }
+
+    #[gpui::test]
+    fn session_restore_keeps_the_cli_picture_without_duplicate_tabs(cx: &mut TestAppContext) {
+        let root = fixture("session-cli-picture");
+        let saved = db::testing::dir("session-cli-picture-state").join("session.json");
+        let (initial, other) = (root.join("initial.png"), root.join("other.png"));
+        for path in [&initial, &other] {
+            std::fs::write(path, png(8, 8)).unwrap();
+        }
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        for populated in [false, true] {
+            let viewer = ws.update_in(cx, |w, window, cx| {
+                w.panes = vec![Pane::default()];
+                w.active_pane = 0;
+                if populated {
+                    w.add_editor(Some(root.join("README.md")), "readme", None, window, cx);
+                    w.open_path(initial.clone(), None, window, cx);
+                    w.open_path(other.clone(), None, window, cx);
+                }
+                std::fs::write(&saved, serde_json::to_vec(&w.snapshot(cx)).unwrap()).unwrap();
+                w.panes = vec![Pane::default()];
+                w.open_path(initial.clone(), None, window, cx);
+                let viewer = w.panes[0].shown_viewer().unwrap().clone();
+                w.restore_session(saved.clone(), window, cx);
+                viewer
+            });
+            wait_for(cx, "the CLI picture and restored session", &|cx| {
+                !ws.read(cx).restoring
+            });
+            cx.read(|cx| {
+                let w = ws.read(cx);
+                assert_eq!(w.panes[0].shown_viewer(), Some(&viewer));
+                assert_eq!(w.panes[0].viewers.len(), if populated { 2 } else { 1 });
+                assert_eq!(w.panes[0].tabs.len(), usize::from(populated));
+                assert!(w.active_editor().is_none());
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn session_restore_keeps_a_view_chosen_while_waiting(cx: &mut TestAppContext) {
+        let root = fixture("session-user-choice");
+        let saved = db::testing::dir("session-user-choice-state").join("session.json");
+        let chosen = root.join("src/util/strings.rs");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root.clone());
+        let store = cx.read(|cx| ExtensionStore::try_global(cx).unwrap());
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(root.join("README.md")), "readme", None, window, cx);
+            std::fs::write(&saved, serde_json::to_vec(&w.snapshot(cx)).unwrap()).unwrap();
+            w.panes = vec![Pane::default()];
+            store.update(cx, |store, _| store.loaded = false);
+            w.restore_session(saved, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.read(|cx| ws.read(cx).restoring));
+        assert!(cx.read(|cx| ws.read(cx).panes[0].tabs.is_empty()));
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(chosen.clone()), "pub fn helper() {}", None, window, cx);
+            store.update(cx, |store, _| store.loaded = true);
+        });
+        wait_for(cx, "restoration after the user choice", &|cx| {
+            !ws.read(cx).restoring
+        });
+        assert_eq!(active_path(&ws, cx), Some(chosen));
+        assert_eq!(cx.read(|cx| ws.read(cx).panes[0].tabs.len()), 2);
+    }
+
+    #[gpui::test]
+    fn session_pages_restore_in_the_background_and_allow_user_selection(cx: &mut TestAppContext) {
+        let root = fixture("session-page-choice");
+        let initial = root.join("README.md");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        let store = cx.read(|cx| ExtensionStore::try_global(cx).unwrap());
+        let keys: [crate::webview::Key; 2] = [
+            ("Acme.pages".into(), "one".into()),
+            ("Acme.pages".into(), "two".into()),
+        ];
+        ws.update_in(cx, |w, window, cx| {
+            w.add_editor(Some(initial.clone()), "readme", None, window, cx);
+            for (ix, key) in keys.iter().enumerate() {
+                let view_type = format!("pages.{ix}");
+                let model = crate::webview::Model::read(serde_json::json!({
+                    "viewType":view_type,"title":format!("Page {ix}"),"html":"<p>Restored</p>"
+                }))
+                .unwrap();
+                store.update(cx, |store, _| {
+                    store.api.webviews.insert(key.clone(), model);
+                });
+                w.restoring_pages.push((key.0.clone(), view_type, None));
+            }
+            w.open_session_webview(keys[0].clone(), window, cx);
+        });
+        assert_eq!(active_path(&ws, cx), Some(initial));
+        let page = cx.read(|cx| ws.read(cx).web_pages[0].0.clone());
+        ws.update_in(cx, |w, window, cx| {
+            // A tab click still takes the selected page to the front.
+            w.open_webview(keys[0].clone(), window, cx);
+            w.open_session_webview(keys[1].clone(), window, cx);
+        });
+        cx.read(|cx| {
+            let w = ws.read(cx);
+            assert_eq!(w.web_pages.len(), 2);
+            assert_eq!(w.web_front.as_ref().map(|(front, _)| front), Some(&page));
+        });
+        ws.update_in(cx, |w, window, cx| {
+            w.web_front = None;
+            w.panes = vec![Pane::default()];
+            w.open_session_webview(keys[1].clone(), window, cx);
+        });
+        assert!(cx.read(|cx| ws.read(cx).web_front.is_none()));
+        ws.update_in(cx, |w, window, cx| {
+            w.restoring_pages.clear();
+            w.open_session_webview(keys[1].clone(), window, cx);
+        });
+        assert_eq!(
+            cx.read(|cx| ws
+                .read(cx)
+                .web_front
+                .as_ref()
+                .unwrap()
+                .0
+                .read(cx)
+                .key
+                .clone()),
+            keys[1]
+        );
     }
 
     #[gpui::test]
