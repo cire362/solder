@@ -54,11 +54,101 @@ async function writable(source) {
   await fs.promises.access(source.revision.resolved, fs.constants.W_OK);
 }
 
-async function save(file, expected, bytes) {
-  const source = await read(file);
-  if (!same(expected, source.revision)) throw changed();
-  await writable(source);
-  const resolved = expected.resolved;
+// A missing name is create-only. A dangling symlink is still an existing
+// name and must never be replaced as though it were missing.
+async function destination(file) {
+  try {
+    const source = await read(file);
+    return { resolved: source.revision.resolved, revision: source.revision };
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    try {
+      await fs.promises.lstat(file);
+    } catch (missing) {
+      if (missing.code !== 'ENOENT') throw missing;
+      const parent = await fs.promises.realpath(path.dirname(file));
+      return { resolved: path.join(parent, path.basename(file)), revision: null };
+    }
+    throw changed();
+  }
+}
+
+async function distinct(source, original, target) {
+  const names = new Set([original.resolved, path.resolve(source)]);
+  let current;
+  try {
+    const resolved = await fs.promises.realpath(source);
+    names.add(resolved);
+    current = await fs.promises.stat(resolved, { bigint: true });
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    // Recovery can outlive the source directory. Where the parent remains,
+    // follow dangling source symlinks too: creating their target is still
+    // an export back to the source, rather than an independent copy.
+    let name = path.resolve(source);
+    for (let hop = 0; hop < 40; hop += 1) {
+      let parent;
+      let entry;
+      try {
+        parent = await fs.promises.realpath(path.dirname(name));
+        name = path.join(parent, path.basename(name));
+        names.add(name);
+        entry = await fs.promises.lstat(name);
+      } catch (missing) {
+        if (missing.code !== 'ENOENT') throw missing;
+        break;
+      }
+      if (!entry.isSymbolicLink()) break;
+      name = path.resolve(parent, await fs.promises.readlink(name));
+      names.add(name);
+      if (hop === 39) throw changed();
+    }
+  }
+  const stamp = target.revision;
+  if (names.has(target.resolved) || (stamp && (
+    (stamp.dev === original.dev && stamp.ino === original.ino)
+    || (current && stamp.dev === current.dev && stamp.ino === current.ino)
+  ))) throw new Error('A notebook copy cannot replace its source');
+}
+
+async function prepareCopy(source, original, file) {
+  const target = await destination(file);
+  await distinct(source, original, target);
+  return target;
+}
+
+const writes = new Map();
+function queued(target, work) {
+  const pending = (writes.get(target) || Promise.resolve()).then(work);
+  const tail = pending.catch(() => {}).finally(() => {
+    if (writes.get(target) === tail) writes.delete(target);
+  });
+  writes.set(target, tail);
+  return pending;
+}
+
+function save(file, expected, bytes) {
+  return queued(expected.resolved, () => write(file, { resolved: expected.resolved, revision: expected }, bytes));
+}
+
+function writeCopy(source, original, file, expected, bytes) {
+  return queued(expected.resolved, () => write(file, expected, bytes, async (current) => {
+    await distinct(source, original, current);
+  }));
+}
+
+async function write(file, target, bytes, checkCopy) {
+  const expected = target.revision;
+  const source = expected ? await read(file) : undefined;
+  if (expected) {
+    if (!same(expected, source.revision)) throw changed();
+    await writable(source);
+  } else {
+    const current = await destination(file);
+    if (current.revision || current.resolved !== target.resolved) throw changed();
+  }
+  if (checkCopy) await checkCopy(target);
+  const resolved = target.resolved;
   const temp = path.join(path.dirname(resolved), `.${path.basename(resolved)}.solder-${crypto.randomBytes(16).toString('hex')}.tmp`);
   let created = false;
   let staged;
@@ -67,7 +157,7 @@ async function save(file, expected, bytes) {
     staged = await fs.promises.open(temp, 'wx', 0o600);
     created = true;
     identity = await staged.stat({ bigint: true });
-    if (process.platform === 'darwin' || process.platform === 'linux') {
+    if (source && (process.platform === 'darwin' || process.platform === 'linux')) {
       // An existing destination keeps the exclusively created inode. GNU
       // --preserve=all may ignore xattr failures, so name the attributes.
       const options = process.platform === 'darwin' ? ['-p']
@@ -80,29 +170,41 @@ async function save(file, expected, bytes) {
     if (copied.dev !== identity.dev || copied.ino !== identity.ino
       || named.dev !== identity.dev || named.ino !== identity.ino
       || !named.isFile() || copied.nlink !== 1n) throw new Error('The notebook staging file changed');
-    if (copied.uid !== source.stat.uid || copied.gid !== source.stat.gid) {
+    if (source && (copied.uid !== source.stat.uid || copied.gid !== source.stat.gid)) {
       throw new Error('Could not preserve the notebook file owner and group');
     }
     if ((copied.mode & 0o222n) === 0n) throw new Error('The notebook file is read-only');
     await staged.truncate(0);
     await staged.writeFile(bytes);
-    await staged.chmod(Number(source.stat.mode & 0o777n));
+    if (source) await staged.chmod(Number(source.stat.mode & 0o777n));
     await staged.sync();
     const next = revision(resolved, await staged.stat({ bigint: true }), hash(bytes));
     await staged.close();
     staged = undefined;
-    const current = await read(file);
-    if (!same(expected, current.revision) || current.stat.mode !== source.stat.mode
-      || current.stat.uid !== source.stat.uid || current.stat.gid !== source.stat.gid
-      || current.stat.ctimeNs !== source.stat.ctimeNs) throw changed();
-    await writable(current);
+    if (expected) {
+      const current = await read(file);
+      if (!same(expected, current.revision) || current.stat.mode !== source.stat.mode
+        || current.stat.uid !== source.stat.uid || current.stat.gid !== source.stat.gid
+        || current.stat.ctimeNs !== source.stat.ctimeNs) throw changed();
+      await writable(current);
+    } else {
+      const current = await destination(file);
+      if (current.revision || current.resolved !== resolved) throw changed();
+    }
+    if (checkCopy) await checkCopy(target);
     const commit = await fs.promises.lstat(temp, { bigint: true });
     if (!commit.isFile() || commit.dev !== identity.dev || commit.ino !== identity.ino
       || commit.nlink !== 1n || commit.size !== next.size || commit.mtimeNs !== next.mtime) {
       throw new Error('The notebook staging file changed');
     }
     // Node cannot lock an independent writer across this check and rename.
-    await fs.promises.rename(temp, resolved);
+    if (expected) await fs.promises.rename(temp, resolved);
+    else {
+      // Publishing a complete inode with link is exclusive even if another
+      // writer creates this name after our final missing-name check.
+      await fs.promises.link(temp, resolved);
+      await fs.promises.unlink(temp);
+    }
     created = false;
     return next;
   } finally {
@@ -124,4 +226,4 @@ async function save(file, expected, bytes) {
   }
 }
 
-module.exports = { read, save };
+module.exports = { read, save, prepareCopy, writeCopy };

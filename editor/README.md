@@ -203,12 +203,35 @@ the file, closing its tab, or closing the window with an answer removes
 it. What is found at the next start is put back after the tabs, as unsaved
 changes with a notice and one undo to the disk text. Nothing is written
 to the file until you save. A text over 16 MB is not kept; an earlier
-copy is retained. Notebook recovery is not implemented.
+copy is retained. Recovery protects the original read revision of both
+local and remote text, even after undo or a failed Save As. A file changed
+outside Solder before restart refuses the save; the recovered text can be
+rescued with Save As. An older copy without a complete content hash also
+needs a different destination. Missing local files can reopen as recovered
+text; unavailable remote files retain their copies for a later reconnect.
 
-Recovered remote text retains its original read revision, even after an
-undo or a failed Save As. A newer target refuses the save. A recovery copy
-from an older version without that revision needs Save As to a new file.
-Disconnected, unreadable and unsupported recovery copies remain on disk.
+Dirty notebooks are kept in the same recovery queue and restored after the
+project tabs. Native Jupyter copies retain metadata, attachments, cell ids
+and complete output bundles. Extension notebooks use the allowed extension's
+API model snapshot, including metadata, execution summaries and binary outputs;
+restoration does not read the live source or run a cell. Execution outputs
+also make a notebook dirty. The original read revision is kept in the backup,
+so an external change cannot become permission to overwrite it at restart.
+
+**Notebook: Export copy**, also used by Save As in a notebook tab, writes a
+separate file through its native writer or extension serializer. The original
+path, revision and changed mark stay as they are. Source aliases are refused;
+an existing destination is checked against its own revision before atomic
+replacement. Exports and saves share the notebook's write queue. Closing or
+successfully saving a notebook releases its recovery copies after preceding
+backup writes finish. A failed snapshot keeps the previous copy and retries.
+
+A notebook recovery file over 16 MB keeps its earlier smaller copy. Each
+reader considers at most 256 copies per pass. Malformed, unsupported,
+permission-denied and unavailable copies remain on disk; there is no recovery
+manager screen. Text encoding and line-ending choices are not included in
+recovery. Notebook recovery/export is tested with native files and first-party
+extension fixtures, not a published notebook extension or a live remote window.
 The operating system's direct Quit can bypass this question: GPUI's
 shutdown callback cannot cancel it. Recovery still runs on that path.
 
@@ -1368,6 +1391,11 @@ It receives the output's MIME data and can exchange messages through
 `createRendererMessaging`. Only files inside that extension are served;
 remote requests, navigation and downloads are blocked. Text and pictures
 stay inline; browser views are created only when a result is opened.
+Recovery and Export copy also retain these outputs. Native Jupyter writes the
+original output bundles; extension serializers decide what their file format
+can preserve. Export is a separate copy, so saving or discarding the original
+still requires its own decision.
+
 Closing the result returns to its notebook. Closing a notebook with
 changes asks, as closing a file does.
 

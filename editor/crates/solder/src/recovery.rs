@@ -30,12 +30,29 @@ struct Kept {
     stamp: Option<crate::remote::Stamp>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct KeptBook {
+    version: u32,
+    path: PathBuf,
+    extension: String,
+    kind: String,
+    #[serde(default)]
+    selected: usize,
+    snapshot: serde_json::Value,
+}
+
 enum Op {
     Keep {
         file: PathBuf,
         path: Option<PathBuf>,
         text: text::Rope,
         stamp: Option<crate::remote::Stamp>,
+    },
+    KeepBook {
+        file: PathBuf,
+        book: KeptBook,
+        snapshot: futures::channel::oneshot::Receiver<Result<serde_json::Value, String>>,
+        done: futures::channel::oneshot::Sender<bool>,
     },
     Forget(PathBuf),
     /// Everything asked before this is on disk.
@@ -50,6 +67,8 @@ pub(super) struct Recovery {
     ops: mpsc::Sender<Op>,
     /// The documents whose text is kept: which state of it, and where.
     kept: HashMap<EntityId, (u64, PathBuf)>,
+    restoring_books: HashMap<EntityId, u64>,
+    extra_copies: HashMap<EntityId, Vec<PathBuf>>,
 }
 
 impl Recovery {
@@ -79,6 +98,36 @@ impl Recovery {
                             ));
                         }
                     }
+                    Op::KeepBook {
+                        file,
+                        mut book,
+                        snapshot,
+                        done,
+                    } => {
+                        // Waiting on this thread keeps a later Forget behind
+                        // the snapshot, without waiting on an extension on UI.
+                        let snapshot = futures::executor::block_on(snapshot)
+                            .map_err(|_| "notebook snapshot was cancelled".to_string())
+                            .and_then(|snapshot| snapshot);
+                        let written = snapshot.and_then(|snapshot| {
+                            book.snapshot = snapshot;
+                            let bytes =
+                                serde_json::to_vec(&book).map_err(|error| error.to_string())?;
+                            if bytes.len() > KEEP_LIMIT {
+                                // Keep the last smaller snapshot, and do not
+                                // attempt this same oversized generation again.
+                                return Ok(false);
+                            }
+                            crate::ipynb::write_atomic(&file, &bytes)?;
+                            Ok(true)
+                        });
+                        if let Err(error) = &written {
+                            crate::journal::error(format_args!(
+                                "could not keep unsaved notebook: {error}"
+                            ));
+                        }
+                        let _ = done.send(written.is_ok());
+                    }
                     Op::Forget(file) => {
                         let _ = std::fs::remove_file(file);
                     }
@@ -96,6 +145,18 @@ impl Recovery {
                 .as_nanos(),
             ops,
             kept: HashMap::default(),
+            restoring_books: HashMap::default(),
+            extra_copies: HashMap::default(),
+        }
+    }
+
+    fn adopt_book(&mut self, id: EntityId, generation: u64, file: PathBuf) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.kept.entry(id) {
+            entry.insert((generation, file));
+        } else {
+            // An edit after restoration may already have queued a newer copy.
+            // Both remain until a save or close acknowledges this notebook.
+            self.extra_copies.entry(id).or_default().push(file);
         }
     }
 
@@ -119,7 +180,7 @@ pub(super) fn folder(root: &Path) -> PathBuf {
 
 /// What was kept in a folder, with each file it is of as it is on disk
 /// now. Blocking.
-fn read(dir: &Path) -> Vec<(PathBuf, Kept, Option<crate::document::Loaded>)> {
+fn read(dir: &Path) -> Vec<(PathBuf, Kept, Option<crate::document::Loaded>, bool)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -142,14 +203,51 @@ fn read(dir: &Path) -> Vec<(PathBuf, Kept, Option<crate::document::Loaded>)> {
             if kept.version == 1 {
                 kept.stamp = None;
             }
-            let on_disk = kept
-                .path
-                .as_deref()
-                .and_then(|path| crate::document::load(path).ok());
-            found.push((file, kept, on_disk));
+            let (on_disk, available) = match kept.path.as_deref().map(crate::document::load) {
+                Some(Ok(loaded)) => (Some(loaded), true),
+                Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => (None, true),
+                Some(Err(_)) => (None, false),
+                None => (None, true),
+            };
+            found.push((file, kept, on_disk, available));
         }
     }
     found
+}
+
+fn read_books(dir: &Path) -> Vec<(PathBuf, KeptBook)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files = entries
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".book.json"))
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+        .into_iter()
+        .take(KEPT_FILES)
+        .filter_map(|file| {
+            let metadata = std::fs::symlink_metadata(&file).ok()?;
+            if !metadata.is_file() || metadata.len() > KEEP_LIMIT as u64 {
+                return None;
+            }
+            let bytes = std::fs::read(&file).ok()?;
+            let book: KeptBook = serde_json::from_slice(&bytes).ok()?;
+            if book.version != 1
+                || !book.path.is_absolute()
+                || book.kind.is_empty()
+                || (!book.extension.is_empty() && book.snapshot["type"] != book.kind)
+                || (book.extension.is_empty() && book.kind != "jupyter-notebook")
+            {
+                return None;
+            }
+            Some((file, book))
+        })
+        .collect()
 }
 
 impl Workspace {
@@ -205,6 +303,73 @@ impl Workspace {
             let _ = recovery.ops.send(keep);
             recovery.kept.insert(id, (doc.version(), file));
         }
+        for (notebook, _) in &self.notebooks {
+            let id = notebook.entity_id();
+            let book = notebook.read(cx);
+            if recovery.restoring_books.get(&id).is_some_and(|generation| {
+                *generation == book.version() || book.recovered_generation() == Some(book.version())
+            }) {
+                // The original copy has not been adopted yet. Do not create
+                // a second one between its ready event and adoption.
+                changed.insert(id);
+                continue;
+            }
+            if !book.is_dirty() {
+                continue;
+            }
+            changed.insert(id);
+            let version = book.version();
+            let known = recovery.kept.get(&id);
+            if known.is_some_and(|(kept, _)| *kept == version) {
+                continue;
+            }
+            let file = known.map(|(_, file)| file.clone()).unwrap_or_else(|| {
+                recovery.dir.join(format!(
+                    "notebook-{}-{}-{}-{}.book.json",
+                    session::name_of(&book.path),
+                    std::process::id(),
+                    recovery.run,
+                    id.as_u64()
+                ))
+            });
+            let (extension, kind) = book.reader();
+            let kept = KeptBook {
+                version: 1,
+                path: book.path.clone(),
+                extension,
+                kind,
+                selected: book.selected(),
+                snapshot: serde_json::Value::Null,
+            };
+            let Some(snapshot) = notebook.update(cx, |book, cx| book.recovery_snapshot(cx)) else {
+                continue;
+            };
+            let (send, snapshot_rx) = futures::channel::oneshot::channel();
+            let (done, acknowledged) = futures::channel::oneshot::channel();
+            let _ = recovery.ops.send(Op::KeepBook {
+                file: file.clone(),
+                book: kept,
+                snapshot: snapshot_rx,
+                done,
+            });
+            recovery.kept.insert(id, (version, file));
+            cx.spawn(async move |this, cx| {
+                let _ = send.send(snapshot.await);
+                let success = acknowledged.await.unwrap_or(false);
+                if !success {
+                    this.update(cx, |this, _| {
+                        if let Some(recovery) = this.recovery.as_mut()
+                            && let Some((kept, _)) = recovery.kept.get_mut(&id)
+                            && *kept == version
+                        {
+                            *kept = version.wrapping_sub(1);
+                        }
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+        }
         // Saved, local undo back to disk, or explicitly closed. A remote
         // recovery stays dirty until it is saved or closed with an answer.
         recovery.kept.retain(|id, (_, file)| {
@@ -213,6 +378,15 @@ impl Workspace {
                 let _ = recovery.ops.send(Op::Forget(file.clone()));
             }
             stays
+        });
+        recovery.extra_copies.retain(|id, files| {
+            if changed.contains(id) {
+                return true;
+            }
+            for file in files {
+                let _ = recovery.ops.send(Op::Forget(file.clone()));
+            }
+            false
         });
         recovery.done(cx)
     }
@@ -225,6 +399,11 @@ impl Workspace {
         };
         for (_, (_, file)) in recovery.kept.drain() {
             let _ = recovery.ops.send(Op::Forget(file));
+        }
+        for (_, files) in recovery.extra_copies.drain() {
+            for file in files {
+                let _ = recovery.ops.send(Op::Forget(file));
+            }
         }
         recovery.done(cx)
     }
@@ -242,16 +421,85 @@ impl Workspace {
                     .timer(Duration::from_millis(25))
                     .await;
             }
-            let found = cx
+            let (found, books) = cx
                 .background_executor()
-                .spawn(async move { read(&dir) })
+                .spawn(async move { (read(&dir), read_books(&dir)) })
                 .await;
             this.update_in(cx, |this, window, cx| {
-                for (file, kept, on_disk) in found {
-                    this.recover_one(file, kept, on_disk, window, cx);
+                for (file, kept, on_disk, available) in found {
+                    if available {
+                        this.recover_one(file, kept, on_disk, window, cx);
+                    }
                 }
             })
             .ok();
+            for (file, kept) in books {
+                let KeptBook {
+                    path,
+                    extension,
+                    kind,
+                    selected,
+                    snapshot,
+                    ..
+                } = kept;
+                let Ok(restoring) = this.update_in(cx, |this, window, cx| {
+                    let known = this
+                        .notebooks
+                        .iter()
+                        .find(|(book, _)| book.read(cx).path == path)
+                        .map(|(book, _)| book.clone());
+                    if known.as_ref().is_some_and(|book| {
+                        let book = book.read(cx);
+                        book.is_dirty() || !book.is(&path, &extension, &kind)
+                    }) {
+                        return None;
+                    }
+                    let book = match known {
+                        Some(book) => book,
+                        None => {
+                            this.open_notebook(path, extension, kind, window, cx);
+                            this.notebook_front.as_ref()?.0.clone()
+                        }
+                    };
+                    if let Some(recovery) = this.recovery.as_mut() {
+                        recovery
+                            .restoring_books
+                            .insert(book.entity_id(), book.read(cx).version());
+                    }
+                    let restoring =
+                        book.update(cx, |book, cx| book.restore(snapshot, selected, cx));
+                    Some((book, restoring))
+                }) else {
+                    continue;
+                };
+                let Some((book, restoring)) = restoring else {
+                    continue;
+                };
+                let restored = restoring.await;
+                this.update_in(cx, |this, window, cx| {
+                    if let Some(recovery) = this.recovery.as_mut() {
+                        recovery.restoring_books.remove(&book.entity_id());
+                    }
+                    if !restored || !this.notebooks.iter().any(|(open, _)| *open == book) {
+                        return;
+                    }
+                    if let Some(recovery) = this.recovery.as_mut() {
+                        let generation = book
+                            .read(cx)
+                            .recovered_generation()
+                            .unwrap_or_else(|| book.read(cx).version());
+                        recovery.adopt_book(book.entity_id(), generation, file);
+                    }
+                    if this
+                        .notebook_front
+                        .as_ref()
+                        .is_some_and(|(front, _)| *front == book)
+                    {
+                        book.read(cx).focus(window, cx);
+                    }
+                })
+                .ok();
+            }
         })
         .detach();
     }
@@ -264,8 +512,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let remote = kept.path.as_deref().is_some_and(crate::remote::is_remote);
-        if (remote && on_disk.is_none())
+        if (kept.path.as_deref().is_some_and(crate::remote::is_remote) && on_disk.is_none())
             || on_disk
                 .as_ref()
                 .is_some_and(|file| file.read_only.is_some())
@@ -362,6 +609,59 @@ impl Workspace {
 mod tests {
     use super::*;
 
+    #[gpui::test]
+    async fn notebook_snapshots_precede_forget_and_adoption_preserves_newer_copies(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let dir = db::testing::dir("recovery-notebook-writer");
+        let document = cx.new(|cx| Document::new(None, "", cx));
+        let id = document.entity_id();
+        let mut recovery = Recovery::new(dir.clone());
+        let old = dir.join("older.book.json");
+        let newer = dir.join("newer.book.json");
+        std::fs::write(&old, "original backup").unwrap();
+        recovery.kept.insert(id, (2, newer.clone()));
+        recovery.adopt_book(id, 1, old.clone());
+        assert_eq!(recovery.kept[&id], (2, newer.clone()));
+        assert_eq!(
+            recovery.extra_copies[&id].as_slice(),
+            std::slice::from_ref(&old)
+        );
+        assert!(old.exists());
+        let (send, snapshot) = futures::channel::oneshot::channel();
+        let (done, acknowledged) = futures::channel::oneshot::channel();
+        recovery
+            .ops
+            .send(Op::KeepBook {
+                file: newer.clone(),
+                book: KeptBook {
+                    version: 1,
+                    path: dir.join("book.ipynb"),
+                    extension: String::new(),
+                    kind: "jupyter-notebook".into(),
+                    selected: 0,
+                    snapshot: serde_json::Value::Null,
+                },
+                snapshot,
+                done,
+            })
+            .unwrap();
+        recovery.ops.send(Op::Forget(newer.clone())).unwrap();
+        let (done, mut finished) = futures::channel::oneshot::channel();
+        recovery.ops.send(Op::Done(done)).unwrap();
+        assert!(finished.try_recv().unwrap().is_none());
+        send.send(Ok(serde_json::json!({"content":"newer"})))
+            .unwrap();
+        assert!(acknowledged.await.unwrap());
+        cx.update(|cx| recovery.done(cx)).await;
+        assert!(!newer.exists());
+        assert!(old.exists());
+        recovery.ops.send(Op::Forget(old.clone())).unwrap();
+        cx.update(|cx| recovery.done(cx)).await;
+        assert!(!old.exists());
+    }
+
     #[test]
     fn recovery_versions_are_read_without_consuming_any_copy() {
         let dir = db::testing::dir("recovery-versions");
@@ -393,7 +693,7 @@ mod tests {
         assert_eq!(found[0].1.stamp, Some(stamp));
         assert_eq!(found[1].1.text, "legacy");
         assert_eq!(found[1].1.stamp, None);
-        assert!(found.iter().all(|(_, _, loaded)| loaded.is_none()));
+        assert!(found.iter().all(|(_, _, loaded, _)| loaded.is_none()));
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 5);
         assert_eq!(read(&dir).len(), 2);
     }
@@ -490,7 +790,7 @@ mod tests {
             .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_nanos(original.mtime))
             .unwrap();
         let _mount = crate::remote::fixture(&source, &cache);
-        let (copy, kept, loaded) = read(file.parent().unwrap()).pop().unwrap();
+        let (copy, kept, loaded, _) = read(file.parent().unwrap()).pop().unwrap();
         assert_eq!(copy, file);
         assert_eq!(kept.stamp, Some(original));
         let loaded = loaded.unwrap();

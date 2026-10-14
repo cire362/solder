@@ -196,6 +196,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("Git: Unstage all", "Git: убрать всё из индекса"),
     ("Import view: Close", "Импорт настроек: закрыть"),
     ("Import view: Confirm", "Импорт настроек: подтвердить"),
+    ("Notebook: Export copy", "Блокнот: экспортировать копию"),
     ("Notebook: Add code", "Блокнот: добавить код"),
     ("Notebook: Add text", "Блокнот: добавить текст"),
     ("Notebook: Delete cell", "Блокнот: удалить ячейку"),
@@ -921,6 +922,26 @@ pub const WORDS: &[(&str, &str)] = &[
     ),
     ("Not saved: {}", "Не сохранено: {}"),
     (
+        "This notebook recovery copy is invalid",
+        "Копия восстановления блокнота повреждена",
+    ),
+    (
+        "This notebook recovery version is not supported",
+        "Версия копии восстановления блокнота не поддерживается",
+    ),
+    (
+        "This notebook was recovered. Its copy is kept until you save or close it.",
+        "Блокнот восстановлен. Его копия хранится до сохранения или закрытия.",
+    ),
+    (
+        "Choose another path for the notebook copy",
+        "Выберите другой путь для копии блокнота",
+    ),
+    (
+        "Notebook copy exported to {}",
+        "Копия блокнота экспортирована в {}",
+    ),
+    (
         "The file is a dangling link. Save to another path.",
         "Файл является повреждённой ссылкой. Сохраните по другому пути.",
     ),
@@ -948,6 +969,14 @@ pub const WORDS: &[(&str, &str)] = &[
     (
         "Saving would change the file owner. Save to a new file.",
         "Сохранение изменит владельца файла. Сохраните в новый файл.",
+    ),
+    (
+        "The notebook path changed while it was read",
+        "Путь блокнота изменился во время чтения",
+    ),
+    (
+        "The notebook copy destination changed. Export again.",
+        "Файл назначения изменился. Повторите экспорт.",
     ),
     (
         "The file path changed during save. Save again.",
