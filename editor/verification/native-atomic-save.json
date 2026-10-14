@@ -1,0 +1,16 @@
+{
+  "date": "2026-10-15",
+  "source": "297d607",
+  "scope": "macOS native controls, own small UTF-8 file via CLI symlink",
+  "saved_sha256": "cef00bcbf90b564e41898d74fcb2a6212c8db03839b2e6982ccca2da1e236e75",
+  "original_symlink_retained": true,
+  "mode_retained": "0640",
+  "extended_attribute_retained": "preserve-native-save",
+  "external_revision_sha256": "b45060bc4f1ad2f1836a214d58d9f7ade552ff41075bf57db8cb825ac6945a64",
+  "stale_save_refused_notice": "The file changed on the target. Reopen it before saving.",
+  "external_revision_unchanged_after_save_as": true,
+  "rescue_sha256": "6306cd985a0836b98ddfe5210f2683295ba428d39588ed5d0d3a94184c299244",
+  "rescue_bytes": "atomic_unsaved_rescue = 3\n",
+  "tab_close_after_save_as_had_no_prompt": true,
+  "recovery_removed_after_save_as": true
+}

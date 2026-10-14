@@ -55,9 +55,12 @@ implementation; its native-window checks and the recovery manager are below.
       text revisions and weak legacy stamps are checked separately. Performance
       with recovery files present is not measured. Verification and plain-file
       startup/typing samples are in `benchmarks/recovery-and-notebook-rescue.md`
-- [ ] Atomic local saves in a real window, Windows replacement/ACL behavior,
-      Linux extended attributes and ACLs, network filesystems, very large files
-      and sudden power loss. Fault injection, same-size/time external edits,
+- [x] Atomic text-save controls in a real macOS window: CLI symlink, native
+      paste and save, mode/xattr retention, stale-save refusal, Save As rescue,
+      clean close and recovery cleanup. Evidence: `verification/native-atomic-save.md`
+- [ ] Atomic local saves: Windows replacement/ACL behavior, Linux extended
+      attributes and ACLs, network filesystems, very large files and sudden
+      power loss. Fault injection, same-size/time external edits,
       source aliases, independent writers, repeated saves and notebook serializer
       failures are checked with temporary files and first-party process fixtures.
       macOS extended attributes are checked on the filesystem. No published
