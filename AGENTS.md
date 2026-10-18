@@ -92,7 +92,9 @@ Never guess a signature.
   its destination revision off the UI thread and preserves the source revision
   through aliases. `file_save::replace` is for intentionally replaced owned
   state. Metadata copying uses the system cp on macOS/Linux; failures, changed
-  owners, read-only files and Unix hard links stop the save. Extended metadata
+  owners, read-only files and Unix hard links stop the save. A filesystem that
+  has no extended attributes at all (FAT, exFAT, many shares) is no failure,
+  and a new file is created there without a hard link (`file_save::create`). Extended metadata
   and Windows identity limitations are recorded in the roadmap.
 - Edits go through `Document::edit`/`apply_edits` with the `EntityId` of the
   **editor** that made them as `origin`. Passing the document's id made the

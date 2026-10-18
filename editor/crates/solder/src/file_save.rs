@@ -278,17 +278,19 @@ fn write_locked(
         _ => return Err(changed()),
     }
     if let Some((_, metadata)) = &original {
-        // Rename is controlled by the directory's permissions. An ACL may
-        // deny writing the file while still allowing its name to be replaced.
-        let writable = OpenOptions::new().write(true).open(&destination)?;
-        if !identity(metadata, &writable.metadata()?) {
-            return Err(changed());
-        }
+        // Said before trying to open it, which fails for a read-only file
+        // with nothing but the system's "permission denied".
         if metadata.permissions().readonly() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 Refused::ReadOnly,
             ));
+        }
+        // Rename is controlled by the directory's permissions. An ACL may
+        // deny writing the file while still allowing its name to be replaced.
+        let writable = OpenOptions::new().write(true).open(&destination)?;
+        if !identity(metadata, &writable.metadata()?) {
+            return Err(changed());
         }
         #[cfg(unix)]
         {
@@ -318,8 +320,10 @@ fn write_locked(
                 "--attributes-only",
                 "--preserve=mode,ownership,timestamps,xattr",
             ]);
+            // Its messages are read below, so they are asked for in English.
+            copy.env("LC_ALL", "C");
             let result = copy.arg(&destination).arg(&staged.0).output()?;
-            if !result.status.success() {
+            if !result.status.success() && !holds_no_attributes(&result.stderr) {
                 return Err(io::Error::other(Refused::Attributes));
             }
             if !identity(&file.metadata()?, &fs::metadata(&staged.0)?) {
@@ -371,13 +375,7 @@ fn write_locked(
     if original.is_some() {
         fs::rename(&staged.0, &destination)?;
     } else {
-        fs::hard_link(&staged.0, &destination).map_err(|error| {
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                changed()
-            } else {
-                error
-            }
-        })?;
+        create(&staged.0, &destination, |from, to| fs::hard_link(from, to))?;
     }
     drop(staged);
     #[cfg(unix)]
@@ -394,6 +392,52 @@ fn write_locked(
         }
     }
     Ok(saved)
+}
+
+/// Whether what the system copier said of a failure is only that the
+/// filesystem has no extended attributes at all, as FAT, exFAT and many
+/// network shares do not: then there were none to lose, and the save goes
+/// on. Asked for them explicitly, GNU cp fails on such a filesystem, and
+/// every save of a file there was refused.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))] // No system copier is run elsewhere.
+fn holds_no_attributes(said: &[u8]) -> bool {
+    let said = String::from_utf8_lossy(said);
+    let mut lines = said
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .peekable();
+    lines.peek().is_some() && lines.all(|line| line.ends_with("Operation not supported"))
+}
+
+/// Publishes a new file under a name nobody has taken. A hard link fails
+/// if the name exists, which is what keeps a creation from replacing a
+/// file made meanwhile. FAT, exFAT and many network shares have no hard
+/// links: there the name is taken first with an empty file of our own and
+/// then replaced. Something that wrote into that empty file in between
+/// would be replaced with it; nothing else can be.
+fn create(
+    staged: &Path,
+    destination: &Path,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let exists = |error: io::Error| match error.kind() {
+        io::ErrorKind::AlreadyExists => changed(),
+        _ => error,
+    };
+    match link(staged, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(changed()),
+        Err(_) => {
+            drop(
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(destination)
+                    .map_err(exists)?,
+            );
+            fs::rename(staged, destination)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -450,6 +494,76 @@ mod tests {
             assert_eq!(leftovers(&dir), 0);
         }
     }
+    #[test]
+    fn a_read_only_file_is_refused_with_its_own_reason() {
+        let dir = folder();
+        let path = dir.join("file");
+        let expected = old(&path);
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).unwrap();
+        let error = write(&path, b"ours", Some(&expected)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("read-only"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        assert_eq!(leftovers(&dir), 0);
+    }
+
+    #[test]
+    fn a_new_file_is_made_where_there_are_no_hard_links() {
+        let dir = folder();
+        let staged = dir.join(".staged");
+        let path = dir.join("file");
+        let unsupported = |_: &Path, _: &Path| Err(io::Error::from(io::ErrorKind::Unsupported));
+        fs::write(&staged, b"ours").unwrap();
+        create(&staged, &path, unsupported).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"ours");
+        assert!(!staged.exists());
+        // A name that was taken meanwhile is not replaced, either way.
+        fs::write(&staged, b"again").unwrap();
+        let error = create(&staged, &path, unsupported).unwrap_err();
+        assert_eq!(error.to_string(), CHANGED);
+        let error = create(&staged, &path, |from, to| fs::hard_link(from, to)).unwrap_err();
+        assert_eq!(error.to_string(), CHANGED);
+        assert_eq!(fs::read(&path).unwrap(), b"ours");
+    }
+
+    #[test]
+    fn a_filesystem_without_attributes_is_told_from_a_failure() {
+        assert!(holds_no_attributes(
+            b"cp: setting attributes for 'b': Operation not supported\n"
+        ));
+        assert!(holds_no_attributes(
+            b"cp: listing attributes of 'a': Operation not supported\ncp: setting attributes for 'b': Operation not supported\n"
+        ));
+        assert!(!holds_no_attributes(b""));
+        assert!(!holds_no_attributes(
+            b"cp: preserving permissions for 'b': Permission denied\n"
+        ));
+        assert!(!holds_no_attributes(
+            b"cp: setting attributes for 'b': Operation not supported\ncp: cannot stat 'a': No such file or directory\n"
+        ));
+    }
+
+    /// Saves on a filesystem with no hard links and no extended attributes,
+    /// when one is named: `SOLDER_TEST_FAT=/Volumes/STICK cargo test`.
+    #[test]
+    fn saves_on_a_fat_volume_when_one_is_given() {
+        let Some(volume) = std::env::var_os("SOLDER_TEST_FAT") else {
+            return;
+        };
+        let dir = PathBuf::from(volume).join(format!("solder-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("new.txt");
+        let made = write(&path, b"made", None).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"made");
+        let saved = write(&path, b"saved", Some(&made)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"saved");
+        assert_eq!(revision(&path).unwrap(), Some(saved));
+        assert_eq!(leftovers(&dir), 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_competing_creator_after_validation_keeps_its_file() {
         let dir = folder();

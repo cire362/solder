@@ -35,8 +35,11 @@ something of its own unchecked or unmade adds it here.
       and sudden power loss. Fault injection, same-size/time external edits,
       source aliases, independent writers, repeated saves and notebook serializer
       failures are checked with temporary files and first-party process fixtures.
-      macOS extended attributes are checked on the filesystem. No published
-      extension or external filesystem was used for these checks
+      macOS extended attributes are checked on the filesystem. Saving and
+      creating files on FAT and exFAT is checked on macOS with disk images
+      (`SOLDER_TEST_FAT`); on Linux such filesystems, where GNU cp reports
+      the missing attributes, were not tried. No published extension or
+      network filesystem was used for these checks
 - [ ] Native multi-window Quit, window/tab close, failed-save and notebook
       controls, and Linux/Windows. On macOS, paste, Undo/Redo, the changed mark,
       Cmd-Q, Cancel and Save All were checked in one real window; saved bytes,
