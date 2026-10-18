@@ -1,0 +1,20 @@
+{
+  "date": "2026-10-18",
+  "source": "297d607 (Rust code unchanged at 9b96b01)",
+  "scope": "Two project windows in one native macOS process with isolated settings",
+  "quit_prompt_named_two_files": true,
+  "cancel_kept_both_backups_and_originals": true,
+  "window_close_cancel_verified": true,
+  "failed_save_stopped_quit": true,
+  "failed_save_notice": "Not saved: Permission denied (os error 13)",
+  "other_project_saved_before_failure": true,
+  "failed_file_original_unchanged": true,
+  "failed_file_recovery_retained": true,
+  "successful_quit_after_repair": true,
+  "process_exited": true,
+  "both_files_saved_sha256": {
+    "first": "4eb2c1b06f67de145c8ed4fbc419d6cfb66ac0b3d9c154f17f32c9ba86e8ac01",
+    "second": "6ac50e3bab638a2460f7758a662606f3ae3c7d72a1f3f49b66d99a7817056ef3"
+  },
+  "recovery_removed_for_both_projects": true
+}

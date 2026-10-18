@@ -72,11 +72,15 @@ implementation; its native-window checks and the recovery manager are below.
       failures are checked with temporary files and first-party process fixtures.
       macOS extended attributes are checked on the filesystem. No published
       extension or external filesystem was used for these checks
-- [ ] Native multi-window Quit, window/tab close, failed-save and notebook
-      controls, and Linux/Windows. On macOS, paste, Undo/Redo, the changed mark,
-      Cmd-Q, Cancel and Save All were checked in one real window; saved bytes,
-      process exit and recovery cleanup were checked too. Character-by-character
-      input injection was unreliable. Multi-window decisions, independent
+- [x] Native macOS multi-window Quit: one decision for two text projects,
+      Cancel, window-close Cancel, failed write stopping Quit with recovery
+      retained, then repaired Save All, process exit and both recovery cleanups.
+      Evidence: `verification/native-multiwindow-quit.md`
+- [ ] Multi-window Quit with notebooks, edits during native decisions and
+      pending writes, SSH disconnects, and Linux/Windows close controls. Native
+      macOS notebook close/export and text-tab Save As close are checked
+      separately above. Paste, Undo/Redo and changed marks were checked live;
+      character-by-character bulk injection was unreliable. Independent
       file/notebook copies, edits during decisions and save ordering are checked
       headlessly. Original remote recovery revisions use the real local helper
       process; a live SSH restart remains unverified. Evidence is in
