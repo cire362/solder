@@ -145,6 +145,9 @@ def inventory(evidence):
         gpu = evidence.out / "gpu-diagnostics.json"
         if gpu.is_file():
             evidence.report["linux_gpu"] = read_json(gpu)
+        desktop = evidence.out / "x11-desktop.json"
+        if desktop.is_file():
+            evidence.report["linux_desktop"] = read_json(desktop)
         modules = ("xkbcommon", "xkbcommon-x11", "wayland-client", "vulkan", "fontconfig",
                    "freetype2", "alsa", "libzstd", "webkit2gtk-4.1")
         evidence.report["linux_system_libraries"] = {}
@@ -417,6 +420,8 @@ def main():
             raise INPUT.Unavailable("Evidence/build output must be inside RUNNER_TEMP")
         if sys.platform.startswith("linux") and os.environ.get("SOLDER_NATIVE_GPU_UNAVAILABLE"):
             raise INPUT.Unavailable(os.environ["SOLDER_NATIVE_GPU_UNAVAILABLE"])
+        if sys.platform.startswith("linux") and os.environ.get("SOLDER_NATIVE_DESKTOP_UNAVAILABLE"):
+            raise INPUT.Unavailable(os.environ["SOLDER_NATIVE_DESKTOP_UNAVAILABLE"])
         binary = build(evidence) if args.build else args.binary.resolve()
         if not binary.is_file():
             raise INPUT.Unavailable(f"No platform binary at {binary}")

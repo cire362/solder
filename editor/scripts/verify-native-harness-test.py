@@ -10,7 +10,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 sys.dont_write_bytecode = True
@@ -165,6 +165,142 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(env["VK_DRIVER_FILES"], "/existing.json")
             self.assertEqual(env["VK_LOADER_DEBUG"], "all")
 
+    def test_x11_manager_probe_only_observes_the_selected_screen(self):
+        desktop = suite.INPUT.X11.__new__(suite.INPUT.X11)
+        desktop.d, desktop.screen = 17, 3
+        desktop.atom = Mock(return_value=42)
+        desktop.selection_owner = Mock(return_value=99)
+        self.assertEqual(desktop.window_manager(), 99)
+        desktop.atom.assert_called_once_with(17, b"WM_S3", 1)
+        desktop.selection_owner.assert_called_once_with(17, 42)
+        desktop.selection_owner.return_value = 0
+        self.assertIsNone(desktop.window_manager())
+        desktop.atom.return_value = 0
+        desktop.selection_owner.reset_mock()
+        self.assertIsNone(desktop.window_manager())
+        desktop.selection_owner.assert_not_called()
+
+    def test_x11_preflight_opens_the_effective_display_instead_of_the_parent_display(self):
+        functions = {"XOpenDisplay": Mock(return_value=17), "XCloseDisplay": Mock(),
+                     "XDefaultRootWindow": Mock(return_value=1), "XDefaultScreen": Mock(return_value=3),
+                     "XTestQueryExtension": Mock(return_value=1)}
+        def binding(library, name, result, *arguments):
+            return functions.get(name, Mock())
+        with patch.dict(suite.INPUT.os.environ, {"DISPLAY": ":unrelated", "WAYLAND_DISPLAY": "wayland"}), \
+                patch.object(suite.INPUT.ctypes.util, "find_library", return_value="existing"), \
+                patch.object(suite.INPUT.c, "CDLL"), patch.object(suite.INPUT, "bind", side_effect=binding):
+            desktop = suite.INPUT.X11({"DISPLAY": ":17"})
+        functions["XOpenDisplay"].assert_called_once_with(b":17")
+        self.assertEqual(desktop.screen, 3)
+        desktop.finish()
+        functions["XCloseDisplay"].assert_called_once_with(17)
+
+    def test_existing_window_manager_is_observed_without_starting_or_focusing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            desktop = SimpleNamespace(window_manager=Mock(return_value=42), finish=Mock())
+            env = {"DISPLAY": ":17", "SOLDER_NATIVE_DESKTOP_UNAVAILABLE": "old result"}
+            with patch.object(ci.INPUT, "X11", return_value=desktop) as opened, \
+                    patch.object(ci.subprocess, "Popen") as spawn:
+                self.assertEqual(ci.prepare_x11_desktop(out, env, False), (None, None))
+            opened.assert_called_once_with(env)
+            desktop.finish.assert_called_once_with()
+            spawn.assert_not_called()
+            self.assertNotIn("SOLDER_NATIVE_DESKTOP_UNAVAILABLE", env)
+            report = suite.read_json(out / "x11-desktop.json")
+            self.assertEqual(report["manager_window"], 42)
+            self.assertIsNone(report["command"])
+            self.assertFalse((out / "report.json").exists())
+
+    def test_bare_owned_xvfb_without_an_installed_manager_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            desktop = SimpleNamespace(window_manager=Mock(return_value=None), finish=Mock())
+            env = {"DISPLAY": ":17"}
+            with patch.object(ci.INPUT, "X11", return_value=desktop), \
+                    patch.object(ci.shutil, "which", return_value=None), \
+                    patch.object(ci.subprocess, "Popen") as spawn:
+                self.assertEqual(ci.prepare_x11_desktop(out, env, True), (None, None))
+            spawn.assert_not_called()
+            self.assertIn("No manager was installed", env["SOLDER_NATIVE_DESKTOP_UNAVAILABLE"])
+            report = suite.read_json(out / "x11-desktop.json")
+            self.assertIsNone(report["manager_window"])
+            self.assertIn("unavailable", report)
+            self.assertFalse((out / "report.json").exists())
+
+    def test_manager_is_never_started_on_an_existing_unmanaged_display(self):
+        with tempfile.TemporaryDirectory() as directory:
+            desktop = SimpleNamespace(window_manager=Mock(return_value=None), finish=Mock())
+            env = {"DISPLAY": ":17"}
+            with patch.object(ci.INPUT, "X11", return_value=desktop), \
+                    patch.object(ci.shutil, "which", return_value="/installed/openbox") as which, \
+                    patch.object(ci.subprocess, "Popen") as spawn:
+                self.assertEqual(ci.prepare_x11_desktop(Path(directory), env, False), (None, None))
+            which.assert_not_called()
+            spawn.assert_not_called()
+            self.assertIn("refusing to change", env["SOLDER_NATIVE_DESKTOP_UNAVAILABLE"])
+
+    def test_owned_xvfb_uses_only_an_existing_manager_and_waits_for_screen_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            desktop = SimpleNamespace(window_manager=Mock(side_effect=[None, None, 42]), finish=Mock())
+            manager = SimpleNamespace(poll=Mock(return_value=None))
+            env = {"DISPLAY": ":17"}
+            with patch.object(ci.INPUT, "X11", return_value=desktop), \
+                    patch.object(ci.shutil, "which", side_effect=lambda name: "/installed/openbox" if name == "openbox" else None), \
+                    patch.object(ci.subprocess, "Popen", return_value=manager) as spawn, \
+                    patch.object(ci.time, "sleep"):
+                process, log = ci.prepare_x11_desktop(out, env, True)
+            try:
+                self.assertIs(process, manager)
+                spawn.assert_called_once_with(["/installed/openbox", "--sm-disable"], env=env,
+                                              stdout=log, stderr=ci.subprocess.STDOUT)
+                self.assertEqual(desktop.window_manager.call_count, 3)
+                self.assertNotIn("SOLDER_NATIVE_DESKTOP_UNAVAILABLE", env)
+                report = suite.read_json(out / "x11-desktop.json")
+                self.assertEqual(report["manager_window"], 42)
+                self.assertFalse((out / "report.json").exists())
+            finally:
+                log.close()
+
+    def test_manager_startup_failure_keeps_unavailable_diagnostics(self):
+        for outcome in ("exited", "timeout", "missing-executable"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                out = Path(directory)
+                desktop = SimpleNamespace(window_manager=Mock(return_value=None), finish=Mock())
+                manager = SimpleNamespace(poll=Mock(return_value=1 if outcome == "exited" else None))
+                env = {"DISPLAY": ":17"}
+                with patch.object(ci.INPUT, "X11", return_value=desktop), \
+                        patch.object(ci.shutil, "which", side_effect=lambda name: "/installed/openbox" if name == "openbox" else None), \
+                        patch.object(ci.subprocess, "Popen", return_value=manager,
+                                     side_effect=FileNotFoundError("manager disappeared") if outcome == "missing-executable" else None), \
+                        patch.object(ci.time, "monotonic", side_effect=[0, 0, 11]), \
+                        patch.object(ci.time, "sleep"):
+                    process, log = ci.prepare_x11_desktop(out, env, True)
+                if log:
+                    log.close()
+                self.assertIn("SOLDER_NATIVE_DESKTOP_UNAVAILABLE", env)
+                self.assertIsNone(suite.read_json(out / "x11-desktop.json")["manager_window"])
+                desktop.finish.assert_called_once_with()
+
+    def test_ci_stops_only_its_manager_and_closes_its_log_after_a_native_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            manager = SimpleNamespace(poll=Mock(return_value=None), terminate=Mock(), wait=Mock())
+            manager_log = io.BytesIO()
+            env = {"DISPLAY": ":17", "DBUS_SESSION_BUS_ADDRESS": "existing"}
+            argv = ["verify-native-ci.py", "--out", str(out), "--binary", str(out / "solder")]
+            with patch.object(ci.sys, "platform", "linux"), patch.object(ci.sys, "argv", argv), \
+                    patch.dict(ci.os.environ, env, clear=True), \
+                    patch.object(ci, "gpu_diagnostics"), \
+                    patch.object(ci, "prepare_x11_desktop", return_value=(manager, manager_log)), \
+                    patch.object(ci.subprocess, "run", side_effect=[SimpleNamespace(returncode=0), SimpleNamespace(returncode=2)]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ci.main(), 2)
+            manager.terminate.assert_called_once_with()
+            manager.wait.assert_called_once_with(timeout=10)
+            self.assertTrue(manager_log.closed)
+
     def test_selected_driver_retains_default_and_selected_probe_results(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -184,21 +320,26 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(suite.read_json(root / "gpu-diagnostics.json")["probe_exit_code"], 0)
             self.assertFalse((root / "report.json").exists())
 
-    def test_missing_gpu_stops_before_build_and_blocks_all_native_checks(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
-            argv = ["verify-native-notebook.py", "--out", str(root), "--build"]
-            env = {"GITHUB_ACTIONS": "true", "RUNNER_TEMP": str(root),
-                   "SOLDER_NATIVE_GPU_UNAVAILABLE": "No preinstalled software driver"}
-            with patch.object(suite.sys, "platform", "linux"), patch.object(suite.sys, "argv", argv), \
-                    patch.dict(suite.os.environ, env), patch.object(suite, "inventory"), \
-                    patch.object(suite, "build") as build, patch.object(suite.INPUT, "X11") as desktop, \
-                    contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(suite.main(), 2)
-            build.assert_not_called()
-            desktop.assert_not_called()
-            report = suite.read_json(root / "report.json")
-            self.assertTrue(all(check["status"] == "blocked" for check in report["checks"].values()))
+    def test_missing_native_prerequisite_stops_before_build_and_blocks_all_native_checks(self):
+        for unavailable in ("SOLDER_NATIVE_GPU_UNAVAILABLE", "SOLDER_NATIVE_DESKTOP_UNAVAILABLE"):
+            with self.subTest(unavailable=unavailable), tempfile.TemporaryDirectory() as directory:
+                self.assert_missing_native_prerequisite(Path(directory), unavailable)
+
+    def assert_missing_native_prerequisite(self, root, unavailable):
+        root = root.resolve()
+        argv = ["verify-native-notebook.py", "--out", str(root), "--build"]
+        env = {"GITHUB_ACTIONS": "true", "RUNNER_TEMP": str(root),
+               unavailable: "Missing runner prerequisite"}
+        with patch.object(suite.sys, "platform", "linux"), patch.object(suite.sys, "argv", argv), \
+                patch.dict(suite.os.environ, env, clear=True), patch.object(suite, "inventory"), \
+                patch.object(suite, "build") as build, patch.object(suite.INPUT, "X11") as desktop, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(suite.main(), 2)
+        build.assert_not_called()
+        desktop.assert_not_called()
+        report = suite.read_json(root / "report.json")
+        self.assertEqual(len(report["checks"]), 6)
+        self.assertTrue(all(check["status"] == "blocked" for check in report["checks"].values()))
 
     def test_failed_diagnostics_preserve_logs_without_claiming_ui_success(self):
         with tempfile.TemporaryDirectory() as directory:

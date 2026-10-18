@@ -56,7 +56,9 @@ implementation; its native-window checks and the recovery manager are below.
       edits, execution outputs, metadata, native/extension restoration, external
       changes, source aliases, pending saves, closed views and recovery cleanup.
       Windows native built-in-reader checks passed. The first Linux run built
-      successfully but could not initialize a GPU device under Xvfb. Native Linux
+      successfully but could not initialize a GPU device under Xvfb. The retry
+      found an OS window with preinstalled SwiftShader but failed foreground
+      ownership on bare Xvfb; notebook stages stayed blocked. Native Linux
       results remain open: `verification/native-ci.md`.
       Missing or declined extension readers retain their copies. Original local
       text revisions and weak legacy stamps are checked separately. Performance

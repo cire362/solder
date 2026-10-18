@@ -1,0 +1,23 @@
+{
+  "reviewed": "2026-10-18",
+  "source": "eee352f",
+  "run": "https://github.com/cire362/solder/actions/runs/39112604725",
+  "job": 117631717926,
+  "result": "failed",
+  "driver": "/opt/google/chrome/vk_swiftshader_icd.json",
+  "os_window_discovered": true,
+  "native_stages_passed": 0,
+  "failed_stage": "cli-empty-session-foreground",
+  "reason": "Timed out waiting for Solder to select the foreground",
+  "blocked_stages": [
+    "notebook-edit-save",
+    "notebook-recovery-written",
+    "notebook-recovery-restored",
+    "notebook-export-copy",
+    "notebook-recovery-save"
+  ],
+  "diagnosis": "Harness started bare Xvfb without a window manager; GPUI X11 activation expects a manager",
+  "reviewed_job_log_sha256": "9bc11916341d5b5d625bc66704796334f9c1cd782198c92540386acb16e97faf",
+  "new_dependencies_installed": false,
+  "native_linux_notebook_verified": false
+}

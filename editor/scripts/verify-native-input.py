@@ -56,23 +56,27 @@ def canonical_path(path):
 class X11:
     backend = "native-x11"
 
-    def __init__(self):
-        if os.environ.get("ZED_HEADLESS") is not None:
+    def __init__(self, env=None):
+        env = os.environ if env is None else env
+        if env.get("ZED_HEADLESS") is not None:
             raise Unavailable("ZED_HEADLESS selects GPUI's headless backend")
-        if os.environ.get("WAYLAND_DISPLAY"):
+        if env.get("WAYLAND_DISPLAY"):
             raise Unavailable("This harness exercises X11, not Wayland")
         x11 = ctypes.util.find_library("X11")
         xtst = ctypes.util.find_library("Xtst")
-        if not x11 or not xtst or not os.environ.get("DISPLAY"):
+        if not x11 or not xtst or not env.get("DISPLAY"):
             raise Unavailable("DISPLAY, libX11 and libXtst are required")
         self.x = c.CDLL(x11)
         self.t = c.CDLL(xtst)
         self.open = bind(self.x, "XOpenDisplay", c.c_void_p, c.c_char_p)
         self.close = bind(self.x, "XCloseDisplay", c.c_int, c.c_void_p)
-        self.d = self.open(None)
+        self.d = self.open(env["DISPLAY"].encode())
         if not self.d:
             raise Unavailable("XOpenDisplay could not connect to DISPLAY")
         self.root = bind(self.x, "XDefaultRootWindow", c.c_ulong, c.c_void_p)(self.d)
+        self.screen = bind(self.x, "XDefaultScreen", c.c_int, c.c_void_p)(self.d)
+        self.selection_owner = bind(self.x, "XGetSelectionOwner", c.c_ulong,
+                                    c.c_void_p, c.c_ulong)
         self.query = bind(self.x, "XQueryTree", c.c_int, c.c_void_p, c.c_ulong,
                           c.POINTER(c.c_ulong), c.POINTER(c.c_ulong),
                           c.POINTER(c.POINTER(c.c_ulong)), c.POINTER(c.c_uint))
@@ -141,6 +145,11 @@ class X11:
         window, revert = c.c_ulong(), c.c_int()
         self.focus(self.d, c.byref(window), c.byref(revert))
         return window.value
+
+    def window_manager(self):
+        # ICCCM managers own WM_Sn for their screen. Observing it never changes focus.
+        atom = self.atom(self.d, f"WM_S{self.screen}".encode("ascii"), 1)
+        return (self.selection_owner(self.d, atom) or None) if atom else None
 
     def owns_focus(self, window, pid):
         focused = self.foreground()

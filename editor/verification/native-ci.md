@@ -36,9 +36,9 @@ source ref selection is available through `verification_ref`.
 - Successful recovered save and recovery cleanup.
 
 The workflow retains report.json, a job summary, OS screenshots, file bytes,
-process logs, source/binary hashes and session/recovery snapshots. Seven local
-contract tests validate its preservation oracle, schema, race waits and partial
-results. Exit 0 means all native stages passed; 1 means failure; 2 means a native
+process logs, source/binary hashes and session/recovery snapshots. Twenty-two local
+contract tests validate preservation, schema, race waits, partial results and
+desktop/driver prerequisite handling. Exit 0 means all native stages passed; 1 means failure; 2 means a native
 prerequisite or stage was unavailable. A partial run must keep the corresponding
 roadmap entries open.
 
@@ -60,5 +60,21 @@ unsupported devices stay blocked, and unrelated crashes fail. Diagnostic logs
 are also printed on a failed run. The platform selector defaults to both;
 `linux-only` avoids repeating the successful Windows build.
 
-This preparation is not proof that Linux can render; the retry must pass and
-produce native evidence before its roadmap box can be checked.
+The retry at `eee352f`, [run 39112604725](https://github.com/cire362/solder/actions/runs/39112604725),
+created an OS window with the runner's existing Chrome SwiftShader driver
+(`/opt/google/chrome/vk_swiftshader_icd.json`). It failed the first stage with
+`Timed out waiting for Solder to select the foreground`; the remaining five
+stages were blocked. No notebook input, recovery or export passed on Linux.
+`linux-native-attempt.json` retains that result and the reviewed job-log hash.
+
+The harness had started bare Xvfb without a window manager. GPUI's X11 window
+activation sends `_NET_ACTIVE_WINDOW` to a manager; its application activation
+is a no-op. The next preparation observes an existing manager, or starts only a
+preinstalled Openbox, Xfwm4 or Metacity on its own Xvfb. It never sets Solder's
+focus itself or alters an existing unmanaged display. Missing managers remain
+blocked before the build. The manager, log and display have owned cleanup.
+No manager or other dependency was installed.
+
+Window discovery and Vulkan diagnostics are not the six native stages. The
+managed-desktop retry must still pass and produce native evidence before its
+roadmap box can be checked. A file chooser portal remains a separate prerequisite.

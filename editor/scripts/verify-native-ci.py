@@ -9,6 +9,7 @@ workflow may instead supply --binary after its separately approved build.
 """
 
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,57 @@ import shutil
 import subprocess
 import sys
 import time
+
+
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("native_input", Path(__file__).with_name("verify-native-input.py"))
+INPUT = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(INPUT)
+
+
+def prepare_x11_desktop(out, env, owned_display):
+    report = {"display": env.get("DISPLAY"), "owned_display": owned_display,
+              "manager_window": None, "command": None}
+    desktop, manager, log = None, None, None
+    try:
+        desktop = INPUT.X11(env)
+        report["manager_window"] = desktop.window_manager()
+        if not report["manager_window"]:
+            # GPUI maps new windows but Linux app activation is a no-op. A bare
+            # Xvfb cannot supply normal desktop focus policy. Never focus Solder
+            # ourselves, since that would bypass the CLI foreground assertion.
+            if not owned_display:
+                raise INPUT.Unavailable("The existing X11 display has no window manager; "
+                                        "refusing to change an existing desktop")
+            commands = (("openbox", "--sm-disable"), ("xfwm4", "--sm-client-disable"),
+                        ("metacity", "--sm-disable"))
+            report["available_managers"] = {name: shutil.which(name) for name, *_ in commands}
+            command = next(([report["available_managers"][name], *args]
+                            for name, *args in commands if report["available_managers"][name]), None)
+            if command is None:
+                raise INPUT.Unavailable("Xvfb has no window manager and no preinstalled Openbox, "
+                                        "Xfwm4 or Metacity was found. No manager was installed; "
+                                        "native foreground verification needs a managed X11 desktop")
+            report["command"] = command
+            log = (out / "window-manager.log").open("wb")
+            manager = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and manager.poll() is None:
+                report["manager_window"] = desktop.window_manager()
+                if report["manager_window"]:
+                    break
+                time.sleep(0.1)
+            if not report["manager_window"]:
+                raise INPUT.Unavailable("The preinstalled window manager did not claim the X11 screen; "
+                                        "inspect window-manager.log")
+        env.pop("SOLDER_NATIVE_DESKTOP_UNAVAILABLE", None)
+    except (INPUT.Unavailable, OSError) as error:
+        report["unavailable"] = env["SOLDER_NATIVE_DESKTOP_UNAVAILABLE"] = str(error)
+    finally:
+        if desktop:
+            desktop.finish()
+        (out / "x11-desktop.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    return manager, log
 
 
 # GPUI 0.2.2's BladeContext uses blade-graphics 0.7.1 with presentation=true.
@@ -215,6 +267,7 @@ def main():
     env = os.environ.copy()
     env["SOLDER_NATIVE_HARNESS_TEST_EXIT_CODE"] = str(tests.returncode)
     server, server_log, display_file = None, None, None
+    manager, manager_log = None, None
     try:
         if sys.platform.startswith("linux"):
             # Explicitly choose this harness's X11 path. Never invoke HeadlessClient.
@@ -239,21 +292,26 @@ def main():
             if not env.get("DBUS_SESSION_BUS_ADDRESS") and shutil.which("dbus-run-session"):
                 command = ["dbus-run-session", "--", *command]
             gpu_diagnostics(out, env, args.software_vulkan)
+            manager, manager_log = prepare_x11_desktop(out, env, owned_display=server is not None)
         result = subprocess.run(command, env=env, timeout=4500)
         if result.returncode:
             # Failed-run diagnostics must be readable without fetching an archive.
-            # These files contain only the first-party fixture and GPU inventory.
-            for name in ("gpu-diagnostics.json", "vulkan-probe-default.log", "vulkan-probe.log",
+            # These files contain the first-party fixture and desktop/GPU diagnostics.
+            for name in ("x11-desktop.json", "window-manager.log", "gpu-diagnostics.json",
+                         "vulkan-probe-default.log", "vulkan-probe.log",
                          "process-1.log", "harness-error.log"):
                 path = out / name
                 if path.is_file():
                     print(f"\n{name}:\n{path.read_text(encoding='utf-8', errors='replace')[-49152:]}", flush=True)
         return result.returncode if tests.returncode == 0 else 1
     finally:
+        if manager and manager.poll() is None:
+            manager.terminate()
+            manager.wait(timeout=10)
         if server and server.poll() is None:
             server.terminate()
             server.wait(timeout=10)
-        for stream in (server_log, display_file):
+        for stream in (manager_log, server_log, display_file):
             if stream:
                 stream.close()
 
