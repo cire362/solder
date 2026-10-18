@@ -1,0 +1,59 @@
+{
+  "reviewed_on": "2026-10-18",
+  "run_url": "https://github.com/cire362/solder/actions/runs/38633325807",
+  "job_url": "https://github.com/cire362/solder/actions/runs/38633325807/job/116090165157",
+  "source_commit": "9b96b015a4c18b36afc8747136f7caa22639871f",
+  "platform": "Windows-2022Server-10.0.20348-SP0",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "binary_sha256": "1a2337cd62048f5b649a029a15120018a13e8c7c125bd511d664d09e799844a5",
+  "artifact_zip_sha256": "ae8d1784bf93b34a1261544a857f92529205a61d0c6d5e521c5f99946371af2f",
+  "checks": {
+    "cli-empty-session-foreground": {
+      "status": "passed",
+      "kind": "native-window",
+      "detail": "OS foreground and real input selected the CLI file from an empty session; saved bytes match"
+    },
+    "notebook-edit-save": {
+      "status": "passed",
+      "kind": "native-window",
+      "detail": "OS input edited the first cell; native save retained outputs, attachments, metadata and unknown fields"
+    },
+    "notebook-recovery-written": {
+      "status": "passed",
+      "kind": "native-window",
+      "detail": "Unsaved native edits and full outputs reached recovery storage while source stayed saved"
+    },
+    "notebook-recovery-restored": {
+      "status": "passed",
+      "kind": "native-window",
+      "detail": "Restart with no CLI argument restored the unsaved cell; real OS input appended to it and full recovery snapshot matches"
+    },
+    "notebook-export-copy": {
+      "status": "passed",
+      "kind": "native-window",
+      "detail": "Platform Save File dialog produced the recovered copy; all fields preserved, source bytes unchanged and recovery retained"
+    },
+    "notebook-recovery-save": {
+      "status": "passed",
+      "kind": "native-window",
+      "detail": "Native save wrote the restored cell and preserved every fixture field; matching recovery copies were removed"
+    }
+  },
+  "saved_file_hashes": {
+    "notebook-saved.ipynb": "815914c510bbdece4d966f8c3f66e19facd1e56db7607aa5469648bc252470b2",
+    "notebook-recovered-saved.ipynb": "74ebaf46e83559d1f86d18e5343c701dc72d5d03a0ff9b85707a1c87f9d1c4dd",
+    "notebook-project/book.copy.ipynb": "74ebaf46e83559d1f86d18e5343c701dc72d5d03a0ff9b85707a1c87f9d1c4dd"
+  },
+  "snapshot_models_independently_rechecked": true,
+  "final_recovery_empty": true,
+  "screenshots_reviewed": [
+    "notebook-restored.png",
+    "platform-save-dialog.png",
+    "notebook-recovered-saved.png"
+  ],
+  "limitations": [
+    "Windows Server 2022 disposable CI desktop, not physical hardware",
+    "Built-in Jupyter reader and 256 KiB output fixture only",
+    "No published extension, kernel, independent views, ACL/hard-link validation or power loss"
+  ]
+}

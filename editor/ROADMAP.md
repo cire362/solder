@@ -46,13 +46,18 @@ implementation; its native-window checks and the recovery manager are below.
       2 MB attachment): force-exit recovery, complete save and cleanup, plus two
       independent native processes with stale-save refusal and separate rescue
       export. Full models and hashes: `verification/large-notebook-recovery.md`
-- [ ] Notebook recovery/export on Linux/Windows, with snapshots beyond the
-      16 MB retention limit, abrupt power loss, independent extension views or
-      a published extension. Headless and first-party process checks cover cell
+- [x] Built-in Jupyter in a native Windows Server 2022 CI window: CLI
+      foreground, OS keyboard input, complete save, force-exit recovery, further
+      input after restart, system-dialog export and cleanup. Six stages passed;
+      snapshots and screenshots reviewed: `verification/windows-native-notebook.md`
+- [ ] Notebook recovery/export on Linux, with snapshots beyond the 16 MB
+      retention limit, abrupt power loss, independent extension views or a
+      published extension; native extension readers on Windows. Headless and first-party process checks cover cell
       edits, execution outputs, metadata, native/extension restoration, external
       changes, source aliases, pending saves, closed views and recovery cleanup.
-      Native Linux/Windows workflow and evidence collection are prepared in
-      `verification/native-ci.md`; runner results remain open.
+      Windows native built-in-reader checks passed. The first Linux run built
+      successfully but could not initialize a GPU device under Xvfb. Native Linux
+      results remain open: `verification/native-ci.md`.
       Missing or declined extension readers retain their copies. Original local
       text revisions and weak legacy stamps are checked separately. Performance
       with recovery files present is not measured. Verification and plain-file
@@ -161,10 +166,11 @@ implementation; its native-window checks and the recovery manager are below.
       the most installed extensions of Open VSX has not produced its list,
       so which extensions work is not known. Everything else of phase 8 is
       tested with extensions written for the tests
-- [ ] Linux and Windows. CI builds and runs the tests on Linux; nothing
-      was looked at in a window there or on Windows. Pages of extensions
-      (the system's browser), notebooks and everything of phase 10 were
-      seen on macOS only
+- [ ] Linux and Windows beyond the native built-in Jupyter/CLI checks passed
+      on a Windows Server 2022 CI desktop. Linux CI builds and runs headless
+      tests; its native run is blocked by GPU initialization. Extension pages,
+      extension notebook readers and the rest of phase 10 still need native
+      checks on both platforms
 - [ ] On screen: folding, selection by column, the pin of a tab and the
       line above a file that is only read. They are tested in a headless
       window, with clicks and keys at the places they are drawn; no keys

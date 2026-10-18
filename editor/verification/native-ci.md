@@ -1,8 +1,12 @@
 # Native Linux and Windows verification
 
-Prepared on the global completion branch. Native runner results remain open
-until a dispatched run produces evidence; local harness contract tests do not
-verify either platform's editor window.
+Dispatched from `9b96b01` on the global completion branch:
+[run 38633325807](https://github.com/cire362/solder/actions/runs/38633325807).
+Windows passed all six native stages; its downloaded models and screenshots
+were independently reviewed (`windows-native-notebook.md`). Linux built but
+exited before creating an OS window: GPU initialization returned
+`NoSupportedDeviceFound`. Native Linux verification remains open. Local harness
+contract tests do not verify either platform's editor window.
 
 The existing `extensions.yml` workflow has an explicit `native-verification`
 mode on disposable Ubuntu 24.04 and Windows 2022 runners. This mode cannot
