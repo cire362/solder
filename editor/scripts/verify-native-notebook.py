@@ -142,6 +142,9 @@ def inventory(evidence):
             result = subprocess.run([tool, "--version"], capture_output=True, text=True, timeout=20)
             evidence.report[tool] = result.stdout.strip() or result.stderr.strip()
     if sys.platform.startswith("linux"):
+        gpu = evidence.out / "gpu-diagnostics.json"
+        if gpu.is_file():
+            evidence.report["linux_gpu"] = read_json(gpu)
         modules = ("xkbcommon", "xkbcommon-x11", "wayland-client", "vulkan", "fontconfig",
                    "freetype2", "alsa", "libzstd", "webkit2gtk-4.1")
         evidence.report["linux_system_libraries"] = {}
@@ -198,8 +201,16 @@ class Suite:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             if self.process is not None and self.process.poll() is not None:
-                raise INPUT.Unavailable(f"Solder exited with {self.process.returncode} while waiting for {what}; "
-                                        "inspect process logs and retained Solder journal")
+                detail = (f"Solder exited with {self.process.returncode} while waiting for {what}; "
+                          "inspect process logs and retained Solder journal")
+                if sys.platform.startswith("linux") and self.launch_number == 1 and self.window is None:
+                    log = self.evidence.out / "process-1.log"
+                    output = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
+                    if all(message in output for message in (
+                            "Failed to initialize X11 client.", "Unable to init GPU context", "NoSupportedDeviceFound")):
+                        raise INPUT.Unavailable(detail + "; no supported Vulkan device at startup; "
+                                                "inspect gpu-diagnostics.json and vulkan-probe.log")
+                raise AssertionError(detail)
             try:
                 result = predicate()
             except FileNotFoundError:
@@ -404,6 +415,8 @@ def main():
             raise INPUT.Unavailable("Native execution requires a disposable GitHub Actions runner")
         if not out.is_relative_to(Path(os.environ["RUNNER_TEMP"]).resolve()):
             raise INPUT.Unavailable("Evidence/build output must be inside RUNNER_TEMP")
+        if sys.platform.startswith("linux") and os.environ.get("SOLDER_NATIVE_GPU_UNAVAILABLE"):
+            raise INPUT.Unavailable(os.environ["SOLDER_NATIVE_GPU_UNAVAILABLE"])
         binary = build(evidence) if args.build else args.binary.resolve()
         if not binary.is_file():
             raise INPUT.Unavailable(f"No platform binary at {binary}")

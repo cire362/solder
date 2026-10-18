@@ -19,6 +19,11 @@ on:
         description: Native verification source ref (empty uses the dispatched ref)
         type: string
         default: ""
+      native_platform:
+        description: Platforms for native verification (ignored by census)
+        type: choice
+        options: [both, linux-only, windows-only]
+        default: both
       count:
         description: How many of the most installed to try
         default: "50"
@@ -76,7 +81,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022]
+        os: ${{ fromJSON(inputs.native_platform == 'linux-only' && '["ubuntu-24.04"]' || inputs.native_platform == 'windows-only' && '["windows-2022"]' || '["ubuntu-24.04","windows-2022"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     defaults:
@@ -112,7 +117,12 @@ jobs:
       - name: First-party native windows and OS input
         env:
           NATIVE_EVIDENCE: ${{ runner.temp }}/solder-native-evidence
-        run: python scripts/verify-native-ci.py --out "$NATIVE_EVIDENCE"
+        run: |
+          args=()
+          # Xvfb supplies X11, not a Vulkan device. Use a driver already on the
+          # image, including browser-bundled SwiftShader outside the loader path.
+          if [ "$RUNNER_OS" = Linux ]; then args+=(--software-vulkan); fi
+          python scripts/verify-native-ci.py --out "$NATIVE_EVIDENCE" "${args[@]}"
       - name: Native evidence summary
         if: always()
         env:

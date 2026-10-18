@@ -16,7 +16,7 @@ locked Cargo dependencies are the same as the existing editor build; the
 harness itself uses only Python's standard library and OS window/input APIs.
 
 ```sh
-gh workflow run extensions.yml --ref feat/roadmap-completion -f mode=native-verification
+gh workflow run extensions.yml --ref feat/roadmap-completion -f mode=native-verification -f native_platform=linux-only
 ```
 
 The scripts require GitHub Actions and output under RUNNER_TEMP. They refuse
@@ -48,3 +48,17 @@ rendering device and Windows interactive desktop remain runner prerequisites;
 missing ones are reported rather than silently installed. X11, not Wayland,
 is exercised. No physical display/GPU, power loss, published extension, kernel
 execution, remote project or independent notebook view is claimed by this suite.
+
+## Linux retry preparation
+
+The first runner built Solder but GPUI could not initialize a Vulkan device.
+The retry selects a preinstalled Lavapipe or browser-bundled SwiftShader driver
+through the Vulkan loader's driver manifest setting. It installs no driver and
+keeps X11/real OS input. A small first-party C probe records default and selected
+driver capabilities; that inventory cannot pass a native UI stage. Missing or
+unsupported devices stay blocked, and unrelated crashes fail. Diagnostic logs
+are also printed on a failed run. The platform selector defaults to both;
+`linux-only` avoids repeating the successful Windows build.
+
+This preparation is not proof that Linux can render; the retry must pass and
+produce native evidence before its roadmap box can be checked.
