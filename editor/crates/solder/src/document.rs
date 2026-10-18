@@ -95,6 +95,9 @@ pub enum DocumentEvent {
     HintsChanged,
     /// Git hunks or conflict regions were recomputed.
     GitChanged,
+    /// A tree is in step with the text again, made after a key was
+    /// answered without one.
+    SyntaxChanged,
 }
 
 /// A merge conflict in the text, by row: `<<<<<<<`, the optional `|||||||`
@@ -281,6 +284,9 @@ pub struct Document {
     indent_unit: &'static str,
     was_dirty: bool,
     pending_saves: usize,
+    /// How long a key waits for the tree: `REPARSE_BUDGET`, or none at all
+    /// in a test of what happens when the tree comes later.
+    reparse_budget: Duration,
     /// Foreground completion, including the revision and dirty-state update.
     save_tail: Option<Shared<Task<bool>>>,
     /// Sorted by start.
@@ -346,6 +352,7 @@ impl Document {
             indent_unit,
             was_dirty: false,
             pending_saves: 0,
+            reparse_budget: REPARSE_BUDGET,
             save_tail: None,
             diagnostics: Arc::default(),
             server_inlays: Arc::default(),
@@ -1423,9 +1430,16 @@ impl Document {
         }));
     }
 
+    /// Whether a key waits for the tree. Without, it is always made later.
+    #[cfg(test)]
+    pub fn wait_for_the_tree(&mut self, wait: bool) {
+        self.reparse_budget = if wait { REPARSE_BUDGET } else { Duration::ZERO };
+    }
+
     fn set_syntax(&mut self, tree: Option<SyntaxTree>, cx: &mut Context<Self>) {
         self.syntax = tree;
         self.syntax_generation += 1;
+        cx.emit(DocumentEvent::SyntaxChanged);
         cx.notify();
     }
 
@@ -1434,7 +1448,7 @@ impl Document {
             return;
         };
         self.syntax_generation += 1;
-        if tree.reparse_within(self.text.rope(), REPARSE_BUDGET) {
+        if tree.reparse_within(self.text.rope(), self.reparse_budget) {
             self.parse_task = None;
             return;
         }

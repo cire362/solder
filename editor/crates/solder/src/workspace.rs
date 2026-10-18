@@ -15214,6 +15214,28 @@ brackets = [
             seen(cx),
             "<template>\n  <div>\n    <p>a</p>\n  </div>|\n</template>\n"
         );
+        // The same with a tree that comes only after each key, as it does
+        // on a busy machine: the line goes back when the tree says so.
+        put(
+            cx,
+            "<template>\n  <div>\n    <p>a</p>\n    |\n</template>\n",
+        );
+        editor.update(cx, |e, cx| {
+            e.document()
+                .update(cx, |doc, _| doc.wait_for_the_tree(false))
+        });
+        cx.simulate_input("</div>");
+        wait_for(cx, "the line to go back with the late tree", &|cx| {
+            let editor = editor.read(cx);
+            let mut text = editor.text(cx);
+            text.insert(editor.newest_range().end, '|');
+            text == "<template>\n  <div>\n    <p>a</p>\n  </div>|\n</template>\n"
+        });
+        // Back to waiting, for what the test goes on to.
+        editor.update(cx, |e, cx| {
+            e.document()
+                .update(cx, |doc, _| doc.wait_for_the_tree(true))
+        });
 
         // The two patterns of `config.toml`: the line after one that ends
         // in a colon is deeper, and `end` goes back as it is typed. When

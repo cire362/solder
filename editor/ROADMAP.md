@@ -207,11 +207,6 @@ something of its own unchecked or unmade adds it here.
       revision and atomically replace the target file, but do not lock other
       writers across the final check and rename. Recovery now retains the
       original remote revision; legacy copies without it require Save As
-- [ ] A line is moved to where its language wants it only if the tree is
-      in step within a millisecond of the key. On a busy machine a closing
-      tag typed in a language of an extension can stay where it was typed,
-      and is not moved when the tree comes later. Tests wait for the tree,
-      so they check what the language says and not this
 - [ ] On Linux, what a program prints just before it ends can be missing
       from its terminal: an error and an exit at once, which is what a
       failed command is. `alacritty_terminal` 0.26 reads the bytes, finds
