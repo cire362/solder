@@ -83,15 +83,18 @@ implementation; its native-window checks and the recovery manager are below.
       character-by-character bulk injection was unreliable. Independent
       file/notebook copies, edits during decisions and save ordering are checked
       headlessly. Original remote recovery revisions use the real local helper
-      process; a live SSH restart remains unverified. Evidence is in
-      `benchmarks/file-state-and-exit.md`
-- [ ] Typing and saving in a native remote-project window, an external SSH
-      server and Linux/Windows clients. On macOS loopback, a release Solder
-      window read fresh server bytes instead of stale cache and followed an
-      external edit through project polling. Seven helper checks also passed;
-      Rust file revisions and LSP mapping are checked separately with processes.
-      SSH PTYs, reconnect and connection loss are not checked against a server.
-      Evidence is in `benchmarks/remote-projects.md`
+      process; native macOS SSH restart is checked separately below. Evidence
+      for the remaining exit cases is in `benchmarks/file-state-and-exit.md`
+- [x] Native macOS loopback SSH: fresh server bytes instead of stale cache,
+      pasted input and save, external-change refusal, force-exit recovery after
+      reconnect, retained source revision, native Save As to another server file
+      and recovery cleanup. Fixed a system-dialog cache alias that had saved
+      locally instead of on the target. Evidence: `verification/native-ssh-save.md`
+- [ ] An external SSH server and Linux/Windows clients, SSH PTYs, reconnect
+      during an active session and connection loss. Seven loopback helper checks
+      passed; Rust file revisions and LSP mapping are checked with processes.
+      Earlier polling checks are in `benchmarks/remote-projects.md`; native
+      macOS input/save/restart checks are in `verification/native-ssh-save.md`
 - [ ] Performance with active SSH connections or containers and large remote
       inventories. `benchmarks/remote-projects.md` compares startup and typing
       with these features inactive

@@ -498,6 +498,35 @@ fn lookup_under(settings: &Path, path: &Path) -> Option<io::Result<Arc<Mount>>> 
 pub fn is_remote(path: &Path) -> bool {
     lookup(path).is_some()
 }
+
+/// Blocking: a native file dialog can return another spelling of the cache
+/// (on macOS, /tmp instead of /private/tmp). Stop resolving at the remote
+/// boundary so links inside a project still pass through its confinement.
+pub fn save_path(path: &Path) -> io::Result<PathBuf> {
+    save_path_under(&crate::settings::config_dir(), path)
+}
+
+fn save_path_under(settings: &Path, path: &Path) -> io::Result<PathBuf> {
+    if lookup_under(settings, path).is_some() {
+        return Ok(path.to_path_buf());
+    }
+    let mut prefix = PathBuf::new();
+    let mut parts = path.components();
+    while let Some(part) = parts.next() {
+        prefix.push(part);
+        prefix = match prefix.canonicalize() {
+            Ok(physical) => physical,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        };
+        if lookup_under(settings, &prefix).is_some() {
+            prefix.extend(parts);
+            return Ok(prefix);
+        }
+    }
+    // Local Save As keeps its symlink identity and metadata rules.
+    Ok(path.to_path_buf())
+}
 /// A mapped URI must still be checked before an editor follows it.
 pub fn contains(root: &Path, path: &Path) -> bool {
     path.starts_with(root)
@@ -875,6 +904,7 @@ pub fn read_versioned(path: &Path) -> io::Result<(Vec<u8>, Option<Stamp>)> {
             Ok((bytes, Some(stamp)))
         }
         Some(mount) => {
+            mount.shared_path(path)?;
             let reply = mount.call("read", json!({"path": mount.relative(path)?}), &[])?;
             let stamp: Stamp = serde_json::from_value(reply.result).map_err(io::Error::other)?;
             mount.cache(path, &reply.bytes)?;
@@ -897,12 +927,16 @@ pub fn write_versioned(
     bytes: &[u8],
     expected: Option<&Stamp>,
 ) -> io::Result<Option<Stamp>> {
+    let resolved = save_path(path)?;
+    let path = resolved.as_path();
     match mount(path)? {
         None => crate::file_save::write(path, bytes, expected).map(Some),
         Some(mount) if !mount.mirror => {
             crate::file_save::write(&mount.shared_path(path)?, bytes, expected).map(Some)
         }
         Some(mount) => {
+            // Refuse a linked cache destination before changing the target.
+            mount.shared_path(path)?;
             let expected = expected
                 .map(|s| json!(s))
                 .unwrap_or_else(|| json!({"missing":true}));
@@ -919,6 +953,8 @@ pub fn write_versioned(
     }
 }
 pub fn write(path: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> {
+    let resolved = save_path(path)?;
+    let path = resolved.as_path();
     match mount(path)? {
         None => return crate::file_save::replace(path, bytes.as_ref()).map(|_| ()),
         Some(mount) if !mount.mirror => {
@@ -945,6 +981,8 @@ pub fn write(path: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> {
 }
 /// Captures an explicitly chosen Save As destination off the UI thread.
 pub fn revision(path: &Path) -> io::Result<Option<Stamp>> {
+    let resolved = save_path(path)?;
+    let path = resolved.as_path();
     match mount(path)? {
         None => crate::file_save::revision(path),
         Some(mount) if !mount.mirror => crate::file_save::revision(&mount.shared_path(path)?),
@@ -957,6 +995,8 @@ pub fn revision(path: &Path) -> io::Result<Option<Stamp>> {
 }
 
 pub fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
+    let (resolved_a, resolved_b) = (save_path(a)?, save_path(b)?);
+    let (a, b) = (resolved_a.as_path(), resolved_b.as_path());
     if a == b {
         return Ok(true);
     }
@@ -1276,6 +1316,84 @@ mod tests {
         assert!(is_remote(&path));
         assert_eq!(read(&path).unwrap_err().kind(), io::ErrorKind::NotConnected);
         assert!(write(&path, b"local fallback").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_as_aliases_stay_remote_and_keep_conflicts_and_closed_channels() {
+        let folder = Folder::new();
+        let source = folder.0.join("server");
+        let cache = folder.0.join("cache");
+        let alias = folder.0.join("dialog-alias");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("file.txt"), "server").unwrap();
+        let mount = fixture(&source, &cache);
+        std::os::unix::fs::symlink(&cache, &alias).unwrap();
+        std::fs::write(cache.join("file.txt"), "stale cache").unwrap();
+        assert_eq!(
+            save_path(&alias.join("new.txt")).unwrap(),
+            cache.join("new.txt")
+        );
+        assert!(same_file(&cache.join("file.txt"), &alias.join("file.txt")).unwrap());
+        let original = revision(&alias.join("file.txt")).unwrap().unwrap();
+        assert_eq!(original.length, 6);
+        write_versioned(&alias.join("new.txt"), b"rescued", None).unwrap();
+        assert_eq!(std::fs::read(source.join("new.txt")).unwrap(), b"rescued");
+        std::fs::write(source.join("file.txt"), "external").unwrap();
+        assert!(write_versioned(&alias.join("file.txt"), b"stale", Some(&original)).is_err());
+        assert_eq!(std::fs::read(source.join("file.txt")).unwrap(), b"external");
+
+        // Resolve an outside alias only up to the project, never through an
+        // interior link that the remote file rules must refuse.
+        std::os::unix::fs::symlink(&source, cache.join("escape")).unwrap();
+        let escape = alias.join("escape/file.txt");
+        assert_eq!(save_path(&escape).unwrap(), cache.join("escape/file.txt"));
+        assert!(revision(&escape).is_err());
+        assert!(write_versioned(&escape, b"escape", None).is_err());
+        assert_eq!(std::fs::read(source.join("file.txt")).unwrap(), b"external");
+
+        drop(mount);
+        assert_eq!(
+            revision(&alias.join("new.txt")).unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
+        assert!(write_versioned(&alias.join("closed.txt"), b"local fallback", None).is_err());
+        assert!(write(&alias.join("new.txt"), b"local fallback").is_err());
+        assert_eq!(std::fs::read(cache.join("new.txt")).unwrap(), b"rescued");
+        assert!(!cache.join("closed.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dialog_aliases_of_unregistered_caches_are_recognized_and_local_links_are_kept() {
+        let folder = Folder::new();
+        let settings = folder.0.join("settings");
+        let root = settings
+            .join("remote/ssh")
+            .join("a".repeat(64))
+            .join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let alias = folder.0.join("settings-alias");
+        std::os::unix::fs::symlink(&settings, &alias).unwrap();
+        let path = alias
+            .join("remote/ssh")
+            .join("a".repeat(64))
+            .join("project/new.txt");
+        let resolved = save_path_under(&settings, &path).unwrap();
+        assert_eq!(resolved, root.join("new.txt"));
+        assert_eq!(
+            lookup_under(&settings, &resolved)
+                .unwrap()
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::NotConnected
+        );
+        let local = folder.0.join("local.txt");
+        std::fs::write(&local, "local").unwrap();
+        let linked = folder.0.join("local-link.txt");
+        std::os::unix::fs::symlink(&local, &linked).unwrap();
+        assert_eq!(save_path(&linked).unwrap(), linked);
     }
 
     #[cfg(unix)]

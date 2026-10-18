@@ -2022,6 +2022,9 @@ Server URI fields map to the local namespace; command arguments stay opaque,
 except schemas the editor itself interprets, such as rust-analyzer runnables.
 SSH projects reconnect before saved tabs are loaded. An unsuccessful reconnect
 keeps their session and unsaved recovery untouched.
+Save As resolves a system dialog's alternate spelling of the cache before
+choosing the destination. It writes to the target, including new files, and
+refuses a disconnected cache or a link inside it before changing remote bytes.
 
 `Container ui: Open dev container` reviews `.devcontainer/devcontainer.json`
 or `.devcontainer.json` before Docker runs. It supports an already cached image,

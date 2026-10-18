@@ -1,0 +1,60 @@
+{
+  "date": "2026-10-18",
+  "base": "eee352f",
+  "fix": "remote.rs + workspace.rs Save As aliases",
+  "binary_sha256": "090edd1d732b08d5548ac2298f78fc0f4bd0342526dbebdd7f2543a561a25c04",
+  "initial_server": "remote_original = 1\n",
+  "native_saved": "remote_native_saved = 2\n",
+  "passed": [
+    "fresh SSH read instead of stale cache",
+    "native OS paste and atomic remote save",
+    "unsaved recovery retained before external change",
+    "native save conflict refused",
+    "restart without arguments reconnected SSH",
+    "unsaved text recovered with original revision",
+    "post-restart external change protected",
+    "native Save As alias wrote separate file to server",
+    "saved tab retains canonical remote namespace",
+    "recovery cleanup after successful rescue"
+  ],
+  "files": {
+    "native.txt": {
+      "text": "remote_external_change = 4\n",
+      "sha256": "f9f3a233f5f4f498c87cdac5b735bbe43516eb1ef003f28dc11c74cb0b794515"
+    },
+    "rescue-fixed.txt": {
+      "text": "remote_unsaved_recovery = 3\n",
+      "sha256": "29772ca38d9f6544179ec2dcfe52fb40cf0e72d7c64a93276df74380e7a78c20"
+    }
+  },
+  "native_dialog_selected_prefix": "/tmp",
+  "saved_tab_prefix": "/private/tmp",
+  "source_files": {
+    "editor/crates/solder/src/remote.rs": "3be0073104efae2243692d6ff23b543d49fe8045dc2c420dc79068ff3beb11ec",
+    "editor/crates/solder/src/workspace.rs": "7042cdc20e37ba6450da5ebb557792e127067ce92e83697954fc1d1935a0cc65"
+  },
+  "scope": {
+    "client": "macOS 26.6.2, Apple M4, Rust 1.94 ci build",
+    "server": "own unprivileged system sshd on loopback, generated ephemeral keys, first-party Python worker",
+    "input": "desktop computer-use API, paste and shortcuts, native system Save As",
+    "limitations": [
+      "external SSH server",
+      "Linux and Windows SSH clients",
+      "SSH PTYs",
+      "connection loss and reconnect during an active session",
+      "multi-window Quit while disconnected",
+      "sudden power loss",
+      "remote notebook execution"
+    ]
+  },
+  "helper_checks": [
+    "handshake",
+    "binary read",
+    "atomic CAS replacement",
+    "same-stamp hash conflict",
+    "exclusive create CAS",
+    "path and symlink escape refusal",
+    "target command cwd, argv quoting and environment"
+  ],
+  "cleanup": "launched processes reaped; temporary directory removed"
+}

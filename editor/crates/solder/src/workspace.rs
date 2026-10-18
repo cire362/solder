@@ -4733,6 +4733,7 @@ impl Workspace {
             let destination = cx
                 .background_executor()
                 .spawn(async move {
+                    let target = crate::remote::save_path(&target)?;
                     let same_current = match current_source {
                         Some(source) => crate::remote::same_file(&source, &target)?,
                         None => false,
@@ -4746,10 +4747,10 @@ impl Workspace {
                     } else {
                         crate::remote::revision(&target)?
                     };
-                    Ok::<_, std::io::Error>((stamp, same_current, same_recovery))
+                    Ok::<_, std::io::Error>((target, stamp, same_current, same_recovery))
                 })
                 .await;
-            let (stamp, same_current, same_recovery) = match destination {
+            let (path, stamp, same_current, same_recovery) = match destination {
                 Ok(destination) => destination,
                 Err(error) => {
                     document.update(cx, |d, cx| d.save_failure(error, cx)).ok();
@@ -21705,6 +21706,74 @@ exports.activate = (context) => {
         );
         assert_eq!(cx.read(|cx| cx.windows().len()), 1);
         cx.update(crate::windows::stop);
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    fn save_as_from_a_native_path_alias_writes_the_remote_target(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let root = db::testing::dir("save-as-remote-alias")
+            .canonicalize()
+            .unwrap();
+        let source = root.join("server");
+        let cache = root.join("cache");
+        let alias = root.join("dialog-alias");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("file.txt"), "server\n").unwrap();
+        let _mount = crate::remote::fixture(&source, &cache);
+        std::os::unix::fs::symlink(&cache, &alias).unwrap();
+        let (workspace, cx) = setup(cx, cache.clone());
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(cache.join("file.txt"), None, window, cx)
+        });
+        wait_for(cx, "the remote document", &|cx| {
+            workspace.read(cx).active_editor().is_some()
+        });
+        cx.simulate_input("native ");
+        cx.dispatch_action(SaveAs);
+        cx.run_until_parked();
+        assert!(cx.did_prompt_for_new_path());
+        cx.simulate_new_path_selection(|_| Some(alias.join("new.txt")));
+        wait_for(cx, "the remote Save As", &|cx| {
+            workspace.read(cx).active_editor().is_some_and(|editor| {
+                editor.read(cx).path(cx) == Some(cache.join("new.txt").as_path())
+                    && !editor.read(cx).doc(cx).is_dirty()
+            })
+        });
+        assert_eq!(
+            std::fs::read(source.join("new.txt")).unwrap(),
+            b"native server\n"
+        );
+        assert_eq!(std::fs::read(source.join("file.txt")).unwrap(), b"server\n");
+
+        cx.simulate_input("unsaved ");
+        std::fs::write(source.join("new.txt"), "external\n").unwrap();
+        cx.dispatch_action(SaveAs);
+        cx.run_until_parked();
+        cx.simulate_new_path_selection(|_| Some(alias.join("new.txt")));
+        wait_for(cx, "the stale alias save refused", &|cx| {
+            workspace
+                .read(cx)
+                .active_editor()
+                .unwrap()
+                .read(cx)
+                .doc(cx)
+                .notice()
+                .is_some()
+        });
+        assert_eq!(
+            std::fs::read(source.join("new.txt")).unwrap(),
+            b"external\n"
+        );
+        assert!(cx.read(|cx| {
+            workspace
+                .read(cx)
+                .active_editor()
+                .unwrap()
+                .read(cx)
+                .doc(cx)
+                .is_dirty()
+        }));
     }
 
     #[gpui::test]
