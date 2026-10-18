@@ -588,6 +588,41 @@ pub fn clone_name(address: &str) -> Option<String> {
         .then(|| name.to_string())
 }
 
+/// Whether `into` is the repository that `address` names on this machine,
+/// or a folder inside it.
+fn into_itself(address: &str, into: &Path, cwd: &Path) -> bool {
+    let address = address.trim();
+    // `host:path` with no `/` before the colon is an SSH address.
+    let ssh = address
+        .split_once(':')
+        .is_some_and(|(host, _)| !host.is_empty() && !host.contains('/'));
+    let source = match address.strip_prefix("file://") {
+        Some(path) => PathBuf::from(path),
+        None if address.contains("://") || ssh => return false,
+        None => cwd.join(address),
+    };
+    resolved(into).starts_with(resolved(&source))
+}
+
+/// `path` with its links followed as far as it is there: the folder a
+/// clone is to make is not there yet, nor perhaps the ones above it.
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut there = path;
+    loop {
+        if let Ok(found) = there.canonicalize() {
+            return rest.iter().rev().fold(found, |path, name| path.join(name));
+        }
+        match (there.parent(), there.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                there = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 /// Clones `address` into `into`, saying what git says of how far it is.
 /// Stopped through `stop`, it ends git and leaves what git leaves.
 pub fn clone(
@@ -611,6 +646,13 @@ pub fn clone(
     if remote && !crate::remote::is_remote(&cwd) {
         return Err(GitError(
             crate::lang::t("Cannot map the remote repository path.").into(),
+        ));
+    }
+    // Git would make the folder first and then clone that empty folder,
+    // inside the repository it was asked for.
+    if !remote && into_itself(address, into, &cwd) {
+        return Err(GitError(
+            crate::lang::t("A repository cannot be cloned into itself").into(),
         ));
     }
     let mut args = vec![
@@ -848,6 +890,21 @@ mod tests {
         let none = clone(&missing, &home.join("other"), &stop, |_| {}).unwrap_err();
         assert!(none.0.contains("nothing"), "{}", none.0);
         assert!(!home.join("other").exists());
+        // Into itself, or into a folder of its own: refused before git
+        // makes a folder there.
+        for inside in [origin.workdir.clone(), origin.workdir.join("nested")] {
+            let error = clone(&address, &inside.join("copy"), &stop, |_| {}).unwrap_err();
+            assert_eq!(error.0, "A repository cannot be cloned into itself");
+            assert!(!inside.join("copy").exists());
+        }
+        let plain = origin.workdir.display().to_string();
+        assert!(clone(&plain, &origin.workdir.join("copy"), &stop, |_| {}).is_err());
+        assert!(!into_itself("git@example.com:a/b", &origin.workdir, &home));
+        assert!(!into_itself(
+            "https://example.com/a",
+            &origin.workdir,
+            &home
+        ));
         // Asked to stop before it began, it makes nothing.
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let stopped = clone(&address, &home.join("third"), &stop, |_| {}).unwrap_err();

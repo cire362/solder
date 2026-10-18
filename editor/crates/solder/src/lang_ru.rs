@@ -643,6 +643,10 @@ pub const WORDS: &[(&str, &str)] = &[
         "This address names no repository",
         "В адресе нет имени репозитория",
     ),
+    (
+        "A repository cannot be cloned into itself",
+        "Репозиторий нельзя клонировать в него самого",
+    ),
     ("{} is not there any more", "{}: папки больше нет"),
     ("No project of that name", "Нет проекта с таким именем"),
     ("open", "открыт"),

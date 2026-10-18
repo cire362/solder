@@ -234,9 +234,8 @@ something of its own unchecked or unmade adds it here.
       with no window, or a folder is dropped on it. There is no menu bar,
       so no Open Recent in one
 - [ ] A clone takes the default branch whole: no branch, depth or
-      submodules to choose, and a clone into a folder inside the
-      repository being cloned is not refused. A project leaves the list of
-      those opened before only when its folder is gone
+      submodules to choose. A project leaves the list of those opened
+      before only when its folder is gone
 - [ ] A crash that is no panic leaves no report: a signal, an abort in
       native code, memory that ran out. Only the editor's own errors reach
       `solder.log`: what the `syntax` and `extension` crates print, what
