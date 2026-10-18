@@ -228,8 +228,7 @@ something of its own unchecked or unmade adds it here.
       text. A picture that is not a file of this machine is named, not
       fetched: the editor asks the network for nothing by itself
 - [ ] A picture has no zoom and cannot be moved about; one larger than
-      64 MB is not shown; ICO, AVIF and HEIC open as text. The keys that go
-      to the next and the previous tab pass over pictures and previews
+      64 MB is not shown; ICO, AVIF and HEIC open as text
 - [ ] A second `solder` started while one runs is a second process, not a
       window of the first. Nothing is done when the Dock icon is clicked
       with no window, or a folder is dropped on it. There is no menu bar,
