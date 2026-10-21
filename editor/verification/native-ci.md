@@ -100,7 +100,7 @@ filename, official Ubuntu source URL, byte count and checksum to the job log
 and summary. It also verifies that no .deb appeared and the installed-package
 database did not change. URI-printing behavior is documented in the
 [APT manual](https://manpages.debian.org/bookworm/apt/apt-get.8.en.html#OPTIONS).
-Eleven offline planner contracts and the 22 native-harness contracts run in
+Fifteen offline planner contracts and the 22 native-harness contracts run in
 `scripts/check.sh` and editor CI.
 
 ```sh
@@ -110,3 +110,18 @@ gh workflow run extensions.yml --ref feat/roadmap-completion -f mode=native-prer
 This is only a package plan. Exact archives and sizes must be reviewed and
 approved before any acquisition or installation; changing runner images or
 package versions requires a fresh plan. Native Linux results remain open.
+
+The first package plan, [run 39606874735](https://github.com/cire362/solder/actions/runs/39606874735),
+refused the runner's `mirror+file:/etc/apt/apt-mirrors.txt/pool/...` aliases.
+APT had printed 32 proposed archives, but no final source URL plan was produced;
+no package archive was fetched or installed. The actual APT records are retained
+as an offline regression fixture, without executable package contents.
+
+The planner now reads only the two allowlisted existing Ubuntu mirror lists.
+It filters eligible official Ubuntu mirrors and pins one concrete URL for human
+review, retaining the original APT alias in the report. This is a deterministic
+review choice, not a claim about APT's randomized fallback selection. Local files,
+foreign hosts, unrelated pool paths and unsupported partial-mirror constraints
+cannot become download locations. Mirror-list behavior is documented by the
+[APT transport manual](https://manpages.debian.org/bookworm/apt/apt-transport-mirror.1.en.html).
+The corrected live plan must still run before any archive approval.

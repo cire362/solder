@@ -76,6 +76,60 @@ class PlannerTests(unittest.TestCase):
             with self.subTest(record=record), self.assertRaises(ValueError):
                 planner.parse_uris(record)
 
+    def test_local_mirror_alias_pins_an_eligible_official_url_and_reads_once(self):
+        alias = "mirror+file:/etc/apt/apt-mirrors.txt/pool/universe/o/openbox/openbox_1.0-1_amd64.deb"
+        listing = ("# Existing image configuration\n\n"
+                   "https://attacker.invalid/ubuntu/\tpriority:0\n"
+                   "https://security.ubuntu.com/ubuntu/\tpriority:0 type:index\n"
+                   "https://archive.ubuntu.com/ubuntu/\tpriority:0 arch:arm64\n"
+                   "https://archive.ubuntu.com/ubuntu/\tpriority:2\n"
+                   "http://azure.archive.ubuntu.com/ubuntu/\tpriority:1 arch:amd64 arch:all type:deb\n")
+        second = alias.replace("openbox_1.0-1_amd64.deb", "openbox_1.0-2_amd64.deb")
+        records = RECORD.replace(URI, alias) + "\n" + RECORD.replace(URI, second).replace(
+            "' openbox_1.0-1_amd64.deb ", "' openbox_1.0-2_amd64.deb ")
+        with patch.object(planner.Path, "read_text", return_value=listing) as read:
+            packages = planner.parse_uris(records)
+        read.assert_called_once_with(encoding="utf-8")
+        self.assertEqual(packages[0]["url"], URI)
+        self.assertEqual(packages[0]["apt_uri"], alias)
+        self.assertEqual(packages[0]["mirror_file"], "/etc/apt/apt-mirrors.txt")
+        self.assertEqual(packages[1]["url"], URI.replace("1.0-1", "1.0-2"))
+
+    def test_mirror_alias_cannot_read_an_arbitrary_file_or_accept_a_partial_mirror(self):
+        alias = "mirror+file:/etc/apt/apt-mirrors.txt/pool/universe/o/openbox/openbox_1.0-1_amd64.deb"
+        for uri in (alias.replace("apt-mirrors.txt", "credentials.txt"),
+                    alias.replace("mirror+file:", "mirror+file://server"),
+                    alias + "?other=true", alias + "#fragment",
+                    alias.replace("/pool/", "/outside/")):
+            with self.subTest(uri=uri), patch.object(planner.Path, "read_text") as read:
+                with self.assertRaises(ValueError):
+                    planner.parse_uris(RECORD.replace(URI, uri))
+                read.assert_not_called()
+        for metadata in ("type:index", "arch:arm64", "component:restricted", "suite:noble"):
+            listing = "https://archive.ubuntu.com/ubuntu/\t" + metadata
+            with self.subTest(metadata=metadata), patch.object(planner.Path, "read_text", return_value=listing):
+                with self.assertRaises(ValueError):
+                    planner.parse_uris(RECORD.replace(URI, alias))
+        with patch.object(planner.Path, "read_text", return_value="https://attacker.invalid/ubuntu/"):
+            with self.assertRaises(ValueError):
+                planner.parse_uris(RECORD.replace(URI, alias))
+
+    def test_real_runner_mirror_records_preserve_all_filenames_sizes_and_hashes(self):
+        output = Path(__file__).with_name("fixtures").joinpath("apt-print-uris-mirrors.txt").read_text()
+        with patch.object(planner.Path, "read_text", return_value="https://archive.ubuntu.com/ubuntu/"):
+            packages = planner.parse_uris(output)
+        self.assertEqual(len(packages), 32)
+        self.assertEqual(sum(package["size_bytes"] for package in packages), 24529196)
+        self.assertTrue(all(package["apt_uri"].startswith("mirror+file:") for package in packages))
+        self.assertTrue(all(package["url"].startswith("https://archive.ubuntu.com/ubuntu/pool/")
+                            for package in packages))
+        self.assertTrue(any("%3a" in package["filename"] for package in packages))
+
+    def test_official_host_does_not_allow_parent_pool_traversal(self):
+        for path in ("/ubuntu/pool/../other/", "/ubuntu/pool/%2e%2e/other/"):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                planner.parse_uris(RECORD.replace("/ubuntu/pool/", path))
+
     def collect(self, result, statuses=(b"installed state", b"installed state")):
         with patch.object(planner.Path, "read_bytes", side_effect=statuses), \
                 patch.object(planner.Path, "read_text", return_value="ID=ubuntu\nVERSION_ID=24.04\n"), \

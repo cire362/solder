@@ -32,5 +32,19 @@
     "reviewed_job_log_sha256": "c6f5734d8ddfe2c685f3377bc84dfaa6b691e8938213020fdd15a6714acfc44b",
     "new_dependencies_installed": false,
     "native_linux_notebook_verified": false
+  },
+  "package_plan_attempt": {
+    "reviewed": "2026-10-21",
+    "source": "c36c57b",
+    "run": "https://github.com/cire362/solder/actions/runs/39606874735",
+    "job": 119245246471,
+    "result": "failed-closed",
+    "reason": "APT print-uris used local mirror-list aliases, not direct HTTP archive URLs",
+    "proposed_archives": 32,
+    "proposed_archive_bytes": 24529196,
+    "package_archives_acquired": 0,
+    "packages_installed": 0,
+    "final_approval_plan_produced": false,
+    "reviewed_job_log_sha256": "c13563354bc2ebaa2a7c47be61500b2e8ed8993a601407af42afd48156e24542"
   }
 }
