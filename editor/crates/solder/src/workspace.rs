@@ -1723,18 +1723,31 @@ impl Workspace {
     }
 
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
-        let pane = &self.panes[self.active_pane];
-        if let Some(ix) = pane.active {
-            let next = (ix + 1) % pane.tabs.len();
-            self.activate(self.active_pane, next, window, cx);
-        }
+        self.step_tab(1, window, cx);
     }
 
     fn prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
-        let pane = &self.panes[self.active_pane];
-        if let Some(ix) = pane.active {
-            let len = pane.tabs.len();
-            self.activate(self.active_pane, (ix + len - 1) % len, window, cx);
+        self.step_tab(-1, window, cx);
+    }
+
+    /// Goes to the tab `by` places along in the pane in front, the files
+    /// first and then the pictures and previews after them, as they are
+    /// drawn, round from the last to the first.
+    fn step_tab(&mut self, by: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let p = self.active_pane;
+        let pane = &self.panes[p];
+        let files = pane.tabs.len();
+        let all = files + pane.viewers.len();
+        let at = match (pane.shown, pane.active) {
+            (Some(viewer), _) => files + viewer,
+            (None, Some(tab)) => tab,
+            (None, None) => return,
+        };
+        let next = (at as isize + by).rem_euclid(all as isize) as usize;
+        if next < files {
+            self.activate(p, next, window, cx);
+        } else {
+            self.show_viewer(p, next - files, true, window, cx);
         }
     }
 
@@ -15214,6 +15227,28 @@ brackets = [
             seen(cx),
             "<template>\n  <div>\n    <p>a</p>\n  </div>|\n</template>\n"
         );
+        // The same with a tree that comes only after each key, as it does
+        // on a busy machine: the line goes back when the tree says so.
+        put(
+            cx,
+            "<template>\n  <div>\n    <p>a</p>\n    |\n</template>\n",
+        );
+        editor.update(cx, |e, cx| {
+            e.document()
+                .update(cx, |doc, _| doc.wait_for_the_tree(false))
+        });
+        cx.simulate_input("</div>");
+        wait_for(cx, "the line to go back with the late tree", &|cx| {
+            let editor = editor.read(cx);
+            let mut text = editor.text(cx);
+            text.insert(editor.newest_range().end, '|');
+            text == "<template>\n  <div>\n    <p>a</p>\n  </div>|\n</template>\n"
+        });
+        // Back to waiting, for what the test goes on to.
+        editor.update(cx, |e, cx| {
+            e.document()
+                .update(cx, |doc, _| doc.wait_for_the_tree(true))
+        });
 
         // The two patterns of `config.toml`: the line after one that ends
         // in a colon is deeper, and `end` goes back as it is typed. When
@@ -21908,10 +21943,12 @@ exports.activate = (context) => {
         });
         // The file behind it comes back when its tab is chosen, and the
         // picture when its own is.
-        ws.update_in(cx, |ws, window, cx| ws.activate(0, 0, window, cx));
+        // The keys that go from tab to tab go through it too, both ways.
+        cx.simulate_keystrokes("ctrl-tab");
         assert!(cx.read(|cx| ws.read(cx).panes[0].shown.is_none()));
         assert_eq!(active_path(&ws, cx), Some(root.join("src/main.rs")));
-        ws.update_in(cx, |ws, window, cx| ws.show_viewer(0, 0, true, window, cx));
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        assert_eq!(cx.read(|cx| ws.read(cx).panes[0].shown), Some(0));
         cx.simulate_keystrokes("secondary-w");
         assert!(cx.read(|cx| ws.read(cx).panes[0].viewers.is_empty()));
         assert_eq!(active_path(&ws, cx), Some(root.join("src/main.rs")));

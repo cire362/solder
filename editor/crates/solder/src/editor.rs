@@ -332,6 +332,15 @@ pub(crate) fn fold_under(buffer: &Buffer, row: usize) -> Option<Range<usize>> {
     last.map(|last| row + 1..last + 1)
 }
 
+/// See `Editor::owed`.
+struct Owed {
+    row: usize,
+    before: indent::Wanted,
+    /// The text it was owed for: once it changes, what it was owed for is
+    /// weighed with the next key instead.
+    version: u64,
+}
+
 pub struct Editor {
     pub(crate) mode: EditorMode,
     /// Set for an editor that is as tall as its text and inside something
@@ -363,6 +372,10 @@ pub struct Editor {
     pub(crate) folds: Vec<Range<usize>>,
     /// The pointer is over the gutter: lines that can be folded say so.
     pub(crate) gutter_hovered: bool,
+    /// A line whose first word was typed while the tree was behind the
+    /// text: the answer from before the typing, kept until a tree in step
+    /// can say whether the line moves.
+    owed: Option<Owed>,
     /// The other places the symbol under the cursor is used, as the
     /// file's server says: in order, and lit up. Asked for a moment after
     /// the cursor came to rest.
@@ -446,6 +459,7 @@ impl Editor {
                 cx.notify();
             }
             DocumentEvent::Saved => cx.emit(EditorEvent::Saved),
+            DocumentEvent::SyntaxChanged => this.settle_owed(cx),
             DocumentEvent::DiagnosticsChanged
             | DocumentEvent::HintsChanged
             | DocumentEvent::GitChanged => cx.notify(),
@@ -473,6 +487,7 @@ impl Editor {
             column: None,
             folds: Vec::new(),
             gutter_hovered: false,
+            owed: None,
             occurrences: Arc::default(),
             occurrences_task: None,
             wrap: None,
@@ -1234,7 +1249,15 @@ impl Editor {
     /// Typed text. Adds bracket and quote pairs, types over a closing
     /// character that is already there, and wraps selections in pairs.
     fn handle_input(&mut self, text: &str, cx: &mut Context<Self>) {
-        let wanted = self.first_word_indent(cx);
+        // While a line is owed, the answer from before it is what what is
+        // typed now is weighed against: the tree of this moment may already
+        // count the earlier keys.
+        let wanted = match self.owed.take() {
+            Some(owed) if Some(owed.row) == self.first_word_row(cx) => {
+                Some((owed.row, owed.before))
+            }
+            _ => self.first_word_indent(cx),
+        };
         self.insert_typed(text, cx);
         self.reindent_first_word(wanted, cx);
         self.after_typing(text, cx);
@@ -1245,6 +1268,13 @@ impl Editor {
     /// row: where what is typed can change how deep the line goes, the
     /// way `end` or a closing tag does.
     fn first_word_indent(&self, cx: &App) -> Option<(usize, indent::Wanted)> {
+        let row = self.first_word_row(cx)?;
+        Some((row, indent::of_row(self.doc(cx), row)?))
+    }
+
+    /// The row of the only cursor, while it is in the blanks or the first
+    /// word of that row.
+    fn first_word_row(&self, cx: &App) -> Option<usize> {
         if self.is_single_line() || self.selections.len() != 1 {
             return None;
         }
@@ -1258,7 +1288,20 @@ impl Editor {
         if word.len() > 32 || word.contains(char::is_whitespace) {
             return None;
         }
-        Some((point.row, indent::of_row(self.doc(cx), point.row)?))
+        Some(point.row)
+    }
+
+    /// The tree came after a key that needed it. If nothing was typed
+    /// since, the line goes where the language wants it now, as it would
+    /// have had the tree been there in time.
+    fn settle_owed(&mut self, cx: &mut Context<Self>) {
+        let Some(owed) = self.owed.take() else {
+            return;
+        };
+        if self.doc(cx).version() != owed.version {
+            return;
+        }
+        self.reindent_first_word(Some((owed.row, owed.before)), cx);
     }
 
     /// Moves the line to where the language wants it, if what was typed
@@ -1272,6 +1315,19 @@ impl Editor {
     ) {
         let Some((row, before)) = before else { return };
         let Some((now_row, now)) = self.first_word_indent(cx) else {
+            // A tree behind the text has no answer yet, which is not an
+            // answer that the line stays. The key is answered when it comes.
+            let behind = self
+                .doc(cx)
+                .syntax()
+                .is_some_and(|syntax| syntax.is_stale());
+            if behind && self.first_word_row(cx) == Some(row) {
+                self.owed = Some(Owed {
+                    row,
+                    before,
+                    version: self.doc(cx).version(),
+                });
+            }
             return;
         };
         if now_row != row || now.text == before.text || (now.in_error && !before.in_error) {
