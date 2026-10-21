@@ -62,7 +62,10 @@ implementation; its native-window checks and the recovery manager are below.
       Windows native built-in-reader checks passed. The first Linux run built
       successfully but could not initialize a GPU device under Xvfb. The retry
       found an OS window with preinstalled SwiftShader but failed foreground
-      ownership on bare Xvfb; notebook stages stayed blocked. Native Linux
+      ownership on bare Xvfb; notebook stages stayed blocked. The managed-desktop
+      attempt found no preinstalled window manager and blocked all six stages.
+      A manual metadata-only package plan prepares an explicit dependency
+      decision; it is not permission to install or a native pass. Native Linux
       results remain open: `verification/native-ci.md`.
       Missing or declined extension readers retain their copies. Original local
       text revisions and weak legacy stamps are checked separately. Performance
@@ -181,7 +184,8 @@ implementation; its native-window checks and the recovery manager are below.
       tested with extensions written for the tests
 - [ ] Linux and Windows beyond the native built-in Jupyter/CLI checks passed
       on a Windows Server 2022 CI desktop. Linux CI builds and runs headless
-      tests; its native run is blocked by GPU initialization. Extension pages,
+      tests; its latest native run is blocked by the missing window manager,
+      after an earlier retry found a window with a preinstalled driver. Extension pages,
       extension notebook readers and the rest of phase 10 still need native
       checks on both platforms
 - [ ] On screen: folding, selection by column, the pin of a tab and the

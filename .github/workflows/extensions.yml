@@ -11,16 +11,16 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Native first-party verification or explicit published-extension census
+        description: Native verification, Linux package plan, or explicit extension census
         type: choice
-        options: [native-verification, census]
+        options: [native-verification, native-prerequisites, census]
         default: native-verification
       verification_ref:
-        description: Native verification source ref (empty uses the dispatched ref)
+        description: Native verification or package-plan source ref (empty uses dispatched ref)
         type: string
         default: ""
       native_platform:
-        description: Platforms for native verification (ignored by census)
+        description: Platforms for native verification (ignored by other modes)
         type: choice
         options: [both, linux-only, windows-only]
         default: both
@@ -35,6 +35,25 @@ permissions:
   contents: read
 
 jobs:
+  native-prerequisites:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'native-prerequisites'
+    name: Linux desktop package plan (no package downloads or installs)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.verification_ref || github.ref }}
+          persist-credentials: false
+      - name: Check the read-only planner contract
+        run: python3 editor/scripts/native-prerequisites-test.py
+      # Match native verification's existing Ubuntu source configuration. Only
+      # repository metadata is refreshed; no build libraries or tools are added.
+      - name: Refresh package metadata only
+        run: sudo apt-get -o APT::Update::Error-Mode=any update
+      - name: Print Ubuntu package URLs, filenames and byte counts
+        run: python3 editor/scripts/native-prerequisites.py --summary "$GITHUB_STEP_SUMMARY"
+
   census:
     if: github.event_name == 'release' || inputs.mode == 'census'
     name: What works

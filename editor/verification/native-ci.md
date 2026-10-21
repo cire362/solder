@@ -78,3 +78,35 @@ No manager or other dependency was installed.
 Window discovery and Vulkan diagnostics are not the six native stages. The
 managed-desktop retry must still pass and produce native evidence before its
 roadmap box can be checked. A file chooser portal remains a separate prerequisite.
+
+## Managed-desktop result and package plan
+
+The attempt at `a166bee`, [run 39114083965](https://github.com/cire362/solder/actions/runs/39114083965),
+found none of the three supported window managers on the runner. It correctly
+blocked all six stages before building or claiming a native result. No manager
+was installed. The job log was reviewed on 2026-10-21; its hash and exact result
+are retained in `linux-native-attempt.json`.
+
+A separate, manual-only `native-prerequisites` mode now prepares the dependency
+decision on a disposable Ubuntu 24.04 runner. It refreshes existing package
+metadata and plans Openbox, the desktop portal service, its GTK backend and
+solver-required dependencies, without recommendations. It neither builds Rust
+nor starts an editor, downloads package archives, installs packages or runs a
+published extension. No new runtime dependency is added by this preparation.
+
+`native-prerequisites.py` uses APT's URI-printing mode, an empty private archive
+cache and no root privileges for resolution. It prints each archive's exact
+filename, official Ubuntu source URL, byte count and checksum to the job log
+and summary. It also verifies that no .deb appeared and the installed-package
+database did not change. URI-printing behavior is documented in the
+[APT manual](https://manpages.debian.org/bookworm/apt/apt-get.8.en.html#OPTIONS).
+Eleven offline planner contracts and the 22 native-harness contracts run in
+`scripts/check.sh` and editor CI.
+
+```sh
+gh workflow run extensions.yml --ref feat/roadmap-completion -f mode=native-prerequisites
+```
+
+This is only a package plan. Exact archives and sizes must be reviewed and
+approved before any acquisition or installation; changing runner images or
+package versions requires a fresh plan. Native Linux results remain open.

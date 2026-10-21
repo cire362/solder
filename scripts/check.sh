@@ -10,6 +10,10 @@ npm run typecheck --silent
 echo "== editor: example plugins"
 npm run plugins --silent
 
+echo "== editor: native verification contracts"
+python3 editor/scripts/verify-native-harness-test.py
+python3 editor/scripts/native-prerequisites-test.py
+
 echo "== editor: format"
 (cd editor && cargo fmt --all --check)
 echo "== editor: clippy"
