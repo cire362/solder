@@ -50,8 +50,12 @@ implementation; its native-window checks and the recovery manager are below.
       foreground, OS keyboard input, complete save, force-exit recovery, further
       input after restart, system-dialog export and cleanup. Six stages passed;
       snapshots and screenshots reviewed: `verification/windows-native-notebook.md`
-- [ ] Notebook recovery/export on Linux, with snapshots beyond the 16 MB
-      retention limit, abrupt power loss, independent extension views or a
+- [x] Native macOS notebook recovery at the actual 16 MiB limit: a rejected
+      copy keeps the last valid file, warns in English/Russian without masking
+      save errors, and retries after shrinking. Complete save and cleanup passed.
+      Explicit writer acknowledgements and three regression tests cover the
+      correction. Evidence: `verification/native-notebook-limit.md`
+- [ ] Notebook recovery/export on Linux, abrupt power loss, independent extension views or a
       published extension; native extension readers on Windows. Headless and first-party process checks cover cell
       edits, execution outputs, metadata, native/extension restoration, external
       changes, source aliases, pending saves, closed views and recovery cleanup.
@@ -226,6 +230,10 @@ implementation; its native-window checks and the recovery manager are below.
       comparisons of a branch with main, not what the site may claim
 
 ### Not finished
+- [ ] Recovery snapshots over 16 MiB are not retained. Notebooks keep the last
+      smaller copy and now warn that the latest changes need an explicit save;
+      text files also keep their last smaller copy. The native macOS notebook
+      boundary and resumed recovery below it are checked separately above
 - [ ] Notebook recovery and successful export notices use the error color and
       long export paths can be clipped. Informational completion should be
       distinguishable from a failed save

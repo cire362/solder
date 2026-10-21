@@ -41,6 +41,21 @@ struct KeptBook {
     snapshot: serde_json::Value,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum BookWrite {
+    Written,
+    TooLarge,
+}
+
+fn write_book(file: &Path, book: &KeptBook, limit: usize) -> Result<BookWrite, String> {
+    let bytes = serde_json::to_vec(book).map_err(|error| error.to_string())?;
+    if bytes.len() > limit {
+        return Ok(BookWrite::TooLarge);
+    }
+    crate::ipynb::write_atomic(file, &bytes)?;
+    Ok(BookWrite::Written)
+}
+
 enum Op {
     Keep {
         file: PathBuf,
@@ -52,7 +67,7 @@ enum Op {
         file: PathBuf,
         book: KeptBook,
         snapshot: futures::channel::oneshot::Receiver<Result<serde_json::Value, String>>,
-        done: futures::channel::oneshot::Sender<bool>,
+        done: futures::channel::oneshot::Sender<Result<BookWrite, String>>,
     },
     Forget(PathBuf),
     /// Everything asked before this is on disk.
@@ -67,6 +82,8 @@ pub(super) struct Recovery {
     ops: mpsc::Sender<Op>,
     /// The documents whose text is kept: which state of it, and where.
     kept: HashMap<EntityId, (u64, PathBuf)>,
+    /// A queued notebook is not yet an acknowledged recovery copy.
+    pending_books: HashMap<EntityId, (u64, PathBuf)>,
     restoring_books: HashMap<EntityId, u64>,
     extra_copies: HashMap<EntityId, Vec<PathBuf>>,
 }
@@ -111,22 +128,14 @@ impl Recovery {
                             .and_then(|snapshot| snapshot);
                         let written = snapshot.and_then(|snapshot| {
                             book.snapshot = snapshot;
-                            let bytes =
-                                serde_json::to_vec(&book).map_err(|error| error.to_string())?;
-                            if bytes.len() > KEEP_LIMIT {
-                                // Keep the last smaller snapshot, and do not
-                                // attempt this same oversized generation again.
-                                return Ok(false);
-                            }
-                            crate::ipynb::write_atomic(&file, &bytes)?;
-                            Ok(true)
+                            write_book(&file, &book, KEEP_LIMIT)
                         });
                         if let Err(error) = &written {
                             crate::journal::error(format_args!(
                                 "could not keep unsaved notebook: {error}"
                             ));
                         }
-                        let _ = done.send(written.is_ok());
+                        let _ = done.send(written);
                     }
                     Op::Forget(file) => {
                         let _ = std::fs::remove_file(file);
@@ -145,6 +154,7 @@ impl Recovery {
                 .as_nanos(),
             ops,
             kept: HashMap::default(),
+            pending_books: HashMap::default(),
             restoring_books: HashMap::default(),
             extra_copies: HashMap::default(),
         }
@@ -318,6 +328,11 @@ impl Workspace {
                 continue;
             }
             changed.insert(id);
+            // One snapshot per notebook is in flight. Edits made while it
+            // is written are picked up by the next recovery pass.
+            if recovery.pending_books.contains_key(&id) {
+                continue;
+            }
             let version = book.version();
             let known = recovery.kept.get(&id);
             if known.is_some_and(|(kept, _)| *kept == version) {
@@ -352,27 +367,50 @@ impl Workspace {
                 snapshot: snapshot_rx,
                 done,
             });
-            recovery.kept.insert(id, (version, file));
+            recovery.pending_books.insert(id, (version, file.clone()));
+            let notebook = notebook.clone();
             cx.spawn(async move |this, cx| {
                 let _ = send.send(snapshot.await);
-                let success = acknowledged.await.unwrap_or(false);
-                if !success {
-                    this.update(cx, |this, _| {
-                        if let Some(recovery) = this.recovery.as_mut()
-                            && let Some((kept, _)) = recovery.kept.get_mut(&id)
-                            && *kept == version
-                        {
-                            *kept = version.wrapping_sub(1);
+                let result = acknowledged.await;
+                this.update(cx, |this, cx| {
+                    let Some(recovery) = this.recovery.as_mut() else {
+                        return;
+                    };
+                    // A save or close may already have queued Forget.
+                    if recovery
+                        .pending_books
+                        .get(&id)
+                        .is_none_or(|(pending, _)| *pending != version)
+                    {
+                        return;
+                    }
+                    recovery.pending_books.remove(&id);
+                    let too_large = match result {
+                        Ok(Ok(BookWrite::Written)) => {
+                            recovery.kept.insert(id, (version, file));
+                            false
                         }
-                    })
-                    .ok();
-                }
+                        Ok(Ok(BookWrite::TooLarge)) => true,
+                        _ => return,
+                    };
+                    notebook.update(cx, |book, cx| {
+                        book.recovery_result(version, too_large, cx);
+                    });
+                })
+                .ok();
             })
             .detach();
         }
         // Saved, local undo back to disk, or explicitly closed. A remote
         // recovery stays dirty until it is saved or closed with an answer.
         recovery.kept.retain(|id, (_, file)| {
+            let stays = changed.contains(id);
+            if !stays {
+                let _ = recovery.ops.send(Op::Forget(file.clone()));
+            }
+            stays
+        });
+        recovery.pending_books.retain(|id, (_, file)| {
             let stays = changed.contains(id);
             if !stays {
                 let _ = recovery.ops.send(Op::Forget(file.clone()));
@@ -398,6 +436,9 @@ impl Workspace {
             return Task::ready(());
         };
         for (_, (_, file)) in recovery.kept.drain() {
+            let _ = recovery.ops.send(Op::Forget(file));
+        }
+        for (_, (_, file)) in recovery.pending_books.drain() {
             let _ = recovery.ops.send(Op::Forget(file));
         }
         for (_, files) in recovery.extra_copies.drain() {
@@ -610,6 +651,59 @@ mod tests {
     use super::*;
 
     #[gpui::test]
+    async fn oversized_notebook_snapshots_do_not_acknowledge_or_replace_the_last_copy(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let dir = db::testing::dir("recovery-notebook-limit");
+        let recovery = Recovery::new(dir.clone());
+        let file = dir.join("work.book.json");
+        let mut previous = Vec::new();
+        for (snapshot, expected) in [
+            (serde_json::json!({"content":"before"}), BookWrite::Written),
+            (
+                serde_json::json!({"content":"x".repeat(KEEP_LIMIT)}),
+                BookWrite::TooLarge,
+            ),
+            (serde_json::json!({"content":"after"}), BookWrite::Written),
+        ] {
+            let book = KeptBook {
+                version: 1,
+                path: dir.join("book.ipynb"),
+                extension: String::new(),
+                kind: "jupyter-notebook".into(),
+                selected: 0,
+                snapshot: serde_json::Value::Null,
+            };
+            let (send, snapshot_rx) = futures::channel::oneshot::channel();
+            let (done, acknowledged) = futures::channel::oneshot::channel();
+            recovery
+                .ops
+                .send(Op::KeepBook {
+                    file: file.clone(),
+                    book,
+                    snapshot: snapshot_rx,
+                    done,
+                })
+                .unwrap();
+            send.send(Ok(snapshot.clone())).unwrap();
+            let result = acknowledged.await.unwrap().unwrap();
+            assert_eq!(result, expected);
+            let bytes = std::fs::read(&file).unwrap();
+            if result == BookWrite::TooLarge {
+                assert_eq!(bytes, previous);
+            } else {
+                let written: KeptBook = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(written.snapshot, snapshot);
+            }
+            previous = bytes;
+        }
+        recovery.ops.send(Op::Forget(file.clone())).unwrap();
+        cx.update(|cx| recovery.done(cx)).await;
+        assert!(!file.exists());
+    }
+
+    #[gpui::test]
     async fn notebook_snapshots_precede_forget_and_adoption_preserves_newer_copies(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -653,7 +747,7 @@ mod tests {
         assert!(finished.try_recv().unwrap().is_none());
         send.send(Ok(serde_json::json!({"content":"newer"})))
             .unwrap();
-        assert!(acknowledged.await.unwrap());
+        assert_eq!(acknowledged.await.unwrap(), Ok(BookWrite::Written));
         cx.update(|cx| recovery.done(cx)).await;
         assert!(!newer.exists());
         assert!(old.exists());

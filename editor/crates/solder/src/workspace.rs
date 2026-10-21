@@ -17135,6 +17135,83 @@ exports.activate = (context) => {
     }
 
     #[gpui::test]
+    fn notebook_recovery_warns_above_the_limit_and_resumes_after_shrinking(
+        cx: &mut TestAppContext,
+    ) {
+        let root = fixture("notebook-recovery-limit");
+        let path = root.join("large.ipynb");
+        let original = serde_json::json!({"nbformat":4,"nbformat_minor":5,
+            "metadata":{"keep":"metadata"},"cells":[{"cell_type":"code","id":"first",
+            "source":"original","metadata":{"tags":["keep"]},"execution_count":7,
+            "outputs":[{"output_type":"stream","name":"stdout","text":"x".repeat(16*1024*1024-64*1024)}]}]});
+        let original_bytes = serde_json::to_vec(&original).unwrap();
+        std::fs::write(&path, &original_bytes).unwrap();
+        let copies = db::testing::dir("notebook-recovery-limit-copies");
+        cx.executor().allow_parking();
+        let (ws, cx) = setup(cx, root);
+        ws.update_in(cx, |w, window, cx| {
+            w.recovery = Some(recovery::Recovery::new(copies.clone()));
+            w.open_path(path.clone(), None, window, cx);
+        });
+        let book = cx.read(|cx| ws.read(cx).notebooks[0].0.clone());
+        wait_for(cx, "the large notebook", &|cx| book.read(cx).is_ready());
+        book.update_in(cx, |book, window, cx| book.focus(window, cx));
+        cx.simulate_input("# small\n");
+        finish_recovery_pass(&ws, cx);
+        let copy = std::fs::read_dir(&copies)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let before = std::fs::read(&copy).unwrap();
+        assert!(before.len() < 16 * 1024 * 1024);
+
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("b".repeat(128 * 1024)));
+        cx.dispatch_action(crate::editor::Paste);
+        finish_recovery_pass(&ws, cx);
+        wait_for(cx, "the recovery size warning", &|cx| {
+            book.read(cx).recovery_warning().is_some()
+        });
+        bounds_soon(cx, "notebook-recovery-warning");
+        assert_eq!(std::fs::read(&copy).unwrap(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        assert!(
+            book.update(cx, |book, cx| book.recovery_snapshot(cx))
+                .is_none()
+        );
+        assert!(cx.read(|cx| book.read(cx).is_dirty()));
+
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("# small_again\n");
+        finish_recovery_pass(&ws, cx);
+        wait_for(cx, "recovery after the notebook shrinks", &|cx| {
+            book.read(cx).recovery_warning().is_none()
+        });
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&copy).unwrap()).unwrap();
+        assert_eq!(
+            written["snapshot"]["content"]["cells"][0]["source"],
+            "# small_again\n"
+        );
+        assert_eq!(
+            written["snapshot"]["content"]["cells"][0]["outputs"],
+            original["cells"][0]["outputs"]
+        );
+        cx.simulate_keystrokes("secondary-s");
+        wait_for(cx, "the complete large notebook save", &|cx| {
+            !book.read(cx).is_dirty()
+        });
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut expected = original;
+        expected["cells"][0]["source"] = "# small_again\n".into();
+        assert_eq!(saved, expected);
+        finish_recovery_pass(&ws, cx);
+        assert!(!copy.exists());
+    }
+
+    #[gpui::test]
     fn native_notebook_recovery_survives_external_changes_and_exports_a_rescue_copy(
         cx: &mut TestAppContext,
     ) {

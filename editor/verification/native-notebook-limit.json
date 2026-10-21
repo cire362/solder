@@ -1,0 +1,136 @@
+{
+  "bytes": 16711676,
+  "output_bytes": 15875602,
+  "output_lines": 835558,
+  "sha256": "eb1759094db1ce39dbf912fcdf16bb4eeae0e6baa77d852a356712a3635d4725",
+  "baseline_backup": {
+    "bytes": 16712080,
+    "sha256": "85e097cf6e246b2f6ab1094c0ee2a8d06a8816894f2b5ff96cc78314f59d17c9",
+    "source": "# below_limit\nprint('limit')\n",
+    "file": "notebook-a819f31ad7d6b437-40462-1792587180678146000-4294967355.book.json"
+  },
+  "oversized": {
+    "last_copy_unchanged": true,
+    "source_unchanged": true,
+    "english_warning_visible": true,
+    "inserted_bytes": 131075,
+    "russian_warning_visible_at_ui_font_size_24": true
+  },
+  "resumed": {
+    "backup_bytes": 16712080,
+    "backup_sha256": "b5dd220ea690af2bea3d14008d53fd90bb4dcbfd3763b994797bf934efeb4f9a",
+    "source": "# small_again\nprint('limit')\n",
+    "full_model_preserved": true,
+    "source_file_unchanged": true
+  },
+  "saved": {
+    "bytes": 16712014,
+    "sha256": "50cab689d6a7ff332cd30da02a167abc100d388e9bb23bca193422f1660b0f58",
+    "full_model_preserved": true,
+    "recovery_files_removed": true,
+    "staging_files_removed": true,
+    "warning_absent_after_shrinking": true,
+    "changed_mark_absent": true
+  },
+  "date": "2026-10-21",
+  "platform": {
+    "system": "Darwin",
+    "version": "26.6.2",
+    "architecture": "arm64"
+  },
+  "source_parent": "a166bee",
+  "profile": "ci",
+  "rust": "1.94.0",
+  "binary_sha256": "4fc62d14e1e2d71ca002b2c2556e326e7514dea88f345262d8f8a614895bd29f",
+  "scope": "Built-in Jupyter reader, native macOS window, disposable HOME, no kernel or published extension",
+  "source_files_sha256": {
+    "editor/crates/solder/src/recovery.rs": "0a7df85463e2d5c4110b7b719b52752ed9be387d9f362f72371f65fb94505ac1",
+    "editor/crates/solder/src/lang_ru.rs": "9dd2ad4ac874e54b22e9ffd054261f2876b1d3f58809a80ccce87916cba0f37e",
+    "editor/crates/solder/src/workspace.rs": "b491c9f836f98de7ab8981b3be5a9e0775ad601e32d3b597877754ac33748f2b",
+    "editor/crates/solder/src/notebook.rs": "d8b012d44d2c133630d081f00c8aeb16c68ecb39fc4e17004db9fd9a349f094f"
+  },
+  "fixture": {
+    "model_without_large_stream": {
+      "nbformat": 4,
+      "nbformat_minor": 5,
+      "metadata": {
+        "solder_verification": "recovery-retention-boundary",
+        "language_info": {
+          "name": "python"
+        }
+      },
+      "cells": [
+        {
+          "cell_type": "code",
+          "id": "limit-code",
+          "metadata": {
+            "tags": [
+              "retention-boundary"
+            ]
+          },
+          "source": "print('limit')\n",
+          "execution_count": 7,
+          "outputs": [
+            {
+              "output_type": "stream",
+              "name": "stdout",
+              "text": ""
+            }
+          ]
+        },
+        {
+          "cell_type": "markdown",
+          "id": "attachment-cell",
+          "metadata": {
+            "kept": true
+          },
+          "source": "attached text",
+          "attachments": {
+            "proof.txt": {
+              "text/plain": "cHJvb2Y="
+            }
+          }
+        }
+      ],
+      "custom_top": {
+        "retain": true
+      }
+    },
+    "stream_repeat": "first-party output\n",
+    "stream_repetitions": 835558,
+    "serialization": "UTF-8 JSON with compact separators, ensure_ascii=False"
+  },
+  "screenshots": {
+    "native-notebook-limit-en.png": {
+      "bytes": 295407,
+      "sha256": "a5ce7472b0e04833ef5d2ae036805bcdbd659661ae00c25879c861d934b4d180"
+    },
+    "native-notebook-limit-ru.png": {
+      "bytes": 382971,
+      "sha256": "899ea09bbf9efa811e5fe44047dda86f1d0e9ff0970b7836d3b1aedb4e2bebcb"
+    },
+    "native-notebook-limit-saved.png": {
+      "bytes": 291491,
+      "sha256": "156d4587966631acee41183070231629a0dc57c4ab154fd4d98722557821743d"
+    }
+  },
+  "remaining": [
+    "Latest recovery snapshots over 16 MiB remain unsupported",
+    "Native Linux/Windows boundary behavior",
+    "Extension-reader oversized models",
+    "Power loss",
+    "Continuous bulk key input",
+    "Performance is not measured by this check"
+  ],
+  "checked_source_files_sha256": {
+    "editor/crates/solder/src/recovery.rs": "8468c5937a292b7bf95678579793c461f75ceefc0062aee639e75de846b9ab71",
+    "editor/crates/solder/src/lang_ru.rs": "9dd2ad4ac874e54b22e9ffd054261f2876b1d3f58809a80ccce87916cba0f37e",
+    "editor/crates/solder/src/workspace.rs": "b491c9f836f98de7ab8981b3be5a9e0775ad601e32d3b597877754ac33748f2b",
+    "editor/crates/solder/src/notebook.rs": "d8b012d44d2c133630d081f00c8aeb16c68ecb39fc4e17004db9fd9a349f094f"
+  },
+  "validation": {
+    "scripts/check.sh": "passed",
+    "Rust 1.98.0 workspace Clippy -D warnings": "passed",
+    "recovery-filtered tests": "22 passed"
+  }
+}

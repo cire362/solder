@@ -226,8 +226,13 @@ replacement. Exports and saves share the notebook's write queue. Closing or
 successfully saving a notebook releases its recovery copies after preceding
 backup writes finish. A failed snapshot keeps the previous copy and retries.
 
-A notebook recovery file over 16 MB keeps its earlier smaller copy. Each
-reader considers at most 256 copies per pass. Malformed, unsupported,
+A notebook recovery file over 16 MiB keeps its earlier smaller copy. The
+notebook warns that its latest changes need a save, without hiding an unrelated
+save error. A smaller subsequent edit retries recovery; only an acknowledged
+current copy or a successful save clears the warning. The actual boundary,
+retention, retry and complete save were checked in a native macOS window
+(`verification/native-notebook-limit.md`). Each reader considers at most 256
+copies per pass. Malformed, unsupported,
 permission-denied and unavailable copies remain on disk; there is no recovery
 manager screen. Text encoding and line-ending choices are not included in
 recovery. Notebook recovery/export is tested with native files and first-party

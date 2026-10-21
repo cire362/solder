@@ -934,6 +934,10 @@ pub const WORDS: &[(&str, &str)] = &[
         "Блокнот восстановлен. Его копия хранится до сохранения или закрытия.",
     ),
     (
+        "Recovery copy exceeds 16 MiB. Save the notebook to protect your latest changes.",
+        "Копия для восстановления больше 16 МиБ. Сохраните блокнот, чтобы не потерять последние изменения.",
+    ),
+    (
         "Choose another path for the notebook copy",
         "Выберите другой путь для копии блокнота",
     ),

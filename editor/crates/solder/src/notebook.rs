@@ -134,6 +134,8 @@ pub struct Notebook {
     runner: Option<SharedString>,
     /// The last thing that went wrong.
     note: Option<SharedString>,
+    /// Kept apart from errors so recovery cannot replace or clear them.
+    recovery_too_large: Option<u64>,
     list: ListState,
     focus_handle: FocusHandle,
 }
@@ -217,6 +219,7 @@ impl Notebook {
             ipynb: None,
             runner: None,
             note: None,
+            recovery_too_large: None,
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             focus_handle: cx.focus_handle(),
         }
@@ -225,10 +228,15 @@ impl Notebook {
     /// Captures only cheap rope/model handles on this thread. Flattening,
     /// notebook JSON and disk writes belong to the recovery writer's workers.
     pub(crate) fn recovery_snapshot(
-        &self,
+        &mut self,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<Value, String>>> {
         if !matches!(self.state, State::Ready) {
+            return None;
+        }
+        // The same rejected generation cannot shrink. Retry after an edit,
+        // including changes to outputs or notebook structure.
+        if self.recovery_too_large == Some(self.generation) {
             return None;
         }
         if self
@@ -238,6 +246,7 @@ impl Notebook {
             .sum::<usize>()
             > 16 * 1024 * 1024
         {
+            self.recovery_result(self.generation, true, cx);
             return None;
         }
         if let Some(file) = &self.ipynb {
@@ -263,6 +272,29 @@ impl Notebook {
         } else {
             Some(self.ask("notebook.snapshot", json!({"uri":self.uri}), cx))
         }
+    }
+
+    pub(crate) fn recovery_result(
+        &mut self,
+        generation: u64,
+        too_large: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // An older write cannot certify newer cells, or undo a later save.
+        if generation != self.generation || !self.is_dirty() {
+            return;
+        }
+        self.recovery_too_large = too_large.then_some(generation);
+        cx.notify();
+    }
+
+    pub(crate) fn recovery_warning(&self) -> Option<SharedString> {
+        self.recovery_too_large.map(|_| {
+            crate::lang::t(
+                "Recovery copy exceeds 16 MiB. Save the notebook to protect your latest changes.",
+            )
+            .into()
+        })
     }
 
     pub(crate) fn recovered_generation(&self) -> Option<u64> {
@@ -690,6 +722,7 @@ impl Notebook {
                     && params["version"].as_u64() == self.host_version
                 {
                     self.dirty = false;
+                    self.recovery_too_large = None;
                     cx.emit(NotebookEvent::Changed);
                 }
             }
@@ -910,7 +943,10 @@ impl Notebook {
                 this.update(cx, |this, cx| {
                     this.pending_saves -= 1;
                     match saved {
-                        Ok(_) if this.generation == generation => this.dirty = false,
+                        Ok(_) if this.generation == generation => {
+                            this.dirty = false;
+                            this.recovery_too_large = None;
+                        }
                         Ok(_) => {}
                         Err(why) => this.note = Some(why.into()),
                     }
@@ -1331,6 +1367,18 @@ impl Render for Notebook {
                 this.save(cx).detach();
             }))
             .child(bar)
+            .children(self.recovery_warning().map(|warning| {
+                div()
+                    .id("notebook-recovery-warning")
+                    .debug_selector(|| "notebook-recovery-warning".into())
+                    .flex_none()
+                    .px_4()
+                    .py_2()
+                    .whitespace_normal()
+                    .text_size(UI_FONT_SMALL)
+                    .text_color(theme.warning)
+                    .child(warning)
+            }))
             .child(div().flex_1().min_h_0().child(body))
     }
 }
@@ -1524,6 +1572,70 @@ fn copy_revision(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    async fn recovery_limits_do_not_clear_errors_or_accept_stale_results(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        cx.update(|cx| cx.set_global(Settings::default()));
+        let path = db::testing::dir("notebook-recovery-limit-state").join("book.ipynb");
+        std::fs::write(&path, serde_json::to_vec(&json!({"nbformat":4,"metadata":{},"cells":[
+            {"cell_type":"code","source":"original","metadata":{},"outputs":[],"execution_count":null}]})).unwrap()).unwrap();
+        let book =
+            cx.new(|cx| Notebook::open(path.clone(), String::new(), "jupyter-notebook".into(), cx));
+        for _ in 0..crate::patience::LOOKS {
+            cx.run_until_parked();
+            if book.read_with(cx, |book, _| book.is_ready()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let document = book.read_with(cx, |book, cx| {
+            book.cells[0].editor.read(cx).document().clone()
+        });
+        document.update(cx, |doc, cx| {
+            doc.apply_edits(vec![(0..8, "x".repeat(16 * 1024 * 1024 + 1))], None, cx)
+        });
+        cx.run_until_parked();
+        let rejected = book.update(cx, |book, cx| {
+            book.note = Some("serializer failed".into());
+            assert!(book.recovery_snapshot(cx).is_none());
+            assert!(book.recovery_warning().is_some());
+            book.version()
+        });
+        document.update(cx, |doc, cx| {
+            let length = doc.text().len();
+            doc.apply_edits(vec![(0..length, "small".into())], None, cx);
+        });
+        cx.run_until_parked();
+        let snapshot = book
+            .update(cx, |book, cx| {
+                book.recovery_result(rejected, false, cx);
+                assert!(book.recovery_warning().is_some());
+                book.recovery_snapshot(cx).unwrap()
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot["content"]["cells"][0]["source"], "small");
+        book.update(cx, |book, cx| {
+            book.recovery_result(book.version(), false, cx);
+            assert!(book.recovery_warning().is_none());
+            assert_eq!(book.note(), Some("serializer failed".into()));
+            book.recovery_result(book.version(), true, cx);
+        });
+        let parked = path.with_extension("parked");
+        std::fs::rename(&path, &parked).unwrap();
+        assert!(!book.update(cx, |book, cx| book.save(cx)).await);
+        assert!(book.read_with(cx, |book, _| book.recovery_warning().is_some()));
+        std::fs::rename(&parked, &path).unwrap();
+        assert!(book.update(cx, |book, cx| book.save(cx)).await);
+        book.update(cx, |book, cx| {
+            book.recovery_result(rejected, true, cx);
+            assert!(book.recovery_warning().is_none());
+            assert!(!book.is_dirty());
+        });
+    }
 
     #[gpui::test]
     async fn restoration_locks_cells_and_export_protects_the_original_symlink_target(
