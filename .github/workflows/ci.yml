@@ -99,6 +99,7 @@ jobs:
         run: |
           python3 scripts/verify-native-harness-test.py
           python3 scripts/native-prerequisites-test.py
+          python3 scripts/package-release-test.py
       # The owner approved this exact wheel for a disposable CI runner.
       - name: Python debugger for the real DAP test
         run: |

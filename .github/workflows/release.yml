@@ -1,0 +1,202 @@
+name: IDE release
+
+on:
+  push:
+    tags: ['v*-preview.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ide-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }} ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+          - os: windows-2022
+            platform: windows
+            arch: x86_64
+            target: x86_64-pc-windows-msvc
+          - os: macos-15
+            platform: macos
+            arch: arm64
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            platform: macos
+            arch: x86_64
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../solder-release-target
+      CARGO_BUILD_JOBS: '2'
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require an immutable preview tag
+        env:
+          RELEASE_REF: ${{ github.ref }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          ref = os.environ['RELEASE_REF']
+          if not re.fullmatch(r'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+-preview\.[0-9]{8}\.[0-9]+', ref):
+              raise SystemExit('Run this workflow from a versioned preview tag')
+          PY
+      - name: Free unused Linux runner tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+      - name: Existing GPUI build libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev \
+            libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
+            libasound2-dev libzstd-dev libwebkit2gtk-4.1-dev pkg-config cmake
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: editor -> ../../solder-release-target
+          key: release-${{ matrix.target }}
+          cache-on-failure: true
+      - name: Check release packager
+        run: python3 editor/scripts/package-release-test.py
+      - name: Compile the native release binary
+        working-directory: editor
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$RELEASE_TARGET" -p solder --bin solder
+      - name: Record native runtime dependencies
+        env:
+          RELEASE_PLATFORM: ${{ matrix.platform }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/solder-release-reports"
+          binary="$CARGO_TARGET_DIR/$RELEASE_TARGET/release/solder"
+          if [ "$RELEASE_PLATFORM" = linux ]; then
+            ldd "$binary" > "$RUNNER_TEMP/solder-release-reports/runtime.txt"
+            if grep -q 'not found' "$RUNNER_TEMP/solder-release-reports/runtime.txt"; then exit 1; fi
+          elif [ "$RELEASE_PLATFORM" = macos ]; then
+            otool -L "$binary" > "$RUNNER_TEMP/solder-release-reports/runtime.txt"
+            if tail -n +2 "$RUNNER_TEMP/solder-release-reports/runtime.txt" | grep -E '/(Users|opt/homebrew|usr/local|private/tmp)/'; then
+              echo 'The binary links to a build-machine library'; exit 1
+            fi
+          else
+            # The linker resolves system imports. Keep the exact executable's
+            # format and dependencies in its archive for manual diagnosis.
+            python3 - "$binary.exe" "$RUNNER_TEMP/solder-release-reports/runtime.txt" <<'PY'
+          from pathlib import Path
+          import os, shutil, subprocess, sys
+          llvm = shutil.which('llvm-readobj') or str(Path(os.environ['ProgramFiles']) / 'LLVM/bin/llvm-readobj.exe')
+          with Path(sys.argv[2]).open('w', encoding='utf-8') as report:
+              subprocess.run([llvm, '--coff-imports', sys.argv[1]], stdout=report, check=True)
+          PY
+          fi
+      - name: Package the native application
+        env:
+          RELEASE_PLATFORM: ${{ matrix.platform }}
+          RELEASE_ARCH: ${{ matrix.arch }}
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SOURCE: ${{ github.sha }}
+        run: |
+          binary="$CARGO_TARGET_DIR/$RELEASE_TARGET/release/solder"
+          if [ "$RELEASE_PLATFORM" = windows ]; then binary="$binary.exe"; fi
+          python3 editor/scripts/package-release.py \
+            --binary "$binary" --platform "$RELEASE_PLATFORM" --arch "$RELEASE_ARCH" \
+            --tag "$RELEASE_TAG" --source "$RELEASE_SOURCE" --out dist \
+            --runtime-report "$RUNNER_TEMP/solder-release-reports/runtime.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish all platform builds
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Verify the complete set and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SOURCE: ${{ github.sha }}
+          RELEASE_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, os, subprocess, tarfile, zipfile
+          tag, source, repo = (os.environ[key] for key in ('RELEASE_TAG', 'RELEASE_SOURCE', 'RELEASE_REPO'))
+          names = [f'solder-{tag}-{platform}-{arch}.{suffix}' for platform, arch, suffix in (
+              ('linux', 'x86_64', 'tar.gz'), ('windows', 'x86_64', 'zip'),
+              ('macos', 'arm64', 'zip'), ('macos', 'x86_64', 'zip'))]
+          hashes = []
+          for name in names:
+              path = Path('dist') / name
+              if not path.is_file() or not path.stat().st_size:
+                  raise SystemExit(f'Missing release archive: {name}')
+              if name.endswith('.tar.gz'):
+                  with tarfile.open(path, 'r:gz') as archive:
+                      info = json.load(archive.extractfile('BUILD-INFO.json'))
+                      binary = archive.extractfile(info['binary']).read()
+              else:
+                  with zipfile.ZipFile(path) as archive:
+                      info = json.loads(archive.read('BUILD-INFO.json'))
+                      binary = archive.read(info['binary'])
+              expected_name = f"solder-{tag}-{info['platform']}-{info['arch']}." + ('tar.gz' if info['platform'] == 'linux' else 'zip')
+              if (info['source'] != source or info['tag'] != tag or expected_name != name or
+                      hashlib.sha256(binary).hexdigest() != info['binary_sha256']):
+                  raise SystemExit(f'Wrong source or corrupted executable in {name}')
+              hashes.append(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {name}\n')
+          checksums = Path('dist/SHA256SUMS.txt')
+          checksums.write_text(''.join(hashes), encoding='utf-8')
+          notes = Path(os.environ['RUNNER_TEMP']) / 'release-notes.md'
+          template = Path('editor/RELEASES.md').read_text(encoding='utf-8')
+          notes.write_text(template.replace('{{TAG}}', tag).replace('{{SOURCE}}', source), encoding='utf-8')
+          # A failed upload can leave our own draft behind. Resume only a
+          # draft for this exact immutable tag; a published release is left alone.
+          existing = subprocess.run(['gh', 'release', 'view', tag, '--repo', repo,
+                                     '--json', 'isDraft,tagName'], capture_output=True, text=True)
+          if existing.returncode == 0:
+              release = json.loads(existing.stdout)
+              if not release['isDraft'] or release['tagName'] != tag:
+                  raise SystemExit('Refusing to replace a published release')
+          else:
+              subprocess.run(['gh', 'release', 'create', tag, '--repo', repo, '--verify-tag',
+                              '--draft', '--prerelease', '--latest=false', '--title', f'Solder {tag}',
+                              '--notes-file', str(notes)], check=True)
+          subprocess.run(['gh', 'release', 'upload', tag, '--repo', repo, '--clobber',
+                          *[str(Path('dist') / name) for name in names], str(checksums)], check=True)
+          subprocess.run(['gh', 'release', 'edit', tag, '--repo', repo, '--draft=false',
+                          '--prerelease', '--latest=false'], check=True)
+          PY

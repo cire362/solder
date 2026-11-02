@@ -28,6 +28,10 @@ open entry until it has evidence. PR #58 is the preceding recovery/export
 implementation; its native-window checks and the recovery manager are below.
 
 ### Not verified
+- [ ] Preview release archives: native compilation and packaging checks do not
+      verify installation or daily use on clean macOS, Windows and Linux systems.
+      Apple notarization, Windows publisher signing, installers and bundled Linux
+      system libraries are not provided. See `RELEASES.md` for launch requirements
 - [x] Startup keeps an explicitly opened file, picture or notebook in front
       while earlier tabs restore, and preserves a choice made during loading.
       Five regression tests passed; the empty-session notebook case was also
