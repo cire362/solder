@@ -79,8 +79,11 @@ implementation; its native-window checks and the recovery manager are below.
       power loss. Fault injection, same-size/time external edits,
       source aliases, independent writers, repeated saves and notebook serializer
       failures are checked with temporary files and first-party process fixtures.
-      macOS extended attributes are checked on the filesystem. No published
-      extension or external filesystem was used for these checks
+      macOS extended attributes are checked on the filesystem. Saving and
+      creating files on FAT and exFAT is checked on macOS with disk images
+      (`SOLDER_TEST_FAT`); on Linux such filesystems, where GNU cp reports
+      the missing attributes, were not tried. No published extension or
+      network filesystem was used for these checks
 - [x] Native macOS multi-window Quit: one decision for two text projects,
       Cancel, window-close Cancel, failed write stopping Quit with recovery
       retained, then repaired Save All, process exit and both recovery cleanups.
@@ -264,11 +267,6 @@ implementation; its native-window checks and the recovery manager are below.
       revision and atomically replace the target file, but do not lock other
       writers across the final check and rename. Recovery now retains the
       original remote revision; legacy copies without it require Save As
-- [ ] A line is moved to where its language wants it only if the tree is
-      in step within a millisecond of the key. On a busy machine a closing
-      tag typed in a language of an extension can stay where it was typed,
-      and is not moved when the tree comes later. Tests wait for the tree,
-      so they check what the language says and not this
 - [ ] On Linux, what a program prints just before it ends can be missing
       from its terminal: an error and an exit at once, which is what a
       failed command is. `alacritty_terminal` 0.26 reads the bytes, finds
@@ -290,16 +288,14 @@ implementation; its native-window checks and the recovery manager are below.
       text. A picture that is not a file of this machine is named, not
       fetched: the editor asks the network for nothing by itself
 - [ ] A picture has no zoom and cannot be moved about; one larger than
-      64 MB is not shown; ICO, AVIF and HEIC open as text. The keys that go
-      to the next and the previous tab pass over pictures and previews
+      64 MB is not shown; ICO, AVIF and HEIC open as text
 - [ ] A second `solder` started while one runs is a second process, not a
       window of the first. Nothing is done when the Dock icon is clicked
       with no window, or a folder is dropped on it. There is no menu bar,
       so no Open Recent in one
 - [ ] A clone takes the default branch whole: no branch, depth or
-      submodules to choose, and a clone into a folder inside the
-      repository being cloned is not refused. A project leaves the list of
-      those opened before only when its folder is gone
+      submodules to choose. A project leaves the list of those opened
+      before only when its folder is gone
 - [ ] A crash that is no panic leaves no report: a signal, an abort in
       native code, memory that ran out. Only the editor's own errors reach
       `solder.log`: what the `syntax` and `extension` crates print, what

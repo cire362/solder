@@ -724,7 +724,8 @@ impl LspStore {
                 DocumentEvent::DirtyChanged
                 | DocumentEvent::DiagnosticsChanged
                 | DocumentEvent::HintsChanged
-                | DocumentEvent::GitChanged => {}
+                | DocumentEvent::GitChanged
+                | DocumentEvent::SyntaxChanged => {}
             }),
             cx.observe_release(document, move |this, _, _| {
                 this.close(id);
